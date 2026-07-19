@@ -6,7 +6,7 @@ use crate::commands;
 use crate::state::AppState;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{App, AppHandle, Manager, Wry};
+use tauri::{App, AppHandle, Emitter, Manager, Wry};
 
 pub const TRAY_ID: &str = "witness-tray";
 
@@ -25,6 +25,7 @@ pub struct TrayHandles {
 
 fn show_main(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        let _ = window.emit("tray-popup", false);
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
@@ -50,6 +51,7 @@ fn show_popup(app: &AppHandle, click: tauri::PhysicalPosition<f64>) {
             y = y.min(ay + ah - h - 8).max(ay);
         }
         let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x, y }));
+        let _ = window.emit("tray-popup", true);
         POPUP_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = window.unminimize();
         let _ = window.show();

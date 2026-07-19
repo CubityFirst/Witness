@@ -18,6 +18,7 @@ import {
   onTranscriptionComplete,
   onTranscriptionFailed,
   onTranscriptionProgress,
+  onTrayPopup,
   onWatcherStatus,
   type LiveTranscript,
   type ModelDownloadProgress,
@@ -82,6 +83,8 @@ export function App() {
   // First-run: prompt to fetch the transcription models.
   const [modelsMissing, setModelsMissing] = useState(false);
   const [modelDl, setModelDl] = useState<ModelDownloadProgress | null>(null);
+  // Tray-flyout mode: no window controls (blur dismisses the window).
+  const [popupMode, setPopupMode] = useState(false);
   const searchDebounce = useRef<number | undefined>(undefined);
 
   const refreshStatus = () => getStatus().then(setStatus).catch(() => {});
@@ -97,6 +100,7 @@ export function App() {
         .catch(() => {});
     }
     const unlisteners = [
+      onTrayPopup(setPopupMode),
       onModelDownloadProgress((p) => {
         setModelDl(p.done && !p.error ? null : p);
         if (p.done && !p.error) {
@@ -247,6 +251,7 @@ export function App() {
             <GearSix />
           </button>
         </nav>
+        {!popupMode && (
         <div class="window-controls">
           <button
             class="win-btn"
@@ -273,6 +278,7 @@ export function App() {
             <X size={14} />
           </button>
         </div>
+        )}
       </header>
       <main class="content">
         {modelsMissing && (

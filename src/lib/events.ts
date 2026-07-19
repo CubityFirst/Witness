@@ -58,3 +58,6 @@ export interface LiveTranscript {
 }
 
 export const onLiveTranscript = on<LiveTranscript>("live-transcript");
+
+/** True when the window was just shown as a tray flyout (blur dismisses). */
+export const onTrayPopup = on<boolean>("tray-popup");
