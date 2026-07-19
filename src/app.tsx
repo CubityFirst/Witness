@@ -37,7 +37,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 /** True when the event landed on an interactive element (skip window drag). */
 function onInteractive(e: MouseEvent): boolean {
   const t = e.target as HTMLElement | null;
-  return !!t?.closest("button, input, select, a, textarea");
+  return !!t?.closest("button, input, select, a, textarea, .pill-click");
 }
 
 /**
