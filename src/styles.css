@@ -569,14 +569,12 @@ body {
   padding-bottom: 8px;
 }
 
-/* Push the menus to the right of the Back button. */
-.transcript-header .menu-wrap:first-of-type {
-  margin-left: auto;
-}
-
 .transcript-titleblock {
+  flex: 1;
   min-width: 0;
-  padding-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
 .transcript-titleblock h2 {

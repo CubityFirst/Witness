@@ -288,6 +288,55 @@ export function TranscriptView(props: {
         <button class="btn btn-ghost btn-with-icon" title="Back" aria-label="Back" onClick={props.onBack}>
           <ArrowLeft size={16} />
         </button>
+        <div class="transcript-titleblock">
+          {editingTitle ? (
+            <input
+              class="rename-input title-input"
+              value={titleText}
+              autoFocus
+              onInput={(e) => setTitleText((e.target as HTMLInputElement).value)}
+              onBlur={() => {
+                setEditingTitle(false);
+                const title = titleText.trim();
+                if (title && title !== m.title) {
+                  renameMeeting(m.id, title).then(() =>
+                    setDetail((d) =>
+                      d ? { ...d, meeting: { ...d.meeting, title } } : d,
+                    ),
+                  );
+                }
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                if (e.key === "Escape") setEditingTitle(false);
+              }}
+            />
+          ) : (
+            <h2
+              title="Double-click to rename"
+              onDblClick={() => {
+                setTitleText(m.title);
+                setEditingTitle(true);
+              }}
+            >
+              {m.title}
+              <button
+                class="icon-btn rename-btn"
+                title="Rename meeting"
+                onClick={() => {
+                  setTitleText(m.title);
+                  setEditingTitle(true);
+                }}
+              >
+                <PencilSimple size={14} />
+              </button>
+            </h2>
+          )}
+          <span class="meeting-meta">
+            {fmtDate(m.started_at)} · {fmtDuration(m.duration_ms)}
+            {m.engine ? ` · ${m.engine}` : ""}
+          </span>
+        </div>
         <div class="menu-wrap">
           <button
             class="btn btn-ghost btn-with-icon"
