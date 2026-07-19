@@ -1,0 +1,61 @@
+[package]
+name = "witness"
+version = "0.1.0"
+description = "Local meeting recorder & transcriber"
+edition = "2021"
+license = "MIT"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png", "protocol-asset"] }
+tauri-plugin-notification = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-global-shortcut = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+simplelog = "0.12"
+crossbeam-channel = "0.5"
+rusqlite = { version = "0.40", features = ["bundled"] }
+hound = "3.5"
+rubato = "0.16"
+audiopus = "0.2"
+ogg = "0.9"
+# Pure-Rust VAD: voice_activity_detector pins ort =2.0.0-rc.10 which clashes
+# with parakeet-rs (ort 2.0.0-rc.12), so we use earshot instead.
+earshot = "1.1"
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+parakeet-rs = { version = "0.3", features = ["cuda", "sortformer"] }
+whisper-rs = "0.14"
+# Speaker embeddings run through our own ort session; version MUST stay
+# pinned to whatever parakeet-rs uses (shared ort-sys).
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray"] }
+ndarray = "0.17"
+realfft = "3"
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.23"
+winreg = "0.55"
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Threading",
+] }
+
+[features]
+default = []
+# Whisper runs on CPU by default; CUDA needs the CUDA toolkit at build time.
+whisper-cuda = ["whisper-rs/cuda"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
