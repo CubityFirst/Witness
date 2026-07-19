@@ -339,9 +339,12 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
             </span>
             <button
               class="icon-btn"
-              title="Forget this voice"
-              onClick={async () => {
-                if (!(await appConfirm(`Forget ${p.name}'s voice?\nExisting transcripts keep their names.`, "Forget voice")))
+              title="Forget this voice (shift-click: no confirm)"
+              onClick={async (e) => {
+                if (
+                  !e.shiftKey &&
+                  !(await appConfirm(`Forget ${p.name}'s voice?\nExisting transcripts keep their names.`, "Forget voice"))
+                )
                   return;
                 deletePerson(p.id).then(() =>
                   setPeople((prev) => prev.filter((x) => x.id !== p.id)),

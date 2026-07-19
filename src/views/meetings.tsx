@@ -112,8 +112,10 @@ export function MeetingsView(props: {
     }
   };
 
-  const onDelete = async (m: Meeting) => {
+  // Shift-click skips the confirmation on all deletion actions.
+  const onDelete = async (m: Meeting, skipConfirm: boolean) => {
     if (
+      !skipConfirm &&
       !(await appConfirm(
         `Move "${m.title}" to the recycle bin?\nItems there are permanently deleted after 30 days.`,
         "Move to bin",
@@ -126,8 +128,9 @@ export function MeetingsView(props: {
     });
   };
 
-  const onPurge = async (m: DeletedMeeting) => {
+  const onPurge = async (m: DeletedMeeting, skipConfirm: boolean) => {
     if (
+      !skipConfirm &&
       !(await appConfirm(
         `Permanently delete "${m.title}" (audio + transcript)?\nThis cannot be undone.`,
         "Delete forever",
@@ -137,8 +140,9 @@ export function MeetingsView(props: {
     purgeMeeting(m.id).then(loadBin);
   };
 
-  const onEmptyBin = async () => {
+  const onEmptyBin = async (skipConfirm: boolean) => {
     if (
+      !skipConfirm &&
       !(await appConfirm(
         `Permanently delete all ${binned.length} meeting(s) in the recycle bin?\nThis cannot be undone.`,
         "Empty bin",
@@ -157,9 +161,10 @@ export function MeetingsView(props: {
         {binOpen && (
           <button
             class="btn btn-ghost recycle-empty"
+            title="Shift-click to skip confirmation"
             onClick={(e) => {
               e.stopPropagation();
-              onEmptyBin();
+              onEmptyBin(e.shiftKey);
             }}
           >
             Empty bin
@@ -182,7 +187,11 @@ export function MeetingsView(props: {
             >
               <ArrowCounterClockwise size={16} />
             </button>
-            <button class="icon-btn" title="Delete forever" onClick={() => onPurge(m)}>
+            <button
+              class="icon-btn"
+              title="Delete forever (shift-click: no confirm)"
+              onClick={(e) => onPurge(m, e.shiftKey)}
+            >
               <Trash size={16} />
             </button>
           </div>
@@ -256,7 +265,11 @@ export function MeetingsView(props: {
           >
             <PencilSimple size={16} />
           </button>
-          <button class="icon-btn" title="Delete" onClick={() => onDelete(m)}>
+          <button
+            class="icon-btn"
+            title="Delete (shift-click: no confirm)"
+            onClick={(e) => onDelete(m, e.shiftKey)}
+          >
             <Trash size={16} />
           </button>
         </div>
