@@ -23,6 +23,15 @@ pub struct Meeting {
     pub status: String,
     pub engine: Option<String>,
     pub trigger: String,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Bookmark {
+    pub id: i64,
+    pub meeting_id: i64,
+    pub at_ms: i64,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -120,7 +129,7 @@ pub struct Db {
     conn: Mutex<Connection>,
 }
 
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
@@ -223,7 +232,41 @@ impl Db {
                 "#,
             )?;
         }
-        debug_assert!(SCHEMA_VERSION == 3);
+        if version < 4 {
+            conn.execute_batch(
+                r#"
+                BEGIN;
+                ALTER TABLE meetings ADD COLUMN notes TEXT NOT NULL DEFAULT '';
+                CREATE TABLE bookmarks (
+                  id INTEGER PRIMARY KEY,
+                  meeting_id INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+                  at_ms INTEGER NOT NULL,
+                  note TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX idx_bookmarks_meeting ON bookmarks(meeting_id, at_ms);
+                CREATE VIRTUAL TABLE meetings_notes_fts USING fts5(
+                  notes,
+                  content='meetings',
+                  content_rowid='id',
+                  tokenize='porter unicode61 remove_diacritics 2'
+                );
+                INSERT INTO meetings_notes_fts(rowid, notes) SELECT id, notes FROM meetings;
+                CREATE TRIGGER meetings_notes_ai AFTER INSERT ON meetings BEGIN
+                  INSERT INTO meetings_notes_fts(rowid, notes) VALUES (new.id, new.notes);
+                END;
+                CREATE TRIGGER meetings_notes_ad AFTER DELETE ON meetings BEGIN
+                  INSERT INTO meetings_notes_fts(meetings_notes_fts, rowid, notes) VALUES ('delete', old.id, old.notes);
+                END;
+                CREATE TRIGGER meetings_notes_au AFTER UPDATE OF notes ON meetings BEGIN
+                  INSERT INTO meetings_notes_fts(meetings_notes_fts, rowid, notes) VALUES ('delete', old.id, old.notes);
+                  INSERT INTO meetings_notes_fts(rowid, notes) VALUES (new.id, new.notes);
+                END;
+                PRAGMA user_version = 4;
+                COMMIT;
+                "#,
+            )?;
+        }
+        debug_assert!(SCHEMA_VERSION == 4);
         Ok(())
     }
 
@@ -290,11 +333,12 @@ impl Db {
             status: row.get(6)?,
             engine: row.get(7)?,
             trigger: row.get(8)?,
+            notes: row.get(9)?,
         })
     }
 
     const MEETING_COLS: &'static str =
-        "id, started_at, ended_at, title, audio_path, duration_ms, status, engine, trigger";
+        "id, started_at, ended_at, title, audio_path, duration_ms, status, engine, trigger, notes";
 
     pub fn list_meetings(&self, offset: i64, limit: i64) -> Result<Vec<Meeting>> {
         let conn = self.conn.lock().unwrap();
@@ -318,9 +362,59 @@ impl Db {
             Self::MEETING_COLS
         ))?;
         let rows = stmt
-            .query_map([], |row| Ok((Self::row_to_meeting(row)?, row.get::<_, String>(9)?)))?
+            .query_map([], |row| Ok((Self::row_to_meeting(row)?, row.get::<_, String>(10)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    pub fn set_notes(&self, meeting_id: i64, notes: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE meetings SET notes = ?2 WHERE id = ?1",
+            params![meeting_id, notes],
+        )?;
+        Ok(())
+    }
+
+    // ---------- bookmarks ----------
+
+    pub fn add_bookmark(&self, meeting_id: i64, at_ms: i64, note: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO bookmarks (meeting_id, at_ms, note) VALUES (?1, ?2, ?3)",
+            params![meeting_id, at_ms, note],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn list_bookmarks(&self, meeting_id: i64) -> Result<Vec<Bookmark>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, meeting_id, at_ms, note FROM bookmarks WHERE meeting_id = ?1 ORDER BY at_ms",
+        )?;
+        let rows = stmt
+            .query_map(params![meeting_id], |row| {
+                Ok(Bookmark {
+                    id: row.get(0)?,
+                    meeting_id: row.get(1)?,
+                    at_ms: row.get(2)?,
+                    note: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn set_bookmark_note(&self, bookmark_id: i64, note: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE bookmarks SET note = ?2 WHERE id = ?1", params![bookmark_id, note])?;
+        Ok(())
+    }
+
+    pub fn delete_bookmark(&self, bookmark_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM bookmarks WHERE id = ?1", params![bookmark_id])?;
+        Ok(())
     }
 
     pub fn soft_delete_meeting(&self, id: i64) -> Result<()> {
@@ -770,7 +864,7 @@ impl Db {
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![
             Box::new(SNIPPET_OPEN),
             Box::new(SNIPPET_CLOSE),
-            Box::new(expr),
+            Box::new(expr.clone()),
         ];
         if let Some(pid) = person_id {
             sql.push_str(&format!(" AND sp.person_id = ?{}", args.len() + 1));
@@ -798,7 +892,7 @@ impl Db {
         args.push(Box::new(offset));
 
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt
+        let mut rows = stmt
             .query_map(rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())), |row| {
                 Ok(SearchHit {
                     meeting_id: row.get(0)?,
@@ -811,6 +905,48 @@ impl Db {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // Meeting-notes hits (segment_id = -1 → open the meeting, no seek).
+        // Speaker/track filters don't apply to notes, so skip them then;
+        // also only on the first page to avoid duplicate appends.
+        if person_id.is_none() && track.is_none() && offset == 0 {
+            let mut sql = String::from(
+                "SELECT m.id, m.title, m.started_at,
+                        snippet(meetings_notes_fts, 0, ?1, ?2, ' … ', 12)
+                 FROM meetings_notes_fts
+                 JOIN meetings m ON m.id = meetings_notes_fts.rowid
+                 WHERE meetings_notes_fts MATCH ?3 AND m.deleted_at IS NULL",
+            );
+            let mut nargs: Vec<Box<dyn rusqlite::ToSql>> = vec![
+                Box::new(SNIPPET_OPEN),
+                Box::new(SNIPPET_CLOSE),
+                Box::new(expr),
+            ];
+            if let Some(from) = date_from {
+                sql.push_str(&format!(" AND m.started_at >= ?{}", nargs.len() + 1));
+                nargs.push(Box::new(from.to_string()));
+            }
+            if let Some(to) = date_to {
+                sql.push_str(&format!(" AND substr(m.started_at, 1, 10) <= ?{}", nargs.len() + 1));
+                nargs.push(Box::new(to.to_string()));
+            }
+            sql.push_str(" ORDER BY bm25(meetings_notes_fts) LIMIT 10");
+            let mut stmt = conn.prepare(&sql)?;
+            let notes_hits = stmt
+                .query_map(rusqlite::params_from_iter(nargs.iter().map(|a| a.as_ref())), |row| {
+                    Ok(SearchHit {
+                        meeting_id: row.get(0)?,
+                        meeting_title: row.get(1)?,
+                        started_at: row.get(2)?,
+                        segment_id: -1,
+                        start_ms: 0,
+                        speaker_name: Some("Notes".into()),
+                        snippet: row.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.extend(notes_hits);
+        }
         Ok(rows)
     }
 }
@@ -911,6 +1047,20 @@ mod tests {
         // FK ON DELETE SET NULL cleared the link.
         let s1 = db.get_speakers(id).unwrap().into_iter().find(|s| s.label == "S1").unwrap();
         assert_eq!(s1.person_id, None);
+
+        // Notes: FTS-searchable through the same search(), bookmarks CRUD.
+        db.set_notes(id, "remember to send the follow-up invoice").unwrap();
+        let hits = db.search("invoice", 0, 10, None, None, None, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].segment_id, -1);
+        assert_eq!(hits[0].speaker_name.as_deref(), Some("Notes"));
+        let bm = db.add_bookmark(id, 12_000, "").unwrap();
+        db.set_bookmark_note(bm, "key decision").unwrap();
+        let bms = db.list_bookmarks(id).unwrap();
+        assert_eq!(bms.len(), 1);
+        assert_eq!(bms[0].note, "key decision");
+        db.delete_bookmark(bm).unwrap();
+        assert!(db.list_bookmarks(id).unwrap().is_empty());
 
         // Recycle bin: soft delete hides, restore brings back.
         db.soft_delete_meeting(id).unwrap();

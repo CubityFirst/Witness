@@ -229,44 +229,63 @@ fn setup(app: &tauri::App) -> anyhow::Result<()> {
         }),
         downloading: std::sync::atomic::AtomicBool::new(false),
         hotkey: Mutex::new(None),
+        bookmark_hotkey: Mutex::new(None),
     });
 
     tray::build(app)?;
 
-    // Global start/stop hotkey.
+    // Global hotkeys: record toggle + bookmark-this-moment. Other apps may
+    // own combos system-wide, so each walks a candidate chain; per-shortcut
+    // handlers keep the two actions apart.
     {
         use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
-        app.handle().plugin(
-            tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _shortcut, event| {
-                    if event.state() == ShortcutState::Pressed {
-                        let recording =
-                            app.state::<AppState>().recorder.lock().unwrap().is_some();
-                        let result = if recording {
-                            commands::do_stop_recording(app, true)
-                        } else {
-                            commands::do_start_recording(app, "manual").map(|_| ())
-                        };
-                        if let Err(e) = result {
-                            log::warn!("hotkey record toggle: {e}");
-                        }
-                    }
-                })
-                .build(),
-        )?;
-        // Other apps may own our preferred combo system-wide; walk a chain.
-        let mut bound = None;
+        app.handle()
+            .plugin(tauri_plugin_global_shortcut::Builder::new().build())?;
+
         for candidate in ["ctrl+alt+r", "ctrl+alt+w", "ctrl+alt+shift+r"] {
-            match app.global_shortcut().register(candidate) {
+            let result = app.global_shortcut().on_shortcut(candidate, |app, _sc, event| {
+                if event.state() == ShortcutState::Pressed {
+                    let recording = app.state::<AppState>().recorder.lock().unwrap().is_some();
+                    let result = if recording {
+                        commands::do_stop_recording(app, true)
+                    } else {
+                        commands::do_start_recording(app, "manual").map(|_| ())
+                    };
+                    if let Err(e) = result {
+                        log::warn!("hotkey record toggle: {e}");
+                    }
+                }
+            });
+            match result {
                 Ok(()) => {
                     log::info!("record hotkey bound: {candidate}");
-                    bound = Some(candidate.to_string());
+                    *app.state::<AppState>().hotkey.lock().unwrap() =
+                        Some(candidate.to_string());
                     break;
                 }
                 Err(e) => log::warn!("hotkey {candidate} unavailable: {e}"),
             }
         }
-        *app.state::<AppState>().hotkey.lock().unwrap() = bound;
+
+        for candidate in ["ctrl+alt+b", "ctrl+alt+m"] {
+            let result = app.global_shortcut().on_shortcut(candidate, |app, _sc, event| {
+                if event.state() == ShortcutState::Pressed {
+                    // "Not recording" is the normal no-op case.
+                    if let Err(e) = commands::do_bookmark_now(app) {
+                        log::debug!("bookmark hotkey: {e}");
+                    }
+                }
+            });
+            match result {
+                Ok(()) => {
+                    log::info!("bookmark hotkey bound: {candidate}");
+                    *app.state::<AppState>().bookmark_hotkey.lock().unwrap() =
+                        Some(candidate.to_string());
+                    break;
+                }
+                Err(e) => log::warn!("hotkey {candidate} unavailable: {e}"),
+            }
+        }
     }
 
     // Launched at login (autostart passes --minimized): start in the tray.
@@ -379,6 +398,11 @@ fn main() {
             commands::purge_meeting,
             commands::empty_recycle_bin,
             commands::rename_meeting,
+            commands::set_meeting_notes,
+            commands::bookmark_now,
+            commands::add_bookmark,
+            commands::set_bookmark_note,
+            commands::delete_bookmark,
             commands::rename_speaker,
             commands::list_people,
             commands::delete_person,

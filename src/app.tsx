@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import {
   type AppStatus,
+  bookmarkNow,
+  downloadModels,
+  getModelStatus,
   getStatus,
   startRecording,
   stopRecording,
@@ -8,6 +11,7 @@ import {
 import {
   onLiveTranscript,
   onMeetingsChanged,
+  onModelDownloadProgress,
   onRecordingLevel,
   onRecordingStarted,
   onRecordingStopped,
@@ -16,6 +20,7 @@ import {
   onTranscriptionProgress,
   onWatcherStatus,
   type LiveTranscript,
+  type ModelDownloadProgress,
   type RecordingLevel,
   type TranscriptionProgress,
 } from "./lib/events";
@@ -24,12 +29,19 @@ import { TranscriptView } from "./views/transcript";
 import { SearchView } from "./views/search";
 import { SettingsView } from "./views/settings";
 import { PeopleView } from "./views/people";
-import { GearSix, Record, Stop } from "./lib/icons";
+import { BookmarkSimple, GearSix, Minus, Record, Square, Stop, X } from "./lib/icons";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+
+/** True when the event landed on an interactive element (skip window drag). */
+function onInteractive(e: MouseEvent): boolean {
+  const t = e.target as HTMLElement | null;
+  return !!t?.closest("button, input, select, a, textarea");
+}
 
 export type View =
   | { kind: "meetings" }
   | { kind: "people" }
-  | { kind: "transcript"; meetingId: number; segmentId?: number }
+  | { kind: "transcript"; meetingId: number; segmentId?: number; highlight?: string }
   | { kind: "search"; query: string }
   | { kind: "settings" };
 
@@ -53,13 +65,34 @@ export function App() {
   // Provisional captions for the meeting currently being recorded.
   const [liveLines, setLiveLines] = useState<LiveTranscript[]>([]);
   const [liveMeetingId, setLiveMeetingId] = useState<number | null>(null);
+  // First-run: prompt to fetch the transcription models.
+  const [modelsMissing, setModelsMissing] = useState(false);
+  const [modelDl, setModelDl] = useState<ModelDownloadProgress | null>(null);
   const searchDebounce = useRef<number | undefined>(undefined);
 
   const refreshStatus = () => getStatus().then(setStatus).catch(() => {});
 
   useEffect(() => {
     refreshStatus();
+    // First-run banner: transcription models not fetched yet.
+    if (localStorage.getItem("witness-model-banner-dismissed") !== "1") {
+      getModelStatus()
+        .then((models) =>
+          setModelsMissing(models.some((m) => m.engine === "parakeet" && !m.present)),
+        )
+        .catch(() => {});
+    }
     const unlisteners = [
+      onModelDownloadProgress((p) => {
+        setModelDl(p.done && !p.error ? null : p);
+        if (p.done && !p.error) {
+          getModelStatus()
+            .then((models) =>
+              setModelsMissing(models.some((m) => m.engine === "parakeet" && !m.present)),
+            )
+            .catch(() => {});
+        }
+      }),
       onRecordingStarted((e) => {
         setLiveLines([]);
         setLiveMeetingId(e.meeting_id);
@@ -145,7 +178,20 @@ export function App() {
 
   return (
     <div class="app">
-      <header class="topbar">
+      <header
+        class="topbar"
+        // The top bar doubles as the (chrome-less) window title bar.
+        onMouseDown={(e) => {
+          if (e.buttons === 1 && !onInteractive(e)) {
+            getCurrentWindow().startDragging().catch(() => {});
+          }
+        }}
+        onDblClick={(e) => {
+          if (!onInteractive(e)) {
+            getCurrentWindow().toggleMaximize().catch(() => {});
+          }
+        }}
+      >
         <button
           class={recording ? "btn btn-with-icon btn-stop" : "btn btn-with-icon btn-record"}
           title={recording ? "Stop recording" : "Start recording"}
@@ -154,6 +200,16 @@ export function App() {
         >
           {recording ? <Stop size={17} /> : <Record size={17} />}
         </button>
+        {recording && (
+          <button
+            class="btn btn-with-icon"
+            title="Bookmark this moment (Ctrl+Alt+B)"
+            aria-label="Bookmark this moment"
+            onClick={() => bookmarkNow().catch(() => {})}
+          >
+            <BookmarkSimple size={16} />
+          </button>
+        )}
         {statusPill}
         <nav class="nav">
           <button
@@ -177,8 +233,66 @@ export function App() {
             <GearSix />
           </button>
         </nav>
+        <div class="window-controls">
+          <button
+            class="win-btn"
+            title="Minimize"
+            aria-label="Minimize"
+            onClick={() => getCurrentWindow().minimize().catch(() => {})}
+          >
+            <Minus size={14} />
+          </button>
+          <button
+            class="win-btn"
+            title="Maximize"
+            aria-label="Maximize"
+            onClick={() => getCurrentWindow().toggleMaximize().catch(() => {})}
+          >
+            <Square size={12} />
+          </button>
+          <button
+            class="win-btn win-close"
+            title="Close to tray"
+            aria-label="Close to tray"
+            onClick={() => getCurrentWindow().hide().catch(() => {})}
+          >
+            <X size={14} />
+          </button>
+        </div>
       </header>
       <main class="content">
+        {modelsMissing && (
+          <div class="model-banner">
+            <span>
+              <b>Transcription models not installed.</b> Recording works, but
+              nothing gets transcribed. One-time download, ~3.5 GB (Parakeet +
+              speaker models).
+            </span>
+            {modelDl && !modelDl.error ? (
+              <span class="muted">
+                {modelDl.total_bytes
+                  ? `${Math.round((modelDl.downloaded_bytes / modelDl.total_bytes) * 100)}% of ${modelDl.file}`
+                  : "downloading…"}
+              </span>
+            ) : (
+              <button
+                class="btn"
+                onClick={() => downloadModels("parakeet").catch((e) => alert(String(e)))}
+              >
+                Download now
+              </button>
+            )}
+            <button
+              class="btn btn-ghost"
+              onClick={() => {
+                localStorage.setItem("witness-model-banner-dismissed", "1");
+                setModelsMissing(false);
+              }}
+            >
+              Later
+            </button>
+          </div>
+        )}
         {(view.kind === "meetings" || view.kind === "search") && (
           <div class="list-toolbar">
             <input
@@ -206,6 +320,7 @@ export function App() {
           <TranscriptView
             meetingId={view.meetingId}
             focusSegmentId={view.segmentId}
+            highlight={view.highlight}
             refreshTick={refreshTick}
             liveLines={
               // Fall back to get_status so a page reload mid-recording
@@ -229,7 +344,7 @@ export function App() {
           <SearchView
             query={view.query}
             onOpen={(meetingId, segmentId) =>
-              setView({ kind: "transcript", meetingId, segmentId })
+              setView({ kind: "transcript", meetingId, segmentId, highlight: view.query })
             }
           />
         )}

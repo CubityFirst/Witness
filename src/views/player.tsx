@@ -28,6 +28,8 @@ function fmtClock(seconds: number): string {
 export function AudioPlayer(props: {
   src: string;
   audioRef: RefObject<HTMLAudioElement>;
+  /** Bookmark positions (ms) shown as ticks on the scrubber. */
+  markers?: number[];
   onTimeUpdate: () => void;
   onDownload: () => void;
 }) {
@@ -123,15 +125,26 @@ export function AudioPlayer(props: {
       />
       <div class="player-row">
         <span class="player-time">{fmtClock(current)}</span>
-        <input
-          class="player-seek"
-          type="range"
-          min={0}
-          max={duration || 0}
-          step={0.1}
-          value={current}
-          onInput={(e) => seek(parseFloat((e.target as HTMLInputElement).value))}
-        />
+        <div class="player-seek-wrap">
+          <input
+            class="player-seek"
+            type="range"
+            min={0}
+            max={duration || 0}
+            step={0.1}
+            value={current}
+            onInput={(e) => seek(parseFloat((e.target as HTMLInputElement).value))}
+          />
+          {duration > 0 &&
+            (props.markers ?? []).map((ms) => (
+              <span
+                class="seek-marker"
+                key={ms}
+                style={{ left: `${Math.min(100, (ms / 1000 / duration) * 100)}%` }}
+                title={fmtClock(ms / 1000)}
+              />
+            ))}
+        </div>
         <span class="player-time player-time-total">{fmtClock(duration)}</span>
       </div>
       <div class="player-row player-controls">

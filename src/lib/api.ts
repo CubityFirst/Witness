@@ -20,6 +20,14 @@ export interface Meeting {
   status: MeetingStatus;
   engine: string | null;
   trigger: "auto" | "manual";
+  notes: string;
+}
+
+export interface Bookmark {
+  id: number;
+  meeting_id: number;
+  at_ms: number;
+  note: string;
 }
 
 export interface Speaker {
@@ -52,6 +60,7 @@ export interface MeetingDetail {
   meeting: Meeting;
   speakers: Speaker[];
   segments: Segment[];
+  bookmarks: Bookmark[];
 }
 
 export interface WatcherStatus {
@@ -156,6 +165,17 @@ export const purgeMeeting = (id: number) =>
 export const emptyRecycleBin = () => invoke<void>("empty_recycle_bin");
 export const renameMeeting = (id: number, title: string) =>
   invoke<void>("rename_meeting", { id, title });
+export const setMeetingNotes = (meetingId: number, notes: string) =>
+  invoke<void>("set_meeting_notes", { meetingId, notes });
+
+/** Flag the current moment of the active recording. */
+export const bookmarkNow = () => invoke<void>("bookmark_now");
+export const addBookmark = (meetingId: number, atMs: number, note: string) =>
+  invoke<number>("add_bookmark", { meetingId, atMs, note });
+export const setBookmarkNote = (bookmarkId: number, note: string) =>
+  invoke<void>("set_bookmark_note", { bookmarkId, note });
+export const deleteBookmark = (bookmarkId: number) =>
+  invoke<void>("delete_bookmark", { bookmarkId });
 export const renameSpeaker = (speakerId: number, name: string) =>
   invoke<void>("rename_speaker", { speakerId, name });
 export const listPeople = () => invoke<Person[]>("list_people");

@@ -25,7 +25,6 @@ pub struct TrayHandles {
 
 fn show_main(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.set_decorations(true);
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
@@ -50,9 +49,6 @@ fn show_popup(app: &AppHandle, click: tauri::PhysicalPosition<f64>) {
             x = x.clamp(ax, (ax + aw - w - 8).max(ax));
             y = y.min(ay + ah - h - 8).max(ay);
         }
-        // Flyouts are chrome-less; show_main restores the title bar for
-        // normal opens.
-        let _ = window.set_decorations(false);
         let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x, y }));
         POPUP_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = window.unminimize();

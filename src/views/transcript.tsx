@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
+  deleteBookmark,
   exportAudio,
   exportTranscript,
   getAudioUrl,
@@ -8,6 +9,9 @@ import {
   renameMeeting,
   renameSpeaker,
   retranscribe,
+  setBookmarkNote,
+  setMeetingNotes,
+  type Bookmark,
   type Engine,
   type MeetingDetail,
   type Segment,
@@ -16,7 +20,7 @@ import {
 import { fmtDate, fmtDuration } from "./meetings";
 import type { LiveTranscript } from "../lib/events";
 import { AudioPlayer } from "./player";
-import { PencilSimple } from "../lib/icons";
+import { BookmarkSimple, PencilSimple, Trash } from "../lib/icons";
 
 function fmtTs(ms: number): string {
   const s = Math.floor(ms / 1000);
@@ -34,6 +38,23 @@ const CHIP_CLASS: Record<string, string> = {
   S3: "chip-s3",
   S4: "chip-s4",
 };
+
+/** Case-insensitive term highlighting for search deep-links. */
+function Highlighted({ text, terms }: { text: string; terms?: string }) {
+  const tokens = (terms ?? "")
+    .split(/\s+/)
+    .map((t) => t.replace(/[^\p{L}\p{N}']/gu, ""))
+    .filter((t) => t.length >= 2 && !["and", "or", "not", "near"].includes(t.toLowerCase()));
+  if (tokens.length === 0) return <>{text}</>;
+  const escaped = [...new Set(tokens)].map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const re = new RegExp(`(${escaped.join("|")})`, "gi");
+  const parts = text.split(re);
+  return (
+    <>
+      {parts.map((p, i) => (i % 2 === 1 ? <mark key={i}>{p}</mark> : p))}
+    </>
+  );
+}
 
 /** Binary search: index of the last segment with start_ms <= t, or -1. */
 function segmentAt(segments: Segment[], t: number): number {
@@ -53,6 +74,8 @@ function segmentAt(segments: Segment[], t: number): number {
 export function TranscriptView(props: {
   meetingId: number;
   focusSegmentId?: number;
+  /** Search query to highlight inside segment text (deep-links). */
+  highlight?: string;
   refreshTick: number;
   /** Provisional captions while this meeting is being recorded. */
   liveLines: LiveTranscript[] | null;
@@ -69,6 +92,8 @@ export function TranscriptView(props: {
   const [copied, setCopied] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleText, setTitleText] = useState("");
+  const [notesDraft, setNotesDraft] = useState("");
+  const [bmEditing, setBmEditing] = useState<{ id: number; text: string } | null>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const focusedOnce = useRef(false);
@@ -82,6 +107,24 @@ export function TranscriptView(props: {
     getAudioUrl(props.meetingId).then(setAudioUrl).catch(() => setAudioUrl(null));
   }, [props.meetingId]);
 
+  // Seed the notes draft when switching meetings (not on refreshTick, so a
+  // reload never clobbers unsaved typing).
+  useEffect(() => {
+    getMeeting(props.meetingId)
+      .then((d) => setNotesDraft(d.meeting.notes))
+      .catch(() => setNotesDraft(""));
+  }, [props.meetingId]);
+
+  const saveNotes = () => {
+    if (detail && notesDraft !== detail.meeting.notes) {
+      setMeetingNotes(props.meetingId, notesDraft).then(() =>
+        setDetail((d) =>
+          d ? { ...d, meeting: { ...d.meeting, notes: notesDraft } } : d,
+        ),
+      );
+    }
+  };
+
   const speakersById = useMemo(() => {
     const m = new Map<
       number,
@@ -92,6 +135,23 @@ export function TranscriptView(props: {
   }, [detail]);
 
   const segments = detail?.segments ?? [];
+  const bookmarks = detail?.bookmarks ?? [];
+
+  // Bookmarks interleave with segments by time.
+  type Row =
+    | { kind: "seg"; seg: Segment; idx: number; at: number }
+    | { kind: "bm"; bm: Bookmark; at: number };
+  const rows = useMemo<Row[]>(() => {
+    const rs: Row[] = segments.map((seg, idx) => ({
+      kind: "seg" as const,
+      seg,
+      idx,
+      at: seg.start_ms,
+    }));
+    for (const bm of bookmarks) rs.push({ kind: "bm", bm, at: bm.at_ms });
+    rs.sort((a, b) => a.at - b.at);
+    return rs;
+  }, [segments, bookmarks]);
 
   // Deep-link from search: scroll to the target segment once loaded.
   useEffect(() => {
@@ -333,8 +393,21 @@ export function TranscriptView(props: {
         </div>
       )}
 
+      <div class="notes-panel">
+        <details open={!!(detail.meeting.notes || notesDraft)}>
+          <summary class="muted">Notes</summary>
+          <textarea
+            class="notes-input"
+            placeholder="Meeting notes… (searchable)"
+            value={notesDraft}
+            onInput={(e) => setNotesDraft((e.target as HTMLTextAreaElement).value)}
+            onBlur={saveNotes}
+          />
+        </details>
+      </div>
+
       <div class="segments" ref={listRef}>
-        {segments.length === 0 && !showLive && (
+        {segments.length === 0 && !showLive && bookmarks.length === 0 && (
           <div class="empty">
             <p class="muted">
               {m.status === "recorded"
@@ -347,7 +420,88 @@ export function TranscriptView(props: {
             </p>
           </div>
         )}
-        {segments.map((seg, idx) => {
+        {rows.map((row) => {
+          if (row.kind === "bm") {
+            const bm = row.bm;
+            return (
+              <div
+                class="segment bookmark-row"
+                key={`bm${bm.id}`}
+                onClick={() => {
+                  const a = audioRef.current;
+                  if (a) {
+                    a.currentTime = bm.at_ms / 1000;
+                    a.play().catch(() => {});
+                  }
+                }}
+              >
+                <span class="chip chip-bookmark">
+                  <BookmarkSimple size={11} />
+                </span>
+                <span class="ts">[{fmtTs(bm.at_ms)}]</span>
+                {bmEditing?.id === bm.id ? (
+                  <input
+                    class="rename-input"
+                    value={bmEditing.text}
+                    autoFocus
+                    placeholder="what happened here?"
+                    onClick={(e) => e.stopPropagation()}
+                    onInput={(e) =>
+                      setBmEditing({ id: bm.id, text: (e.target as HTMLInputElement).value })
+                    }
+                    onBlur={() => {
+                      const note = bmEditing.text.trim();
+                      setBmEditing(null);
+                      setBookmarkNote(bm.id, note).then(() =>
+                        setDetail((d) =>
+                          d
+                            ? {
+                                ...d,
+                                bookmarks: d.bookmarks.map((x) =>
+                                  x.id === bm.id ? { ...x, note } : x,
+                                ),
+                              }
+                            : d,
+                        ),
+                      );
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                      if (e.key === "Escape") setBmEditing(null);
+                    }}
+                  />
+                ) : (
+                  <span
+                    class={`segment-text ${bm.note ? "" : "muted"}`}
+                    title="Click to edit note"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setBmEditing({ id: bm.id, text: bm.note });
+                    }}
+                  >
+                    {bm.note || "bookmark — click to add a note"}
+                  </span>
+                )}
+                <button
+                  class="icon-btn"
+                  title="Remove bookmark"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    deleteBookmark(bm.id).then(() =>
+                      setDetail((d) =>
+                        d
+                          ? { ...d, bookmarks: d.bookmarks.filter((x) => x.id !== bm.id) }
+                          : d,
+                      ),
+                    );
+                  }}
+                >
+                  <Trash size={14} />
+                </button>
+              </div>
+            );
+          }
+          const { seg, idx } = row;
           const sp = seg.speaker_id != null ? speakersById.get(seg.speaker_id) : undefined;
           const label = sp?.label ?? (seg.track === "mic" ? "me" : "S?");
           return (
@@ -390,7 +544,9 @@ export function TranscriptView(props: {
                 />
               )}
               <span class="ts">[{fmtTs(seg.start_ms)}]</span>
-              <span class="segment-text">{seg.text}</span>
+              <span class="segment-text">
+                <Highlighted text={seg.text} terms={props.highlight} />
+              </span>
             </div>
           );
         })}
@@ -401,6 +557,7 @@ export function TranscriptView(props: {
           <AudioPlayer
             src={audioUrl}
             audioRef={audioRef}
+            markers={bookmarks.map((b) => b.at_ms)}
             onTimeUpdate={onTimeUpdate}
             onDownload={() => exportAudio(m.id).catch((e) => alert(String(e)))}
           />

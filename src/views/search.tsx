@@ -32,7 +32,7 @@ function Snippet({ text }: { text: string }) {
 
 export function SearchView(props: {
   query: string;
-  onOpen: (meetingId: number, segmentId: number) => void;
+  onOpen: (meetingId: number, segmentId?: number) => void;
 }) {
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [hasMore, setHasMore] = useState(false);
@@ -141,7 +141,10 @@ export function SearchView(props: {
             <div
               class="search-hit"
               key={h.segment_id}
-              onClick={() => props.onOpen(h.meeting_id, h.segment_id)}
+              onClick={() =>
+                // Notes hits (segment_id -1) open the meeting without a seek.
+                props.onOpen(h.meeting_id, h.segment_id > 0 ? h.segment_id : undefined)
+              }
             >
               {h.speaker_name && <span class="muted">{h.speaker_name}: </span>}
               <Snippet text={h.snippet} />

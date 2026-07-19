@@ -211,6 +211,25 @@ body {
   background: var(--ok);
 }
 
+.model-banner {
+  max-width: 900px;
+  margin: 0 auto 14px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  background: rgba(213, 160, 33, 0.1);
+  border: 1px solid rgba(213, 160, 33, 0.4);
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.model-banner span:first-child {
+  flex: 1;
+  min-width: 200px;
+}
+
 .list-toolbar {
   max-width: 900px;
   margin: 0 auto 12px;
@@ -236,6 +255,36 @@ body {
   display: flex;
   gap: 4px;
   margin-left: auto;
+}
+
+/* Custom title-bar window controls (the window is chrome-less). */
+.window-controls {
+  display: flex;
+  gap: 2px;
+  margin-left: 4px;
+}
+
+.win-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 30px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.win-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.win-close:hover {
+  background: var(--rec);
+  color: #fff;
 }
 
 .nav-btn {
@@ -605,9 +654,68 @@ body {
   text-align: left;
 }
 
-.player-seek {
+.player-seek-wrap {
   flex: 1;
   min-width: 120px;
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.player-seek {
+  width: 100%;
+}
+
+.seek-marker {
+  position: absolute;
+  top: -3px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--warn);
+  pointer-events: none;
+  transform: translateX(-2px);
+}
+
+.bookmark-row {
+  background: rgba(213, 160, 33, 0.06);
+  border-left: 2px solid var(--warn);
+}
+
+.chip-bookmark {
+  background: var(--warn);
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 7px;
+}
+
+.notes-panel {
+  padding-bottom: 10px;
+}
+
+.notes-panel summary {
+  cursor: pointer;
+  font-size: 13px;
+  user-select: none;
+}
+
+.notes-input {
+  width: 100%;
+  min-height: 64px;
+  margin-top: 6px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 8px 10px;
+  font-family: inherit;
+  font-size: 13px;
+  resize: vertical;
+}
+
+.notes-input:focus {
+  outline: none;
+  border-color: var(--accent);
 }
 
 .player-speed {

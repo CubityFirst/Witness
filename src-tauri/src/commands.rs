@@ -240,6 +240,7 @@ pub struct MeetingDetail {
     pub meeting: Meeting,
     pub speakers: Vec<Speaker>,
     pub segments: Vec<Segment>,
+    pub bookmarks: Vec<crate::db::Bookmark>,
 }
 
 #[tauri::command]
@@ -252,8 +253,68 @@ pub fn get_meeting(state: State<'_, AppState>, id: i64) -> Result<MeetingDetail,
     Ok(MeetingDetail {
         speakers: state.db.get_speakers(id).map_err(err)?,
         segments: state.db.get_segments(id).map_err(err)?,
+        bookmarks: state.db.list_bookmarks(id).map_err(err)?,
         meeting,
     })
+}
+
+#[tauri::command]
+pub fn set_meeting_notes(
+    state: State<'_, AppState>,
+    meeting_id: i64,
+    notes: String,
+) -> Result<(), String> {
+    state.db.set_notes(meeting_id, &notes).map_err(err)
+}
+
+// ---------- bookmarks ----------
+
+/// Flag "this moment" in the active recording (hotkey + top-bar button).
+pub fn do_bookmark_now(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let (meeting_id, at_ms) = {
+        let rec = state.recorder.lock().unwrap();
+        let handle = rec.as_ref().ok_or("Not recording")?;
+        let elapsed = (chrono::Local::now() - handle.started_at).num_milliseconds().max(0);
+        (handle.meeting_id, elapsed)
+    };
+    state.db.add_bookmark(meeting_id, at_ms, "").map_err(err)?;
+    let _ = app.emit(events::MEETINGS_CHANGED, ());
+    let secs = at_ms / 1000;
+    toast(app, &format!("Bookmarked {}:{:02}", secs / 60, secs % 60));
+    Ok(())
+}
+
+#[tauri::command]
+pub fn bookmark_now(app: AppHandle) -> Result<(), String> {
+    do_bookmark_now(&app)
+}
+
+#[tauri::command]
+pub fn add_bookmark(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    meeting_id: i64,
+    at_ms: i64,
+    note: String,
+) -> Result<i64, String> {
+    let id = state.db.add_bookmark(meeting_id, at_ms, &note).map_err(err)?;
+    let _ = app.emit(events::MEETINGS_CHANGED, ());
+    Ok(id)
+}
+
+#[tauri::command]
+pub fn set_bookmark_note(
+    state: State<'_, AppState>,
+    bookmark_id: i64,
+    note: String,
+) -> Result<(), String> {
+    state.db.set_bookmark_note(bookmark_id, &note).map_err(err)
+}
+
+#[tauri::command]
+pub fn delete_bookmark(state: State<'_, AppState>, bookmark_id: i64) -> Result<(), String> {
+    state.db.delete_bookmark(bookmark_id).map_err(err)
 }
 
 /// "Delete" = move to the recycle bin (auto-purged after 30 days).

@@ -113,6 +113,31 @@ export const Export = (props: { size?: number }) => (
   />
 );
 
+export const BookmarkSimple = (props: { size?: number }) => (
+  <Icon
+    size={props.size}
+    d="M184,32H72A16,16,0,0,0,56,48V224a8,8,0,0,0,12.24,6.78L128,193.43l59.77,37.35A8,8,0,0,0,200,224V48A16,16,0,0,0,184,32Zm0,177.57-51.77-32.35a8,8,0,0,0-8.48,0L72,209.57V48H184Z"
+  />
+);
+
+export const Minus = (props: { size?: number }) => (
+  <Icon size={props.size} d="M224,128a8,8,0,0,1-8,8H40a8,8,0,0,1,0-16H216A8,8,0,0,1,224,128Z" />
+);
+
+export const Square = (props: { size?: number }) => (
+  <Icon
+    size={props.size}
+    d="M208,32H48A16,16,0,0,0,32,48V208a16,16,0,0,0,16,16H208a16,16,0,0,0,16-16V48A16,16,0,0,0,208,32Zm0,176H48V48H208V208Z"
+  />
+);
+
+export const X = (props: { size?: number }) => (
+  <Icon
+    size={props.size}
+    d="M205.66,194.34a8,8,0,0,1-11.32,11.32L128,139.31,61.66,205.66a8,8,0,0,1-11.32-11.32L116.69,128,50.34,61.66A8,8,0,0,1,61.66,50.34L128,116.69l66.34-66.35a8,8,0,0,1,11.32,11.32L139.31,128Z"
+  />
+);
+
 export const ArrowCounterClockwise = (props: { size?: number }) => (
   <Icon
     size={props.size}

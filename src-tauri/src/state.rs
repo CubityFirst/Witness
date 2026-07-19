@@ -21,4 +21,6 @@ pub struct AppState {
     /// Which global record hotkey actually bound (others may own our
     /// preferred combos system-wide).
     pub hotkey: Mutex<Option<String>>,
+    /// Which bookmark-this-moment hotkey bound.
+    pub bookmark_hotkey: Mutex<Option<String>>,
 }
