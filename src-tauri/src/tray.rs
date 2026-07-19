@@ -13,9 +13,35 @@ pub const TRAY_ID: &str = "witness-tray";
 /// Set while the window is shown as a tray flyout: the next focus loss
 /// hides it again (see the Focused handler in main.rs).
 static POPUP_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// When the flyout appeared — programmatic move/resize during opening must
+/// not count as the user "arranging" it.
+static POPUP_SHOWN_AT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
 
 pub fn take_popup_mode() -> bool {
     POPUP_MODE.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// A user-initiated resize/move of the flyout "pins" it into a normal
+/// window: blur no longer dismisses it (the resize itself steals focus,
+/// which used to close it mid-drag) and the window controls come back.
+pub fn maybe_pin_popup(app: &AppHandle) {
+    use std::sync::atomic::Ordering;
+    if !POPUP_MODE.load(Ordering::SeqCst) {
+        return;
+    }
+    let opening = POPUP_SHOWN_AT
+        .lock()
+        .unwrap()
+        .map(|t| t.elapsed() < std::time::Duration::from_millis(600))
+        .unwrap_or(false);
+    if opening {
+        return;
+    }
+    POPUP_MODE.store(false, Ordering::SeqCst);
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.emit("tray-popup", false);
+    }
 }
 
 pub struct TrayHandles {
@@ -50,6 +76,7 @@ fn show_popup(app: &AppHandle, click: tauri::PhysicalPosition<f64>) {
             x = x.clamp(ax, (ax + aw - w - 8).max(ax));
             y = y.min(ay + ah - h - 8).max(ay);
         }
+        *POPUP_SHOWN_AT.lock().unwrap() = Some(std::time::Instant::now());
         let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x, y }));
         let _ = window.emit("tray-popup", true);
         POPUP_MODE.store(true, std::sync::atomic::Ordering::SeqCst);

@@ -384,6 +384,13 @@ fn main() {
                         let _ = window.hide();
                     }
                 }
+                // Resizing/moving the flyout pins it (the resize grab itself
+                // blurs the window, which used to dismiss it mid-drag).
+                tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Moved(_) => {
+                    if window.label() == "main" {
+                        tray::maybe_pin_popup(window.app_handle());
+                    }
+                }
                 _ => {}
             }
         })
