@@ -15,7 +15,7 @@
         "label": "main",
         "title": "Witness",
         "width": 460,
-        "height": 360,
+        "height": 620,
         "minWidth": 460,
         "minHeight": 360,
         "resizable": true,
