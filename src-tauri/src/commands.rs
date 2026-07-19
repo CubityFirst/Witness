@@ -144,6 +144,7 @@ fn open_captions_overlay(app: &AppHandle) {
     .always_on_top(true)
     .decorations(false)
     .skip_taskbar(true)
+    .background_color(tauri::webview::Color(12, 13, 16, 255))
     .build();
     if let Err(e) = result {
         log::warn!("captions overlay failed to open: {e}");
