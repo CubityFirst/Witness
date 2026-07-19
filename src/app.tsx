@@ -38,6 +38,20 @@ function onInteractive(e: MouseEvent): boolean {
   return !!t?.closest("button, input, select, a, textarea");
 }
 
+/**
+ * Presses within this many pixels of a window edge belong to the native
+ * resize borders (undecorated windows still hit-test them) — the title-bar
+ * drag must not swallow those, or the window can't be resized from the top.
+ */
+function onResizeBorder(e: MouseEvent): boolean {
+  const m = 8;
+  return (
+    e.clientY < m ||
+    e.clientX < m ||
+    window.innerWidth - e.clientX < m
+  );
+}
+
 export type View =
   | { kind: "meetings" }
   | { kind: "people" }
@@ -182,7 +196,7 @@ export function App() {
         class="topbar"
         // The top bar doubles as the (chrome-less) window title bar.
         onMouseDown={(e) => {
-          if (e.buttons === 1 && !onInteractive(e)) {
+          if (e.buttons === 1 && !onInteractive(e) && !onResizeBorder(e)) {
             getCurrentWindow().startDragging().catch(() => {});
           }
         }}
