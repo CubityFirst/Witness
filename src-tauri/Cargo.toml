@@ -44,6 +44,11 @@ realfft = "3"
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.23"
 winreg = "0.55"
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Threading",
+] }
 
 [features]
 default = []

@@ -79,6 +79,8 @@ meeting_watcher (registry poll, 2 s)          commands.rs (UI)
 - `speaker_id::rematch_all` retro-labels stored voice prints after any
   enrollment change (rename_speaker / delete_person spawn it) — pure DB
   cosine math, no audio.
+- Meeting auto-naming reads Teams *window titles* only (meeting_title.rs),
+  polls 12/30/60 s after auto-start, and never overwrites a user rename.
 - Captions overlay = second webview window "captions" (#captions hash
   route); must stay listed in capabilities/default.json `windows`.
 - Global record hotkey walks a candidate chain (ctrl+alt+r → w →
