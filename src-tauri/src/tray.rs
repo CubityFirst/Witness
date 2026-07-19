@@ -22,6 +22,17 @@ pub fn take_popup_mode() -> bool {
     POPUP_MODE.swap(false, std::sync::atomic::Ordering::SeqCst)
 }
 
+pub fn is_popup_mode() -> bool {
+    POPUP_MODE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Convert the flyout into a normal pinned window (controls come back).
+pub fn pin_popup(window: &tauri::WebviewWindow) {
+    if POPUP_MODE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        let _ = window.emit("tray-popup", false);
+    }
+}
+
 /// A user-initiated resize/move of the flyout "pins" it into a normal
 /// window: blur no longer dismisses it (the resize itself steals focus,
 /// which used to close it mid-drag) and the window controls come back.

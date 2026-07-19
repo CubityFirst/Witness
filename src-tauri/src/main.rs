@@ -378,10 +378,31 @@ fn main() {
                     let _ = window.hide();
                 }
                 // Tray-flyout mode: dismiss on focus loss, like the native
-                // volume/Wi-Fi popups. Normal opens are unaffected.
+                // volume/Wi-Fi popups — unless the cursor is on the window
+                // itself (grabbing a resize border blurs BEFORE any resize
+                // event fires); then pin it instead. Normal opens unaffected.
                 tauri::WindowEvent::Focused(false) => {
-                    if window.label() == "main" && tray::take_popup_mode() {
-                        let _ = window.hide();
+                    if window.label() == "main" && tray::is_popup_mode() {
+                        let on_window = (|| -> Option<bool> {
+                            let cursor = window.cursor_position().ok()?;
+                            let pos = window.outer_position().ok()?;
+                            let size = window.outer_size().ok()?;
+                            let margin = 16.0;
+                            Some(
+                                cursor.x >= pos.x as f64 - margin
+                                    && cursor.x <= (pos.x + size.width as i32) as f64 + margin
+                                    && cursor.y >= pos.y as f64 - margin
+                                    && cursor.y <= (pos.y + size.height as i32) as f64 + margin,
+                            )
+                        })()
+                        .unwrap_or(false);
+                        if on_window {
+                            if let Some(webview) = window.app_handle().get_webview_window("main") {
+                                tray::pin_popup(&webview);
+                            }
+                        } else if tray::take_popup_mode() {
+                            let _ = window.hide();
+                        }
                     }
                 }
                 // Resizing/moving the flyout pins it (the resize grab itself
