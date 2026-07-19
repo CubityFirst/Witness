@@ -94,35 +94,6 @@ pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64,
         open_captions_overlay(app);
     }
 
-    // Auto-recorded meetings: try to pick up the meeting subject from the
-    // Teams window title (it settles a little after joining).
-    if trigger == "auto" {
-        let title_app = app.clone();
-        std::thread::Builder::new()
-            .name("meeting-title".into())
-            .spawn(move || {
-                for delay_s in [12u64, 30, 60] {
-                    std::thread::sleep(std::time::Duration::from_secs(delay_s));
-                    let state = title_app.state::<AppState>();
-                    // Stop if the recording ended or the user renamed it.
-                    if state.recorder.lock().unwrap().as_ref().map(|r| r.meeting_id) != Some(id) {
-                        return;
-                    }
-                    let Ok(Some(meeting)) = state.db.get_meeting(id) else { return };
-                    if !meeting.title.starts_with("Meeting 2") {
-                        return; // user already renamed
-                    }
-                    if let Some(title) = crate::meeting_title::find_teams_meeting_title() {
-                        log::info!("meeting {id}: auto-named from Teams window: {title}");
-                        let _ = state.db.rename_meeting(id, &title);
-                        let _ = title_app.emit(events::MEETINGS_CHANGED, ());
-                        return;
-                    }
-                }
-            })
-            .ok();
-    }
-
     log::info!("recording started: meeting {id} ({trigger})");
     Ok(id)
 }

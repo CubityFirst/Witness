@@ -15,7 +15,6 @@ mod diarize;
 mod encoder;
 mod events;
 mod live_transcribe;
-mod meeting_title;
 mod meeting_watcher;
 mod models;
 mod pipeline;
