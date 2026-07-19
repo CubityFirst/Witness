@@ -1,6 +1,5 @@
 import { useEffect, useState } from "preact/hooks";
 import {
-  confirmDialog,
   deletePerson,
   downloadModels,
   getAutostart,
@@ -24,6 +23,7 @@ import {
 } from "../lib/api";
 import { onModelDownloadProgress, type ModelDownloadProgress } from "../lib/events";
 import { Trash } from "../lib/icons";
+import { appConfirm } from "../lib/confirm";
 
 export function SettingsView(props: { watcher: WatcherStatus | null }) {
   const [settings, setSettings] = useState<SettingsData | null>(null);
@@ -341,7 +341,7 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
               class="icon-btn"
               title="Forget this voice"
               onClick={async () => {
-                if (!(await confirmDialog(`Forget ${p.name}'s voice?\nExisting transcripts keep their names.`)))
+                if (!(await appConfirm(`Forget ${p.name}'s voice?\nExisting transcripts keep their names.`, "Forget voice")))
                   return;
                 deletePerson(p.id).then(() =>
                   setPeople((prev) => prev.filter((x) => x.id !== p.id)),

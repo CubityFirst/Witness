@@ -30,6 +30,7 @@ import { TranscriptView } from "./views/transcript";
 import { SearchView } from "./views/search";
 import { SettingsView } from "./views/settings";
 import { PeopleView } from "./views/people";
+import { ConfirmHost } from "./lib/confirm";
 import { BookmarkSimple, GearSix, Minus, Record, Square, Stop, X } from "./lib/icons";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
@@ -370,6 +371,7 @@ export function App() {
         )}
         {view.kind === "settings" && <SettingsView watcher={status?.watcher ?? null} />}
       </main>
+      <ConfirmHost />
     </div>
   );
 }

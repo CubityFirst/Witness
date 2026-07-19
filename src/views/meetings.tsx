@@ -1,6 +1,5 @@
 import { useEffect, useState } from "preact/hooks";
 import {
-  confirmDialog,
   deleteMeeting,
   emptyRecycleBin,
   listDeletedMeetings,
@@ -21,6 +20,7 @@ import {
   WarningCircle,
   Waveform,
 } from "../lib/icons";
+import { appConfirm } from "../lib/confirm";
 
 const PAGE = 50;
 
@@ -113,7 +113,12 @@ export function MeetingsView(props: {
   };
 
   const onDelete = async (m: Meeting) => {
-    if (!(await confirmDialog(`Move "${m.title}" to the recycle bin?\nItems there are permanently deleted after 30 days.`)))
+    if (
+      !(await appConfirm(
+        `Move "${m.title}" to the recycle bin?\nItems there are permanently deleted after 30 days.`,
+        "Move to bin",
+      ))
+    )
       return;
     deleteMeeting(m.id).then(() => {
       setMeetings((prev) => prev.filter((x) => x.id !== m.id));
@@ -122,13 +127,23 @@ export function MeetingsView(props: {
   };
 
   const onPurge = async (m: DeletedMeeting) => {
-    if (!(await confirmDialog(`Permanently delete "${m.title}" (audio + transcript)?\nThis cannot be undone.`)))
+    if (
+      !(await appConfirm(
+        `Permanently delete "${m.title}" (audio + transcript)?\nThis cannot be undone.`,
+        "Delete forever",
+      ))
+    )
       return;
     purgeMeeting(m.id).then(loadBin);
   };
 
   const onEmptyBin = async () => {
-    if (!(await confirmDialog(`Permanently delete all ${binned.length} meeting(s) in the recycle bin?\nThis cannot be undone.`)))
+    if (
+      !(await appConfirm(
+        `Permanently delete all ${binned.length} meeting(s) in the recycle bin?\nThis cannot be undone.`,
+        "Empty bin",
+      ))
+    )
       return;
     emptyRecycleBin().then(loadBin);
   };

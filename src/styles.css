@@ -211,6 +211,46 @@ body {
   background: var(--ok);
 }
 
+/* ---------- in-app modal ---------- */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px 20px 14px;
+  max-width: 380px;
+  width: calc(100% - 48px);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+
+.modal-message {
+  margin: 0 0 16px;
+  line-height: 1.5;
+  white-space: pre-line;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.btn-danger {
+  background: var(--rec);
+  border-color: var(--rec);
+  color: #fff;
+}
+
 .model-banner {
   max-width: 900px;
   margin: 0 auto 14px;
