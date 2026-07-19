@@ -161,7 +161,6 @@ export function MeetingsView(props: {
         {binOpen && (
           <button
             class="btn btn-ghost recycle-empty"
-            title="Shift-click to skip confirmation"
             onClick={(e) => {
               e.stopPropagation();
               onEmptyBin(e.shiftKey);
@@ -189,7 +188,7 @@ export function MeetingsView(props: {
             </button>
             <button
               class="icon-btn"
-              title="Delete forever (shift-click: no confirm)"
+              title="Delete forever"
               onClick={(e) => onPurge(m, e.shiftKey)}
             >
               <Trash size={16} />
@@ -267,7 +266,7 @@ export function MeetingsView(props: {
           </button>
           <button
             class="icon-btn"
-            title="Delete (shift-click: no confirm)"
+            title="Delete"
             onClick={(e) => onDelete(m, e.shiftKey)}
           >
             <Trash size={16} />

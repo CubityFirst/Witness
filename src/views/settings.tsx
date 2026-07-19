@@ -339,7 +339,7 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
             </span>
             <button
               class="icon-btn"
-              title="Forget this voice (shift-click: no confirm)"
+              title="Forget this voice"
               onClick={async (e) => {
                 if (
                   !e.shiftKey &&
