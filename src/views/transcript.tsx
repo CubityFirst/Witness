@@ -20,7 +20,15 @@ import {
 import { fmtDate, fmtDuration } from "./meetings";
 import type { LiveTranscript } from "../lib/events";
 import { AudioPlayer } from "./player";
-import { BookmarkSimple, PencilSimple, Trash } from "../lib/icons";
+import {
+  ArrowLeft,
+  ArrowsClockwise,
+  BookmarkSimple,
+  CheckCircle,
+  Export,
+  PencilSimple,
+  Trash,
+} from "../lib/icons";
 
 function fmtTs(ms: number): string {
   const s = Math.floor(ms / 1000);
@@ -277,12 +285,17 @@ export function TranscriptView(props: {
   return (
     <div class="transcript-view">
       <div class="transcript-header">
-        <button class="btn btn-ghost" onClick={props.onBack}>
-          ← Back
+        <button class="btn btn-ghost btn-with-icon" title="Back" aria-label="Back" onClick={props.onBack}>
+          <ArrowLeft size={16} />
         </button>
         <div class="menu-wrap">
-          <button class="btn btn-ghost" onClick={() => { setExportMenu(!exportMenu); setEngineMenu(false); }}>
-            {copied ? "Copied ✓" : "Export ▾"}
+          <button
+            class="btn btn-ghost btn-with-icon"
+            title={copied ? "Copied to clipboard" : "Export transcript"}
+            aria-label="Export transcript"
+            onClick={() => { setExportMenu(!exportMenu); setEngineMenu(false); }}
+          >
+            {copied ? <CheckCircle size={16} /> : <Export size={16} />}
           </button>
           {exportMenu && (
             <div class="menu">
@@ -295,8 +308,13 @@ export function TranscriptView(props: {
           )}
         </div>
         <div class="menu-wrap">
-          <button class="btn btn-ghost" onClick={() => { setEngineMenu(!engineMenu); setExportMenu(false); }}>
-            Retranscribe ▾
+          <button
+            class="btn btn-ghost btn-with-icon"
+            title="Retranscribe"
+            aria-label="Retranscribe"
+            onClick={() => { setEngineMenu(!engineMenu); setExportMenu(false); }}
+          >
+            <ArrowsClockwise size={16} />
           </button>
           {engineMenu && (
             <div class="menu">
