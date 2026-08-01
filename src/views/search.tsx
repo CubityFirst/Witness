@@ -7,6 +7,7 @@ import {
   type SearchHit,
 } from "../lib/api";
 import { fmtDate } from "./meetings";
+import { notifyError } from "../lib/notify";
 
 const PAGE = 40;
 
@@ -22,11 +23,11 @@ function Snippet({ text }: { text: string }) {
     if (a < 0) break;
     const b = rest.indexOf("\x02", a + 1);
     if (b < 0) break;
-    if (a > 0) parts.push(<span>{rest.slice(0, a)}</span>);
-    parts.push(<mark>{rest.slice(a + 1, b)}</mark>);
+    if (a > 0) parts.push(<span key={`text-${parts.length}`}>{rest.slice(0, a)}</span>);
+    parts.push(<mark key={`mark-${parts.length}`}>{rest.slice(a + 1, b)}</mark>);
     rest = rest.slice(b + 1);
   }
-  if (rest) parts.push(<span>{rest}</span>);
+  if (rest) parts.push(<span key={`text-${parts.length}`}>{rest}</span>);
   return <span>{parts}</span>;
 }
 
@@ -42,6 +43,7 @@ export function SearchView(props: {
   const [who, setWho] = useState("");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
+  const [loading, setLoading] = useState(false);
   const requestGeneration = useRef(0);
 
   const filters = (): SearchFilters => ({
@@ -53,6 +55,7 @@ export function SearchView(props: {
 
   const load = (offset: number, append: boolean) => {
     const generation = ++requestGeneration.current;
+    setLoading(true);
     return search(props.query, offset, filters())
       .then((rows) => {
         if (generation !== requestGeneration.current) return;
@@ -62,16 +65,32 @@ export function SearchView(props: {
         setHits((prev) => (append ? [...prev, ...rows] : rows));
       })
       .catch((e) => {
-        if (generation === requestGeneration.current) setError(String(e));
+        if (generation === requestGeneration.current) {
+          setError(String(e));
+          notifyError("Could not search transcripts", e);
+        }
+      })
+      .finally(() => {
+        if (generation === requestGeneration.current) setLoading(false);
       });
   };
 
   useEffect(() => {
-    listPeople().then(setPeople).catch(() => {});
+    let cancelled = false;
+    listPeople()
+      .then((rows) => {
+        if (!cancelled) setPeople(rows);
+      })
+      .catch((error) => {
+        if (!cancelled) notifyError("Could not load people for search filters", error);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
-    load(0, false);
+    void load(0, false);
     return () => {
       requestGeneration.current += 1;
     };
@@ -88,7 +107,7 @@ export function SearchView(props: {
 
   return (
     <div class="search-view">
-      <h2 class="search-heading">
+      <h2 class="search-heading" aria-live="polite">
         Results for “{props.query}”
         <span class="muted"> — {hits.length}{hasMore ? "+" : ""} match{hits.length === 1 ? "" : "es"}</span>
       </h2>
@@ -96,6 +115,7 @@ export function SearchView(props: {
         <select
           class="player-speed"
           title="Who said it"
+          aria-label="Filter by speaker"
           value={who}
           onChange={(e) => setWho((e.target as HTMLSelectElement).value)}
         >
@@ -128,6 +148,7 @@ export function SearchView(props: {
         </label>
         {(who || dateFrom || dateTo) && (
           <button
+            type="button"
             class="btn btn-ghost"
             onClick={() => {
               setWho("");
@@ -139,16 +160,29 @@ export function SearchView(props: {
           </button>
         )}
       </div>
-      {error && <div class="error">{error}</div>}
-      {!error && hits.length === 0 && <div class="empty muted">No matches.</div>}
+      {error && (
+        <div class="view-error" role="alert">
+          <p>Search failed: {error}</p>
+          <button type="button" class="btn" onClick={() => void load(0, false)}>
+            Try again
+          </button>
+        </div>
+      )}
+      {loading && hits.length === 0 && !error && (
+        <div class="empty muted" role="status">Searching…</div>
+      )}
+      {!loading && !error && hits.length === 0 && (
+        <div class="empty muted">No matches.</div>
+      )}
       {[...groups.entries()].map(([meetingId, group]) => (
         <div class="search-group" key={meetingId}>
-          <div class="search-group-title">
+          <h3 class="search-group-title">
             {group[0].meeting_title}
             <span class="muted"> · {fmtDate(group[0].started_at)}</span>
-          </div>
+          </h3>
           {group.map((h) => (
-            <div
+            <button
+              type="button"
               class="search-hit"
               key={h.segment_id}
               onClick={() =>
@@ -158,18 +192,20 @@ export function SearchView(props: {
             >
               {h.speaker_name && <span class="muted">{h.speaker_name}: </span>}
               <Snippet text={h.snippet} />
-            </div>
+            </button>
           ))}
         </div>
       ))}
       {hasMore && (
         <button
+          type="button"
           class="btn btn-ghost"
+          disabled={loading}
           onClick={() =>
-            load(hits.filter((hit) => hit.segment_id > 0).length, true)
+            void load(hits.filter((hit) => hit.segment_id > 0).length, true)
           }
         >
-          Load more
+          {loading ? "Loading…" : "Load more"}
         </button>
       )}
     </div>

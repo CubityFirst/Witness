@@ -76,6 +76,8 @@ export interface AppStatus {
   recording_since: string | null;
   transcribing_meeting_id: number | null;
   queue_len: number;
+  processing_stage: string | null;
+  processing_pct: number | null;
   watcher: WatcherStatus;
 }
 
@@ -113,9 +115,64 @@ export interface PersonMeetingStat {
   segments: number;
 }
 
+export interface AudioDevice {
+  id: string;
+  name: string;
+}
+
 export interface AudioDevices {
-  render: string[];
-  capture: string[];
+  render: AudioDevice[];
+  capture: AudioDevice[];
+}
+
+export interface DiagnosticDatabase {
+  path: string;
+  healthy: boolean;
+  detail: string;
+}
+
+export interface DiagnosticModel {
+  id: string;
+  present: boolean;
+  expected_revision: string;
+  installed_revision: string | null;
+  integrity_error: string | null;
+}
+
+export interface DiagnosticTrackHealth {
+  connected: boolean;
+  device_loss_count: number;
+  capture_overflow_count: number;
+  capture_dropped_ms: number;
+  live_dropped_ms: number;
+  live_disconnected: boolean;
+  fatal_error: string | null;
+}
+
+export interface Diagnostics {
+  generated_at: string;
+  app_version: string;
+  platform: string;
+  runtime_data_dir: string;
+  configured_data_dir: string | null;
+  restart_required: boolean;
+  database: DiagnosticDatabase;
+  log_path: string;
+  recording_state: string;
+  recording_meeting_id: number | null;
+  recording_since: string | null;
+  capture_health: {
+    mic: DiagnosticTrackHealth;
+    loopback: DiagnosticTrackHealth;
+    writer_error: string | null;
+  } | null;
+  capture_health_is_current: boolean;
+  processing_meeting_id: number | null;
+  processing_stage: string | null;
+  processing_pct: number | null;
+  queue_len: number;
+  models: DiagnosticModel[];
+  report: string;
 }
 
 export interface SearchHit {
@@ -207,6 +264,8 @@ export const updateSettings = (settings: SettingsData) =>
 export const pickDataDir = () => invoke<string | null>("pick_data_dir");
 
 export const listAudioDevices = () => invoke<AudioDevices>("list_audio_devices");
+export const getDiagnostics = () => invoke<Diagnostics>("get_diagnostics");
+export const exportDiagnostics = () => invoke<boolean>("export_diagnostics");
 export const getModelStatus = () => invoke<ModelInfo[]>("get_model_status");
 export const downloadModels = (engine: Engine) =>
   invoke<void>("download_models", { engine });

@@ -10,6 +10,7 @@
 //! silence using packet timestamps.
 
 use crossbeam_channel::{SendTimeoutError, Sender, TrySendError};
+use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -60,13 +61,31 @@ pub enum CaptureMsg {
 /// This bounds memory without making ordinary scheduler stalls lossy.
 pub const CAPTURE_QUEUE_CAPACITY: usize = 256;
 
+/// A Windows audio endpoint. `id` is the persistent WASAPI endpoint ID; the
+/// friendly `name` is presentation-only and may change after driver updates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AudioDevice {
+    pub id: String,
+    pub name: String,
+}
+
+fn sort_devices(devices: &mut [AudioDevice]) {
+    devices.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
 /// ~200 ms shared-mode buffer: roomy enough to survive scheduling hiccups.
 #[cfg(windows)]
 const BUFFER_DURATION_HNS: i64 = 2_000_000;
 
-/// Enumerate active device friendly names: (render/outputs, capture/mics).
+/// Enumerate active device endpoint IDs and friendly names:
+/// (render/outputs, capture/mics).
 /// Runs on its own thread so COM state never leaks into the caller.
-pub fn list_devices() -> Result<(Vec<String>, Vec<String>), String> {
+pub fn list_devices() -> Result<(Vec<AudioDevice>, Vec<AudioDevice>), String> {
     #[cfg(windows)]
     {
         let handle = std::thread::spawn(|| -> Result<_, String> {
@@ -77,15 +96,16 @@ pub fn list_devices() -> Result<(Vec<String>, Vec<String>), String> {
                 let collection = enumerator
                     .get_device_collection(&direction)
                     .map_err(|e| e.to_string())?;
-                let mut names = Vec::new();
+                let mut devices = Vec::new();
                 for i in 0..collection.get_nbr_devices().map_err(|e| e.to_string())? {
                     if let Ok(device) = collection.get_device_at_index(i) {
-                        if let Ok(name) = device.get_friendlyname() {
-                            names.push(name);
+                        if let (Ok(id), Ok(name)) = (device.get_id(), device.get_friendlyname()) {
+                            devices.push(AudioDevice { id, name });
                         }
                     }
                 }
-                lists.push(names);
+                sort_devices(&mut devices);
+                lists.push(devices);
             }
             let capture = lists.pop().unwrap_or_default();
             let render = lists.pop().unwrap_or_default();
@@ -122,6 +142,7 @@ fn resolve_device(
         let wanted_lower = wanted.to_lowercase();
         let collection = enumerator.get_device_collection(direction)?;
         let mut substring_hit = None;
+        let mut substring_ambiguous = false;
         for i in 0..collection.get_nbr_devices()? {
             let device = collection.get_device_at_index(i)?;
             let device_name = device.get_friendlyname().unwrap_or_default();
@@ -129,9 +150,18 @@ fn resolve_device(
             if lower == wanted_lower {
                 return Ok(device);
             }
-            if substring_hit.is_none() && lower.contains(&wanted_lower) {
-                substring_hit = Some(device);
+            if lower.contains(&wanted_lower) {
+                if substring_hit.is_some() {
+                    substring_ambiguous = true;
+                } else {
+                    substring_hit = Some(device);
+                }
             }
+        }
+        if substring_ambiguous {
+            return Err(wasapi::WasapiError::DeviceNotFound(format!(
+                "configured legacy device name '{wanted}' matches multiple endpoints"
+            )));
         }
         return substring_hit.ok_or_else(|| {
             wasapi::WasapiError::DeviceNotFound(format!("configured device '{wanted}' not present"))
@@ -420,7 +450,33 @@ pub fn spawn_capture(
 
 #[cfg(test)]
 mod tests {
-    use super::{PendingOverflow, TrackKind};
+    use super::{sort_devices, AudioDevice, PendingOverflow, TrackKind};
+
+    #[test]
+    fn devices_sort_by_name_then_stable_id() {
+        let mut devices = vec![
+            AudioDevice {
+                id: "z".into(),
+                name: "Speakers".into(),
+            },
+            AudioDevice {
+                id: "b".into(),
+                name: "headset".into(),
+            },
+            AudioDevice {
+                id: "a".into(),
+                name: "Headset".into(),
+            },
+        ];
+        sort_devices(&mut devices);
+        assert_eq!(
+            devices
+                .into_iter()
+                .map(|device| device.id)
+                .collect::<Vec<_>>(),
+            ["a", "b", "z"]
+        );
+    }
 
     #[test]
     fn pending_overflow_is_losslessly_restored_when_queue_stays_full() {

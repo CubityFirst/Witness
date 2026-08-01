@@ -5,6 +5,7 @@ use crate::events::WatcherStatus;
 use crate::meeting_watcher::WatcherControl;
 use crate::pipeline::Pipeline;
 use crate::recorder::RecorderHandle;
+use crate::recorder::RecordingHealth;
 use crate::settings::Settings;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -60,6 +61,9 @@ pub struct AppState {
     /// from the active directory while a restart is pending.
     pub configured_data_dir: Mutex<Option<String>>,
     pub recorder: Mutex<RecorderState>,
+    /// Current recording health while capturing, or the final health from the
+    /// most recently completed recording in this process.
+    pub recording_health: Mutex<Option<RecordingHealth>>,
     pub recording_trigger: Mutex<&'static str>,
     pub pipeline: Pipeline,
     pub watcher: Arc<WatcherControl>,

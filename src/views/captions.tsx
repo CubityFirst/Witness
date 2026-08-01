@@ -9,13 +9,29 @@ import { onLiveTranscript, type LiveTranscript } from "../lib/events";
  */
 export function CaptionsOverlay() {
   const [lines, setLines] = useState<LiveTranscript[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  const closeOverlay = () =>
+    getCurrentWindow()
+      .close()
+      .catch((closeError) => setError(`Could not close captions: ${String(closeError)}`));
 
   useEffect(() => {
     const un = onLiveTranscript((line) =>
       setLines((prev) => [...prev.slice(-2), line]),
-    );
+    ).catch((listenError) => {
+      setError(`Live captions disconnected: ${String(listenError)}`);
+      return () => {};
+    });
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") void closeOverlay();
+    };
+    window.addEventListener("keydown", onKeyDown);
     return () => {
-      un.then((u) => u());
+      un.then((u) => u()).catch((detachError) =>
+        console.error("Could not detach the live-caption listener", detachError),
+      );
+      window.removeEventListener("keydown", onKeyDown);
     };
   }, []);
 
@@ -24,14 +40,30 @@ export function CaptionsOverlay() {
     // children — start the drag ourselves so the whole window is grabbable.
     <div
       class="captions-overlay"
+      role="region"
+      aria-label="Live captions"
       onMouseDown={(e) => {
-        if (e.buttons === 1) {
-          getCurrentWindow().startDragging().catch(() => {});
+        if (e.buttons === 1 && !(e.target as HTMLElement).closest("button")) {
+          getCurrentWindow()
+            .startDragging()
+            .catch((dragError) => setError(`Could not move captions: ${String(dragError)}`));
         }
       }}
     >
-      <div class="captions-grip">● Witness — live captions (drag to move)</div>
-      <div class="captions-lines">
+      <div class="captions-grip">
+        <span>● Witness — live captions (drag to move)</span>
+        <button
+          type="button"
+          class="captions-close"
+          aria-label="Close live captions"
+          title="Close captions (Escape)"
+          onClick={closeOverlay}
+        >
+          ×
+        </button>
+      </div>
+      {error && <div class="captions-error" role="alert">{error}</div>}
+      <div class="captions-lines" role="log" aria-live="polite" aria-relevant="additions">
         {lines.length === 0 && (
           <div class="captions-line captions-idle">Listening…</div>
         )}

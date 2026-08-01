@@ -8,6 +8,7 @@ import {
   Rewind,
   SpeakerHigh,
 } from "../lib/icons";
+import { notifyError } from "../lib/notify";
 
 const SPEEDS = [0.75, 1, 1.25, 1.5, 1.75, 2];
 
@@ -58,7 +59,9 @@ export function AudioPlayer(props: {
   const toggle = () => {
     const a = props.audioRef.current;
     if (!a) return;
-    if (a.paused) a.play().catch(() => {});
+    if (a.paused) {
+      a.play().catch((error) => notifyError("Could not play recording", error));
+    }
     else a.pause();
   };
 
@@ -89,7 +92,9 @@ export function AudioPlayer(props: {
       if (!a) return;
       if (e.key === " ") {
         e.preventDefault();
-        if (a.paused) a.play().catch(() => {});
+        if (a.paused) {
+          a.play().catch((error) => notifyError("Could not play recording", error));
+        }
         else a.pause();
       } else if (e.key === "ArrowLeft") {
         e.preventDefault();
