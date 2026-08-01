@@ -36,7 +36,7 @@ pub fn create_engine(engine: Engine, models_dir: &Path) -> Result<Box<dyn AsrEng
 /// lone "You" is its most common noise output. Compared after normalization,
 /// so punctuation/case variants all match. Deliberately short — a real
 /// "thank you all for joining" must never die here.
-const HALLUCINATIONS: &[&str] = &[
+const DEFAULT_HALLUCINATIONS: &[&str] = &[
     "you",
     "thank you",
     "thanks for watching",
@@ -45,16 +45,35 @@ const HALLUCINATIONS: &[&str] = &[
     "subtitles by the amara org community",
 ];
 
+pub fn default_junk_phrases() -> Vec<String> {
+    DEFAULT_HALLUCINATIONS
+        .iter()
+        .map(|phrase| (*phrase).to_string())
+        .collect()
+}
+
+fn normalize_phrase(text: &str) -> String {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// True when ASR output for a chunk is noise fallout rather than speech:
 /// empty/punctuation-only text, or a known hallucination phrase.
+#[cfg(test)]
 pub fn is_junk_text(text: &str) -> bool {
-    let normalized = text
-        .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    normalized.is_empty() || HALLUCINATIONS.contains(&normalized.as_str())
+    let phrases = default_junk_phrases();
+    is_junk_text_with(text, &phrases)
+}
+
+pub fn is_junk_text_with(text: &str, phrases: &[String]) -> bool {
+    let normalized = normalize_phrase(text);
+    normalized.is_empty()
+        || phrases
+            .iter()
+            .any(|phrase| normalize_phrase(phrase) == normalized)
 }
 
 #[cfg(test)]
@@ -73,5 +92,7 @@ mod tests {
         assert!(!is_junk_text("Thank you all for joining today."));
         assert!(!is_junk_text("Can you see my screen?"));
         assert!(!is_junk_text("OK."));
+        assert!(is_junk_text_with("custom noise", &["Custom noise!".into()]));
+        assert!(!is_junk_text_with("Thank you", &[]));
     }
 }

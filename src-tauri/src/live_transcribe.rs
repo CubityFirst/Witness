@@ -136,6 +136,7 @@ impl TrackState {
 /// Returns None when the Parakeet model isn't downloaded.
 pub fn spawn(
     models_dir: PathBuf,
+    junk_phrases: Vec<String>,
     on_line: impl Fn(&'static str, u64, u64, String) + Send + 'static,
 ) -> Option<Sender<LiveMsg>> {
     crate::models::parakeet_dir(&models_dir)?;
@@ -182,7 +183,7 @@ pub fn spawn(
                 match result {
                     Ok(segments) => {
                         for seg in segments {
-                            if !crate::asr::is_junk_text(&seg.text) {
+                            if !crate::asr::is_junk_text_with(&seg.text, &junk_phrases) {
                                 on_line(track.kind.name(), seg.start_ms, seg.end_ms, seg.text);
                             }
                         }
@@ -265,9 +266,13 @@ mod tests {
         let samples_48k = crate::resample::resample_all(&samples_16k, 16_000, 48_000).unwrap();
 
         let (line_tx, line_rx) = crossbeam_channel::unbounded();
-        let tx = spawn(models_dir, move |track, start_ms, end_ms, text| {
-            let _ = line_tx.send((track, start_ms, end_ms, text));
-        })
+        let tx = spawn(
+            models_dir,
+            crate::asr::default_junk_phrases(),
+            move |track, start_ms, end_ms, text| {
+                let _ = line_tx.send((track, start_ms, end_ms, text));
+            },
+        )
         .expect("Parakeet model missing — run cuda_smoke first");
 
         for chunk in samples_48k.chunks(4800) {

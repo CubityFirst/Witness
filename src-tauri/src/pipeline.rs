@@ -251,6 +251,7 @@ fn transcribe_chunks(
     chunks: &[vad::SpeechChunk],
     progress_base: f32,
     progress_span: f32,
+    junk_phrases: &[String],
     progress: &impl Fn(&'static str, f32),
 ) -> Result<Vec<asr::AsrSegment>> {
     let total_ms = vad::total_ms(chunks).max(1);
@@ -265,7 +266,7 @@ fn transcribe_chunks(
         segments.extend(
             transcribed
                 .into_iter()
-                .filter(|segment| !asr::is_junk_text(&segment.text)),
+                .filter(|segment| !asr::is_junk_text_with(&segment.text, junk_phrases)),
         );
         done_ms += samples.len() as u64 / 16;
         progress(
@@ -301,7 +302,7 @@ fn process(
         .get_meeting(meeting_id)?
         .with_context(|| format!("meeting {meeting_id} not in database"))?;
 
-    let (rec_dir, audio_dir, models_dir, default_engine, bitrate, threshold) = {
+    let (rec_dir, audio_dir, models_dir, default_engine, bitrate, threshold, junk_phrases) = {
         let s = settings.lock().unwrap();
         (
             s.rec_tmp_dir(),
@@ -310,6 +311,7 @@ fn process(
             s.engine,
             s.opus_bitrate_kbps,
             s.speaker_match_threshold,
+            s.junk_phrases.clone(),
         )
     };
     let mut rtf: Option<f32> = None;
@@ -364,8 +366,15 @@ fn process(
                 let _permit = ml_scheduler::batch();
                 asr::create_engine(engine_kind, &models_dir)?
             };
-            let mic_segments =
-                transcribe_chunks(engine.as_mut(), &mic_16k, &mic_chunks, 0.0, 0.5, &progress)?;
+            let mic_segments = transcribe_chunks(
+                engine.as_mut(),
+                &mic_16k,
+                &mic_chunks,
+                0.0,
+                0.5,
+                &junk_phrases,
+                &progress,
+            )?;
             drop(mic_chunks);
             drop(mic_16k);
 
@@ -386,6 +395,7 @@ fn process(
                 &loop_chunks,
                 0.5,
                 0.5,
+                &junk_phrases,
                 &progress,
             )?;
             (

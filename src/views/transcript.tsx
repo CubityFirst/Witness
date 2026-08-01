@@ -257,8 +257,8 @@ export function TranscriptView(props: {
     const name = renameText.trim();
     setRenaming(null);
     if (!name) return;
-    const currentName = detail?.speakers.find((speaker) => speaker.id === speakerId)?.display_name;
-    if (name === currentName?.trim()) return;
+    const currentSpeaker = detail?.speakers.find((speaker) => speaker.id === speakerId);
+    if (name === currentSpeaker?.display_name.trim() && !currentSpeaker.auto_labeled) return;
     renameSpeaker(speakerId, name)
       .then(() =>
         setDetail((d) =>
@@ -266,7 +266,9 @@ export function TranscriptView(props: {
             ? {
                 ...d,
                 speakers: d.speakers.map((s) =>
-                  s.id === speakerId ? { ...s, display_name: name } : s,
+                  s.id === speakerId
+                    ? { ...s, display_name: name, auto_labeled: false }
+                    : s,
                 ),
               }
             : d,

@@ -180,6 +180,7 @@ pub fn l2_normalize(v: &mut [f32]) {
 }
 
 /// Merge an existing print with new evidence, weighted by speech seconds.
+#[cfg(test)]
 pub fn merge_embeddings(old: &[f32], old_secs: f64, new: &[f32], new_secs: f64) -> Vec<f32> {
     let mut out: Vec<f32> = old
         .iter()
@@ -282,14 +283,13 @@ pub fn rematch_all(db: &crate::db::Db, threshold: f32) -> Result<usize> {
         match best_match(&people, &embedding, threshold) {
             Some((pid, name, _sim)) => {
                 if sp.person_id != Some(pid) || sp.display_name != name {
-                    db.set_auto_match(sp.id, &name, Some(pid))?;
-                    changed += 1;
+                    changed += usize::from(db.set_auto_match(sp.id, &name, Some(pid))?);
                 }
             }
             None if sp.auto_labeled => {
                 // Its person was deleted or the print moved away: revert.
-                db.set_auto_match(sp.id, &default_name_for(&sp.label), None)?;
-                changed += 1;
+                changed +=
+                    usize::from(db.set_auto_match(sp.id, &default_name_for(&sp.label), None)?);
             }
             None => {}
         }

@@ -31,6 +31,7 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
   const [gpu, setGpu] = useState<GpuStatus | null>(null);
   const [dl, setDl] = useState<ModelDownloadProgress | null>(null);
   const [patternsText, setPatternsText] = useState("");
+  const [junkPhrasesText, setJunkPhrasesText] = useState("");
   const [saved, setSaved] = useState(false);
   const [people, setPeople] = useState<Person[]>([]);
   const [devices, setDevices] = useState<AudioDevices | null>(null);
@@ -44,6 +45,7 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
     getSettings().then((s) => {
       setSettings(s);
       setPatternsText(s.watch_patterns.join(", "));
+      setJunkPhrasesText(s.junk_phrases.join("\n"));
     });
     refreshModels();
     getGpuStatus().then(setGpu).catch(() => {});
@@ -78,6 +80,14 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
       .map((p) => p.trim())
       .filter(Boolean);
     save({ ...settings, watch_patterns: patterns });
+  };
+
+  const commitJunkPhrases = () => {
+    const phrases = junkPhrasesText
+      .split("\n")
+      .map((phrase) => phrase.trim())
+      .filter(Boolean);
+    save({ ...settings, junk_phrases: phrases });
   };
 
   const pickDir = () =>
@@ -267,6 +277,22 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
             auto-labels (more mistakes), higher = fewer
           </span>
         </div>
+        <div class="setting-row setting-row-top">
+          <label for="junk-phrases">Discarded noise phrases</label>
+          <textarea
+            id="junk-phrases"
+            class="text-input"
+            rows={4}
+            value={junkPhrasesText}
+            onInput={(event) =>
+              setJunkPhrasesText((event.target as HTMLTextAreaElement).value)
+            }
+            onBlur={commitJunkPhrases}
+          />
+          <span class="muted">
+            one exact phrase per line; clear the list to disable phrase filtering
+          </span>
+        </div>
         <p class="muted">
           {hotkey
             ? `Global hotkey: ${hotkey.toUpperCase().replaceAll("+", " + ")} starts/stops recording.`
@@ -298,7 +324,10 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
           <div class="setting-row" key={mo.id}>
             <label>{mo.display_name}</label>
             {mo.present ? (
-              <span class="badge badge-transcribed">
+              <span
+                class="badge badge-transcribed"
+                title={`Verified revision ${mo.installed_revision}`}
+              >
                 installed{mo.size_mb != null ? ` · ${Math.round(mo.size_mb)} MB` : ""}
               </span>
             ) : dl && dl.model_id === mo.id ? (
@@ -310,10 +339,20 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
                     : `${Math.round(dl.downloaded_bytes / 1e6)} MB…`}
               </span>
             ) : (
-              <button class="btn btn-ghost" onClick={() => downloadModels(mo.engine)}>
-                Download
-              </button>
+              <>
+                {mo.integrity_error && (
+                  <span class="badge badge-failed" title={mo.integrity_error}>
+                    integrity check failed
+                  </span>
+                )}
+                <button class="btn btn-ghost" onClick={() => downloadModels(mo.engine)}>
+                  {mo.integrity_error ? "Repair" : "Download"}
+                </button>
+              </>
             )}
+            <code class="muted" title={`Expected revision ${mo.expected_revision}`}>
+              rev {mo.expected_revision.slice(0, 8)}
+            </code>
           </div>
         ))}
         <p class="muted">

@@ -1126,6 +1126,10 @@ mark {
   flex-wrap: wrap;
 }
 
+.setting-row-top {
+  align-items: flex-start;
+}
+
 .setting-row > label:first-child {
   min-width: 140px;
 }
