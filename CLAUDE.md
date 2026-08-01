@@ -104,11 +104,26 @@ min/max/close (close hides to tray). A second webview window "captions"
   grabs blur before any resize event fires).
 - **Meeting auto-naming reads Teams window titles only** (12/30/60 s after
   auto-start; never overwrites a user rename). No process memory, no UIA
-  scraping, no Graph API.
+  scraping, no Graph API. The watcher snapshots Teams window handles while
+  the mic is idle; naming prefers windows that appeared since (the call
+  window) over the long-lived main window, whose title is just the open
+  chat/tab. Falls back to all windows if no new ones survive filtering.
+- **Meeting end stops any running recording**, not just auto-started ones —
+  StopMeeting only fires after a watched meeting was detected and ended, so
+  manual recordings made outside a call are never touched.
 - **Live captions are provisional by design** — VAD-cut chunks on ~0.7 s
   pauses (15 s cap), tagged Me/Them only; the final pass replaces them
   with the diarized transcript. Timeline stays aligned with the WAVs
   because writer silence insertions are forwarded as `LiveMsg::Silence`.
+- **Phantom-line defense is two-layered** (mic pops / AC hum used to become
+  transcript lines): vad.rs demands ≥5 consecutive speech frames (~80 ms,
+  `MIN_SPEECH_FRAMES`) at a 0.65 threshold before a span counts as speech —
+  transients light up 1–2 frames; and `asr::is_junk_text` drops known
+  noise hallucinations (lone "You", "Thank you.", YouTube-outro phrases)
+  plus empty/punctuation-only output, in both the pipeline and live
+  captions. Both constants are shared by live_transcribe.rs, which also
+  refuses to cut a chunk until a run confirms real speech. Retranscribing
+  an old meeting re-runs VAD, so it cleans up past phantom lines too.
 - Search snippets use `\x01`/`\x02` markers (control chars can't occur in
   transcripts) rendered as `<mark>` by the frontend — never raw HTML.
 - Exports (md/txt/srt/vtt) render backend-side; "download" actions go

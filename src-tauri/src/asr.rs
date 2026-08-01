@@ -26,3 +26,48 @@ pub fn create_engine(engine: Engine, models_dir: &Path) -> Result<Box<dyn AsrEng
         Engine::Whisper => Ok(Box::new(crate::asr_whisper::WhisperEngine::new(models_dir)?)),
     }
 }
+
+/// Phrases the engines invent for noise-only audio (pops/hum the VAD let
+/// through). Whisper's YouTube-training artifacts are well documented;
+/// lone "You" is its most common noise output. Compared after normalization,
+/// so punctuation/case variants all match. Deliberately short — a real
+/// "thank you all for joining" must never die here.
+const HALLUCINATIONS: &[&str] = &[
+    "you",
+    "thank you",
+    "thanks for watching",
+    "thank you for watching",
+    "please subscribe",
+    "subtitles by the amara org community",
+];
+
+/// True when ASR output for a chunk is noise fallout rather than speech:
+/// empty/punctuation-only text, or a known hallucination phrase.
+pub fn is_junk_text(text: &str) -> bool {
+    let normalized = text
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    normalized.is_empty() || HALLUCINATIONS.contains(&normalized.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn junk_filter() {
+        assert!(is_junk_text(""));
+        assert!(is_junk_text(" . "));
+        assert!(is_junk_text("You"));
+        assert!(is_junk_text("Thank you."));
+        assert!(is_junk_text("Thanks for watching!"));
+        assert!(is_junk_text("Subtitles by the Amara.org community"));
+
+        assert!(!is_junk_text("Thank you all for joining today."));
+        assert!(!is_junk_text("Can you see my screen?"));
+        assert!(!is_junk_text("OK."));
+    }
+}

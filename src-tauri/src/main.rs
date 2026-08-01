@@ -329,10 +329,15 @@ fn setup(app: &tauri::App) -> anyhow::Result<()> {
                 }
             }
             WatcherCommand::StopMeeting => {
+                // The meeting is over: stop whatever recording is running,
+                // auto- or manually started. This only fires after a watched
+                // meeting was detected and ended, so a manual recording made
+                // outside any call is never touched.
                 let state = watch_app.state::<AppState>();
-                let is_auto = *state.recording_trigger.lock().unwrap() == "auto";
+                let trigger = *state.recording_trigger.lock().unwrap();
                 let recording = state.recorder.lock().unwrap().is_some();
-                if recording && is_auto {
+                if recording {
+                    log::info!("meeting ended: stopping {trigger} recording");
                     if let Err(e) = commands::do_stop_recording(&watch_app, false) {
                         log::warn!("auto-record stop failed: {e}");
                     }

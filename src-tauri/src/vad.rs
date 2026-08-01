@@ -12,7 +12,14 @@ use earshot::Detector;
 /// earshot frame: 256 samples @ 16 kHz = 16 ms.
 const FRAME: usize = 256;
 const FRAME_MS: u64 = 16;
-const THRESHOLD: f32 = 0.5;
+/// Per-frame speech score cutoff. 0.5 let steady low-level noise (AC hum)
+/// hover across the line; the existing 200 ms padding absorbs the slightly
+/// later speech onsets a higher bar causes.
+pub const THRESHOLD: f32 = 0.65;
+/// A raw span must reach this many consecutive speech frames (~80 ms) to
+/// count as speech at all — mic pops and clicks light up 1–2 frames, real
+/// words always exceed this. Shared with the live-caption VAD gate.
+pub const MIN_SPEECH_FRAMES: usize = 5;
 /// Speech padding on each side of a region (~200 ms).
 const PAD_FRAMES: usize = 12;
 /// Regions closer than this are merged (~500 ms).
@@ -48,7 +55,28 @@ pub fn chunk_speech(samples_16k: &[f32]) -> Vec<SpeechChunk> {
         }
     }
 
-    // Collect raw speech spans [start, end) in frames.
+    // Emit chunks, splitting anything over the TDT cap.
+    let mut chunks = Vec::new();
+    for (s, e) in regions(&speech) {
+        let mut start = s;
+        while start < e {
+            let end = (start + MAX_CHUNK_FRAMES).min(e);
+            chunks.push(SpeechChunk {
+                start_ms: start as u64 * FRAME_MS,
+                samples: samples_16k[start * FRAME..end * FRAME].to_vec(),
+            });
+            start = end;
+        }
+    }
+    chunks
+}
+
+/// Per-frame speech flags → padded, merged regions [start, end) in frames.
+/// Spans shorter than MIN_SPEECH_FRAMES are discarded before padding — a
+/// 1–2 frame blip is a transient, and padding would inflate it into a
+/// ~400 ms chunk the ASR then hallucinates words for.
+fn regions(speech: &[bool]) -> Vec<(usize, usize)> {
+    let n_frames = speech.len();
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
     while i < n_frames {
@@ -57,13 +85,12 @@ pub fn chunk_speech(samples_16k: &[f32]) -> Vec<SpeechChunk> {
             while i < n_frames && speech[i] {
                 i += 1;
             }
-            spans.push((start, i));
+            if i - start >= MIN_SPEECH_FRAMES {
+                spans.push((start, i));
+            }
         } else {
             i += 1;
         }
-    }
-    if spans.is_empty() {
-        return Vec::new();
     }
 
     // Pad each span, then merge overlapping/near spans.
@@ -78,26 +105,49 @@ pub fn chunk_speech(samples_16k: &[f32]) -> Vec<SpeechChunk> {
             _ => merged.push((s, e)),
         }
     }
-
-    // Emit chunks, splitting anything over the TDT cap.
-    let mut chunks = Vec::new();
-    for (s, e) in merged {
-        let mut start = s;
-        while start < e {
-            let end = (start + MAX_CHUNK_FRAMES).min(e);
-            chunks.push(SpeechChunk {
-                start_ms: start as u64 * FRAME_MS,
-                samples: samples_16k[start * FRAME..end * FRAME].to_vec(),
-            });
-            start = end;
-        }
-    }
-    chunks
+    merged
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_blips_are_not_speech() {
+        // A mic pop: 2 frames flagged in otherwise silent audio → dropped.
+        let mut flags = vec![false; 200];
+        flags[50] = true;
+        flags[51] = true;
+        assert!(regions(&flags).is_empty());
+
+        // Two separate pops don't add up to speech either.
+        flags[120] = true;
+        assert!(regions(&flags).is_empty());
+    }
+
+    #[test]
+    fn real_spans_survive_with_padding() {
+        let mut flags = vec![false; 200];
+        for f in &mut flags[50..50 + MIN_SPEECH_FRAMES] {
+            *f = true;
+        }
+        let r = regions(&flags);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0], (50 - PAD_FRAMES, 50 + MIN_SPEECH_FRAMES + PAD_FRAMES));
+    }
+
+    #[test]
+    fn near_spans_merge() {
+        let mut flags = vec![false; 300];
+        for f in &mut flags[50..60] {
+            *f = true;
+        }
+        // 20 frames apart (< pad + merge gap) → one region.
+        for f in &mut flags[80..90] {
+            *f = true;
+        }
+        assert_eq!(regions(&flags).len(), 1);
+    }
 
     #[test]
     fn silence_yields_no_chunks() {
@@ -109,6 +159,29 @@ mod tests {
         assert!(chunk_speech(&[]).is_empty());
         assert!(chunk_speech(&[0.0; 100]).is_empty()); // below one frame
         let _ = chunk_speech(&vec![0.01; 16_000 + 37]); // non-multiple of frame
+    }
+
+    /// Real-speech sanity for THRESHOLD/MIN_SPEECH_FRAMES: the detector must
+    /// keep the bulk of actual speech. Needs %TEMP%\witness-tts.wav (16 kHz
+    /// mono i16, SAPI-generated — see asr_parakeet::tests::tts_transcribe).
+    /// `cargo test vad_keeps_tts_speech -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn vad_keeps_tts_speech() {
+        let wav = std::env::temp_dir().join("witness-tts.wav");
+        let mut reader = hound::WavReader::open(&wav).expect("generate TTS wav first");
+        assert_eq!(reader.spec().sample_rate, 16_000);
+        let samples: Vec<f32> = reader
+            .samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect();
+        let total_s = samples.len() as f64 / 16_000.0;
+        let kept_s = total_ms(&chunk_speech(&samples)) as f64 / 1000.0;
+        println!("VAD kept {kept_s:.1}s of {total_s:.1}s TTS speech");
+        assert!(
+            kept_s >= total_s * 0.7,
+            "VAD too aggressive: kept {kept_s:.1}s of {total_s:.1}s"
+        );
     }
 
     #[test]

@@ -166,7 +166,14 @@ fn process(
                 (&loop_chunks, &mut loop_segments),
             ] {
                 for chunk in chunks.iter() {
-                    out.extend(engine.transcribe(&chunk.samples, chunk.start_ms)?);
+                    // Noise chunks the VAD let through make the engines
+                    // hallucinate ("Thank you." on a mic pop) — drop those.
+                    out.extend(
+                        engine
+                            .transcribe(&chunk.samples, chunk.start_ms)?
+                            .into_iter()
+                            .filter(|s| !asr::is_junk_text(&s.text)),
+                    );
                     done_ms += chunk.samples.len() as u64 / 16;
                     progress("asr", done_ms as f32 / total_ms as f32);
                 }

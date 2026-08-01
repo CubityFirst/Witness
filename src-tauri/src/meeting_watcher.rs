@@ -42,6 +42,10 @@ pub struct WatcherControl {
     pub suppressed: AtomicBool,
     /// Lowercased patterns matched against consent-store subkey names.
     pub patterns: Mutex<Vec<String>>,
+    /// Teams window handles seen while no meeting was active — lets meeting
+    /// naming tell the call window (spawned with the call) from the main app
+    /// window, whose title is just whatever chat/tab is open.
+    pub idle_teams_windows: Mutex<Vec<isize>>,
 }
 
 impl WatcherControl {
@@ -50,6 +54,7 @@ impl WatcherControl {
             enabled: AtomicBool::new(enabled),
             suppressed: AtomicBool::new(false),
             patterns: Mutex::new(patterns.iter().map(|p| p.to_lowercase()).collect()),
+            idle_teams_windows: Mutex::new(Vec::new()),
         })
     }
 
@@ -129,6 +134,14 @@ pub fn spawn(
                 } else {
                     inactive_ticks += 1;
                     active_ticks = 0;
+                }
+
+                // While idle, keep a fresh baseline of Teams windows so that
+                // once a call starts, naming can prefer the windows the call
+                // spawned. Frozen from the first active tick onward.
+                if !in_meeting && !mic_active {
+                    *control.idle_teams_windows.lock().unwrap() =
+                        crate::meeting_title::teams_window_handles();
                 }
 
                 if !in_meeting && mic_active && active_ticks >= START_TICKS {

@@ -6,8 +6,7 @@ and everything you hear, as separate tracks), transcribes it on-device with
 speaker labels, and keeps a browsable, full-text-searchable archive of every
 meeting. Nothing ever leaves your machine.
 
-Sibling project to [Vigil](../vigil) — same single-process, tray-first
-philosophy.
+Sibling project to Vigil — same single-process, tray-first philosophy.
 
 ## Features
 

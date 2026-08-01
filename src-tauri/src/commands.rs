@@ -112,7 +112,8 @@ pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64,
                     if !meeting.title.starts_with("Meeting 2") {
                         return; // user already renamed
                     }
-                    if let Some(title) = crate::meeting_title::find_teams_meeting_title() {
+                    let pre_call = state.watcher.idle_teams_windows.lock().unwrap().clone();
+                    if let Some(title) = crate::meeting_title::find_teams_meeting_title(&pre_call) {
                         log::info!("meeting {id}: auto-named from Teams window: {title}");
                         let _ = state.db.rename_meeting(id, &title);
                         let _ = title_app.emit(events::MEETINGS_CHANGED, ());

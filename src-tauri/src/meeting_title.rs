@@ -2,6 +2,12 @@
 //! meeting window's title usually carries the meeting subject, ending in
 //! "| Microsoft Teams". Reading window titles is far more robust than UI
 //! scraping — worst case we find nothing and the timestamp name stays.
+//!
+//! The main Teams window and the call window belong to the same process, and
+//! the main window's title is whatever chat/tab happens to be open — which
+//! can look meeting-ish. The watcher snapshots Teams window handles while no
+//! meeting is active (`teams_window_handles`), and naming prefers windows
+//! that appeared since: those are the ones the call spawned.
 
 /// Titles that are Teams app tabs, not meeting subjects (after stripping
 /// the "| Microsoft Teams" suffix).
@@ -19,8 +25,9 @@ const GENERIC_TITLES: &[&str] = &[
     "calls",
 ];
 
+/// Visible top-level windows of any Teams process: (hwnd, raw title).
 #[cfg(windows)]
-pub fn find_teams_meeting_title() -> Option<String> {
+fn teams_windows() -> Vec<(isize, String)> {
     use windows::core::BOOL;
     use windows::Win32::Foundation::{HWND, LPARAM};
     use windows::Win32::System::Threading::{
@@ -33,7 +40,7 @@ pub fn find_teams_meeting_title() -> Option<String> {
     };
 
     unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let titles = unsafe { &mut *(lparam.0 as *mut Vec<String>) };
+        let windows = unsafe { &mut *(lparam.0 as *mut Vec<(isize, String)>) };
         unsafe {
             if !IsWindowVisible(hwnd).as_bool() {
                 return BOOL(1);
@@ -71,19 +78,49 @@ pub fn find_teams_meeting_title() -> Option<String> {
             let mut buf = vec![0u16; len as usize + 1];
             let read = GetWindowTextW(hwnd, &mut buf);
             if read > 0 {
-                titles.push(String::from_utf16_lossy(&buf[..read as usize]));
+                windows.push((hwnd.0 as isize, String::from_utf16_lossy(&buf[..read as usize])));
             }
         }
         BOOL(1)
     }
 
-    let mut titles: Vec<String> = Vec::new();
+    let mut windows: Vec<(isize, String)> = Vec::new();
     unsafe {
-        let _ = EnumWindows(Some(enum_proc), LPARAM(&mut titles as *mut _ as isize));
+        let _ = EnumWindows(Some(enum_proc), LPARAM(&mut windows as *mut _ as isize));
     }
+    windows
+}
+
+#[cfg(not(windows))]
+fn teams_windows() -> Vec<(isize, String)> {
+    Vec::new()
+}
+
+/// Handles of the Teams windows that exist right now. The watcher calls this
+/// while the mic is idle so `find_teams_meeting_title` can tell call windows
+/// (spawned with the call) from the long-lived main window.
+pub fn teams_window_handles() -> Vec<isize> {
+    teams_windows().into_iter().map(|(hwnd, _)| hwnd).collect()
+}
+
+/// `pre_call` = window handles snapshotted before the call started. Windows
+/// not in it were spawned by the call and are preferred; if none survive
+/// (stale/empty baseline, or Teams reuses the main window), fall back to all.
+pub fn find_teams_meeting_title(pre_call: &[isize]) -> Option<String> {
+    let windows = teams_windows();
+    let fresh: Vec<&String> = windows
+        .iter()
+        .filter(|(hwnd, _)| !pre_call.contains(hwnd))
+        .map(|(_, title)| title)
+        .collect();
+    let pool: Vec<&String> = if fresh.is_empty() {
+        windows.iter().map(|(_, title)| title).collect()
+    } else {
+        fresh
+    };
 
     // Strip the app suffix, drop generic tab names, prefer meeting-ish ones.
-    let mut candidates: Vec<String> = titles
+    let mut candidates: Vec<String> = pool
         .into_iter()
         .map(|t| {
             t.trim_end_matches("| Microsoft Teams")
@@ -100,9 +137,4 @@ pub fn find_teams_meeting_title() -> Option<String> {
         (std::cmp::Reverse(meetingish), std::cmp::Reverse(t.len()))
     });
     candidates.into_iter().next()
-}
-
-#[cfg(not(windows))]
-pub fn find_teams_meeting_title() -> Option<String> {
-    None
 }

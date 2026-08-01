@@ -42,6 +42,11 @@ struct TrackState {
     pending_start: u64,  // absolute 16 kHz sample index of pending[0]
     frames_checked: usize,
     last_voice_frame: Option<usize>,
+    /// Current run of consecutive voiced frames.
+    voiced_run: usize,
+    /// A run reached vad::MIN_SPEECH_FRAMES — the buffer holds real speech,
+    /// not just a pop/click, so it's worth transcribing.
+    speech_confirmed: bool,
 }
 
 impl TrackState {
@@ -54,12 +59,16 @@ impl TrackState {
             pending_start: 0,
             frames_checked: 0,
             last_voice_frame: None,
+            voiced_run: 0,
+            speech_confirmed: false,
         })
     }
 
     fn reset_vad(&mut self) {
         self.frames_checked = 0;
         self.last_voice_frame = None;
+        self.voiced_run = 0;
+        self.speech_confirmed = false;
         self.detector.reset();
     }
 
@@ -70,33 +79,39 @@ impl TrackState {
         while self.frames_checked < total_frames {
             let i = self.frames_checked;
             let frame = &self.pending[i * FRAME..(i + 1) * FRAME];
-            if self.detector.predict_f32(frame) > 0.5 {
+            if self.detector.predict_f32(frame) > crate::vad::THRESHOLD {
                 self.last_voice_frame = Some(i);
+                self.voiced_run += 1;
+                if self.voiced_run >= crate::vad::MIN_SPEECH_FRAMES {
+                    self.speech_confirmed = true;
+                }
+            } else {
+                self.voiced_run = 0;
             }
             self.frames_checked += 1;
         }
-        match self.last_voice_frame {
-            Some(last) => {
-                let trailing_silence = total_frames.saturating_sub(last + 1);
-                if trailing_silence >= SILENCE_CUT_FRAMES {
-                    Some(((last + 1 + PAD_FRAMES).min(total_frames)) * FRAME)
-                } else if self.pending.len() >= MAX_BUFFER {
-                    Some(self.pending.len())
-                } else {
-                    None
-                }
-            }
-            None => {
-                if self.pending.len() > IDLE_DROP {
-                    // Nothing voiced — slide the window, keep a short tail.
-                    let keep = 8 * FRAME;
-                    let drop = self.pending.len() - keep;
-                    self.pending.drain(..drop);
-                    self.pending_start += drop as u64;
-                    self.reset_vad();
-                }
+        if self.speech_confirmed {
+            // speech_confirmed implies at least one voiced frame.
+            let last = self.last_voice_frame.unwrap();
+            let trailing_silence = total_frames.saturating_sub(last + 1);
+            if trailing_silence >= SILENCE_CUT_FRAMES {
+                Some(((last + 1 + PAD_FRAMES).min(total_frames)) * FRAME)
+            } else if self.pending.len() >= MAX_BUFFER {
+                Some(self.pending.len())
+            } else {
                 None
             }
+        } else {
+            // Nothing but silence or sub-word blips (mic pops) — slide the
+            // window rather than sending noise to the engine.
+            if self.pending.len() > IDLE_DROP {
+                let keep = 8 * FRAME;
+                let drop = self.pending.len() - keep;
+                self.pending.drain(..drop);
+                self.pending_start += drop as u64;
+                self.reset_vad();
+            }
+            None
         }
     }
 
@@ -153,7 +168,7 @@ pub fn spawn(
                 match engine.transcribe(&chunk, start_ms) {
                     Ok(segments) => {
                         for seg in segments {
-                            if !seg.text.is_empty() {
+                            if !crate::asr::is_junk_text(&seg.text) {
                                 on_line(track.kind.name(), seg.start_ms, seg.end_ms, seg.text);
                             }
                         }
@@ -180,7 +195,7 @@ pub fn spawn(
                     LiveMsg::Silence { kind, count_48k } => {
                         // A timeline gap: flush any pending speech, then jump.
                         let track = if kind == TrackKind::Mic { &mut mic } else { &mut lop };
-                        if track.last_voice_frame.is_some() {
+                        if track.speech_confirmed {
                             let cut = track.pending.len();
                             transcribe(track, cut);
                         }
@@ -193,7 +208,7 @@ pub fn spawn(
 
             // Recording ended: flush whatever speech is left on both tracks.
             for track in [&mut mic, &mut lop] {
-                if track.last_voice_frame.is_some() {
+                if track.speech_confirmed {
                     let cut = track.pending.len();
                     transcribe(track, cut);
                 }
