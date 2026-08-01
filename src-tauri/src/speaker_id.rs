@@ -41,7 +41,11 @@ fn hz_to_mel(hz: f32) -> f32 {
 /// Triangular mel filterbank over FFT bins: (bin_start, weights) per mel.
 fn mel_banks() -> Vec<(usize, Vec<f32>)> {
     let nyquist = SAMPLE_RATE as f32 / 2.0;
-    let high = if HIGH_FREQ > 0.0 { HIGH_FREQ.min(nyquist) } else { nyquist };
+    let high = if HIGH_FREQ > 0.0 {
+        HIGH_FREQ.min(nyquist)
+    } else {
+        nyquist
+    };
     let mel_low = hz_to_mel(LOW_FREQ);
     let mel_high = hz_to_mel(high);
     let n_bins = FFT_SIZE / 2 + 1;
@@ -86,7 +90,8 @@ pub fn fbank(samples: &[f32]) -> Vec<Vec<f32>> {
     // Povey window: (0.5 - 0.5*cos(2*pi*n/(N-1)))^0.85
     let window: Vec<f32> = (0..FRAME_LEN)
         .map(|n| {
-            let hann = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * n as f32 / (FRAME_LEN - 1) as f32).cos();
+            let hann =
+                0.5 - 0.5 * (2.0 * std::f32::consts::PI * n as f32 / (FRAME_LEN - 1) as f32).cos();
             hann.powf(0.85)
         })
         .collect();
@@ -179,7 +184,9 @@ pub fn merge_embeddings(old: &[f32], old_secs: f64, new: &[f32], new_secs: f64) 
     let mut out: Vec<f32> = old
         .iter()
         .zip(new)
-        .map(|(o, n)| (o * old_secs as f32 + n * new_secs as f32) / (old_secs + new_secs).max(1e-6) as f32)
+        .map(|(o, n)| {
+            (o * old_secs as f32 + n * new_secs as f32) / (old_secs + new_secs).max(1e-6) as f32
+        })
         .collect();
     l2_normalize(&mut out);
     out
@@ -200,7 +207,10 @@ impl Embedder {
             .commit_from_file(&path)
             .with_context(|| format!("loading speaker model {}", path.display()))?;
         let input_name = session.inputs()[0].name().to_string();
-        Ok(Embedder { session, input_name })
+        Ok(Embedder {
+            session,
+            input_name,
+        })
     }
 
     /// Voice print of one speaker's 16 kHz speech (L2-normalized).
@@ -222,7 +232,10 @@ impl Embedder {
             .try_extract_tensor::<f32>()
             .context("extract embedding")?;
         let dim = *shape.as_ref().last().unwrap_or(&0) as usize;
-        anyhow::ensure!(dim > 0 && data.len() >= dim, "unexpected embedding shape {shape:?}");
+        anyhow::ensure!(
+            dim > 0 && data.len() >= dim,
+            "unexpected embedding shape {shape:?}"
+        );
         let mut emb = data[data.len() - dim..].to_vec();
         l2_normalize(&mut emb);
         Ok(emb)
@@ -263,7 +276,9 @@ pub fn rematch_all(db: &crate::db::Db, threshold: f32) -> Result<usize> {
         if !(sp.auto_labeled || (sp.person_id.is_none() && is_default)) {
             continue;
         }
-        let Some(embedding) = db.get_embedding_only(sp.id)? else { continue };
+        let Some(embedding) = db.get_embedding_only(sp.id)? else {
+            continue;
+        };
         match best_match(&people, &embedding, threshold) {
             Some((pid, name, _sim)) => {
                 if sp.person_id != Some(pid) || sp.display_name != name {
@@ -324,7 +339,9 @@ mod tests {
             let mut r = hound::WavReader::open(&path)
                 .unwrap_or_else(|_| panic!("generate {} first", path.display()));
             assert_eq!(r.spec().sample_rate, 16_000);
-            r.samples::<i16>().map(|s| s.unwrap() as f32 / 32768.0).collect()
+            r.samples::<i16>()
+                .map(|s| s.unwrap() as f32 / 32768.0)
+                .collect()
         };
         let mut embedder = Embedder::new(&models_dir).unwrap();
         let a1 = embedder.embed(&load("a1")).unwrap();
@@ -335,7 +352,12 @@ mod tests {
 
         let same_a = cosine(&a1, &a2);
         let same_b = cosine(&b1, &b2);
-        let cross = [cosine(&a1, &b1), cosine(&a1, &b2), cosine(&a2, &b1), cosine(&a2, &b2)];
+        let cross = [
+            cosine(&a1, &b1),
+            cosine(&a1, &b2),
+            cosine(&a2, &b1),
+            cosine(&a2, &b2),
+        ];
         let worst_cross = cross.iter().cloned().fold(f32::MIN, f32::max);
         println!("same-voice: hazel {same_a:.3}, zira {same_b:.3}");
         println!("cross-voice: {cross:?} (max {worst_cross:.3})");

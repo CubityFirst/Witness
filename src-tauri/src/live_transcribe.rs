@@ -18,7 +18,10 @@ use earshot::Detector;
 use std::path::PathBuf;
 
 pub enum LiveMsg {
-    Audio { kind: TrackKind, samples_48k: Vec<f32> },
+    Audio {
+        kind: TrackKind,
+        samples_48k: Vec<f32>,
+    },
     /// Timeline gap (silence the writer inserted), in 48 kHz samples.
     Silence { kind: TrackKind, count_48k: u64 },
 }
@@ -38,8 +41,8 @@ struct TrackState {
     kind: TrackKind,
     resampler: StreamResampler,
     detector: Detector,
-    pending: Vec<f32>,   // 16 kHz samples awaiting transcription
-    pending_start: u64,  // absolute 16 kHz sample index of pending[0]
+    pending: Vec<f32>,  // 16 kHz samples awaiting transcription
+    pending_start: u64, // absolute 16 kHz sample index of pending[0]
     frames_checked: usize,
     last_voice_frame: Option<usize>,
     /// Current run of consecutive voiced frames.
@@ -180,7 +183,11 @@ pub fn spawn(
             while let Ok(msg) = rx.recv() {
                 match msg {
                     LiveMsg::Audio { kind, samples_48k } => {
-                        let track = if kind == TrackKind::Mic { &mut mic } else { &mut lop };
+                        let track = if kind == TrackKind::Mic {
+                            &mut mic
+                        } else {
+                            &mut lop
+                        };
                         match track.resampler.push(&samples_48k) {
                             Ok(out) => track.pending.extend_from_slice(&out),
                             Err(e) => {
@@ -194,7 +201,11 @@ pub fn spawn(
                     }
                     LiveMsg::Silence { kind, count_48k } => {
                         // A timeline gap: flush any pending speech, then jump.
-                        let track = if kind == TrackKind::Mic { &mut mic } else { &mut lop };
+                        let track = if kind == TrackKind::Mic {
+                            &mut mic
+                        } else {
+                            &mut lop
+                        };
                         if track.speech_confirmed {
                             let cut = track.pending.len();
                             transcribe(track, cut);
@@ -257,13 +268,18 @@ mod tests {
         }
         // A trailing second of silence lets the VAD cut the last utterance.
         for _ in 0..12 {
-            tx.send(LiveMsg::Audio { kind: TrackKind::Mic, samples_48k: vec![0.0; 4800] })
-                .unwrap();
+            tx.send(LiveMsg::Audio {
+                kind: TrackKind::Mic,
+                samples_48k: vec![0.0; 4800],
+            })
+            .unwrap();
         }
         drop(tx); // worker flushes and exits
 
         let mut all_text = String::new();
-        while let Ok((track, start_ms, end_ms, text)) = line_rx.recv_timeout(std::time::Duration::from_secs(60)) {
+        while let Ok((track, start_ms, end_ms, text)) =
+            line_rx.recv_timeout(std::time::Duration::from_secs(60))
+        {
             println!("live [{track} {start_ms}-{end_ms} ms] {text}");
             all_text.push_str(&text);
             all_text.push(' ');

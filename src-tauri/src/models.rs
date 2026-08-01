@@ -91,21 +91,29 @@ pub fn status(models_dir: &Path) -> Vec<ModelInfo> {
             engine: Engine::Parakeet,
             display_name: "Parakeet TDT 0.6B v3 (ONNX)".into(),
             present: parakeet.is_some(),
-            size_mb: if parakeet.is_some() { size_mb(&parakeet_paths) } else { None },
+            size_mb: if parakeet.is_some() {
+                size_mb(&parakeet_paths)
+            } else {
+                None
+            },
         },
         ModelInfo {
             id: "sortformer".into(),
             engine: Engine::Parakeet,
             display_name: "Sortformer diarization (4 speakers)".into(),
             present: sortformer.is_some(),
-            size_mb: sortformer.as_ref().and_then(|p| size_mb(std::slice::from_ref(p))),
+            size_mb: sortformer
+                .as_ref()
+                .and_then(|p| size_mb(std::slice::from_ref(p))),
         },
         ModelInfo {
             id: "whisper".into(),
             engine: Engine::Whisper,
             display_name: "Whisper large-v3-turbo (q5_0)".into(),
             present: whisper.is_some(),
-            size_mb: whisper.as_ref().and_then(|p| size_mb(std::slice::from_ref(p))),
+            size_mb: whisper
+                .as_ref()
+                .and_then(|p| size_mb(std::slice::from_ref(p))),
         },
         {
             let speaker = speaker_id_path(models_dir);
@@ -114,7 +122,9 @@ pub fn status(models_dir: &Path) -> Vec<ModelInfo> {
                 engine: Engine::Parakeet,
                 display_name: "Speaker voice prints (ERes2Net)".into(),
                 present: speaker.is_some(),
-                size_mb: speaker.as_ref().and_then(|p| size_mb(std::slice::from_ref(p))),
+                size_mb: speaker
+                    .as_ref()
+                    .and_then(|p| size_mb(std::slice::from_ref(p))),
             }
         },
     ]
@@ -122,12 +132,14 @@ pub fn status(models_dir: &Path) -> Vec<ModelInfo> {
 
 /// Bridges hf-hub's Progress trait onto a plain callback
 /// (model_id, file, downloaded, total).
+type DownloadProgress<'a> = dyn Fn(&str, &str, u64, Option<u64>) + 'a;
+
 struct ProgressBridge<'a> {
     model_id: &'a str,
     file: String,
     downloaded: u64,
     total: u64,
-    cb: &'a dyn Fn(&str, &str, u64, Option<u64>),
+    cb: &'a DownloadProgress<'a>,
 }
 
 impl Progress for ProgressBridge<'_> {
@@ -151,12 +163,12 @@ impl Progress for ProgressBridge<'_> {
     }
 }
 
-fn download_repo(
+fn download_repo<'a>(
     models_dir: &Path,
     model_id: &str,
     repo: &str,
     files: &[&str],
-    cb: &dyn Fn(&str, &str, u64, Option<u64>),
+    cb: &'a DownloadProgress<'a>,
 ) -> Result<()> {
     let api = ApiBuilder::new()
         .with_cache_dir(cache_dir(models_dir))
@@ -186,7 +198,13 @@ fn download_repo(
 #[cfg(test)]
 pub fn download_speaker_id(models_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(cache_dir(models_dir)).ok();
-    download_repo(models_dir, "speaker-id", SPEAKER_ID_REPO, &[SPEAKER_ID_FILE], &|_, _, _, _| {})
+    download_repo(
+        models_dir,
+        "speaker-id",
+        SPEAKER_ID_REPO,
+        &[SPEAKER_ID_FILE],
+        &|_, _, _, _| {},
+    )
 }
 
 /// Blocking download of everything the given engine needs.

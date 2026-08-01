@@ -22,8 +22,12 @@ pub trait AsrEngine: Send {
 /// are created per job and dropped afterwards so VRAM is freed between runs.
 pub fn create_engine(engine: Engine, models_dir: &Path) -> Result<Box<dyn AsrEngine>> {
     match engine {
-        Engine::Parakeet => Ok(Box::new(crate::asr_parakeet::ParakeetEngine::new(models_dir)?)),
-        Engine::Whisper => Ok(Box::new(crate::asr_whisper::WhisperEngine::new(models_dir)?)),
+        Engine::Parakeet => Ok(Box::new(crate::asr_parakeet::ParakeetEngine::new(
+            models_dir,
+        )?)),
+        Engine::Whisper => Ok(Box::new(crate::asr_whisper::WhisperEngine::new(
+            models_dir,
+        )?)),
     }
 }
 

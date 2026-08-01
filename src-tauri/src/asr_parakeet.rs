@@ -74,11 +74,15 @@ mod tests {
             .unwrap_or_else(|_| std::path::PathBuf::from("target/debug/models"));
         std::fs::create_dir_all(&models_dir).unwrap();
 
-        crate::models::download(crate::settings::Engine::Parakeet, &models_dir, |m, f, d, t| {
-            if let Some(t) = t {
-                println!("{m}/{f}: {} / {} MB", d / 1_000_000, t / 1_000_000);
-            }
-        })
+        crate::models::download(
+            crate::settings::Engine::Parakeet,
+            &models_dir,
+            |m, f, d, t| {
+                if let Some(t) = t {
+                    println!("{m}/{f}: {} / {} MB", d / 1_000_000, t / 1_000_000);
+                }
+            },
+        )
         .unwrap();
 
         let mut engine = ParakeetEngine::new(&models_dir).unwrap();

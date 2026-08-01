@@ -58,7 +58,10 @@ pub fn assign_speaker(diar: &[DiarSegment], start_ms: u64, end_ms: u64) -> Optio
         if d.start_ms >= end_ms {
             break; // diar is sorted by start
         }
-        let overlap = d.end_ms.min(end_ms).saturating_sub(d.start_ms.max(start_ms));
+        let overlap = d
+            .end_ms
+            .min(end_ms)
+            .saturating_sub(d.start_ms.max(start_ms));
         if d.speaker < overlap_by_speaker.len() {
             overlap_by_speaker[d.speaker] += overlap;
         }

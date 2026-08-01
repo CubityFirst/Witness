@@ -78,7 +78,9 @@ pub fn list_devices() -> Result<(Vec<String>, Vec<String>), String> {
             let render = lists.pop().unwrap_or_default();
             Ok((render, capture))
         });
-        handle.join().map_err(|_| "device enumeration panicked".to_string())?
+        handle
+            .join()
+            .map_err(|_| "device enumeration panicked".to_string())?
     }
     #[cfg(not(windows))]
     {
@@ -145,7 +147,14 @@ fn run_capture(
             let mix = audio_client.get_mixformat()?;
             let rate = mix.get_samplespersec();
             let channels = mix.get_nchannels();
-            let format = WaveFormat::new(32, 32, &SampleType::Float, rate as usize, channels as usize, None);
+            let format = WaveFormat::new(
+                32,
+                32,
+                &SampleType::Float,
+                rate as usize,
+                channels as usize,
+                None,
+            );
             let blockalign = format.get_blockalign() as usize;
 
             let mode = StreamMode::EventsShared {
@@ -157,7 +166,10 @@ fn run_capture(
             let capture_client = audio_client.get_audiocaptureclient()?;
             audio_client.start_stream()?;
 
-            let _ = tx.send(CaptureMsg::Format { kind, sample_rate: rate });
+            let _ = tx.send(CaptureMsg::Format {
+                kind,
+                sample_rate: rate,
+            });
             log::info!(
                 "{} capture open on '{}': {} Hz, {} ch",
                 kind.name(),
@@ -202,8 +214,16 @@ fn run_capture(
                             mono.push(acc / ch as f32);
                         }
                     }
-                    let qpc = if info.flags.timestamp_error { 0 } else { info.timestamp };
-                    let _ = tx.send(CaptureMsg::Packet { kind, samples: mono, qpc_100ns: qpc });
+                    let qpc = if info.flags.timestamp_error {
+                        0
+                    } else {
+                        info.timestamp
+                    };
+                    let _ = tx.send(CaptureMsg::Packet {
+                        kind,
+                        samples: mono,
+                        qpc_100ns: qpc,
+                    });
                 }
             }
             let _ = audio_client.stop_stream();
@@ -238,19 +258,6 @@ fn run_capture(
     Err("audio capture is Windows-only".into())
 }
 
-#[cfg(test)]
-mod tests {
-    /// Real-device enumeration: `cargo test list_devices_smoke -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn list_devices_smoke() {
-        let (render, capture) = super::list_devices().unwrap();
-        println!("render devices: {render:#?}");
-        println!("capture devices: {capture:#?}");
-        assert!(!render.is_empty() && !capture.is_empty());
-    }
-}
-
 /// Spawns a capture thread; it runs until `stop` is set or a fatal error.
 /// `device_name` picks a specific device by friendly name (None = default).
 pub fn spawn_capture(
@@ -272,4 +279,17 @@ pub fn spawn_capture(
             }
         })
         .expect("spawn capture thread")
+}
+
+#[cfg(test)]
+mod tests {
+    /// Real-device enumeration: `cargo test list_devices_smoke -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn list_devices_smoke() {
+        let (render, capture) = super::list_devices().unwrap();
+        println!("render devices: {render:#?}");
+        println!("capture devices: {capture:#?}");
+        assert!(!render.is_empty() && !capture.is_empty());
+    }
 }

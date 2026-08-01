@@ -1,4 +1,4 @@
-﻿//! SQLite storage (rusqlite, WAL, external-content FTS5). All queries live
+//! SQLite storage (rusqlite, WAL, external-content FTS5). All queries live
 //! here; the rest of the app passes plain data types in and out.
 
 use anyhow::{Context, Result};
@@ -83,6 +83,8 @@ pub struct NewSpeaker {
     pub auto_labeled: bool,
 }
 
+pub type SpeakerEmbeddingRecord = (String, Option<Vec<f32>>, f64);
+
 fn embedding_to_blob(e: &[f32]) -> Vec<u8> {
     e.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
@@ -141,7 +143,9 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        let db = Db { conn: Mutex::new(conn) };
+        let db = Db {
+            conn: Mutex::new(conn),
+        };
         db.migrate()?;
         Ok(db)
     }
@@ -149,6 +153,10 @@ impl Db {
     fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        anyhow::ensure!(
+            version <= SCHEMA_VERSION,
+            "database schema version {version} is newer than this Witness build supports ({SCHEMA_VERSION})"
+        );
         if version < 1 {
             conn.execute_batch(
                 r#"
@@ -266,7 +274,6 @@ impl Db {
                 "#,
             )?;
         }
-        debug_assert!(SCHEMA_VERSION == 4);
         Ok(())
     }
 
@@ -281,12 +288,7 @@ impl Db {
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn finish_recording(
-        &self,
-        id: i64,
-        ended_at: &str,
-        duration_ms: i64,
-    ) -> Result<()> {
+    pub fn finish_recording(&self, id: i64, ended_at: &str, duration_ms: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE meetings SET ended_at = ?2, duration_ms = ?3, status = 'recorded' WHERE id = ?1",
@@ -297,7 +299,10 @@ impl Db {
 
     pub fn set_status(&self, id: i64, status: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE meetings SET status = ?2 WHERE id = ?1", params![id, status])?;
+        conn.execute(
+            "UPDATE meetings SET status = ?2 WHERE id = ?1",
+            params![id, status],
+        )?;
         Ok(())
     }
 
@@ -312,7 +317,10 @@ impl Db {
 
     pub fn rename_meeting(&self, id: i64, title: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE meetings SET title = ?2 WHERE id = ?1", params![id, title])?;
+        conn.execute(
+            "UPDATE meetings SET title = ?2 WHERE id = ?1",
+            params![id, title],
+        )?;
         Ok(())
     }
 
@@ -362,7 +370,9 @@ impl Db {
             Self::MEETING_COLS
         ))?;
         let rows = stmt
-            .query_map([], |row| Ok((Self::row_to_meeting(row)?, row.get::<_, String>(10)?)))?
+            .query_map([], |row| {
+                Ok((Self::row_to_meeting(row)?, row.get::<_, String>(10)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -407,7 +417,10 @@ impl Db {
 
     pub fn set_bookmark_note(&self, bookmark_id: i64, note: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE bookmarks SET note = ?2 WHERE id = ?1", params![bookmark_id, note])?;
+        conn.execute(
+            "UPDATE bookmarks SET note = ?2 WHERE id = ?1",
+            params![bookmark_id, note],
+        )?;
         Ok(())
     }
 
@@ -428,7 +441,10 @@ impl Db {
 
     pub fn restore_meeting(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE meetings SET deleted_at = NULL WHERE id = ?1", params![id])?;
+        conn.execute(
+            "UPDATE meetings SET deleted_at = NULL WHERE id = ?1",
+            params![id],
+        )?;
         Ok(())
     }
 
@@ -456,7 +472,10 @@ impl Db {
             placeholders
         ))?;
         let rows = stmt
-            .query_map(rusqlite::params_from_iter(statuses.iter()), Self::row_to_meeting)?
+            .query_map(
+                rusqlite::params_from_iter(statuses.iter()),
+                Self::row_to_meeting,
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -536,10 +555,7 @@ impl Db {
     }
 
     /// One speaker row with its stored voice print (for enrollment on rename).
-    pub fn get_speaker_embedding(
-        &self,
-        speaker_id: i64,
-    ) -> Result<Option<(String, Option<Vec<f32>>, f64)>> {
+    pub fn get_speaker_embedding(&self, speaker_id: i64) -> Result<Option<SpeakerEmbeddingRecord>> {
         let conn = self.conn.lock().unwrap();
         let row = conn
             .query_row(
@@ -639,12 +655,7 @@ impl Db {
         Ok(row)
     }
 
-    pub fn create_person(
-        &self,
-        name: &str,
-        embedding: &[f32],
-        sample_seconds: f64,
-    ) -> Result<i64> {
+    pub fn create_person(&self, name: &str, embedding: &[f32], sample_seconds: f64) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO people (name, embedding, sample_seconds, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -690,8 +701,14 @@ impl Db {
     ) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        tx.execute("DELETE FROM segments WHERE meeting_id = ?1", params![meeting_id])?;
-        tx.execute("DELETE FROM speakers WHERE meeting_id = ?1", params![meeting_id])?;
+        tx.execute(
+            "DELETE FROM segments WHERE meeting_id = ?1",
+            params![meeting_id],
+        )?;
+        tx.execute(
+            "DELETE FROM speakers WHERE meeting_id = ?1",
+            params![meeting_id],
+        )?;
         {
             let mut ins_speaker = tx.prepare(
                 "INSERT INTO speakers (meeting_id, label, display_name, person_id, auto_labeled, embedding, emb_seconds)
@@ -800,7 +817,10 @@ impl Db {
         // before the FTS5 vtab ever parses the MATCH expression).
         let is_valid = conn
             .prepare("SELECT 1 FROM segments_fts WHERE segments_fts MATCH ?1 LIMIT 1")
-            .and_then(|mut s| s.query(params![trimmed]).and_then(|mut rows| rows.next().map(|_| ())))
+            .and_then(|mut s| {
+                s.query(params![trimmed])
+                    .and_then(|mut rows| rows.next().map(|_| ()))
+            })
             .is_ok();
         let has_syntax = trimmed.contains('"')
             || trimmed.contains(" OR ")
@@ -880,7 +900,10 @@ impl Db {
         }
         if let Some(to) = date_to {
             // Inclusive day: anything on the 'to' date still matches.
-            sql.push_str(&format!(" AND substr(m.started_at, 1, 10) <= ?{}", args.len() + 1));
+            sql.push_str(&format!(
+                " AND substr(m.started_at, 1, 10) <= ?{}",
+                args.len() + 1
+            ));
             args.push(Box::new(to.to_string()));
         }
         sql.push_str(&format!(
@@ -893,17 +916,20 @@ impl Db {
 
         let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt
-            .query_map(rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())), |row| {
-                Ok(SearchHit {
-                    meeting_id: row.get(0)?,
-                    meeting_title: row.get(1)?,
-                    started_at: row.get(2)?,
-                    segment_id: row.get(3)?,
-                    start_ms: row.get(4)?,
-                    speaker_name: row.get(5)?,
-                    snippet: row.get(6)?,
-                })
-            })?
+            .query_map(
+                rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())),
+                |row| {
+                    Ok(SearchHit {
+                        meeting_id: row.get(0)?,
+                        meeting_title: row.get(1)?,
+                        started_at: row.get(2)?,
+                        segment_id: row.get(3)?,
+                        start_ms: row.get(4)?,
+                        speaker_name: row.get(5)?,
+                        snippet: row.get(6)?,
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         // Meeting-notes hits (segment_id = -1 → open the meeting, no seek).
@@ -927,23 +953,29 @@ impl Db {
                 nargs.push(Box::new(from.to_string()));
             }
             if let Some(to) = date_to {
-                sql.push_str(&format!(" AND substr(m.started_at, 1, 10) <= ?{}", nargs.len() + 1));
+                sql.push_str(&format!(
+                    " AND substr(m.started_at, 1, 10) <= ?{}",
+                    nargs.len() + 1
+                ));
                 nargs.push(Box::new(to.to_string()));
             }
             sql.push_str(" ORDER BY bm25(meetings_notes_fts) LIMIT 10");
             let mut stmt = conn.prepare(&sql)?;
             let notes_hits = stmt
-                .query_map(rusqlite::params_from_iter(nargs.iter().map(|a| a.as_ref())), |row| {
-                    Ok(SearchHit {
-                        meeting_id: row.get(0)?,
-                        meeting_title: row.get(1)?,
-                        started_at: row.get(2)?,
-                        segment_id: -1,
-                        start_ms: 0,
-                        speaker_name: Some("Notes".into()),
-                        snippet: row.get(3)?,
-                    })
-                })?
+                .query_map(
+                    rusqlite::params_from_iter(nargs.iter().map(|a| a.as_ref())),
+                    |row| {
+                        Ok(SearchHit {
+                            meeting_id: row.get(0)?,
+                            meeting_title: row.get(1)?,
+                            started_at: row.get(2)?,
+                            segment_id: -1,
+                            start_ms: 0,
+                            speaker_name: Some("Notes".into()),
+                            snippet: row.get(3)?,
+                        })
+                    },
+                )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows.extend(notes_hits);
         }
@@ -964,7 +996,8 @@ mod tests {
         let id = db
             .create_meeting("Test meeting", "2026-07-18T10:00:00+01:00", "manual")
             .unwrap();
-        db.finish_recording(id, "2026-07-18T10:30:00+01:00", 1_800_000).unwrap();
+        db.finish_recording(id, "2026-07-18T10:30:00+01:00", 1_800_000)
+            .unwrap();
         assert_eq!(db.get_meeting(id).unwrap().unwrap().status, "recorded");
 
         let speakers = vec![
@@ -1001,7 +1034,8 @@ mod tests {
                 text: "quarterly forecast numbers".into(),
             },
         ];
-        db.replace_transcript(id, &speakers, &segments, "parakeet").unwrap();
+        db.replace_transcript(id, &speakers, &segments, "parakeet")
+            .unwrap();
 
         let m = db.get_meeting(id).unwrap().unwrap();
         assert_eq!(m.status, "transcribed");
@@ -1010,15 +1044,33 @@ mod tests {
         assert_eq!(db.get_segments(id).unwrap().len(), 2);
 
         // FTS: whole word, prefix (type-ahead), stemming via porter.
-        let hits = db.search("forecast", 0, 10, None, None, None, None).unwrap();
+        let hits = db
+            .search("forecast", 0, 10, None, None, None, None)
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].snippet.contains(SNIPPET_OPEN));
         assert_eq!(hits[0].speaker_name.as_deref(), Some("Speaker 1"));
-        assert_eq!(db.search("quart", 0, 10, None, None, None, None).unwrap().len(), 1);
-        assert_eq!(db.search("meetings", 0, 10, None, None, None, None).unwrap().len(), 1); // stemmed
-        assert!(db.search("nonexistentword", 0, 10, None, None, None, None).unwrap().is_empty());
+        assert_eq!(
+            db.search("quart", 0, 10, None, None, None, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.search("meetings", 0, 10, None, None, None, None)
+                .unwrap()
+                .len(),
+            1
+        ); // stemmed
+        assert!(db
+            .search("nonexistentword", 0, 10, None, None, None, None)
+            .unwrap()
+            .is_empty());
         // Hostile input must not error, just return no rows.
-        assert!(db.search("\"unbalanced AND ( NEAR", 0, 10, None, None, None, None).unwrap().is_empty());
+        assert!(db
+            .search("\"unbalanced AND ( NEAR", 0, 10, None, None, None, None)
+            .unwrap()
+            .is_empty());
 
         // Stored speaker embedding survives the roundtrip.
         let s1 = db
@@ -1036,20 +1088,32 @@ mod tests {
         let alice = db.create_person("Alice", &[0.6, 0.8], 12.5).unwrap();
         assert_eq!(db.get_person_by_name("alice").unwrap().unwrap().id, alice);
         db.rename_speaker(s1.id, "Alice", Some(alice)).unwrap();
-        let s1 = db.get_speakers(id).unwrap().into_iter().find(|s| s.label == "S1").unwrap();
+        let s1 = db
+            .get_speakers(id)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.label == "S1")
+            .unwrap();
         assert_eq!(s1.display_name, "Alice");
         assert_eq!(s1.person_id, Some(alice));
         assert!(!s1.auto_labeled);
-        db.update_person_embedding(alice, &[1.0, 0.0], 30.0).unwrap();
+        db.update_person_embedding(alice, &[1.0, 0.0], 30.0)
+            .unwrap();
         assert_eq!(db.list_people().unwrap()[0].embedding, vec![1.0, 0.0]);
         db.delete_person(alice).unwrap();
         assert!(db.list_people().unwrap().is_empty());
         // FK ON DELETE SET NULL cleared the link.
-        let s1 = db.get_speakers(id).unwrap().into_iter().find(|s| s.label == "S1").unwrap();
+        let s1 = db
+            .get_speakers(id)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.label == "S1")
+            .unwrap();
         assert_eq!(s1.person_id, None);
 
         // Notes: FTS-searchable through the same search(), bookmarks CRUD.
-        db.set_notes(id, "remember to send the follow-up invoice").unwrap();
+        db.set_notes(id, "remember to send the follow-up invoice")
+            .unwrap();
         let hits = db.search("invoice", 0, 10, None, None, None, None).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].segment_id, -1);
@@ -1065,7 +1129,10 @@ mod tests {
         // Recycle bin: soft delete hides, restore brings back.
         db.soft_delete_meeting(id).unwrap();
         assert!(db.list_meetings(0, 10).unwrap().is_empty());
-        assert!(db.search("budget", 0, 10, None, None, None, None).unwrap().is_empty());
+        assert!(db
+            .search("budget", 0, 10, None, None, None, None)
+            .unwrap()
+            .is_empty());
         let binned = db.list_deleted_meetings().unwrap();
         assert_eq!(binned.len(), 1);
         assert_eq!(binned[0].0.id, id);
@@ -1075,7 +1142,10 @@ mod tests {
 
         // Delete cascades through speakers/segments/FTS.
         db.delete_meeting(id).unwrap();
-        assert!(db.search("forecast", 0, 10, None, None, None, None).unwrap().is_empty());
+        assert!(db
+            .search("forecast", 0, 10, None, None, None, None)
+            .unwrap()
+            .is_empty());
         assert!(db.get_segments(id).unwrap().is_empty());
 
         drop(db);

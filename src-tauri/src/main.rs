@@ -32,7 +32,7 @@ use crate::db::Db;
 use crate::meeting_watcher::{WatcherCommand, WatcherControl};
 use crate::pipeline::{Job, PipelineEvent};
 use crate::settings::Settings;
-use crate::state::AppState;
+use crate::state::{AppState, RecorderState};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -45,7 +45,10 @@ fn init_logging(data_dir: &std::path::Path) {
     };
     let log_path = data_dir.join("witness.log");
     // Simple size-capped rotation: keep one previous generation.
-    if std::fs::metadata(&log_path).map(|m| m.len() > LOG_ROTATE_BYTES).unwrap_or(false) {
+    if std::fs::metadata(&log_path)
+        .map(|m| m.len() > LOG_ROTATE_BYTES)
+        .unwrap_or(false)
+    {
         let _ = std::fs::rename(&log_path, data_dir.join("witness.log.old"));
     }
     let mut loggers: Vec<Box<dyn SharedLogger>> = vec![TermLogger::new(
@@ -54,7 +57,11 @@ fn init_logging(data_dir: &std::path::Path) {
         TerminalMode::Mixed,
         ColorChoice::Auto,
     )];
-    if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
         loggers.push(WriteLogger::new(LevelFilter::Info, Config::default(), file));
     }
     let _ = CombinedLogger::init(loggers);
@@ -65,7 +72,11 @@ fn init_logging(data_dir: &std::path::Path) {
 /// sizes from the real file size so nothing recorded is lost.
 fn repair_wav_header(path: &std::path::Path) {
     use std::io::{Seek, SeekFrom, Write};
-    let Ok(mut file) = std::fs::OpenOptions::new().read(true).write(true).open(path) else {
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    else {
         return;
     };
     let Ok(meta) = file.metadata() else { return };
@@ -76,8 +87,12 @@ fn repair_wav_header(path: &std::path::Path) {
     }
     let riff = ((size - 8) as u32).to_le_bytes();
     let data = ((size - 44) as u32).to_le_bytes();
-    let _ = file.seek(SeekFrom::Start(4)).and_then(|_| file.write_all(&riff));
-    let _ = file.seek(SeekFrom::Start(40)).and_then(|_| file.write_all(&data));
+    let _ = file
+        .seek(SeekFrom::Start(4))
+        .and_then(|_| file.write_all(&riff));
+    let _ = file
+        .seek(SeekFrom::Start(40))
+        .and_then(|_| file.write_all(&data));
 }
 
 /// Re-enqueue work interrupted by a crash or quit:
@@ -94,8 +109,12 @@ fn recover_orphans(db: &Db, settings: &Settings, pipeline: &pipeline::Pipeline) 
             if path.extension().and_then(|e| e.to_str()) != Some("toml") {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else { continue };
-            let Ok(meta) = toml::from_str::<recorder::RecMeta>(&text) else { continue };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(meta) = toml::from_str::<recorder::RecMeta>(&text) else {
+                continue;
+            };
             let Ok(Some(meeting)) = db.get_meeting(meta.meeting_id) else {
                 // Meeting row is gone; clean up strays.
                 let (mic, lop, meta_path) = recorder::wav_paths(&rec_dir, meta.meeting_id);
@@ -128,7 +147,11 @@ fn recover_orphans(db: &Db, settings: &Settings, pipeline: &pipeline::Pipeline) 
     if let Ok(processing) = db.meetings_with_status(&["processing"]) {
         for m in processing {
             log::info!("re-queueing interrupted transcription: meeting {}", m.id);
-            pipeline.enqueue(Job { meeting_id: m.id, transcribe: true, engine: None });
+            pipeline.enqueue(Job {
+                meeting_id: m.id,
+                transcribe: true,
+                engine: None,
+            });
         }
     }
     if let Ok(recorded) = db.meetings_with_status(&["recorded"]) {
@@ -148,7 +171,7 @@ fn recover_orphans(db: &Db, settings: &Settings, pipeline: &pipeline::Pipeline) 
 }
 
 fn setup(app: &tauri::App) -> anyhow::Result<()> {
-    let settings = Settings::load();
+    let settings = Settings::load_result().map_err(anyhow::Error::msg)?;
     let data_dir = settings.data_dir();
     for dir in [
         data_dir.clone(),
@@ -173,16 +196,27 @@ fn setup(app: &tauri::App) -> anyhow::Result<()> {
     let pipe_db = db.clone();
     let pipeline = pipeline::spawn(db.clone(), settings.clone(), move |event| {
         match event {
-            PipelineEvent::Progress { meeting_id, stage, pct } => {
+            PipelineEvent::Progress {
+                meeting_id,
+                stage,
+                pct,
+            } => {
                 let _ = pipe_app.emit(
                     events::TRANSCRIPTION_PROGRESS,
-                    events::TranscriptionProgress { meeting_id, stage, pct },
+                    events::TranscriptionProgress {
+                        meeting_id,
+                        stage,
+                        pct,
+                    },
                 );
             }
             PipelineEvent::Complete { meeting_id, rtf } => {
                 let _ = pipe_app.emit(
                     events::TRANSCRIPTION_COMPLETE,
-                    events::TranscriptionDone { meeting_id, error: None },
+                    events::TranscriptionDone {
+                        meeting_id,
+                        error: None,
+                    },
                 );
                 let _ = pipe_app.emit(events::MEETINGS_CHANGED, ());
                 // Only toast when a transcript was actually produced. The
@@ -193,31 +227,41 @@ fn setup(app: &tauri::App) -> anyhow::Result<()> {
                         let speed = rtf
                             .map(|r| format!(" ({r:.0}× realtime)"))
                             .unwrap_or_default();
-                        commands::toast(&pipe_app, &format!("Transcript ready: {}{speed}", m.title));
+                        commands::toast(
+                            &pipe_app,
+                            &format!("Transcript ready: {}{speed}", m.title),
+                        );
                     }
                 }
             }
             PipelineEvent::Failed { meeting_id, error } => {
                 let _ = pipe_app.emit(
                     events::TRANSCRIPTION_FAILED,
-                    events::TranscriptionDone { meeting_id, error: Some(error.clone()) },
+                    events::TranscriptionDone {
+                        meeting_id,
+                        error: Some(error.clone()),
+                    },
                 );
                 let _ = pipe_app.emit(events::MEETINGS_CHANGED, ());
-                commands::toast(&pipe_app, "Transcription failed — you can retry from the meeting page.");
+                commands::toast(
+                    &pipe_app,
+                    "Transcription failed — you can retry from the meeting page.",
+                );
             }
         }
     });
 
-    let (auto_record, patterns) = {
+    let (auto_record, patterns, configured_data_dir) = {
         let s = settings.lock().unwrap();
-        (s.auto_record, s.watch_patterns.clone())
+        (s.auto_record, s.watch_patterns.clone(), s.data_dir.clone())
     };
     let watcher = WatcherControl::new(auto_record, &patterns);
 
     app.manage(AppState {
         db: db.clone(),
         settings: settings.clone(),
-        recorder: Mutex::new(None),
+        configured_data_dir: Mutex::new(configured_data_dir),
+        recorder: Mutex::new(RecorderState::Idle),
         recording_trigger: Mutex::new("manual"),
         pipeline,
         watcher: watcher.clone(),
@@ -243,24 +287,30 @@ fn setup(app: &tauri::App) -> anyhow::Result<()> {
             .plugin(tauri_plugin_global_shortcut::Builder::new().build())?;
 
         for candidate in ["ctrl+alt+r", "ctrl+alt+w", "ctrl+alt+shift+r"] {
-            let result = app.global_shortcut().on_shortcut(candidate, |app, _sc, event| {
-                if event.state() == ShortcutState::Pressed {
-                    let recording = app.state::<AppState>().recorder.lock().unwrap().is_some();
-                    let result = if recording {
-                        commands::do_stop_recording(app, true)
-                    } else {
-                        commands::do_start_recording(app, "manual").map(|_| ())
-                    };
-                    if let Err(e) = result {
-                        log::warn!("hotkey record toggle: {e}");
+            let result = app
+                .global_shortcut()
+                .on_shortcut(candidate, |app, _sc, event| {
+                    if event.state() == ShortcutState::Pressed {
+                        let recording = app
+                            .state::<AppState>()
+                            .recorder
+                            .lock()
+                            .unwrap()
+                            .is_recording();
+                        let result = if recording {
+                            commands::do_stop_recording(app, true)
+                        } else {
+                            commands::do_start_recording(app, "manual").map(|_| ())
+                        };
+                        if let Err(e) = result {
+                            log::warn!("hotkey record toggle: {e}");
+                        }
                     }
-                }
-            });
+                });
             match result {
                 Ok(()) => {
                     log::info!("record hotkey bound: {candidate}");
-                    *app.state::<AppState>().hotkey.lock().unwrap() =
-                        Some(candidate.to_string());
+                    *app.state::<AppState>().hotkey.lock().unwrap() = Some(candidate.to_string());
                     break;
                 }
                 Err(e) => log::warn!("hotkey {candidate} unavailable: {e}"),
@@ -268,14 +318,16 @@ fn setup(app: &tauri::App) -> anyhow::Result<()> {
         }
 
         for candidate in ["ctrl+alt+b", "ctrl+alt+m"] {
-            let result = app.global_shortcut().on_shortcut(candidate, |app, _sc, event| {
-                if event.state() == ShortcutState::Pressed {
-                    // "Not recording" is the normal no-op case.
-                    if let Err(e) = commands::do_bookmark_now(app) {
-                        log::debug!("bookmark hotkey: {e}");
+            let result = app
+                .global_shortcut()
+                .on_shortcut(candidate, |app, _sc, event| {
+                    if event.state() == ShortcutState::Pressed {
+                        // "Not recording" is the normal no-op case.
+                        if let Err(e) = commands::do_bookmark_now(app) {
+                            log::debug!("bookmark hotkey: {e}");
+                        }
                     }
-                }
-            });
+                });
             match result {
                 Ok(()) => {
                     log::info!("bookmark hotkey bound: {candidate}");
@@ -309,7 +361,11 @@ fn setup(app: &tauri::App) -> anyhow::Result<()> {
                     .map(|t| t.with_timezone(&chrono::Utc) < cutoff)
                     .unwrap_or(false);
                 if expired {
-                    log::info!("recycle bin: purging meeting {} ({})", meeting.id, meeting.title);
+                    log::info!(
+                        "recycle bin: purging meeting {} ({})",
+                        meeting.id,
+                        meeting.title
+                    );
                     if let Err(e) = commands::purge_meeting_data(&state, meeting.id) {
                         log::warn!("purge of meeting {} failed: {e}", meeting.id);
                     }
@@ -335,7 +391,7 @@ fn setup(app: &tauri::App) -> anyhow::Result<()> {
                 // outside any call is never touched.
                 let state = watch_app.state::<AppState>();
                 let trigger = *state.recording_trigger.lock().unwrap();
-                let recording = state.recorder.lock().unwrap().is_some();
+                let recording = state.recorder.lock().unwrap().is_recording();
                 if recording {
                     log::info!("meeting ended: stopping {trigger} recording");
                     if let Err(e) = commands::do_stop_recording(&watch_app, false) {
@@ -379,8 +435,10 @@ fn main() {
             match event {
                 // Close button minimizes to tray; recording continues.
                 tauri::WindowEvent::CloseRequested { api, .. } => {
-                    api.prevent_close();
-                    let _ = window.hide();
+                    if window.label() == "main" {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
                 }
                 // Tray-flyout mode: dismiss on focus loss, like the native
                 // volume/Wi-Fi popups — unless the cursor is on the window
@@ -412,10 +470,10 @@ fn main() {
                 }
                 // Resizing/moving the flyout pins it (the resize grab itself
                 // blurs the window, which used to dismiss it mid-drag).
-                tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Moved(_) => {
-                    if window.label() == "main" {
-                        tray::maybe_pin_popup(window.app_handle());
-                    }
+                tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Moved(_)
+                    if window.label() == "main" =>
+                {
+                    tray::maybe_pin_popup(window.app_handle());
                 }
                 _ => {}
             }
