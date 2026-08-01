@@ -272,6 +272,7 @@ fn setup(app: &tauri::App) -> anyhow::Result<()> {
         settings: settings.clone(),
         configured_data_dir: Mutex::new(configured_data_dir),
         recorder: Mutex::new(RecorderState::Idle),
+        recording_health: Mutex::new(None),
         recording_trigger: Mutex::new("manual"),
         pipeline,
         watcher: watcher.clone(),
@@ -490,6 +491,8 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
+            commands::get_diagnostics,
+            commands::export_diagnostics,
             commands::start_recording,
             commands::stop_recording,
             commands::list_meetings,

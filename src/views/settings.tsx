@@ -2,7 +2,9 @@ import { useEffect, useState } from "preact/hooks";
 import {
   deletePerson,
   downloadModels,
+  exportDiagnostics,
   getAutostart,
+  getDiagnostics,
   getGpuStatus,
   getHotkey,
   getModelStatus,
@@ -14,6 +16,7 @@ import {
   setAutostart,
   updateSettings,
   type AudioDevices,
+  type Diagnostics,
   type Engine,
   type GpuStatus,
   type ModelInfo,
@@ -24,9 +27,42 @@ import {
 import { onModelDownloadProgress, type ModelDownloadProgress } from "../lib/events";
 import { Trash } from "../lib/icons";
 import { appConfirm } from "../lib/confirm";
+import { notifyError, notifySuccess } from "../lib/notify";
+
+function configuredDeviceOption(
+  configured: string | null | undefined,
+  devices: AudioDevices["capture"],
+) {
+  if (!configured) return null;
+  const byId = devices.find((device) => device.id === configured);
+  if (byId) return { kind: "id" as const, device: byId };
+  const lower = configured.toLowerCase();
+  const byLegacyName = devices.find((device) => device.name.toLowerCase() === lower);
+  return byLegacyName
+    ? { kind: "legacy" as const, device: byLegacyName }
+    : { kind: "missing" as const, device: null };
+}
+
+async function copyDiagnosticText(text: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("Clipboard access is unavailable");
+}
 
 export function SettingsView(props: { watcher: WatcherStatus | null }) {
   const [settings, setSettings] = useState<SettingsData | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [gpu, setGpu] = useState<GpuStatus | null>(null);
   const [dl, setDl] = useState<ModelDownloadProgress | null>(null);
@@ -35,43 +71,101 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
   const [saved, setSaved] = useState(false);
   const [people, setPeople] = useState<Person[]>([]);
   const [devices, setDevices] = useState<AudioDevices | null>(null);
+  const [devicesError, setDevicesError] = useState<string | null>(null);
   const [autostart, setAutostartState] = useState<boolean | null>(null);
   const [needsRestart, setNeedsRestart] = useState(false);
   const [hotkey, setHotkey] = useState<string | null>(null);
+  const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
+  const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
+  const [diagnosticsCopied, setDiagnosticsCopied] = useState(false);
 
-  const refreshModels = () => getModelStatus().then(setModels).catch(() => {});
+  const refreshModels = () =>
+    getModelStatus()
+      .then(setModels)
+      .catch((error) => notifyError("Could not load model status", error));
+  const loadSettings = () => {
+    setSettingsError(null);
+    getSettings()
+      .then((loaded) => {
+        setSettings(loaded);
+        setPatternsText(loaded.watch_patterns.join(", "));
+        setJunkPhrasesText(loaded.junk_phrases.join("\n"));
+      })
+      .catch((error) => {
+        const message = String(error);
+        setSettingsError(message);
+        notifyError("Could not load settings", error);
+      });
+  };
+  const refreshDiagnostics = () => {
+    setDiagnosticsError(null);
+    getDiagnostics()
+      .then(setDiagnostics)
+      .catch((error) => setDiagnosticsError(String(error)));
+  };
 
   useEffect(() => {
-    getSettings().then((s) => {
-      setSettings(s);
-      setPatternsText(s.watch_patterns.join(", "));
-      setJunkPhrasesText(s.junk_phrases.join("\n"));
-    });
+    loadSettings();
     refreshModels();
-    getGpuStatus().then(setGpu).catch(() => {});
-    listPeople().then(setPeople).catch(() => {});
-    listAudioDevices().then(setDevices).catch(() => {});
-    getAutostart().then(setAutostartState).catch(() => {});
-    getHotkey().then(setHotkey).catch(() => {});
+    getGpuStatus()
+      .then(setGpu)
+      .catch((error) => notifyError("Could not check GPU status", error));
+    listPeople()
+      .then(setPeople)
+      .catch((error) => notifyError("Could not load enrolled people", error));
+    listAudioDevices()
+      .then(setDevices)
+      .catch((error) => setDevicesError(String(error)));
+    getAutostart()
+      .then(setAutostartState)
+      .catch((error) => notifyError("Could not read autostart status", error));
+    getHotkey()
+      .then(setHotkey)
+      .catch((error) => notifyError("Could not read hotkey status", error));
+    refreshDiagnostics();
     const un = onModelDownloadProgress((p) => {
       setDl(p.done && !p.error ? null : p);
       if (p.done) refreshModels();
+    }).catch((error) => {
+      notifyError("Could not connect to model download updates", error);
+      return () => {};
     });
     return () => {
-      un.then((u) => u());
+      un.then((u) => u()).catch((error) =>
+        console.error("Could not detach model download updates", error),
+      );
     };
   }, []);
 
-  if (!settings) return <div class="empty">Loading…</div>;
+  if (!settings) {
+    return settingsError ? (
+      <div class="error-state" role="alert">
+        <p>Could not load settings: {settingsError}</p>
+        <button class="btn" onClick={loadSettings}>Try again</button>
+      </div>
+    ) : (
+      <div class="empty" role="status">Loading…</div>
+    );
+  }
+
+  const micDevice = configuredDeviceOption(settings.mic_device, devices?.capture ?? []);
+  const loopbackDevice = configuredDeviceOption(
+    settings.loopback_device,
+    devices?.render ?? [],
+  );
 
   const save = (next: SettingsData) => {
+    const previous = settings;
     setSettings(next);
     updateSettings(next)
       .then(() => {
         setSaved(true);
         setTimeout(() => setSaved(false), 1500);
       })
-      .catch((e) => alert(String(e)));
+      .catch((error) => {
+        setSettings(previous);
+        notifyError("Could not save settings", error);
+      });
   };
 
   const commitPatterns = () => {
@@ -91,12 +185,14 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
   };
 
   const pickDir = () =>
-    pickDataDir().then((dir) => {
-      if (dir && dir !== settings.data_dir) {
-        save({ ...settings, data_dir: dir });
-        setNeedsRestart(true);
-      }
-    });
+    pickDataDir()
+      .then((dir) => {
+        if (dir && dir !== settings.data_dir) {
+          save({ ...settings, data_dir: dir });
+          setNeedsRestart(true);
+        }
+      })
+      .catch((error) => notifyError("Could not choose a data directory", error));
 
   return (
     <div class="settings-view">
@@ -118,7 +214,10 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
         {needsRestart && (
           <div class="setting-row">
             <span class="muted">The new data directory applies after a restart.</span>
-            <button class="btn" onClick={() => restartApp()}>
+            <button
+              class="btn"
+              onClick={() => restartApp().catch((error) => notifyError("Could not restart Witness", error))}
+            >
               Restart Witness
             </button>
           </div>
@@ -133,7 +232,7 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
                 const enabled = (e.target as HTMLInputElement).checked;
                 setAutostart(enabled)
                   .then(() => setAutostartState(enabled))
-                  .catch((err) => alert(String(err)));
+                  .catch((error) => notifyError("Could not update autostart", error));
               }}
             />{" "}
             Start Witness with Windows (minimized to tray)
@@ -167,8 +266,9 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
           <span class="muted">comma-separated, matched against mic-using app names</span>
         </div>
         <div class="setting-row">
-          <label>Microphone</label>
+          <label for="microphone-device">Microphone</label>
           <select
+            id="microphone-device"
             class="text-input"
             value={settings.mic_device ?? ""}
             onChange={(e) =>
@@ -179,16 +279,32 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
             }
           >
             <option value="">Default input device</option>
+            {settings.mic_device && micDevice?.kind !== "id" && (
+              <option value={settings.mic_device}>
+                {micDevice?.kind === "legacy"
+                  ? `${micDevice.device.name} (legacy name — reselect to pin this endpoint)`
+                  : devices
+                    ? `Missing configured device — ${settings.mic_device}`
+                    : `Configured device — checking availability…`}
+              </option>
+            )}
             {(devices?.capture ?? []).map((d) => (
-              <option value={d} key={d}>
-                {d}
+              <option value={d.id} key={d.id}>
+                {d.name}
               </option>
             ))}
           </select>
+          {devices && micDevice?.kind === "missing" && (
+            <span class="badge badge-failed">configured microphone is not connected</span>
+          )}
+          {devices && micDevice?.kind === "legacy" && (
+            <span class="muted">Stored by its old friendly name; reselect it to use the stable ID.</span>
+          )}
         </div>
         <div class="setting-row">
-          <label>Meeting audio</label>
+          <label for="loopback-device">Meeting audio</label>
           <select
+            id="loopback-device"
             class="text-input"
             value={settings.loopback_device ?? ""}
             onChange={(e) =>
@@ -199,17 +315,33 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
             }
           >
             <option value="">Default output device</option>
+            {settings.loopback_device && loopbackDevice?.kind !== "id" && (
+              <option value={settings.loopback_device}>
+                {loopbackDevice?.kind === "legacy"
+                  ? `${loopbackDevice.device.name} (legacy name — reselect to pin this endpoint)`
+                  : devices
+                    ? `Missing configured device — ${settings.loopback_device}`
+                    : `Configured device — checking availability…`}
+              </option>
+            )}
             {(devices?.render ?? []).map((d) => (
-              <option value={d} key={d}>
-                {d}
+              <option value={d.id} key={d.id}>
+                {d.name}
               </option>
             ))}
           </select>
+          {devices && loopbackDevice?.kind === "missing" && (
+            <span class="badge badge-failed">configured output is not connected</span>
+          )}
+          {devices && loopbackDevice?.kind === "legacy" && (
+            <span class="muted">Stored by its old friendly name; reselect it to use the stable ID.</span>
+          )}
           <span class="muted">
             the output Teams plays through — pick a dedicated one (e.g.
             "Chat") to keep music &amp; game audio out of recordings
           </span>
         </div>
+        {devicesError && <p class="badge badge-failed">Audio devices could not be listed: {devicesError}</p>}
         <div class="setting-row muted">
           Watcher: {props.watcher
             ? `Teams key found: ${props.watcher.teams_key_found ? "yes" : "no"} · mic in use: ${props.watcher.mic_in_use ? "yes" : "no"}${props.watcher.suppressed ? " · auto-restart suppressed" : ""}`
@@ -345,7 +477,14 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
                     integrity check failed
                   </span>
                 )}
-                <button class="btn btn-ghost" onClick={() => downloadModels(mo.engine)}>
+                <button
+                  class="btn btn-ghost"
+                  onClick={() =>
+                    downloadModels(mo.engine).catch((error) =>
+                      notifyError(`Could not download ${mo.display_name}`, error),
+                    )
+                  }
+                >
                   {mo.integrity_error ? "Repair" : "Download"}
                 </button>
               </>
@@ -359,6 +498,120 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
           Recording works without models — they're only needed for
           transcription.
         </p>
+      </section>
+
+      <section>
+        <h3>Diagnostics</h3>
+        <p class="muted">
+          This report contains operational state and local paths, but no audio,
+          transcript text, notes, voice prints, or private settings.
+        </p>
+        {diagnosticsError && (
+          <p class="badge badge-failed">Diagnostics unavailable: {diagnosticsError}</p>
+        )}
+        {diagnostics ? (
+          <>
+            <div class="setting-row">
+              <label>Build</label>
+              <span>
+                Witness {diagnostics.app_version} · {diagnostics.platform}
+              </span>
+            </div>
+            <div class="setting-row">
+              <label>Runtime data</label>
+              <code class="path">{diagnostics.runtime_data_dir}</code>
+              {diagnostics.restart_required && (
+                <span class="badge badge-processing">restart pending</span>
+              )}
+            </div>
+            <div class="setting-row">
+              <label>Database</label>
+              <code class="path">{diagnostics.database.path}</code>
+              <span
+                class={`badge ${diagnostics.database.healthy ? "badge-transcribed" : "badge-failed"}`}
+                title={diagnostics.database.detail}
+              >
+                {diagnostics.database.healthy ? "healthy" : "check failed"}
+              </span>
+            </div>
+            <div class="setting-row">
+              <label>Log</label>
+              <code class="path">{diagnostics.log_path}</code>
+            </div>
+            <div class="setting-row">
+              <label>Recording</label>
+              <span>
+                {diagnostics.recording_state}
+                {diagnostics.recording_meeting_id != null
+                  ? ` · meeting ${diagnostics.recording_meeting_id}`
+                  : ""}
+              </span>
+            </div>
+            <div class="setting-row">
+              <label>Processing</label>
+              <span>
+                {diagnostics.processing_meeting_id == null
+                  ? "idle"
+                  : `meeting ${diagnostics.processing_meeting_id} · ${diagnostics.processing_stage ?? "starting"}${diagnostics.processing_pct == null ? "" : ` · ${diagnostics.processing_pct.toFixed(1)}%`}`}
+                {` · ${diagnostics.queue_len} queued`}
+              </span>
+            </div>
+            <div class="setting-row">
+              <label>Capture health</label>
+              <span>
+                {diagnostics.capture_health
+                  ? `${diagnostics.capture_health_is_current ? "current" : "last recording"}: mic ${diagnostics.capture_health.mic.connected ? "connected" : "disconnected"}, ${diagnostics.capture_health.mic.capture_dropped_ms} ms dropped · output ${diagnostics.capture_health.loopback.connected ? "connected" : "disconnected"}, ${diagnostics.capture_health.loopback.capture_dropped_ms} ms dropped`
+                  : "not available in this session"}
+              </span>
+            </div>
+            <div class="setting-row">
+              <label>Model integrity</label>
+              <span>
+                {diagnostics.models.filter((model) => model.present).length}/
+                {diagnostics.models.length} verified
+                {diagnostics.models.some((model) => model.integrity_error)
+                  ? " · one or more checks failed"
+                  : ""}
+              </span>
+            </div>
+            <div class="setting-row">
+              <button class="btn btn-ghost" onClick={refreshDiagnostics}>
+                Refresh
+              </button>
+              <button
+                class="btn btn-ghost"
+                onClick={() =>
+                  copyDiagnosticText(diagnostics.report)
+                    .then(() => {
+                      setDiagnosticsCopied(true);
+                      setTimeout(() => setDiagnosticsCopied(false), 1500);
+                      notifySuccess("Diagnostic report copied");
+                    })
+                    .catch((error) => notifyError("Could not copy diagnostics", error))
+                }
+              >
+                {diagnosticsCopied ? "Copied ✓" : "Copy report"}
+              </button>
+              <button
+                class="btn btn-ghost"
+                onClick={() =>
+                  exportDiagnostics()
+                    .then((exported) => {
+                      if (exported) notifySuccess("Diagnostic report exported");
+                    })
+                    .catch((error) => notifyError("Could not export diagnostics", error))
+                }
+              >
+                Export…
+              </button>
+              <span class="muted">
+                generated {new Date(diagnostics.generated_at).toLocaleString()}
+              </span>
+            </div>
+          </>
+        ) : (
+          !diagnosticsError && <p class="muted">Checking…</p>
+        )}
       </section>
 
       <section>
@@ -385,9 +638,9 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
                   !(await appConfirm(`Forget ${p.name}'s voice?\nExisting transcripts keep their names.`, "Forget voice"))
                 )
                   return;
-                deletePerson(p.id).then(() =>
-                  setPeople((prev) => prev.filter((x) => x.id !== p.id)),
-                );
+                deletePerson(p.id)
+                  .then(() => setPeople((prev) => prev.filter((x) => x.id !== p.id)))
+                  .catch((error) => notifyError(`Could not forget ${p.name}`, error));
               }}
             >
               <Trash size={15} />

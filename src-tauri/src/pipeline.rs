@@ -42,8 +42,15 @@ pub enum PipelineEvent {
 pub struct Pipeline {
     wake: Sender<()>,
     current: Arc<Mutex<Option<i64>>>,
+    progress: Arc<Mutex<Option<PipelineProgress>>>,
     control: Arc<Mutex<()>>,
     db: Arc<Db>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PipelineProgress {
+    pub stage: String,
+    pub pct: f32,
 }
 
 impl Pipeline {
@@ -63,6 +70,12 @@ impl Pipeline {
 
     pub fn current_meeting(&self) -> Option<i64> {
         *self.current.lock().unwrap()
+    }
+
+    /// Most recent processing stage, retained for status polling when a UI
+    /// opens after the corresponding progress event was emitted.
+    pub fn progress(&self) -> Option<PipelineProgress> {
+        self.progress.lock().unwrap().clone()
     }
 
     /// Cancel queued/failed work. The dequeue gate closes the race where a
@@ -108,6 +121,8 @@ pub fn spawn(
     let (wake, rx): (Sender<()>, Receiver<()>) = crossbeam_channel::bounded(1);
     let current = Arc::new(Mutex::new(None));
     let current_worker = current.clone();
+    let progress = Arc::new(Mutex::new(None));
+    let progress_worker = progress.clone();
     let control = Arc::new(Mutex::new(()));
     let worker_control = control.clone();
     let worker_db = db.clone();
@@ -133,12 +148,27 @@ pub fn spawn(
                     };
                     let job = persisted_job(&saved);
                     let meeting_id = job.meeting_id;
+                    *progress_worker.lock().unwrap() = None;
+                    let emit = |event: PipelineEvent| {
+                        match &event {
+                            PipelineEvent::Progress { stage, pct, .. } => {
+                                *progress_worker.lock().unwrap() = Some(PipelineProgress {
+                                    stage: (*stage).to_string(),
+                                    pct: *pct,
+                                });
+                            }
+                            PipelineEvent::Complete { .. } | PipelineEvent::Failed { .. } => {
+                                *progress_worker.lock().unwrap() = None;
+                            }
+                        }
+                        on_event(event);
+                    };
                     let result = process(
                         &worker_db,
                         &settings,
                         &job,
                         saved.revision,
-                        &on_event,
+                        &emit,
                     );
                     *current_worker.lock().unwrap() = None;
                     match result {
@@ -146,7 +176,7 @@ pub fn spawn(
                             .complete_pipeline_job(meeting_id, saved.revision)
                         {
                             Ok(true) => {
-                                on_event(PipelineEvent::Complete { meeting_id, rtf });
+                                emit(PipelineEvent::Complete { meeting_id, rtf });
                             }
                             Ok(false) => {
                                 log::info!(
@@ -157,7 +187,7 @@ pub fn spawn(
                                 log::error!(
                                     "pipeline job {meeting_id} completed but its queue record could not be removed: {error:#}"
                                 );
-                                on_event(PipelineEvent::Failed {
+                                emit(PipelineEvent::Failed {
                                     meeting_id,
                                     error: format!("processing completed but queue commit failed: {error:#}"),
                                 });
@@ -181,7 +211,7 @@ pub fn spawn(
                                     if !transcript_committed {
                                         let _ = worker_db.set_status(meeting_id, "failed");
                                     }
-                                    on_event(PipelineEvent::Failed {
+                                    emit(PipelineEvent::Failed {
                                         meeting_id,
                                         error: message,
                                     });
@@ -191,7 +221,7 @@ pub fn spawn(
                                 ),
                                 Err(db_error) => {
                                     let _ = worker_db.set_status(meeting_id, "failed");
-                                    on_event(PipelineEvent::Failed {
+                                    emit(PipelineEvent::Failed {
                                         meeting_id,
                                         error: format!(
                                             "{message}; additionally could not save failure state: {db_error:#}"
@@ -214,6 +244,7 @@ pub fn spawn(
     Pipeline {
         wake,
         current,
+        progress,
         control,
         db,
     }
@@ -287,7 +318,7 @@ fn process(
     settings: &Mutex<Settings>,
     job: &Job,
     revision: i64,
-    on_event: &(impl Fn(PipelineEvent) + Send),
+    on_event: &impl Fn(PipelineEvent),
 ) -> Result<Option<f32>> {
     let meeting_id = job.meeting_id;
     let progress = |stage: &'static str, pct: f32| {

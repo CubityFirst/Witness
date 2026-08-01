@@ -90,6 +90,7 @@ pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64,
 
     let level_app = app.clone();
     let health_app = app.clone();
+    *state.recording_health.lock().unwrap() = None;
     let handle = recorder::start_with_health(
         &rec_dir,
         id,
@@ -107,6 +108,11 @@ pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64,
             );
         },
         move |health| {
+            *health_app
+                .state::<AppState>()
+                .recording_health
+                .lock()
+                .unwrap() = Some(health.clone());
             let _ = health_app.emit(events::RECORDING_HEALTH, health);
         },
     );
@@ -262,6 +268,7 @@ pub fn do_stop_recording(app: &AppHandle, by_user: bool) -> Result<(), String> {
             ));
         }
     };
+    *state.recording_health.lock().unwrap() = Some(stats.health.clone());
     if let Err(e) = state.db.finish_recording(
         id,
         &chrono::Local::now().to_rfc3339(),
@@ -315,20 +322,266 @@ pub struct AppStatus {
     pub recording_since: Option<String>,
     pub transcribing_meeting_id: Option<i64>,
     pub queue_len: usize,
+    pub processing_stage: Option<String>,
+    pub processing_pct: Option<f32>,
     pub watcher: events::WatcherStatus,
 }
 
 #[tauri::command]
 pub fn get_status(state: State<'_, AppState>) -> AppStatus {
     let rec = state.recorder.lock().unwrap();
+    let progress = state.pipeline.progress();
     AppStatus {
         recording: rec.is_recording(),
         meeting_id: rec.meeting_id(),
         recording_since: rec.started_at().map(|t| t.to_rfc3339()),
         transcribing_meeting_id: state.pipeline.current_meeting(),
         queue_len: state.pipeline.queue_len(),
+        processing_stage: progress.as_ref().map(|progress| progress.stage.clone()),
+        processing_pct: progress.map(|progress| progress.pct),
         watcher: state.last_watcher_status.lock().unwrap().clone(),
     }
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiagnosticDatabase {
+    pub path: String,
+    pub healthy: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiagnosticModel {
+    pub id: String,
+    pub present: bool,
+    pub expected_revision: String,
+    pub installed_revision: Option<String>,
+    pub integrity_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Diagnostics {
+    pub generated_at: String,
+    pub app_version: String,
+    pub platform: String,
+    pub runtime_data_dir: String,
+    pub configured_data_dir: Option<String>,
+    pub restart_required: bool,
+    pub database: DiagnosticDatabase,
+    pub log_path: String,
+    pub recording_state: String,
+    pub recording_meeting_id: Option<i64>,
+    pub recording_since: Option<String>,
+    pub capture_health: Option<crate::recorder::RecordingHealth>,
+    pub capture_health_is_current: bool,
+    pub processing_meeting_id: Option<i64>,
+    pub processing_stage: Option<String>,
+    pub processing_pct: Option<f32>,
+    pub queue_len: usize,
+    pub models: Vec<DiagnosticModel>,
+    /// A transcript/audio-free text representation suitable for support.
+    pub report: String,
+}
+
+fn check_database(path: &std::path::Path) -> DiagnosticDatabase {
+    use rusqlite::OpenFlags;
+
+    let result = rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .and_then(|connection| connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0)));
+    match result {
+        Ok(detail) => DiagnosticDatabase {
+            path: path.display().to_string(),
+            healthy: detail == "ok",
+            detail,
+        },
+        Err(error) => DiagnosticDatabase {
+            path: path.display().to_string(),
+            healthy: false,
+            detail: error.to_string(),
+        },
+    }
+}
+
+fn render_diagnostics(diagnostics: &Diagnostics) -> String {
+    use std::fmt::Write;
+
+    let mut text = String::new();
+    let _ = writeln!(text, "Witness diagnostics");
+    let _ = writeln!(text, "Generated: {}", diagnostics.generated_at);
+    let _ = writeln!(text, "Version: {}", diagnostics.app_version);
+    let _ = writeln!(text, "Platform: {}", diagnostics.platform);
+    let _ = writeln!(
+        text,
+        "Runtime data directory: {}",
+        diagnostics.runtime_data_dir
+    );
+    let _ = writeln!(
+        text,
+        "Configured data directory: {}",
+        diagnostics
+            .configured_data_dir
+            .as_deref()
+            .unwrap_or("default")
+    );
+    let _ = writeln!(text, "Restart required: {}", diagnostics.restart_required);
+    let _ = writeln!(text, "Database: {}", diagnostics.database.path);
+    let _ = writeln!(
+        text,
+        "Database health: {} ({})",
+        if diagnostics.database.healthy {
+            "ok"
+        } else {
+            "failed"
+        },
+        diagnostics.database.detail
+    );
+    let _ = writeln!(text, "Log: {}", diagnostics.log_path);
+    let _ = writeln!(text, "Recording state: {}", diagnostics.recording_state);
+    let _ = writeln!(
+        text,
+        "Recording meeting: {}",
+        diagnostics
+            .recording_meeting_id
+            .map_or_else(|| "none".into(), |id| id.to_string())
+    );
+    let _ = writeln!(
+        text,
+        "Processing: meeting={}, stage={}, progress={}, queued={}",
+        diagnostics
+            .processing_meeting_id
+            .map_or_else(|| "none".into(), |id| id.to_string()),
+        diagnostics.processing_stage.as_deref().unwrap_or("idle"),
+        diagnostics
+            .processing_pct
+            .map_or_else(|| "n/a".into(), |pct| format!("{pct:.1}%")),
+        diagnostics.queue_len
+    );
+    if let Some(health) = &diagnostics.capture_health {
+        let _ = writeln!(
+            text,
+            "Capture health ({}): mic connected={}, losses={}, dropped={} ms; loopback connected={}, losses={}, dropped={} ms; writer error={}",
+            if diagnostics.capture_health_is_current { "current" } else { "last recording" },
+            health.mic.connected,
+            health.mic.device_loss_count,
+            health.mic.capture_dropped_ms,
+            health.loopback.connected,
+            health.loopback.device_loss_count,
+            health.loopback.capture_dropped_ms,
+            health.writer_error.as_deref().unwrap_or("none")
+        );
+    } else {
+        let _ = writeln!(text, "Capture health: not available in this session");
+    }
+    let _ = writeln!(text, "Models:");
+    for model in &diagnostics.models {
+        let _ = writeln!(
+            text,
+            "- {}: {}, expected={}, installed={}, integrity={}",
+            model.id,
+            if model.present { "present" } else { "missing" },
+            model.expected_revision,
+            model.installed_revision.as_deref().unwrap_or("none"),
+            model.integrity_error.as_deref().unwrap_or("ok")
+        );
+    }
+    text
+}
+
+fn collect_diagnostics(state: &AppState) -> Diagnostics {
+    let (runtime_data_dir, db_path, models_dir) = {
+        let settings = state.settings.lock().unwrap();
+        (
+            settings.data_dir(),
+            settings.db_path(),
+            settings.models_dir(),
+        )
+    };
+    let configured_data_dir = state.configured_data_dir.lock().unwrap().clone();
+    let restart_required = configured_data_dir
+        .as_deref()
+        .map(std::path::Path::new)
+        .is_some_and(|configured| configured != runtime_data_dir);
+    let (recording_state, recording_meeting_id, recording_since, recording) = {
+        let recorder = state.recorder.lock().unwrap();
+        let name = match &*recorder {
+            RecorderState::Idle => "idle",
+            RecorderState::Starting => "starting",
+            RecorderState::Recording(_) => "recording",
+            RecorderState::Stopping { .. } => "stopping",
+        };
+        (
+            name.to_string(),
+            recorder.meeting_id(),
+            recorder.started_at().map(|started| started.to_rfc3339()),
+            recorder.is_recording(),
+        )
+    };
+    let progress = state.pipeline.progress();
+    let models = models::status(&models_dir)
+        .into_iter()
+        .map(|model| DiagnosticModel {
+            id: model.id,
+            present: model.present,
+            expected_revision: model.expected_revision,
+            installed_revision: model.installed_revision,
+            integrity_error: model.integrity_error,
+        })
+        .collect();
+    let mut diagnostics = Diagnostics {
+        generated_at: chrono::Local::now().to_rfc3339(),
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        platform: format!("{} / {}", std::env::consts::OS, std::env::consts::ARCH),
+        runtime_data_dir: runtime_data_dir.display().to_string(),
+        configured_data_dir,
+        restart_required,
+        database: check_database(&db_path),
+        log_path: runtime_data_dir.join("witness.log").display().to_string(),
+        recording_state,
+        recording_meeting_id,
+        recording_since,
+        capture_health: state.recording_health.lock().unwrap().clone(),
+        capture_health_is_current: recording,
+        processing_meeting_id: state.pipeline.current_meeting(),
+        processing_stage: progress.as_ref().map(|progress| progress.stage.clone()),
+        processing_pct: progress.map(|progress| progress.pct),
+        queue_len: state.pipeline.queue_len(),
+        models,
+        report: String::new(),
+    };
+    diagnostics.report = render_diagnostics(&diagnostics);
+    diagnostics
+}
+
+#[tauri::command]
+pub fn get_diagnostics(state: State<'_, AppState>) -> Diagnostics {
+    collect_diagnostics(&state)
+}
+
+/// Save a privacy-conscious support report. It contains paths and operational
+/// state, but never transcript text, notes, audio, voice prints, or settings.
+#[tauri::command]
+pub async fn export_diagnostics(app: AppHandle) -> Result<bool, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let diagnostics = collect_diagnostics(&app.state::<AppState>());
+    let filename = format!(
+        "Witness-diagnostics-{}.txt",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
+    let picked = app
+        .dialog()
+        .file()
+        .set_file_name(filename)
+        .add_filter("Text report", &["txt"])
+        .blocking_save_file();
+    let Some(destination) = picked.and_then(|file| file.into_path().ok()) else {
+        return Ok(false);
+    };
+    std::fs::write(destination, diagnostics.report).map_err(err)?;
+    Ok(true)
 }
 
 // ---------- recording commands ----------
@@ -928,11 +1181,12 @@ pub fn download_models(app: AppHandle, engine: Engine) -> Result<(), String> {
 
 #[derive(Debug, Serialize)]
 pub struct AudioDevices {
-    pub render: Vec<String>,
-    pub capture: Vec<String>,
+    pub render: Vec<crate::audio_capture::AudioDevice>,
+    pub capture: Vec<crate::audio_capture::AudioDevice>,
 }
 
-/// Active endpoint names for the Settings device pickers.
+/// Active endpoints for the Settings device pickers. Future selections store
+/// the stable endpoint ID; capture still accepts legacy friendly-name values.
 #[tauri::command]
 pub async fn list_audio_devices() -> Result<AudioDevices, String> {
     let (render, capture) = crate::audio_capture::list_devices()?;

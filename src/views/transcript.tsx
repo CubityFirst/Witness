@@ -29,6 +29,7 @@ import {
   PencilSimple,
   Trash,
 } from "../lib/icons";
+import { notifyError, notifyInfo, notifySuccess } from "../lib/notify";
 
 function fmtTs(ms: number): string {
   const s = Math.floor(ms / 1000);
@@ -79,6 +80,32 @@ function segmentAt(segments: Segment[], t: number): number {
   return ans;
 }
 
+function handleMenuKey(
+  event: KeyboardEvent,
+  close: () => void,
+  trigger: HTMLButtonElement | null,
+) {
+  const menu = event.currentTarget as HTMLElement;
+  const items = [...menu.querySelectorAll<HTMLButtonElement>("button:not([disabled])")];
+  const index = items.indexOf(document.activeElement as HTMLButtonElement);
+  if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    close();
+    trigger?.focus();
+  } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    const direction = event.key === "ArrowDown" ? 1 : -1;
+    items[(index + direction + items.length) % items.length]?.focus();
+  } else if (event.key === "Home") {
+    event.preventDefault();
+    items[0]?.focus();
+  } else if (event.key === "End") {
+    event.preventDefault();
+    items.at(-1)?.focus();
+  }
+}
+
 export function TranscriptView(props: {
   meetingId: number;
   focusSegmentId?: number;
@@ -92,6 +119,8 @@ export function TranscriptView(props: {
   const [detail, setDetail] = useState<MeetingDetail | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [audioError, setAudioError] = useState<string | null>(null);
+  const [reloadTick, setReloadTick] = useState(0);
   const [activeIdx, setActiveIdx] = useState(-1);
   // Speaker rename: anchored to the specific segment whose chip was clicked.
   const [renaming, setRenaming] = useState<{ speakerId: number; segId: number } | null>(null);
@@ -107,6 +136,13 @@ export function TranscriptView(props: {
   const listRef = useRef<HTMLDivElement>(null);
   const focusedOnce = useRef(false);
   const notesMeetingId = useRef<number | null>(null);
+  const copiedTimer = useRef<number | undefined>(undefined);
+  const exportButtonRef = useRef<HTMLButtonElement>(null);
+  const exportMenuRef = useRef<HTMLDivElement>(null);
+  const engineButtonRef = useRef<HTMLButtonElement>(null);
+  const engineMenuRef = useRef<HTMLDivElement>(null);
+  const bookmarkCancel = useRef<number | null>(null);
+  const speakerRenameCancel = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -127,36 +163,82 @@ export function TranscriptView(props: {
         if (cancelled) return;
         setDetail(null);
         setLoadError(String(error));
+        notifyError("Could not load the meeting", error);
       });
     return () => {
       cancelled = true;
     };
-  }, [props.meetingId, props.refreshTick]);
+  }, [props.meetingId, props.refreshTick, reloadTick]);
 
   useEffect(() => {
     let cancelled = false;
     setAudioUrl(null);
+    setAudioError(null);
     getAudioUrl(props.meetingId)
       .then((url) => {
         if (!cancelled) setAudioUrl(url);
       })
-      .catch(() => {
-        if (!cancelled) setAudioUrl(null);
+      .catch((error) => {
+        if (!cancelled) {
+          setAudioUrl(null);
+          setAudioError(String(error));
+        }
       });
     return () => {
       cancelled = true;
     };
   }, [props.meetingId]);
 
+  useEffect(
+    () => () => {
+      window.clearTimeout(copiedTimer.current);
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!exportMenu && !engineMenu) return;
+    const menu = exportMenu ? exportMenuRef.current : engineMenuRef.current;
+    requestAnimationFrame(() => menu?.querySelector<HTMLButtonElement>("button")?.focus());
+
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (
+        !exportMenuRef.current?.contains(target) &&
+        !engineMenuRef.current?.contains(target) &&
+        !exportButtonRef.current?.contains(target) &&
+        !engineButtonRef.current?.contains(target)
+      ) {
+        setExportMenu(false);
+        setEngineMenu(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setExportMenu(false);
+      setEngineMenu(false);
+      (exportMenu ? exportButtonRef.current : engineButtonRef.current)?.focus();
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [exportMenu, engineMenu]);
+
   const saveNotes = () => {
     if (detail && notesDraft !== detail.meeting.notes) {
       setMeetingNotes(props.meetingId, notesDraft)
         .then(() =>
           setDetail((d) =>
-            d ? { ...d, meeting: { ...d.meeting, notes: notesDraft } } : d,
+            d?.meeting.id === props.meetingId
+              ? { ...d, meeting: { ...d.meeting, notes: notesDraft } }
+              : d,
           ),
         )
-        .catch((error) => alert(`Could not save notes: ${String(error)}`));
+        .catch((error) => notifyError("Could not save notes", error));
     }
   };
 
@@ -224,9 +306,11 @@ export function TranscriptView(props: {
       focusedOnce.current = true;
       setActiveIdx(idx);
       requestAnimationFrame(() => {
-        listRef.current
-          ?.querySelector(`[data-idx="${idx}"]`)
-          ?.scrollIntoView({ block: "center" });
+        const target = listRef.current?.querySelector<HTMLElement>(
+          `[data-idx="${idx}"]`,
+        );
+        target?.focus({ preventScroll: true });
+        target?.scrollIntoView({ block: "center" });
       });
     }
   }, [segments, props.focusSegmentId]);
@@ -249,7 +333,7 @@ export function TranscriptView(props: {
     const a = audioRef.current;
     if (!a) return;
     a.currentTime = seg.start_ms / 1000;
-    a.play().catch(() => {});
+    a.play().catch((error) => notifyError("Could not play the recording", error));
     setActiveIdx(idx);
   };
 
@@ -262,7 +346,7 @@ export function TranscriptView(props: {
     renameSpeaker(speakerId, name)
       .then(() =>
         setDetail((d) =>
-          d
+          d?.meeting.id === props.meetingId
             ? {
                 ...d,
                 speakers: d.speakers.map((s) =>
@@ -274,12 +358,14 @@ export function TranscriptView(props: {
             : d,
         ),
       )
-      .catch((error) => alert(`Could not rename speaker: ${String(error)}`));
+      .catch((error) => notifyError("Could not rename the speaker", error));
   };
 
   const doRetranscribe = (engine?: Engine) => {
     setEngineMenu(false);
-    retranscribe(props.meetingId, engine).catch((e) => alert(String(e)));
+    retranscribe(props.meetingId, engine)
+      .then(() => notifyInfo("Transcription queued"))
+      .catch((error) => notifyError("Could not queue transcription", error));
   };
 
   const copyTranscript = async () => {
@@ -298,21 +384,37 @@ export function TranscriptView(props: {
         ta.remove();
       }
       setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch (e) {
-      alert(String(e));
+      notifySuccess("Transcript copied to the clipboard");
+      window.clearTimeout(copiedTimer.current);
+      copiedTimer.current = window.setTimeout(() => setCopied(false), 1500);
+    } catch (error) {
+      notifyError("Could not copy the transcript", error);
     }
   };
 
   const doExport = (format: TranscriptFormat) => {
     setExportMenu(false);
-    exportTranscript(props.meetingId, format).catch((e) => alert(String(e)));
+    exportTranscript(props.meetingId, format).catch((error) =>
+      notifyError("Could not export the transcript", error),
+    );
   };
 
   if (loadError) {
-    return <div class="error">Could not load meeting: {loadError}</div>;
+    return (
+      <div class="view-error" role="alert">
+        <p>Could not load meeting: {loadError}</p>
+        <div class="view-error-actions">
+          <button type="button" class="btn btn-ghost" onClick={props.onBack}>
+            Back
+          </button>
+          <button type="button" class="btn" onClick={() => setReloadTick((tick) => tick + 1)}>
+            Try again
+          </button>
+        </div>
+      </div>
+    );
   }
-  if (!detail) return <div class="empty">Loading…</div>;
+  if (!detail) return <div class="empty" role="status">Loading…</div>;
   const m = detail.meeting;
 
   // Live captions take over while the meeting is still recording (the final
@@ -326,7 +428,7 @@ export function TranscriptView(props: {
   return (
     <div class="transcript-view">
       <div class="transcript-header">
-        <button class="btn btn-ghost btn-with-icon" title="Back" aria-label="Back" onClick={props.onBack}>
+        <button type="button" class="btn btn-ghost btn-with-icon" title="Back" aria-label="Back" onClick={props.onBack}>
           <ArrowLeft size={16} />
         </button>
         <div class="transcript-titleblock">
@@ -343,12 +445,12 @@ export function TranscriptView(props: {
                   renameMeeting(m.id, title)
                     .then(() =>
                       setDetail((d) =>
-                        d ? { ...d, meeting: { ...d.meeting, title } } : d,
+                        d?.meeting.id === props.meetingId
+                          ? { ...d, meeting: { ...d.meeting, title } }
+                          : d,
                       ),
                     )
-                    .catch((error) =>
-                      alert(`Could not rename meeting: ${String(error)}`),
-                    );
+                    .catch((error) => notifyError("Could not rename the meeting", error));
                 }
               }}
               onKeyDown={(e) => {
@@ -366,8 +468,10 @@ export function TranscriptView(props: {
             >
               {m.title}
               <button
+                type="button"
                 class="icon-btn rename-btn"
                 title="Rename meeting"
+                aria-label="Rename meeting"
                 onClick={() => {
                   setTitleText(m.title);
                   setEditingTitle(true);
@@ -384,43 +488,69 @@ export function TranscriptView(props: {
         </div>
         <div class="menu-wrap">
           <button
+            type="button"
+            ref={exportButtonRef}
             class="btn btn-ghost btn-with-icon"
             title={copied ? "Copied to clipboard" : "Export transcript"}
             aria-label="Export transcript"
+            aria-haspopup="menu"
+            aria-expanded={exportMenu}
+            aria-controls="transcript-export-menu"
             onClick={() => { setExportMenu(!exportMenu); setEngineMenu(false); }}
           >
             {copied ? <CheckCircle size={16} /> : <Export size={16} />}
           </button>
           {exportMenu && (
-            <div class="menu">
-              <button onClick={copyTranscript}>Copy to clipboard</button>
-              <button onClick={() => doExport("md")}>Markdown…</button>
-              <button onClick={() => doExport("txt")}>Plain text…</button>
-              <button onClick={() => doExport("srt")}>Subtitles (SRT)…</button>
-              <button onClick={() => doExport("vtt")}>Subtitles (WebVTT)…</button>
+            <div
+              class="menu"
+              id="transcript-export-menu"
+              ref={exportMenuRef}
+              role="menu"
+              onKeyDown={(event) =>
+                handleMenuKey(event, () => setExportMenu(false), exportButtonRef.current)
+              }
+            >
+              <button type="button" role="menuitem" onClick={copyTranscript}>Copy to clipboard</button>
+              <button type="button" role="menuitem" onClick={() => doExport("md")}>Markdown…</button>
+              <button type="button" role="menuitem" onClick={() => doExport("txt")}>Plain text…</button>
+              <button type="button" role="menuitem" onClick={() => doExport("srt")}>Subtitles (SRT)…</button>
+              <button type="button" role="menuitem" onClick={() => doExport("vtt")}>Subtitles (WebVTT)…</button>
             </div>
           )}
         </div>
         <div class="menu-wrap">
           <button
+            type="button"
+            ref={engineButtonRef}
             class="btn btn-ghost btn-with-icon"
             title="Retranscribe"
             aria-label="Retranscribe"
+            aria-haspopup="menu"
+            aria-expanded={engineMenu}
+            aria-controls="transcript-engine-menu"
             onClick={() => { setEngineMenu(!engineMenu); setExportMenu(false); }}
           >
             <ArrowsClockwise size={16} />
           </button>
           {engineMenu && (
-            <div class="menu">
-              <button onClick={() => doRetranscribe("parakeet")}>with Parakeet</button>
-              <button onClick={() => doRetranscribe("whisper")}>with Whisper</button>
+            <div
+              class="menu"
+              id="transcript-engine-menu"
+              ref={engineMenuRef}
+              role="menu"
+              onKeyDown={(event) =>
+                handleMenuKey(event, () => setEngineMenu(false), engineButtonRef.current)
+              }
+            >
+              <button type="button" role="menuitem" onClick={() => doRetranscribe("parakeet")}>with Parakeet</button>
+              <button type="button" role="menuitem" onClick={() => doRetranscribe("whisper")}>with Whisper</button>
             </div>
           )}
         </div>
       </div>
 
       {speakerStats.length > 0 && (
-        <div class="stats-bar">
+        <div class="stats-bar" aria-label="Speaker statistics">
           {speakerStats.map((s) => (
             <span class="stat-chip" key={s.name}>
               <span class={`chip ${CHIP_CLASS[s.label] ?? "chip-s1"}`}>{s.name}</span>
@@ -432,7 +562,7 @@ export function TranscriptView(props: {
       )}
 
       {showLive && (
-        <div class="live-feed">
+        <div class="live-feed" role="log" aria-live="polite" aria-relevant="additions">
           <div class="live-header">
             <span class="rec-dot" /> Live captions
             <span class="muted">· provisional</span>
@@ -458,6 +588,7 @@ export function TranscriptView(props: {
           <summary class="muted">Notes</summary>
           <textarea
             class="notes-input"
+            aria-label="Meeting notes"
             placeholder="Meeting notes… (searchable)"
             value={notesDraft}
             onInput={(e) => setNotesDraft((e.target as HTMLTextAreaElement).value)}
@@ -466,7 +597,13 @@ export function TranscriptView(props: {
         </details>
       </div>
 
-      <div class="segments" ref={listRef}>
+      {audioError && m.audio_path && (
+        <div class="inline-warning" role="status">
+          Audio playback is unavailable: {audioError}
+        </div>
+      )}
+
+      <div class="segments" ref={listRef} aria-label="Transcript">
         {segments.length === 0 && !showLive && bookmarks.length === 0 && (
           <div class="empty">
             <p class="muted">
@@ -487,35 +624,48 @@ export function TranscriptView(props: {
               <div
                 class="segment bookmark-row"
                 key={`bm${bm.id}`}
-                onClick={() => {
+              >
+                <button
+                  type="button"
+                  class="bookmark-seek"
+                  aria-label={`Play recording at bookmark ${fmtTs(bm.at_ms)}`}
+                  aria-disabled={!audioUrl}
+                  onClick={() => {
                   const a = audioRef.current;
                   if (a) {
                     a.currentTime = bm.at_ms / 1000;
-                    a.play().catch(() => {});
+                    a.play().catch((error) =>
+                      notifyError("Could not play the recording", error),
+                    );
                   }
                 }}
-              >
-                <span class="chip chip-bookmark">
-                  <BookmarkSimple size={11} />
-                </span>
-                <span class="ts">[{fmtTs(bm.at_ms)}]</span>
+                >
+                  <span class="chip chip-bookmark" aria-hidden="true">
+                    <BookmarkSimple size={11} />
+                  </span>
+                  <span class="ts">[{fmtTs(bm.at_ms)}]</span>
+                </button>
                 {bmEditing?.id === bm.id ? (
                   <input
                     class="rename-input"
                     value={bmEditing.text}
                     autoFocus
+                    aria-label="Bookmark note"
                     placeholder="what happened here?"
-                    onClick={(e) => e.stopPropagation()}
                     onInput={(e) =>
                       setBmEditing({ id: bm.id, text: (e.target as HTMLInputElement).value })
                     }
                     onBlur={() => {
+                      if (bookmarkCancel.current === bm.id) {
+                        bookmarkCancel.current = null;
+                        return;
+                      }
                       const note = bmEditing.text.trim();
                       setBmEditing(null);
                       setBookmarkNote(bm.id, note)
                         .then(() =>
                           setDetail((d) =>
-                            d
+                            d?.meeting.id === props.meetingId
                               ? {
                                   ...d,
                                   bookmarks: d.bookmarks.map((x) =>
@@ -525,43 +675,44 @@ export function TranscriptView(props: {
                               : d,
                           ),
                         )
-                        .catch((error) =>
-                          alert(`Could not save bookmark: ${String(error)}`),
-                        );
+                        .catch((error) => notifyError("Could not save the bookmark", error));
                     }}
                     onKeyDown={(e) => {
                       if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-                      if (e.key === "Escape") setBmEditing(null);
+                      if (e.key === "Escape") {
+                        bookmarkCancel.current = bm.id;
+                        setBmEditing(null);
+                      }
                     }}
                   />
                 ) : (
-                  <span
-                    class={`segment-text ${bm.note ? "" : "muted"}`}
+                  <button
+                    type="button"
+                    class={`bookmark-note segment-text ${bm.note ? "" : "muted"}`}
                     title="Click to edit note"
-                    onClick={(e) => {
-                      e.stopPropagation();
+                    onClick={() => {
+                      bookmarkCancel.current = null;
                       setBmEditing({ id: bm.id, text: bm.note });
                     }}
                   >
                     {bm.note || "bookmark — click to add a note"}
-                  </span>
+                  </button>
                 )}
                 <button
+                  type="button"
                   class="icon-btn"
                   title="Remove bookmark"
-                  onClick={(e) => {
-                    e.stopPropagation();
+                  aria-label={`Remove bookmark at ${fmtTs(bm.at_ms)}`}
+                  onClick={() => {
                     deleteBookmark(bm.id)
                       .then(() =>
                         setDetail((d) =>
-                          d
+                          d?.meeting.id === props.meetingId
                             ? { ...d, bookmarks: d.bookmarks.filter((x) => x.id !== bm.id) }
                             : d,
                         ),
                       )
-                      .catch((error) =>
-                        alert(`Could not delete bookmark: ${String(error)}`),
-                      );
+                      .catch((error) => notifyError("Could not remove the bookmark", error));
                   }}
                 >
                   <Trash size={14} />
@@ -575,20 +726,20 @@ export function TranscriptView(props: {
           return (
             <div
               class={`segment ${idx === activeIdx ? "segment-active" : ""}`}
-              data-idx={idx}
               key={seg.id}
-              onClick={() => seekTo(seg, idx)}
             >
-              <span
+              <button
+                type="button"
                 class={`chip ${CHIP_CLASS[label] ?? "chip-s1"}`}
                 title={
                   sp?.auto_labeled
                     ? "Auto-matched by voice — click to rename/confirm"
                     : "Click to rename speaker"
                 }
-                onClick={(e) => {
-                  e.stopPropagation();
+                disabled={seg.speaker_id == null}
+                onClick={() => {
                   if (seg.speaker_id != null) {
+                    speakerRenameCancel.current = false;
                     setRenaming({ speakerId: seg.speaker_id, segId: seg.id });
                     setRenameText(sp?.display_name ?? "");
                   }
@@ -596,25 +747,44 @@ export function TranscriptView(props: {
               >
                 {sp?.auto_labeled ? "≈ " : ""}
                 {sp?.display_name ?? label}
-              </span>
+              </button>
               {renaming != null && renaming.segId === seg.id && (
                 <input
                   class="rename-input"
                   value={renameText}
                   autoFocus
-                  onClick={(e) => e.stopPropagation()}
+                  aria-label={`Rename ${sp?.display_name ?? label}`}
                   onInput={(e) => setRenameText((e.target as HTMLInputElement).value)}
-                  onBlur={() => commitSpeakerRename(renaming.speakerId)}
+                  onBlur={() => {
+                    if (speakerRenameCancel.current) {
+                      speakerRenameCancel.current = false;
+                    } else {
+                      commitSpeakerRename(renaming.speakerId);
+                    }
+                  }}
                   onKeyDown={(e) => {
                     if (e.key === "Enter") commitSpeakerRename(renaming.speakerId);
-                    if (e.key === "Escape") setRenaming(null);
+                    if (e.key === "Escape") {
+                      speakerRenameCancel.current = true;
+                      setRenaming(null);
+                    }
                   }}
                 />
               )}
-              <span class="ts">[{fmtTs(seg.start_ms)}]</span>
-              <span class="segment-text">
-                <Highlighted text={seg.text} terms={props.highlight} />
-              </span>
+              <button
+                type="button"
+                class="segment-seek"
+                data-idx={idx}
+                aria-current={idx === activeIdx ? "true" : undefined}
+                aria-label={`Play at ${fmtTs(seg.start_ms)}: ${seg.text}`}
+                aria-disabled={!audioUrl}
+                onClick={() => seekTo(seg, idx)}
+              >
+                <span class="ts">[{fmtTs(seg.start_ms)}]</span>
+                <span class="segment-text">
+                  <Highlighted text={seg.text} terms={props.highlight} />
+                </span>
+              </button>
             </div>
           );
         })}
@@ -627,7 +797,11 @@ export function TranscriptView(props: {
             audioRef={audioRef}
             markers={bookmarks.map((b) => b.at_ms)}
             onTimeUpdate={onTimeUpdate}
-            onDownload={() => exportAudio(m.id).catch((e) => alert(String(e)))}
+            onDownload={() =>
+              exportAudio(m.id).catch((error) =>
+                notifyError("Could not export the audio", error),
+              )
+            }
           />
         </div>
       )}

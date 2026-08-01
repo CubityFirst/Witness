@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "preact/hooks";
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
   getPeopleStats,
   listMeetings,
@@ -6,6 +6,7 @@ import {
   type PersonMeetingStat,
 } from "../lib/api";
 import { fmtDate, fmtDuration } from "./meetings";
+import { notifyError } from "../lib/notify";
 
 const WEEKS = 12;
 
@@ -45,7 +46,13 @@ function WeeklyTrend({ meetings }: { meetings: Meeting[] }) {
         {weeks.reduce((s, w) => s + w.count, 0)} meetings,{" "}
         {fmtDuration(weeks.reduce((s, w) => s + w.ms, 0))} total
       </div>
-      <svg viewBox="0 0 100 34" preserveAspectRatio="none" class="trend-chart">
+      <svg
+        viewBox="0 0 100 34"
+        preserveAspectRatio="none"
+        class="trend-chart"
+        role="img"
+        aria-label={`Meeting duration over the last ${WEEKS} weeks`}
+      >
         {weeks.map((w, i) => {
           const h = w.ms > 0 ? Math.max(2, (w.ms / maxMs) * 30) : 0.8;
           return (
@@ -86,10 +93,44 @@ export function PeopleView(props: {
   const [stats, setStats] = useState<PersonMeetingStat[]>([]);
   const [meetings, setMeetings] = useState<Meeting[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const requestGeneration = useRef(0);
+
+  const load = async () => {
+    const generation = ++requestGeneration.current;
+    setLoading(true);
+    try {
+      const loadAllMeetings = async () => {
+        const all: Meeting[] = [];
+        for (;;) {
+          const page = await listMeetings(all.length, 500);
+          all.push(...page);
+          if (page.length < 500) return all;
+        }
+      };
+      const [nextStats, nextMeetings] = await Promise.all([
+        getPeopleStats(),
+        loadAllMeetings(),
+      ]);
+      if (generation !== requestGeneration.current) return;
+      setStats(nextStats);
+      setMeetings(nextMeetings);
+      setLoadError(null);
+    } catch (error) {
+      if (generation !== requestGeneration.current) return;
+      setLoadError(String(error));
+      notifyError("Could not load people statistics", error);
+    } finally {
+      if (generation === requestGeneration.current) setLoading(false);
+    }
+  };
 
   useEffect(() => {
-    getPeopleStats().then(setStats).catch(() => {});
-    listMeetings(0, 500).then(setMeetings).catch(() => {});
+    void load();
+    return () => {
+      requestGeneration.current += 1;
+    };
   }, [props.refreshTick]);
 
   const people = useMemo(() => {
@@ -120,6 +161,21 @@ export function PeopleView(props: {
     });
   }, [stats]);
 
+  if (loading && people.length === 0) {
+    return <div class="empty" role="status">Loading people…</div>;
+  }
+
+  if (loadError && people.length === 0) {
+    return (
+      <div class="view-error" role="alert">
+        <p>Could not load people: {loadError}</p>
+        <button type="button" class="btn" onClick={() => void load()}>
+          Try again
+        </button>
+      </div>
+    );
+  }
+
   if (people.length === 0) {
     return (
       <div class="empty">
@@ -137,8 +193,11 @@ export function PeopleView(props: {
       <WeeklyTrend meetings={meetings} />
       {people.map((p) => (
         <div class="person-card" key={p.key}>
-          <div
+          <button
+            type="button"
             class="person-head"
+            aria-expanded={expanded === p.key}
+            aria-controls={`person-meetings-${p.key}`}
             onClick={() => setExpanded(expanded === p.key ? null : p.key)}
           >
             <span class={`chip ${p.isMe ? "chip-me" : "chip-s1"}`}>{p.name}</span>
@@ -151,12 +210,13 @@ export function PeopleView(props: {
                 <> · {Math.round((p.talkMs / Math.max(1, p.togetherMs)) * 100)}% of meeting time</>
               )}
             </span>
-            <span class="muted">{expanded === p.key ? "▾" : "▸"}</span>
-          </div>
+            <span class="muted" aria-hidden="true">{expanded === p.key ? "▾" : "▸"}</span>
+          </button>
           {expanded === p.key && (
-            <div class="person-meetings">
+            <div class="person-meetings" id={`person-meetings-${p.key}`}>
               {p.meetings.map((m) => (
-                <div
+                <button
+                  type="button"
                   class="person-meeting-row"
                   key={m.meeting_id}
                   onClick={() => props.onOpen(m.meeting_id)}
@@ -169,7 +229,7 @@ export function PeopleView(props: {
                       <> · {Math.round((m.talk_ms / m.duration_ms) * 100)}%</>
                     )}
                   </span>
-                </div>
+                </button>
               ))}
             </div>
           )}
