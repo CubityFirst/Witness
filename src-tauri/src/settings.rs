@@ -86,6 +86,11 @@ pub struct Settings {
     #[serde(default = "default_patterns")]
     pub watch_patterns: Vec<String>,
 
+    /// Exact normalized ASR phrases discarded when a VAD chunk is otherwise
+    /// speech-like. Clearing this list disables phrase-based filtering.
+    #[serde(default = "crate::asr::default_junk_phrases")]
+    pub junk_phrases: Vec<String>,
+
     /// Target bitrate for the archived stereo Ogg Opus file.
     #[serde(default = "default_bitrate")]
     pub opus_bitrate_kbps: u32,
@@ -113,6 +118,7 @@ impl Default for Settings {
             caption_overlay: true,
             speaker_match_threshold: 0.6,
             watch_patterns: default_patterns(),
+            junk_phrases: crate::asr::default_junk_phrases(),
             opus_bitrate_kbps: DEFAULT_OPUS_BITRATE_KBPS,
             mic_device: None,
             loopback_device: None,
@@ -247,6 +253,12 @@ impl Settings {
         for (index, pattern) in self.watch_patterns.iter().enumerate() {
             validate_nonempty_text(&format!("watch_patterns[{index}]"), pattern)?;
         }
+        if self.junk_phrases.len() > 100 {
+            return Err("junk_phrases cannot contain more than 100 phrases".into());
+        }
+        for (index, phrase) in self.junk_phrases.iter().enumerate() {
+            validate_nonempty_text(&format!("junk_phrases[{index}]"), phrase)?;
+        }
         if let Some(device) = &self.mic_device {
             validate_nonempty_text("mic_device", device)?;
         }
@@ -266,6 +278,14 @@ impl Settings {
             .watch_patterns
             .into_iter()
             .map(|value| value.trim().to_owned())
+            .collect();
+        let mut seen_phrases = std::collections::HashSet::new();
+        settings.junk_phrases = settings
+            .junk_phrases
+            .into_iter()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .filter(|value| seen_phrases.insert(value.to_lowercase()))
             .collect();
         settings.mic_device = normalize_optional_text(settings.mic_device);
         settings.loopback_device = normalize_optional_text(settings.loopback_device);
@@ -500,6 +520,10 @@ mod tests {
         assert!(settings.validate().is_err());
 
         settings.watch_patterns = vec!["Teams".into()];
+        settings.junk_phrases = vec!["phrase".into(); 101];
+        assert!(settings.validate().is_err());
+
+        settings.junk_phrases = vec![];
         settings.mic_device = Some("bad\0device".into());
         assert!(settings.validate().is_err());
     }
@@ -512,6 +536,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.data_dir = Some("  C:\\Witness Data  ".into());
         settings.watch_patterns = vec!["  Teams  ".into(), " Zoom ".into()];
+        settings.junk_phrases = vec!["  Thank you.  ".into(), "thank YOU.".into(), " ".into()];
         settings.mic_device = Some("   ".into());
         settings.loopback_device = Some("  Speakers  ".into());
 
@@ -522,6 +547,7 @@ mod tests {
 
         assert_eq!(loaded.data_dir.as_deref(), Some("C:\\Witness Data"));
         assert_eq!(loaded.watch_patterns, vec!["Teams", "Zoom"]);
+        assert_eq!(loaded.junk_phrases, vec!["Thank you."]);
         assert_eq!(loaded.mic_device, None);
         assert_eq!(loaded.loopback_device.as_deref(), Some("Speakers"));
         assert!(matches!(loaded.engine, Engine::Whisper));

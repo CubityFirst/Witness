@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -50,7 +51,7 @@ pub struct Speaker {
 pub struct Person {
     pub id: i64,
     pub name: String,
-    /// Seconds of speech folded into this voice print so far.
+    /// Seconds of explicit, currently linked speech represented by this print.
     pub sample_seconds: f64,
     pub created_at: String,
     #[serde(skip)]
@@ -83,6 +84,7 @@ pub struct NewSpeaker {
     pub auto_labeled: bool,
 }
 
+#[cfg(test)]
 pub type SpeakerEmbeddingRecord = (String, Option<Vec<f32>>, f64);
 
 fn embedding_to_blob(e: &[f32]) -> Vec<u8> {
@@ -93,6 +95,88 @@ fn blob_to_embedding(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+fn default_speaker_name(label: &str) -> String {
+    if label == "me" {
+        "Me".into()
+    } else {
+        label
+            .strip_prefix('S')
+            .map(|number| format!("Speaker {number}"))
+            .unwrap_or_else(|| label.to_string())
+    }
+}
+
+/// Rebuild a person's voice print from the explicit speaker links that still
+/// exist outside the recycle bin. The people row is a cache of these source
+/// rows, never an independently accumulated value.
+fn recompute_person(tx: &rusqlite::Transaction<'_>, person_id: i64) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "SELECT sp.embedding, sp.emb_seconds
+         FROM speakers sp
+         JOIN meetings m ON m.id = sp.meeting_id
+         WHERE sp.person_id = ?1
+           AND sp.auto_labeled = 0
+           AND sp.label != 'me'
+           AND sp.embedding IS NOT NULL
+           AND sp.emb_seconds > 0
+           AND m.deleted_at IS NULL",
+    )?;
+    let rows = stmt
+        .query_map(params![person_id], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, f64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let mut weighted = Vec::<f64>::new();
+    let mut total_seconds = 0.0f64;
+    for (blob, seconds) in rows {
+        let embedding = blob_to_embedding(&blob);
+        if embedding.is_empty() {
+            continue;
+        }
+        if weighted.is_empty() {
+            weighted.resize(embedding.len(), 0.0);
+        }
+        anyhow::ensure!(
+            weighted.len() == embedding.len(),
+            "speaker embeddings for person {person_id} have inconsistent dimensions"
+        );
+        for (sum, value) in weighted.iter_mut().zip(embedding) {
+            *sum += f64::from(value) * seconds;
+        }
+        total_seconds += seconds;
+    }
+
+    let mut embedding: Vec<f32> = weighted.into_iter().map(|value| value as f32).collect();
+    let norm = embedding
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    if norm > 0.0 {
+        for value in &mut embedding {
+            *value /= norm;
+        }
+    }
+    tx.execute(
+        "UPDATE people SET embedding = ?2, sample_seconds = ?3 WHERE id = ?1",
+        params![person_id, embedding_to_blob(&embedding), total_seconds],
+    )?;
+    Ok(())
+}
+
+fn meeting_person_ids(tx: &rusqlite::Transaction<'_>, meeting_id: i64) -> Result<HashSet<i64>> {
+    let mut stmt = tx.prepare(
+        "SELECT DISTINCT person_id FROM speakers
+         WHERE meeting_id = ?1 AND person_id IS NOT NULL AND auto_labeled = 0",
+    )?;
+    let person_ids = stmt
+        .query_map(params![meeting_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<HashSet<_>>>()?;
+    Ok(person_ids)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -467,8 +551,14 @@ impl Db {
     }
 
     pub fn delete_meeting(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM meetings WHERE id = ?1", params![id])?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let affected = meeting_person_ids(&tx, id)?;
+        tx.execute("DELETE FROM meetings WHERE id = ?1", params![id])?;
+        for person_id in affected {
+            recompute_person(&tx, person_id)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -573,20 +663,32 @@ impl Db {
     }
 
     pub fn soft_delete_meeting(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let affected = meeting_person_ids(&tx, id)?;
+        tx.execute(
             "UPDATE meetings SET deleted_at = ?2 WHERE id = ?1",
             params![id, chrono::Local::now().to_rfc3339()],
         )?;
+        for person_id in affected {
+            recompute_person(&tx, person_id)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
     pub fn restore_meeting(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let affected = meeting_person_ids(&tx, id)?;
+        tx.execute(
             "UPDATE meetings SET deleted_at = NULL WHERE id = ?1",
             params![id],
         )?;
+        for person_id in affected {
+            recompute_person(&tx, person_id)?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -687,16 +789,48 @@ impl Db {
         speaker_id: i64,
         display_name: &str,
         person_id: Option<i64>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let current = conn
+            .query_row(
+                "SELECT label, display_name, person_id, auto_labeled
+                 FROM speakers WHERE id = ?1",
+                params![speaker_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, i64>(3)? != 0,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((label, current_name, current_person_id, auto_labeled)) = current else {
+            return Ok(false);
+        };
+        // Re-check eligibility while holding the database lock. A background
+        // re-match may have read this row just before the user named it.
+        if !auto_labeled
+            && (current_person_id.is_some() || current_name != default_speaker_name(&label))
+        {
+            return Ok(false);
+        }
+        if current_name == display_name
+            && current_person_id == person_id
+            && auto_labeled == person_id.is_some()
+        {
+            return Ok(false);
+        }
+        let changed = conn.execute(
             "UPDATE speakers SET display_name = ?2, person_id = ?3, auto_labeled = ?4 WHERE id = ?1",
             params![speaker_id, display_name, person_id, person_id.is_some() as i64],
         )?;
-        Ok(())
+        Ok(changed == 1)
     }
 
-    /// One speaker row with its stored voice print (for enrollment on rename).
+    /// One speaker row with its stored voice print.
+    #[cfg(test)]
     pub fn get_speaker_embedding(&self, speaker_id: i64) -> Result<Option<SpeakerEmbeddingRecord>> {
         let conn = self.conn.lock().unwrap();
         let row = conn
@@ -738,19 +872,65 @@ impl Db {
         Ok(rows)
     }
 
-    /// User-driven rename: clears the auto flag and (optionally) links a person.
+    /// User-driven rename and enrollment. The speaker link and every affected
+    /// person's derived centroid change atomically, so retries are idempotent.
     pub fn rename_speaker(
         &self,
         speaker_id: i64,
         display_name: &str,
-        person_id: Option<i64>,
-    ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        enroll: bool,
+    ) -> Result<Option<i64>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let (label, previous_person_id) = tx
+            .query_row(
+                "SELECT label, person_id FROM speakers WHERE id = ?1",
+                params![speaker_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?
+            .with_context(|| format!("speaker {speaker_id} does not exist"))?;
+
+        let person_id = if enroll && label != "me" {
+            let existing = tx
+                .query_row(
+                    "SELECT id FROM people WHERE name = ?1 COLLATE NOCASE",
+                    params![display_name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Some(match existing {
+                Some(id) => id,
+                None => {
+                    tx.execute(
+                        "INSERT INTO people (name, embedding, sample_seconds, created_at)
+                         VALUES (?1, ?2, 0, ?3)",
+                        params![
+                            display_name,
+                            embedding_to_blob(&[]),
+                            chrono::Local::now().to_rfc3339()
+                        ],
+                    )?;
+                    tx.last_insert_rowid()
+                }
+            })
+        } else {
+            None
+        };
+
+        tx.execute(
             "UPDATE speakers SET display_name = ?2, person_id = ?3, auto_labeled = 0 WHERE id = ?1",
             params![speaker_id, display_name, person_id],
         )?;
-        Ok(())
+
+        let mut affected = HashSet::new();
+        affected.extend(previous_person_id);
+        affected.extend(person_id);
+        for affected_person_id in affected {
+            recompute_person(&tx, affected_person_id)?;
+        }
+        tx.commit()?;
+        Ok(person_id)
     }
 
     // ---------- people (enrolled voice prints) ----------
@@ -775,6 +955,7 @@ impl Db {
         Ok(rows)
     }
 
+    #[cfg(test)]
     pub fn get_person_by_name(&self, name: &str) -> Result<Option<Person>> {
         let conn = self.conn.lock().unwrap();
         let row = conn
@@ -797,34 +978,6 @@ impl Db {
         Ok(row)
     }
 
-    pub fn create_person(&self, name: &str, embedding: &[f32], sample_seconds: f64) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO people (name, embedding, sample_seconds, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                name,
-                embedding_to_blob(embedding),
-                sample_seconds,
-                chrono::Local::now().to_rfc3339()
-            ],
-        )?;
-        Ok(conn.last_insert_rowid())
-    }
-
-    pub fn update_person_embedding(
-        &self,
-        person_id: i64,
-        embedding: &[f32],
-        sample_seconds: f64,
-    ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE people SET embedding = ?2, sample_seconds = ?3 WHERE id = ?1",
-            params![person_id, embedding_to_blob(embedding), sample_seconds],
-        )?;
-        Ok(())
-    }
-
     pub fn delete_person(&self, person_id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM people WHERE id = ?1", params![person_id])?;
@@ -843,6 +996,28 @@ impl Db {
     ) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        let mut affected_people = meeting_person_ids(&tx, meeting_id)?;
+        let mut manual_names = HashMap::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT label, display_name, person_id
+                 FROM speakers WHERE meeting_id = ?1 AND auto_labeled = 0",
+            )?;
+            let old_speakers = stmt
+                .query_map(params![meeting_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (label, display_name, person_id) in old_speakers {
+                if person_id.is_some() || display_name != default_speaker_name(&label) {
+                    manual_names.insert(label, (display_name, person_id));
+                }
+            }
+        }
         tx.execute(
             "DELETE FROM segments WHERE meeting_id = ?1",
             params![meeting_id],
@@ -858,15 +1033,23 @@ impl Db {
             )?;
             let mut speaker_ids = std::collections::HashMap::new();
             for sp in speakers {
+                let manual = manual_names.get(&sp.label);
+                let display_name =
+                    manual.map_or(sp.display_name.as_str(), |value| value.0.as_str());
+                let person_id = manual.map_or(sp.person_id, |value| value.1);
+                let auto_labeled = manual.is_none() && sp.auto_labeled;
                 ins_speaker.execute(params![
                     meeting_id,
                     sp.label,
-                    sp.display_name,
-                    sp.person_id,
-                    sp.auto_labeled as i64,
+                    display_name,
+                    person_id,
+                    auto_labeled as i64,
                     sp.embedding.as_deref().map(embedding_to_blob),
                     sp.emb_seconds,
                 ])?;
+                if !auto_labeled {
+                    affected_people.extend(person_id);
+                }
                 speaker_ids.insert(sp.label.clone(), tx.last_insert_rowid());
             }
             let mut ins_seg = tx.prepare(
@@ -893,6 +1076,9 @@ impl Db {
             "UPDATE meetings SET status = 'transcribed', engine = ?2 WHERE id = ?1",
             params![meeting_id, engine],
         )?;
+        for person_id in affected_people {
+            recompute_person(&tx, person_id)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1129,6 +1315,253 @@ impl Db {
 mod tests {
     use super::*;
 
+    fn test_db(label: &str) -> (Db, std::path::PathBuf) {
+        let unique = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!(
+            "witness-db-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        (Db::open(&dir.join("test.db")).unwrap(), dir)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_remote_speaker(
+        db: &Db,
+        title: &str,
+        label: &str,
+        display_name: &str,
+        embedding: Vec<f32>,
+        seconds: f64,
+        person_id: Option<i64>,
+        auto_labeled: bool,
+    ) -> (i64, i64) {
+        let meeting_id = db
+            .create_meeting(title, "2026-08-01T12:00:00Z", "manual")
+            .unwrap();
+        db.replace_transcript(
+            meeting_id,
+            &[NewSpeaker {
+                label: label.into(),
+                display_name: display_name.into(),
+                embedding: Some(embedding),
+                emb_seconds: seconds,
+                person_id,
+                auto_labeled,
+            }],
+            &[],
+            "test",
+        )
+        .unwrap();
+        let speaker_id = db.get_speakers(meeting_id).unwrap()[0].id;
+        (meeting_id, speaker_id)
+    }
+
+    fn person(db: &Db, name: &str) -> Person {
+        db.get_person_by_name(name).unwrap().unwrap()
+    }
+
+    fn assert_embedding(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() < 1e-5,
+                "expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_rename_is_idempotent_and_confirming_auto_label_enrolls_once() {
+        let (db, dir) = test_db("identity-repeat");
+        let (_, first) = add_remote_speaker(
+            &db,
+            "First",
+            "S1",
+            "Speaker 1",
+            vec![1.0, 0.0],
+            10.0,
+            None,
+            false,
+        );
+        let alice_id = db.rename_speaker(first, "Alice", true).unwrap().unwrap();
+        db.rename_speaker(first, "Alice", true).unwrap();
+        let alice = person(&db, "Alice");
+        assert_eq!(alice.id, alice_id);
+        assert_eq!(alice.sample_seconds, 10.0);
+        assert_embedding(&alice.embedding, &[1.0, 0.0]);
+
+        let (second_meeting, auto_match) = add_remote_speaker(
+            &db,
+            "Second",
+            "S1",
+            "Alice",
+            vec![0.0, 1.0],
+            5.0,
+            Some(alice_id),
+            true,
+        );
+        assert_eq!(person(&db, "Alice").sample_seconds, 10.0);
+        db.rename_speaker(auto_match, "Alice", true).unwrap();
+        let alice = person(&db, "Alice");
+        assert_eq!(alice.sample_seconds, 15.0);
+        assert_embedding(&alice.embedding, &[0.894_427_2, 0.447_213_6]);
+        assert!(
+            !db.speakers_with_embeddings()
+                .unwrap()
+                .into_iter()
+                .find(|speaker| speaker.id == auto_match)
+                .unwrap()
+                .auto_labeled
+        );
+        assert!(!db
+            .set_auto_match(auto_match, "Wrong", Some(alice_id))
+            .unwrap());
+        assert_eq!(
+            db.get_speakers(second_meeting)
+                .unwrap()
+                .into_iter()
+                .find(|speaker| speaker.id == auto_match)
+                .map(|speaker| speaker.display_name),
+            Some("Alice".into())
+        );
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reassignment_recomputes_both_people_without_double_counting() {
+        let (db, dir) = test_db("identity-reassign");
+        let (_, first) = add_remote_speaker(
+            &db,
+            "First",
+            "S1",
+            "Speaker 1",
+            vec![1.0, 0.0],
+            6.0,
+            None,
+            false,
+        );
+        let (_, second) = add_remote_speaker(
+            &db,
+            "Second",
+            "S1",
+            "Speaker 1",
+            vec![0.0, 1.0],
+            2.0,
+            None,
+            false,
+        );
+        db.rename_speaker(first, "Alice", true).unwrap();
+        db.rename_speaker(second, "Alice", true).unwrap();
+        assert_eq!(person(&db, "Alice").sample_seconds, 8.0);
+
+        let bob_id = db.rename_speaker(second, "Bob", true).unwrap().unwrap();
+        db.rename_speaker(second, "Bob", true).unwrap();
+        let alice = person(&db, "Alice");
+        let bob = person(&db, "Bob");
+        assert_eq!(alice.sample_seconds, 6.0);
+        assert_embedding(&alice.embedding, &[1.0, 0.0]);
+        assert_eq!(bob.id, bob_id);
+        assert_eq!(bob.sample_seconds, 2.0);
+        assert_embedding(&bob.embedding, &[0.0, 1.0]);
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unlink_trash_restore_and_delete_are_reflected_in_centroid() {
+        let (db, dir) = test_db("identity-delete");
+        let (first_meeting, first) = add_remote_speaker(
+            &db,
+            "First",
+            "S1",
+            "Speaker 1",
+            vec![1.0, 0.0],
+            6.0,
+            None,
+            false,
+        );
+        let (second_meeting, second) = add_remote_speaker(
+            &db,
+            "Second",
+            "S1",
+            "Speaker 1",
+            vec![0.0, 1.0],
+            2.0,
+            None,
+            false,
+        );
+        db.rename_speaker(first, "Alice", true).unwrap();
+        db.rename_speaker(second, "Alice", true).unwrap();
+
+        db.rename_speaker(second, "Speaker 1", false).unwrap();
+        assert_eq!(person(&db, "Alice").sample_seconds, 6.0);
+        db.rename_speaker(second, "Alice", true).unwrap();
+
+        db.soft_delete_meeting(first_meeting).unwrap();
+        let alice = person(&db, "Alice");
+        assert_eq!(alice.sample_seconds, 2.0);
+        assert_embedding(&alice.embedding, &[0.0, 1.0]);
+
+        db.restore_meeting(first_meeting).unwrap();
+        let alice = person(&db, "Alice");
+        assert_eq!(alice.sample_seconds, 8.0);
+        assert_embedding(&alice.embedding, &[0.948_683_3, 0.316_227_76]);
+
+        db.delete_meeting(second_meeting).unwrap();
+        let alice = person(&db, "Alice");
+        assert_eq!(alice.sample_seconds, 6.0);
+        assert_embedding(&alice.embedding, &[1.0, 0.0]);
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn retranscription_preserves_manual_link_and_replaces_its_evidence() {
+        let (db, dir) = test_db("identity-retranscribe");
+        let (meeting_id, speaker_id) = add_remote_speaker(
+            &db,
+            "Meeting",
+            "S1",
+            "Speaker 1",
+            vec![1.0, 0.0],
+            10.0,
+            None,
+            false,
+        );
+        let alice_id = db
+            .rename_speaker(speaker_id, "Alice", true)
+            .unwrap()
+            .unwrap();
+        let replacement = [NewSpeaker {
+            label: "S1".into(),
+            display_name: "Speaker 1".into(),
+            embedding: Some(vec![0.0, 1.0]),
+            emb_seconds: 4.0,
+            person_id: None,
+            auto_labeled: false,
+        }];
+        db.replace_transcript(meeting_id, &replacement, &[], "test")
+            .unwrap();
+        db.replace_transcript(meeting_id, &replacement, &[], "test")
+            .unwrap();
+
+        let speaker = &db.get_speakers(meeting_id).unwrap()[0];
+        assert_eq!(speaker.display_name, "Alice");
+        assert_eq!(speaker.person_id, Some(alice_id));
+        assert!(!speaker.auto_labeled);
+        let alice = person(&db, "Alice");
+        assert_eq!(alice.sample_seconds, 4.0);
+        assert_embedding(&alice.embedding, &[0.0, 1.0]);
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn version_four_database_gets_durable_pipeline_queue() {
         let dir = std::env::temp_dir().join(format!("witness-db-v4-test-{}", std::process::id()));
@@ -1248,10 +1681,9 @@ mod tests {
         assert_eq!(emb.unwrap(), vec![0.6, 0.8]);
         assert!((secs - 12.5).abs() < 1e-9);
 
-        // People: create, case-insensitive lookup, link on rename, delete.
-        let alice = db.create_person("Alice", &[0.6, 0.8], 12.5).unwrap();
+        // People: create through enrollment, case-insensitive lookup, delete.
+        let alice = db.rename_speaker(s1.id, "Alice", true).unwrap().unwrap();
         assert_eq!(db.get_person_by_name("alice").unwrap().unwrap().id, alice);
-        db.rename_speaker(s1.id, "Alice", Some(alice)).unwrap();
         let s1 = db
             .get_speakers(id)
             .unwrap()
@@ -1261,9 +1693,7 @@ mod tests {
         assert_eq!(s1.display_name, "Alice");
         assert_eq!(s1.person_id, Some(alice));
         assert!(!s1.auto_labeled);
-        db.update_person_embedding(alice, &[1.0, 0.0], 30.0)
-            .unwrap();
-        assert_eq!(db.list_people().unwrap()[0].embedding, vec![1.0, 0.0]);
+        assert_eq!(db.list_people().unwrap()[0].embedding, vec![0.6, 0.8]);
         db.delete_person(alice).unwrap();
         assert!(db.list_people().unwrap().is_empty());
         // FK ON DELETE SET NULL cleared the link.

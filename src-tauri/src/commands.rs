@@ -47,7 +47,7 @@ pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64,
             return Err(err(e));
         }
     };
-    let (rec_dir, mic_device, loopback_device, live_enabled, models_dir, overlay) = {
+    let (rec_dir, mic_device, loopback_device, live_enabled, models_dir, overlay, junk_phrases) = {
         let s = state.settings.lock().unwrap();
         (
             s.rec_tmp_dir(),
@@ -56,24 +56,29 @@ pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64,
             s.live_transcribe,
             s.models_dir(),
             s.caption_overlay,
+            s.junk_phrases.clone(),
         )
     };
 
     // Live captions: best-effort — needs the Parakeet model on disk.
     let live_tx = if live_enabled {
         let live_app = app.clone();
-        let tx = crate::live_transcribe::spawn(models_dir, move |track, start_ms, end_ms, text| {
-            let _ = live_app.emit(
-                events::LIVE_TRANSCRIPT,
-                events::LiveTranscript {
-                    meeting_id: id,
-                    track,
-                    start_ms,
-                    end_ms,
-                    text,
-                },
-            );
-        });
+        let tx = crate::live_transcribe::spawn(
+            models_dir,
+            junk_phrases,
+            move |track, start_ms, end_ms, text| {
+                let _ = live_app.emit(
+                    events::LIVE_TRANSCRIPT,
+                    events::LiveTranscript {
+                        meeting_id: id,
+                        track,
+                        start_ms,
+                        end_ms,
+                        text,
+                    },
+                );
+            },
+        );
         if tx.is_none() {
             log::info!("live captions off: Parakeet model not downloaded");
         }
@@ -454,6 +459,7 @@ pub fn delete_meeting(app: AppHandle, state: State<'_, AppState>, id: i64) -> Re
         let _ = state.db.restore_meeting(id);
         return Err(format!("Cannot delete this meeting yet: {error:#}"));
     }
+    rematch_speakers(app.clone());
     let _ = app.emit(events::MEETINGS_CHANGED, ());
     Ok(())
 }
@@ -461,6 +467,7 @@ pub fn delete_meeting(app: AppHandle, state: State<'_, AppState>, id: i64) -> Re
 #[tauri::command]
 pub fn restore_meeting(app: AppHandle, state: State<'_, AppState>, id: i64) -> Result<(), String> {
     state.db.restore_meeting(id).map_err(err)?;
+    rematch_speakers(app.clone());
     let _ = app.emit(events::MEETINGS_CHANGED, ());
     Ok(())
 }
@@ -579,10 +586,27 @@ fn is_generic_name(name: &str) -> bool {
         || (lower.starts_with("speaker") && lower[7..].trim().chars().all(|c| c.is_ascii_digit()))
 }
 
-/// Renaming a remote speaker is also the enrollment gesture: the speaker's
-/// stored voice print is folded into (or creates) the named person, so
-/// future meetings auto-label them. Auto-matches never touch prints —
-/// only these explicit renames do.
+fn rematch_speakers(app: AppHandle) {
+    std::thread::Builder::new()
+        .name("rematch".into())
+        .spawn(move || {
+            let state = app.state::<AppState>();
+            let threshold = state.settings.lock().unwrap().speaker_match_threshold;
+            match crate::speaker_id::rematch_all(&state.db, threshold) {
+                Ok(0) => {}
+                Ok(n) => {
+                    log::info!("retroactive voice re-match updated {n} speaker label(s)");
+                    let _ = app.emit(events::MEETINGS_CHANGED, ());
+                }
+                Err(e) => log::warn!("retroactive re-match failed: {e:#}"),
+            }
+        })
+        .ok();
+}
+
+/// Renaming a remote speaker is also the enrollment gesture. Its person's
+/// print is rebuilt from every explicit link in the same transaction, so
+/// retries and reassignment cannot count the same speaker twice.
 #[tauri::command]
 pub fn rename_speaker(
     app: AppHandle,
@@ -594,75 +618,11 @@ pub fn rename_speaker(
     if name.is_empty() {
         return Err("Name cannot be empty".into());
     }
-    let mut person_id = None;
-    if !is_generic_name(name) {
-        if let Some((label, embedding, secs)) =
-            state.db.get_speaker_embedding(speaker_id).map_err(err)?
-        {
-            if label != "me" {
-                // Always link a person (so stats unify across meetings);
-                // fold in the voice print only when this speaker has one.
-                let existing = state.db.get_person_by_name(name).map_err(err)?;
-                person_id = Some(match (existing, embedding) {
-                    (Some(person), Some(embedding)) => {
-                        let (merged, total) = if person.embedding.is_empty() {
-                            (embedding, secs)
-                        } else {
-                            (
-                                crate::speaker_id::merge_embeddings(
-                                    &person.embedding,
-                                    person.sample_seconds,
-                                    &embedding,
-                                    secs,
-                                ),
-                                person.sample_seconds + secs,
-                            )
-                        };
-                        state
-                            .db
-                            .update_person_embedding(person.id, &merged, total)
-                            .map_err(err)?;
-                        log::info!("folded {secs:.0}s of speech into voice print for {name}");
-                        person.id
-                    }
-                    (Some(person), None) => person.id,
-                    (None, Some(embedding)) => {
-                        log::info!("enrolled new person {name} ({secs:.0}s of speech)");
-                        state
-                            .db
-                            .create_person(name, &embedding, secs)
-                            .map_err(err)?
-                    }
-                    (None, None) => state.db.create_person(name, &[], 0.0).map_err(err)?,
-                });
-            }
-        }
-    }
     state
         .db
-        .rename_speaker(speaker_id, name, person_id)
+        .rename_speaker(speaker_id, name, !is_generic_name(name))
         .map_err(err)?;
-
-    // Enrollment changed the people set: retroactively re-match all stored
-    // voice prints in the background (cheap — pure cosine over the DB).
-    if person_id.is_some() {
-        let rematch_app = app.clone();
-        std::thread::Builder::new()
-            .name("rematch".into())
-            .spawn(move || {
-                let state = rematch_app.state::<AppState>();
-                let threshold = state.settings.lock().unwrap().speaker_match_threshold;
-                match crate::speaker_id::rematch_all(&state.db, threshold) {
-                    Ok(0) => {}
-                    Ok(n) => {
-                        log::info!("retroactive voice re-match updated {n} speaker label(s)");
-                        let _ = rematch_app.emit(events::MEETINGS_CHANGED, ());
-                    }
-                    Err(e) => log::warn!("retroactive re-match failed: {e:#}"),
-                }
-            })
-            .ok();
-    }
+    rematch_speakers(app);
     Ok(())
 }
 
@@ -697,19 +657,8 @@ pub fn delete_person(
     person_id: i64,
 ) -> Result<(), String> {
     state.db.delete_person(person_id).map_err(err)?;
-    // Revert any auto labels that pointed at the deleted person.
-    let threshold = state.settings.lock().unwrap().speaker_match_threshold;
-    std::thread::Builder::new()
-        .name("rematch".into())
-        .spawn(move || {
-            let state = app.state::<AppState>();
-            if let Ok(n) = crate::speaker_id::rematch_all(&state.db, threshold) {
-                if n > 0 {
-                    let _ = app.emit(events::MEETINGS_CHANGED, ());
-                }
-            }
-        })
-        .ok();
+    // Revert or reassign automatic labels that pointed at the deleted person.
+    rematch_speakers(app);
     Ok(())
 }
 

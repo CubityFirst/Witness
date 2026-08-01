@@ -88,6 +88,7 @@ export interface SettingsData {
   caption_overlay: boolean;
   speaker_match_threshold: number;
   watch_patterns: string[];
+  junk_phrases: string[];
   opus_bitrate_kbps: number;
   mic_device?: string | null;
   loopback_device?: string | null;
@@ -133,6 +134,9 @@ export interface ModelInfo {
   display_name: string;
   present: boolean;
   size_mb: number | null;
+  expected_revision: string;
+  installed_revision: string | null;
+  integrity_error: string | null;
 }
 
 export interface GpuStatus {

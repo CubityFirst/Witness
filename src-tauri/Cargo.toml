@@ -33,6 +33,8 @@ ogg = "0.9"
 # with parakeet-rs (ort 2.0.0-rc.12), so we use earshot instead.
 earshot = "1.1"
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
+sha2 = "0.10"
+hex = "0.4"
 parakeet-rs = { version = "0.3", features = ["cuda", "sortformer"] }
 whisper-rs = "0.14"
 # Speaker embeddings run through our own ort session; version MUST stay
