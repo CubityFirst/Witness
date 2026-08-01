@@ -39,7 +39,9 @@ impl AsrEngine for WhisperEngine {
             .unwrap_or(4);
         params.set_n_threads(threads.min(8));
 
-        state.full(params, samples_16k).context("Whisper inference")?;
+        state
+            .full(params, samples_16k)
+            .context("Whisper inference")?;
 
         let n = state.full_n_segments().context("segment count")?;
         let mut segments = Vec::with_capacity(n as usize);
@@ -76,11 +78,15 @@ mod tests {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("target/debug/models"));
         std::fs::create_dir_all(&models_dir).unwrap();
-        crate::models::download(crate::settings::Engine::Whisper, &models_dir, |m, f, d, t| {
-            if let Some(t) = t {
-                println!("{m}/{f}: {} / {} MB", d / 1_000_000, t / 1_000_000);
-            }
-        })
+        crate::models::download(
+            crate::settings::Engine::Whisper,
+            &models_dir,
+            |m, f, d, t| {
+                if let Some(t) = t {
+                    println!("{m}/{f}: {} / {} MB", d / 1_000_000, t / 1_000_000);
+                }
+            },
+        )
         .unwrap();
 
         let wav = std::env::temp_dir().join("witness-tts.wav");

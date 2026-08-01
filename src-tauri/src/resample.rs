@@ -17,7 +17,10 @@ pub struct StreamResampler {
 impl StreamResampler {
     pub fn new(in_rate: u32, out_rate: u32) -> Result<StreamResampler> {
         if in_rate == out_rate {
-            return Ok(StreamResampler { inner: None, pending: Vec::new() });
+            return Ok(StreamResampler {
+                inner: None,
+                pending: Vec::new(),
+            });
         }
         let params = SincInterpolationParameters {
             sinc_len: 128,
@@ -26,14 +29,12 @@ impl StreamResampler {
             oversampling_factor: 128,
             window: WindowFunction::Blackman2,
         };
-        let inner = SincFixedIn::<f32>::new(
-            out_rate as f64 / in_rate as f64,
-            1.1,
-            params,
-            CHUNK,
-            1,
-        )?;
-        Ok(StreamResampler { inner: Some(inner), pending: Vec::new() })
+        let inner =
+            SincFixedIn::<f32>::new(out_rate as f64 / in_rate as f64, 1.1, params, CHUNK, 1)?;
+        Ok(StreamResampler {
+            inner: Some(inner),
+            pending: Vec::new(),
+        })
     }
 
     /// Feed input samples; returns whatever output is ready.
@@ -112,12 +113,19 @@ mod tests {
     fn downsample_48k_to_16k() {
         let input = sine(48_000, 2.0, 300.0);
         let out = resample_all(&input, 48_000, 16_000).unwrap();
-        assert!((out.len() as i64 - 32_000).unsigned_abs() < 700, "length {}", out.len());
+        assert!(
+            (out.len() as i64 - 32_000).unsigned_abs() < 700,
+            "length {}",
+            out.len()
+        );
     }
 
     #[test]
     fn passthrough_when_rates_match() {
         let input = sine(48_000, 0.1, 440.0);
-        assert_eq!(resample_all(&input, 48_000, 48_000).unwrap().len(), input.len());
+        assert_eq!(
+            resample_all(&input, 48_000, 48_000).unwrap().len(),
+            input.len()
+        );
     }
 }

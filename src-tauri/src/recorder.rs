@@ -128,7 +128,10 @@ impl Track {
         }
         self.written += count;
         if let Some(live) = &self.live {
-            let _ = live.send(LiveMsg::Silence { kind: self.kind, count_48k: count });
+            let _ = live.send(LiveMsg::Silence {
+                kind: self.kind,
+                count_48k: count,
+            });
         }
         Ok(())
     }
@@ -156,12 +159,14 @@ pub fn start(
     live: Option<crossbeam_channel::Sender<LiveMsg>>,
     on_level: impl Fn(f32, f32, u64) + Send + 'static,
 ) -> Result<RecorderHandle> {
-    std::fs::create_dir_all(rec_dir)
-        .with_context(|| format!("creating {}", rec_dir.display()))?;
+    std::fs::create_dir_all(rec_dir).with_context(|| format!("creating {}", rec_dir.display()))?;
     let (mic_path, loop_path, meta_path) = wav_paths(rec_dir, meeting_id);
     let started_at = chrono::Local::now();
 
-    let meta = RecMeta { meeting_id, started_at: started_at.to_rfc3339() };
+    let meta = RecMeta {
+        meeting_id,
+        started_at: started_at.to_rfc3339(),
+    };
     std::fs::write(&meta_path, toml::to_string(&meta)?)
         .with_context(|| format!("writing {}", meta_path.display()))?;
 
@@ -172,7 +177,12 @@ pub fn start(
     let (tx, rx) = crossbeam_channel::unbounded::<CaptureMsg>();
     let captures = vec![
         spawn_capture(TrackKind::Mic, stop.clone(), tx.clone(), mic_device),
-        spawn_capture(TrackKind::Loopback, stop.clone(), tx.clone(), loopback_device),
+        spawn_capture(
+            TrackKind::Loopback,
+            stop.clone(),
+            tx.clone(),
+            loopback_device,
+        ),
     ];
     drop(tx); // writer sees Disconnected once both capture threads exit
 
@@ -200,12 +210,19 @@ pub fn start(
                         }
                         track.resampler = Some(StreamResampler::new(sample_rate, TARGET_RATE)?);
                     }
-                    Ok(CaptureMsg::Packet { kind, samples, qpc_100ns }) => {
-                        let track = if kind == TrackKind::Mic { &mut mic } else { &mut lop };
+                    Ok(CaptureMsg::Packet {
+                        kind,
+                        samples,
+                        qpc_100ns,
+                    }) => {
+                        let track = if kind == TrackKind::Mic {
+                            &mut mic
+                        } else {
+                            &mut lop
+                        };
                         if track.resampler.is_none() {
                             // Packet before Format shouldn't happen; be safe.
-                            track.resampler =
-                                Some(StreamResampler::new(TARGET_RATE, TARGET_RATE)?);
+                            track.resampler = Some(StreamResampler::new(TARGET_RATE, TARGET_RATE)?);
                         }
                         let mut skip = 0usize;
                         if qpc_100ns != 0 {
@@ -224,8 +241,7 @@ pub fn start(
                                 // (Skip counted in 48 kHz samples but applied
                                 // at device rate — coarse on purpose; the
                                 // threshold keeps it from thrashing.)
-                                skip = ((track.written - expected - GAP_THRESHOLD / 2)
-                                    as usize)
+                                skip = ((track.written - expected - GAP_THRESHOLD / 2) as usize)
                                     .min(samples.len());
                             }
                         }
@@ -307,7 +323,11 @@ mod tests {
         std::thread::sleep(Duration::from_secs(4));
         let stats = handle.stop().unwrap();
         println!("recorded {} ms", stats.duration_ms);
-        assert!(stats.duration_ms >= 2_500, "too short: {} ms", stats.duration_ms);
+        assert!(
+            stats.duration_ms >= 2_500,
+            "too short: {} ms",
+            stats.duration_ms
+        );
 
         let (mic, lop, meta) = wav_paths(&dir, 1);
         assert!(meta.exists());

@@ -15,8 +15,7 @@ pub const TRAY_ID: &str = "witness-tray";
 static POPUP_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// When the flyout appeared — programmatic move/resize during opening must
 /// not count as the user "arranging" it.
-static POPUP_SHOWN_AT: std::sync::Mutex<Option<std::time::Instant>> =
-    std::sync::Mutex::new(None);
+static POPUP_SHOWN_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
 pub fn take_popup_mode() -> bool {
     POPUP_MODE.swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -73,9 +72,10 @@ fn show_main(app: &AppHandle) {
 /// monitor's work area so it never draws under the taskbar.
 fn show_popup(app: &AppHandle, click: tauri::PhysicalPosition<f64>) {
     if let Some(window) = app.get_webview_window("main") {
-        let size = window
-            .outer_size()
-            .unwrap_or(tauri::PhysicalSize { width: 460, height: 360 });
+        let size = window.outer_size().unwrap_or(tauri::PhysicalSize {
+            width: 460,
+            height: 360,
+        });
         let (w, h) = (size.width as i32, size.height as i32);
 
         let (mut x, mut y) = (click.x as i32 - w + 20, click.y as i32 - h - 12);
@@ -107,7 +107,11 @@ pub fn build(app: &App) -> tauri::Result<()> {
     let menu = Menu::with_items(app, &[&open, &sep1, &record, &status, &sep2, &quit])?;
 
     TrayIconBuilder::with_id(TRAY_ID)
-        .icon(app.default_window_icon().expect("bundled window icon").clone())
+        .icon(
+            app.default_window_icon()
+                .expect("bundled window icon")
+                .clone(),
+        )
         .tooltip("Witness — idle")
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -119,7 +123,7 @@ pub fn build(app: &App) -> tauri::Result<()> {
                     .recorder
                     .lock()
                     .unwrap()
-                    .is_some();
+                    .is_recording();
                 let result = if recording {
                     commands::do_stop_recording(app, true)
                 } else {
@@ -131,7 +135,13 @@ pub fn build(app: &App) -> tauri::Result<()> {
             }
             "quit" => {
                 // Finalize any active recording before exiting.
-                if app.state::<AppState>().recorder.lock().unwrap().is_some() {
+                if app
+                    .state::<AppState>()
+                    .recorder
+                    .lock()
+                    .unwrap()
+                    .is_recording()
+                {
                     if let Err(e) = commands::do_stop_recording(app, true) {
                         log::error!("stopping recording on quit: {e}");
                     }
@@ -149,7 +159,11 @@ pub fn build(app: &App) -> tauri::Result<()> {
             } => {
                 show_popup(tray.app_handle(), position);
             }
-            TrayIconEvent::DoubleClick { button: MouseButton::Left, position, .. } => {
+            TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                position,
+                ..
+            } => {
                 show_popup(tray.app_handle(), position);
             }
             _ => {}
@@ -163,9 +177,11 @@ pub fn build(app: &App) -> tauri::Result<()> {
 /// Reflect recording state in the tray menu, tooltip and icon (red = live).
 pub fn update(app: &AppHandle, recording: bool) {
     if let Some(handles) = app.try_state::<TrayHandles>() {
-        let _ = handles
-            .record
-            .set_text(if recording { "Stop recording" } else { "Record now" });
+        let _ = handles.record.set_text(if recording {
+            "Stop recording"
+        } else {
+            "Record now"
+        });
         let _ = handles
             .status
             .set_text(if recording { "● Recording" } else { "Idle" });

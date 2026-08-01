@@ -20,7 +20,7 @@ use audiopus::{Application, Channels, SampleRate};
 use ogg::writing::PacketWriteEndInfo;
 use ogg::{PacketReader, PacketWriter};
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 
 /// 20 ms @ 48 kHz.
@@ -48,6 +48,9 @@ pub fn encode_opus(
         }
     }
     let total_samples = mic.len().max(lop.len()) as u64;
+    if total_samples == 0 {
+        bail!("cannot archive an empty recording");
+    }
 
     let mut encoder = Encoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Voip)
         .context("creating Opus encoder")?;
@@ -126,11 +129,29 @@ pub fn encode_opus(
         };
         writer.write_packet(packet[..n].to_vec(), serial, end_info, granule)?;
 
-        if encoded_samples % (FRAME as u64 * 250) == 0 {
+        if encoded_samples.is_multiple_of(FRAME as u64 * 250) {
             progress((encoded_samples as f32 / total_samples as f32).min(1.0));
         }
     }
-    drop(writer);
+    // BufWriter::drop intentionally ignores flush errors.  Extract and flush
+    // it explicitly so disk-full and device errors are reported before the
+    // temporary archive is promoted into place.
+    let mut buffered = writer.into_inner();
+    buffered.flush().context("flushing Ogg archive")?;
+    let file = buffered
+        .into_inner()
+        .map_err(|e| e.into_error())
+        .context("finalizing Ogg archive")?;
+    file.sync_all().context("syncing Ogg archive")?;
+
+    // A previous attempt can have completed the rename but failed before the
+    // DB path was committed.  Windows does not replace an existing target via
+    // std::fs::rename, so remove that unreferenced retry artifact first.  The
+    // source WAVs remain intact until the caller commits the DB update.
+    if out_path.exists() {
+        std::fs::remove_file(out_path)
+            .with_context(|| format!("removing stale {}", out_path.display()))?;
+    }
     std::fs::rename(&tmp_path, out_path)
         .with_context(|| format!("renaming {} into place", tmp_path.display()))?;
     progress(1.0);
@@ -173,12 +194,11 @@ fn has_mix_tag(data: &[u8]) -> bool {
 /// f32 tracks at 48 kHz, undoing the comfort mix when the file has one
 /// (legacy files were hard-panned L=mic / R=loopback).
 pub fn decode_opus(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
-    let file = BufReader::new(
-        File::open(path).with_context(|| format!("opening {}", path.display()))?,
-    );
+    let file =
+        BufReader::new(File::open(path).with_context(|| format!("opening {}", path.display()))?);
     let mut reader = PacketReader::new(file);
-    let mut decoder = Decoder::new(SampleRate::Hz48000, Channels::Stereo)
-        .context("creating Opus decoder")?;
+    let mut decoder =
+        Decoder::new(SampleRate::Hz48000, Channels::Stereo).context("creating Opus decoder")?;
 
     let mut mic = Vec::new();
     let mut lop = Vec::new();
@@ -272,7 +292,10 @@ mod tests {
                 n += 1;
             }
         }
-        (((l2 / n as f64) as f32).sqrt(), ((r2 / n as f64) as f32).sqrt())
+        (
+            ((l2 / n as f64) as f32).sqrt(),
+            ((r2 / n as f64) as f32).sqrt(),
+        )
     }
 
     #[test]
@@ -295,8 +318,14 @@ mod tests {
         // stronger on the left (0.75 vs 0.25).
         let (raw_l, raw_r) = raw_channel_rms(&out);
         assert!(raw_l > 0.1, "left ear silent (rms {raw_l})");
-        assert!(raw_r > 0.03, "right ear silent — comfort mix missing (rms {raw_r})");
-        assert!(raw_l > raw_r * 2.0, "expected mic biased left ({raw_l} vs {raw_r})");
+        assert!(
+            raw_r > 0.03,
+            "right ear silent — comfort mix missing (rms {raw_r})"
+        );
+        assert!(
+            raw_l > raw_r * 2.0,
+            "expected mic biased left ({raw_l} vs {raw_r})"
+        );
 
         // Retranscription: unmix must recover the separated tracks.
         let (mic_dec, lop_dec) = decode_opus(&out).unwrap();

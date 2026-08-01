@@ -199,7 +199,11 @@ mod tests {
             })
             .collect();
         for c in chunk_speech(&noise) {
-            assert!(c.samples.len() <= 240 * 16_000, "chunk too long: {}", c.samples.len());
+            assert!(
+                c.samples.len() <= 240 * 16_000,
+                "chunk too long: {}",
+                c.samples.len()
+            );
         }
     }
 }

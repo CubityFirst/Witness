@@ -1,4 +1,4 @@
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import {
   listPeople,
   search,
@@ -42,6 +42,7 @@ export function SearchView(props: {
   const [who, setWho] = useState("");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
+  const requestGeneration = useRef(0);
 
   const filters = (): SearchFilters => ({
     personId: who.startsWith("p") ? parseInt(who.slice(1), 10) : null,
@@ -50,14 +51,20 @@ export function SearchView(props: {
     dateTo: dateTo || null,
   });
 
-  const load = (offset: number, append: boolean) =>
-    search(props.query, offset, filters())
+  const load = (offset: number, append: boolean) => {
+    const generation = ++requestGeneration.current;
+    return search(props.query, offset, filters())
       .then((rows) => {
+        if (generation !== requestGeneration.current) return;
+        const transcriptHits = rows.filter((row) => row.segment_id > 0).length;
         setError(null);
-        setHasMore(rows.length >= PAGE);
+        setHasMore(transcriptHits >= PAGE);
         setHits((prev) => (append ? [...prev, ...rows] : rows));
       })
-      .catch((e) => setError(String(e)));
+      .catch((e) => {
+        if (generation === requestGeneration.current) setError(String(e));
+      });
+  };
 
   useEffect(() => {
     listPeople().then(setPeople).catch(() => {});
@@ -65,6 +72,9 @@ export function SearchView(props: {
 
   useEffect(() => {
     load(0, false);
+    return () => {
+      requestGeneration.current += 1;
+    };
   }, [props.query, who, dateFrom, dateTo]);
 
   // Group consecutive hits by meeting (results come ordered by relevance,
@@ -153,7 +163,12 @@ export function SearchView(props: {
         </div>
       ))}
       {hasMore && (
-        <button class="btn btn-ghost" onClick={() => load(hits.length, true)}>
+        <button
+          class="btn btn-ghost"
+          onClick={() =>
+            load(hits.filter((hit) => hit.segment_id > 0).length, true)
+          }
+        >
           Load more
         </button>
       )}

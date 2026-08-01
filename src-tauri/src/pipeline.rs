@@ -21,12 +21,22 @@ pub struct Job {
 
 #[derive(Debug)]
 pub enum PipelineEvent {
-    Progress { meeting_id: i64, stage: &'static str, pct: f32 },
+    Progress {
+        meeting_id: i64,
+        stage: &'static str,
+        pct: f32,
+    },
     /// `rtf` = audio seconds per wall-clock second of transcription (a low
     /// number on a GPU box usually means the CUDA EP silently fell back to
     /// CPU — surfaced so that failure mode is visible).
-    Complete { meeting_id: i64, rtf: Option<f32> },
-    Failed { meeting_id: i64, error: String },
+    Complete {
+        meeting_id: i64,
+        rtf: Option<f32>,
+    },
+    Failed {
+        meeting_id: i64,
+        error: String,
+    },
 }
 
 pub struct Pipeline {
@@ -98,7 +108,11 @@ fn process(
 ) -> Result<Option<f32>> {
     let meeting_id = job.meeting_id;
     let progress = |stage: &'static str, pct: f32| {
-        on_event(PipelineEvent::Progress { meeting_id, stage, pct: pct * 100.0 });
+        on_event(PipelineEvent::Progress {
+            meeting_id,
+            stage,
+            pct: pct * 100.0,
+        });
     };
 
     let meeting = db
@@ -126,7 +140,10 @@ fn process(
     } else if let Some(rel) = &meeting.audio_path {
         let path = audio_dir.join(rel);
         if !path.exists() {
-            bail!("no source audio: WAVs cleaned up and {} missing", path.display());
+            bail!(
+                "no source audio: WAVs cleaned up and {} missing",
+                path.display()
+            );
         }
         encoder::decode_opus(&path)?
     } else {

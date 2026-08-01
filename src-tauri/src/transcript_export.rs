@@ -41,7 +41,13 @@ fn clock(ms: i64) -> String {
 /// SRT wants `HH:MM:SS,mmm`, VTT wants `HH:MM:SS.mmm`.
 fn stamp(ms: i64, sep: char) -> String {
     let s = ms / 1000;
-    format!("{:02}:{:02}:{:02}{sep}{:03}", s / 3600, (s % 3600) / 60, s % 60, ms % 1000)
+    format!(
+        "{:02}:{:02}:{:02}{sep}{:03}",
+        s / 3600,
+        (s % 3600) / 60,
+        s % 60,
+        ms % 1000
+    )
 }
 
 pub fn render(db: &Db, meeting_id: i64, format: ExportFormat) -> Result<String> {
@@ -60,7 +66,13 @@ pub fn render(db: &Db, meeting_id: i64, format: ExportFormat) -> Result<String> 
     let name_of = |seg: &crate::db::Segment| -> String {
         seg.speaker_id
             .and_then(|id| speakers.get(&id).cloned())
-            .unwrap_or_else(|| if seg.track == "mic" { "Me".into() } else { "Them".into() })
+            .unwrap_or_else(|| {
+                if seg.track == "mic" {
+                    "Me".into()
+                } else {
+                    "Them".into()
+                }
+            })
     };
 
     let mut out = String::new();
@@ -84,7 +96,12 @@ pub fn render(db: &Db, meeting_id: i64, format: ExportFormat) -> Result<String> 
         ExportFormat::Text => {
             out.push_str(&format!("{}\n{}\n\n", meeting.title, meeting.started_at));
             for seg in &segments {
-                out.push_str(&format!("[{}] {}: {}\n", clock(seg.start_ms), name_of(seg), seg.text));
+                out.push_str(&format!(
+                    "[{}] {}: {}\n",
+                    clock(seg.start_ms),
+                    name_of(seg),
+                    seg.text
+                ));
             }
         }
         ExportFormat::Srt => {

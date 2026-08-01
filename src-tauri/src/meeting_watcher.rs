@@ -146,10 +146,11 @@ pub fn spawn(
 
                 if !in_meeting && mic_active && active_ticks >= START_TICKS {
                     in_meeting = true;
-                    if enabled && !control.suppressed.load(Ordering::Relaxed) {
-                        if !send(WatcherCommand::StartMeeting) {
-                            return;
-                        }
+                    if enabled
+                        && !control.suppressed.load(Ordering::Relaxed)
+                        && !send(WatcherCommand::StartMeeting)
+                    {
+                        return;
                     }
                 } else if in_meeting && !mic_active && inactive_ticks >= STOP_TICKS {
                     in_meeting = false;
@@ -166,7 +167,7 @@ pub fn spawn(
                     mic_in_use: mic_active,
                     suppressed: control.suppressed.load(Ordering::Relaxed),
                 };
-                let changed = last_status.as_ref().map_or(true, |s| {
+                let changed = last_status.as_ref().is_none_or(|s| {
                     s.enabled != status.enabled
                         || s.teams_key_found != status.teams_key_found
                         || s.mic_in_use != status.mic_in_use

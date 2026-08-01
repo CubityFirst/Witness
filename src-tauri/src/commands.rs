@@ -7,7 +7,7 @@ use crate::events;
 use crate::models::ModelInfo;
 use crate::pipeline::Job;
 use crate::settings::{Engine, Settings};
-use crate::state::AppState;
+use crate::state::{AppState, RecorderState};
 use crate::{models, recorder, tray};
 use serde::Serialize;
 use std::sync::atomic::Ordering;
@@ -32,15 +32,21 @@ pub fn toast(app: &AppHandle, body: &str) {
 pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64, String> {
     let state = app.state::<AppState>();
     let mut rec = state.recorder.lock().unwrap();
-    if rec.is_some() {
+    if rec.is_busy() {
         return Err("Already recording".into());
     }
+    *rec = RecorderState::Starting;
+    drop(rec);
+
     let now = chrono::Local::now();
     let title = format!("Meeting {}", now.format("%Y-%m-%d %H:%M"));
-    let id = state
-        .db
-        .create_meeting(&title, &now.to_rfc3339(), trigger)
-        .map_err(err)?;
+    let id = match state.db.create_meeting(&title, &now.to_rfc3339(), trigger) {
+        Ok(id) => id,
+        Err(e) => {
+            *state.recorder.lock().unwrap() = RecorderState::Idle;
+            return Err(err(e));
+        }
+    };
     let (rec_dir, mic_device, loopback_device, live_enabled, models_dir, overlay) = {
         let s = state.settings.lock().unwrap();
         (
@@ -59,7 +65,13 @@ pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64,
         let tx = crate::live_transcribe::spawn(models_dir, move |track, start_ms, end_ms, text| {
             let _ = live_app.emit(
                 events::LIVE_TRANSCRIPT,
-                events::LiveTranscript { meeting_id: id, track, start_ms, end_ms, text },
+                events::LiveTranscript {
+                    meeting_id: id,
+                    track,
+                    start_ms,
+                    end_ms,
+                    text,
+                },
             );
         });
         if tx.is_none() {
@@ -72,20 +84,54 @@ pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64,
     let live_started = live_tx.is_some();
 
     let level_app = app.clone();
-    let handle = recorder::start(&rec_dir, id, mic_device, loopback_device, live_tx, move |mic_rms, loopback_rms, elapsed_ms| {
-        let _ = level_app.emit(
-            events::RECORDING_LEVEL,
-            events::RecordingLevel { mic_rms, loopback_rms, elapsed_ms },
-        );
-    })
-    .map_err(err)?;
+    let handle = recorder::start(
+        &rec_dir,
+        id,
+        mic_device,
+        loopback_device,
+        live_tx,
+        move |mic_rms, loopback_rms, elapsed_ms| {
+            let _ = level_app.emit(
+                events::RECORDING_LEVEL,
+                events::RecordingLevel {
+                    mic_rms,
+                    loopback_rms,
+                    elapsed_ms,
+                },
+            );
+        },
+    );
+    let handle = match handle {
+        Ok(handle) => handle,
+        Err(e) => {
+            // Recorder startup may have created a sidecar or one WAV before a
+            // later step failed.  Roll back both filesystem and DB state so a
+            // failed Start never leaves a phantom active meeting.
+            let (mic, lop, meta) = recorder::wav_paths(&rec_dir, id);
+            for path in [mic, lop, meta] {
+                if let Err(remove_err) = std::fs::remove_file(&path) {
+                    if remove_err.kind() != std::io::ErrorKind::NotFound {
+                        log::warn!("failed to roll back {}: {remove_err}", path.display());
+                    }
+                }
+            }
+            if let Err(db_err) = state.db.delete_meeting(id) {
+                log::error!("failed to roll back meeting {id}: {db_err:#}");
+            }
+            *state.recorder.lock().unwrap() = RecorderState::Idle;
+            return Err(err(e));
+        }
+    };
     *state.recording_trigger.lock().unwrap() = trigger;
-    *rec = Some(handle);
-    drop(rec);
+    *state.recorder.lock().unwrap() = RecorderState::Recording(handle);
 
     let _ = app.emit(
         events::RECORDING_STARTED,
-        events::RecordingStarted { meeting_id: id, trigger, started_at: now.to_rfc3339() },
+        events::RecordingStarted {
+            meeting_id: id,
+            trigger,
+            started_at: now.to_rfc3339(),
+        },
     );
     let _ = app.emit(events::MEETINGS_CHANGED, ());
     tray::update(app, true);
@@ -105,10 +151,12 @@ pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64,
                     std::thread::sleep(std::time::Duration::from_secs(delay_s));
                     let state = title_app.state::<AppState>();
                     // Stop if the recording ended or the user renamed it.
-                    if state.recorder.lock().unwrap().as_ref().map(|r| r.meeting_id) != Some(id) {
+                    if state.recorder.lock().unwrap().meeting_id() != Some(id) {
                         return;
                     }
-                    let Ok(Some(meeting)) = state.db.get_meeting(id) else { return };
+                    let Ok(Some(meeting)) = state.db.get_meeting(id) else {
+                        return;
+                    };
                     if !meeting.title.starts_with("Meeting 2") {
                         return; // user already renamed
                     }
@@ -160,12 +208,27 @@ fn close_captions_overlay(app: &AppHandle) {
 
 pub fn do_stop_recording(app: &AppHandle, by_user: bool) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let handle = state
-        .recorder
-        .lock()
-        .unwrap()
-        .take()
-        .ok_or("Not recording")?;
+    let handle = {
+        let mut recorder = state.recorder.lock().unwrap();
+        match std::mem::replace(&mut *recorder, RecorderState::Idle) {
+            RecorderState::Recording(handle) => {
+                *recorder = RecorderState::Stopping {
+                    meeting_id: handle.meeting_id,
+                    started_at: handle.started_at,
+                };
+                handle
+            }
+            RecorderState::Starting => {
+                *recorder = RecorderState::Starting;
+                return Err("Recording is still starting".into());
+            }
+            stopping @ RecorderState::Stopping { .. } => {
+                *recorder = stopping;
+                return Err("Recording is already stopping".into());
+            }
+            RecorderState::Idle => return Err("Not recording".into()),
+        }
+    };
     let id = handle.meeting_id;
 
     // Manual stop during a live call: don't auto-restart until the call ends.
@@ -173,18 +236,56 @@ pub fn do_stop_recording(app: &AppHandle, by_user: bool) -> Result<(), String> {
         state.watcher.suppressed.store(true, Ordering::Relaxed);
     }
 
-    let stats = handle.stop().map_err(err)?;
-    state
-        .db
-        .finish_recording(id, &chrono::Local::now().to_rfc3339(), stats.duration_ms as i64)
-        .map_err(err)?;
-    let _ = app.emit(events::RECORDING_STOPPED, events::RecordingStopped { meeting_id: id });
+    let stats = match handle.stop() {
+        Ok(stats) => stats,
+        Err(e) => {
+            *state.recorder.lock().unwrap() = RecorderState::Idle;
+            tray::update(app, false);
+            close_captions_overlay(app);
+            let _ = app.emit(
+                events::RECORDING_STOPPED,
+                events::RecordingStopped { meeting_id: id },
+            );
+            let _ = app.emit(events::MEETINGS_CHANGED, ());
+            return Err(format!(
+                "Recording stopped but its WAV files could not be finalized: {:#}. Restart Witness to recover them.",
+                e
+            ));
+        }
+    };
+    if let Err(e) = state.db.finish_recording(
+        id,
+        &chrono::Local::now().to_rfc3339(),
+        stats.duration_ms as i64,
+    ) {
+        *state.recorder.lock().unwrap() = RecorderState::Idle;
+        tray::update(app, false);
+        close_captions_overlay(app);
+        let _ = app.emit(
+            events::RECORDING_STOPPED,
+            events::RecordingStopped { meeting_id: id },
+        );
+        let _ = app.emit(events::MEETINGS_CHANGED, ());
+        return Err(format!(
+            "Recording stopped but could not be saved to the database: {:#}. Restart Witness to recover it.",
+            e
+        ));
+    }
+    *state.recorder.lock().unwrap() = RecorderState::Idle;
+    let _ = app.emit(
+        events::RECORDING_STOPPED,
+        events::RecordingStopped { meeting_id: id },
+    );
     let _ = app.emit(events::MEETINGS_CHANGED, ());
     tray::update(app, false);
     close_captions_overlay(app);
 
     let transcribe = state.settings.lock().unwrap().auto_transcribe;
-    state.pipeline.enqueue(Job { meeting_id: id, transcribe, engine: None });
+    state.pipeline.enqueue(Job {
+        meeting_id: id,
+        transcribe,
+        engine: None,
+    });
     log::info!("recording stopped: meeting {id} ({} ms)", stats.duration_ms);
     Ok(())
 }
@@ -205,9 +306,9 @@ pub struct AppStatus {
 pub fn get_status(state: State<'_, AppState>) -> AppStatus {
     let rec = state.recorder.lock().unwrap();
     AppStatus {
-        recording: rec.is_some(),
-        meeting_id: rec.as_ref().map(|r| r.meeting_id),
-        recording_since: rec.as_ref().map(|r| r.started_at.to_rfc3339()),
+        recording: rec.is_recording(),
+        meeting_id: rec.meeting_id(),
+        recording_since: rec.started_at().map(|t| t.to_rfc3339()),
         transcribing_meeting_id: state.pipeline.current_meeting(),
         queue_len: state.pipeline.queue_len(),
         watcher: state.last_watcher_status.lock().unwrap().clone(),
@@ -234,7 +335,10 @@ pub fn list_meetings(
     offset: i64,
     limit: i64,
 ) -> Result<Vec<Meeting>, String> {
-    state.db.list_meetings(offset, limit.clamp(1, 500)).map_err(err)
+    state
+        .db
+        .list_meetings(offset, limit.clamp(1, 500))
+        .map_err(err)
 }
 
 #[derive(Debug, Serialize)]
@@ -276,8 +380,12 @@ pub fn do_bookmark_now(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let (meeting_id, at_ms) = {
         let rec = state.recorder.lock().unwrap();
-        let handle = rec.as_ref().ok_or("Not recording")?;
-        let elapsed = (chrono::Local::now() - handle.started_at).num_milliseconds().max(0);
+        let RecorderState::Recording(handle) = &*rec else {
+            return Err("Not recording".into());
+        };
+        let elapsed = (chrono::Local::now() - handle.started_at)
+            .num_milliseconds()
+            .max(0);
         (handle.meeting_id, elapsed)
     };
     state.db.add_bookmark(meeting_id, at_ms, "").map_err(err)?;
@@ -300,7 +408,10 @@ pub fn add_bookmark(
     at_ms: i64,
     note: String,
 ) -> Result<i64, String> {
-    let id = state.db.add_bookmark(meeting_id, at_ms, &note).map_err(err)?;
+    let id = state
+        .db
+        .add_bookmark(meeting_id, at_ms, &note)
+        .map_err(err)?;
     let _ = app.emit(events::MEETINGS_CHANGED, ());
     Ok(id)
 }
@@ -322,7 +433,7 @@ pub fn delete_bookmark(state: State<'_, AppState>, bookmark_id: i64) -> Result<(
 /// "Delete" = move to the recycle bin (auto-purged after 30 days).
 #[tauri::command]
 pub fn delete_meeting(app: AppHandle, state: State<'_, AppState>, id: i64) -> Result<(), String> {
-    if state.recorder.lock().unwrap().as_ref().map(|r| r.meeting_id) == Some(id) {
+    if state.recorder.lock().unwrap().meeting_id() == Some(id) {
         return Err("Stop the recording before deleting this meeting".into());
     }
     state.db.soft_delete_meeting(id).map_err(err)?;
@@ -351,23 +462,65 @@ pub fn list_deleted_meetings(state: State<'_, AppState>) -> Result<Vec<DeletedMe
         .list_deleted_meetings()
         .map_err(err)?
         .into_iter()
-        .map(|(meeting, deleted_at)| DeletedMeeting { meeting, deleted_at })
+        .map(|(meeting, deleted_at)| DeletedMeeting {
+            meeting,
+            deleted_at,
+        })
         .collect())
 }
 
 /// Permanent removal: audio + WAVs + rows. Shared by the bin UI and the
 /// 30-day auto-purge.
+fn remove_if_exists(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("deleting {}: {e}", path.display())),
+    }
+}
+
+fn safe_archive_path(root: &std::path::Path, relative: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::{Component, Path};
+
+    let relative = Path::new(relative);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err("meeting has an invalid archived-audio path".into());
+    }
+    Ok(root.join(relative))
+}
+
 pub fn purge_meeting_data(state: &AppState, id: i64) -> Result<(), String> {
-    let meeting = state.db.get_meeting(id).map_err(err)?;
+    let is_binned = state
+        .db
+        .list_deleted_meetings()
+        .map_err(err)?
+        .iter()
+        .any(|(meeting, _)| meeting.id == id);
+    if !is_binned {
+        return Err("Only meetings in the recycle bin can be permanently deleted".into());
+    }
+    let meeting = state
+        .db
+        .get_meeting(id)
+        .map_err(err)?
+        .ok_or_else(|| format!("meeting {id} not found"))?;
     let s = state.settings.lock().unwrap();
-    if let Some(Some(rel)) = meeting.map(|m| m.audio_path) {
-        let _ = std::fs::remove_file(s.audio_dir().join(rel));
+    if let Some(rel) = meeting.audio_path {
+        remove_if_exists(&safe_archive_path(&s.audio_dir(), &rel)?)?;
     }
     let (mic, lop, meta) = recorder::wav_paths(&s.rec_tmp_dir(), id);
     drop(s);
     for p in [mic, lop, meta] {
-        let _ = std::fs::remove_file(p);
+        remove_if_exists(&p)?;
     }
+    // Only forget the row after every known copy is gone.  If Windows has a
+    // file locked, the binned row remains available for a later retry rather
+    // than falsely reporting a permanent deletion.
     state.db.delete_meeting(id).map_err(err)
 }
 
@@ -454,14 +607,20 @@ pub fn rename_speaker(
                     (Some(person), None) => person.id,
                     (None, Some(embedding)) => {
                         log::info!("enrolled new person {name} ({secs:.0}s of speech)");
-                        state.db.create_person(name, &embedding, secs).map_err(err)?
+                        state
+                            .db
+                            .create_person(name, &embedding, secs)
+                            .map_err(err)?
                     }
                     (None, None) => state.db.create_person(name, &[], 0.0).map_err(err)?,
                 });
             }
         }
     }
-    state.db.rename_speaker(speaker_id, name, person_id).map_err(err)?;
+    state
+        .db
+        .rename_speaker(speaker_id, name, person_id)
+        .map_err(err)?;
 
     // Enrollment changed the people set: retroactively re-match all stored
     // voice prints in the background (cheap — pure cosine over the DB).
@@ -659,7 +818,13 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
 #[tauri::command]
 pub fn restart_app(app: AppHandle) {
     // Finalize any active recording first.
-    if app.state::<AppState>().recorder.lock().unwrap().is_some() {
+    if app
+        .state::<AppState>()
+        .recorder
+        .lock()
+        .unwrap()
+        .is_recording()
+    {
         let _ = do_stop_recording(&app, true);
     }
     app.restart();
@@ -681,7 +846,11 @@ pub fn retranscribe(
     if meeting.status == "recording" {
         return Err("Meeting is still recording".into());
     }
-    state.pipeline.enqueue(Job { meeting_id, transcribe: true, engine });
+    state.pipeline.enqueue(Job {
+        meeting_id,
+        transcribe: true,
+        engine,
+    });
     Ok(())
 }
 
@@ -689,24 +858,35 @@ pub fn retranscribe(
 
 #[tauri::command]
 pub fn get_settings(state: State<'_, AppState>) -> Settings {
-    state.settings.lock().unwrap().clone()
+    let mut settings = state.settings.lock().unwrap().clone();
+    settings.data_dir = state.configured_data_dir.lock().unwrap().clone();
+    settings
 }
 
 #[tauri::command]
 pub fn update_settings(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, AppState>,
     settings: Settings,
 ) -> Result<(), String> {
+    let settings = settings.normalized()?;
     settings.save()?;
-    state.watcher.enabled.store(settings.auto_record, Ordering::Relaxed);
+    state
+        .watcher
+        .enabled
+        .store(settings.auto_record, Ordering::Relaxed);
     state.watcher.set_patterns(&settings.watch_patterns);
-    // A changed data_dir applies to db/log on next launch, but make the new
-    // audio dir playable right away.
-    let _ = app
-        .asset_protocol_scope()
-        .allow_directory(settings.audio_dir(), true);
-    *state.settings.lock().unwrap() = settings;
+
+    // A data-directory switch must be all-or-nothing.  Persist the requested
+    // value for the next launch, but keep every live path (DB, recordings,
+    // models, log, and asset scope) rooted at the directory opened at startup.
+    // Applying only some of them immediately can strand a new recording in a
+    // directory whose DB row still lives in the old database.
+    *state.configured_data_dir.lock().unwrap() = settings.data_dir.clone();
+    let active_data_dir = state.settings.lock().unwrap().data_dir.clone();
+    let mut active_settings = settings;
+    active_settings.data_dir = active_data_dir;
+    *state.settings.lock().unwrap() = active_settings;
     Ok(())
 }
 
@@ -714,7 +894,9 @@ pub fn update_settings(
 pub async fn pick_data_dir(app: AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
     let folder = app.dialog().file().blocking_pick_folder();
-    Ok(folder.and_then(|f| f.into_path().ok()).map(|p| p.to_string_lossy().into_owned()))
+    Ok(folder
+        .and_then(|f| f.into_path().ok())
+        .map(|p| p.to_string_lossy().into_owned()))
 }
 
 // ---------- models ----------

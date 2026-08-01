@@ -90,6 +90,7 @@ export function TranscriptView(props: {
   onBack: () => void;
 }) {
   const [detail, setDetail] = useState<MeetingDetail | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [activeIdx, setActiveIdx] = useState(-1);
   // Speaker rename: anchored to the specific segment whose chip was clicked.
@@ -105,31 +106,57 @@ export function TranscriptView(props: {
   const audioRef = useRef<HTMLAudioElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const focusedOnce = useRef(false);
+  const notesMeetingId = useRef<number | null>(null);
 
   useEffect(() => {
-    getMeeting(props.meetingId).then(setDetail).catch(() => setDetail(null));
+    let cancelled = false;
+    setLoadError(null);
+    setDetail((current) =>
+      current?.meeting.id === props.meetingId ? current : null,
+    );
+    getMeeting(props.meetingId)
+      .then((loaded) => {
+        if (cancelled) return;
+        setDetail(loaded);
+        if (notesMeetingId.current !== props.meetingId) {
+          notesMeetingId.current = props.meetingId;
+          setNotesDraft(loaded.meeting.notes);
+        }
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setDetail(null);
+        setLoadError(String(error));
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [props.meetingId, props.refreshTick]);
 
   useEffect(() => {
+    let cancelled = false;
     setAudioUrl(null);
-    getAudioUrl(props.meetingId).then(setAudioUrl).catch(() => setAudioUrl(null));
-  }, [props.meetingId]);
-
-  // Seed the notes draft when switching meetings (not on refreshTick, so a
-  // reload never clobbers unsaved typing).
-  useEffect(() => {
-    getMeeting(props.meetingId)
-      .then((d) => setNotesDraft(d.meeting.notes))
-      .catch(() => setNotesDraft(""));
+    getAudioUrl(props.meetingId)
+      .then((url) => {
+        if (!cancelled) setAudioUrl(url);
+      })
+      .catch(() => {
+        if (!cancelled) setAudioUrl(null);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [props.meetingId]);
 
   const saveNotes = () => {
     if (detail && notesDraft !== detail.meeting.notes) {
-      setMeetingNotes(props.meetingId, notesDraft).then(() =>
-        setDetail((d) =>
-          d ? { ...d, meeting: { ...d.meeting, notes: notesDraft } } : d,
-        ),
-      );
+      setMeetingNotes(props.meetingId, notesDraft)
+        .then(() =>
+          setDetail((d) =>
+            d ? { ...d, meeting: { ...d.meeting, notes: notesDraft } } : d,
+          ),
+        )
+        .catch((error) => alert(`Could not save notes: ${String(error)}`));
     }
   };
 
@@ -161,7 +188,35 @@ export function TranscriptView(props: {
     return rs;
   }, [segments, bookmarks]);
 
+  // Per-speaker share for the stats bar (finished transcripts only).
+  const speakerStats = useMemo(() => {
+    if (segments.length === 0) return [];
+    const acc = new Map<string, { name: string; label: string; talk: number; words: number }>();
+    for (const seg of segments) {
+      const sp = seg.speaker_id != null ? speakersById.get(seg.speaker_id) : undefined;
+      const label = sp?.label ?? (seg.track === "mic" ? "me" : "S?");
+      const key = String(seg.speaker_id ?? label);
+      const entry = acc.get(key) ?? {
+        name: sp?.display_name ?? label,
+        label,
+        talk: 0,
+        words: 0,
+      };
+      entry.talk += seg.end_ms - seg.start_ms;
+      entry.words += seg.text.split(/\s+/).filter(Boolean).length;
+      acc.set(key, entry);
+    }
+    const list = [...acc.values()].sort((a, b) => b.talk - a.talk);
+    const total = list.reduce((s, x) => s + x.talk, 0) || 1;
+    return list.map((x) => ({ ...x, share: (x.talk / total) * 100 }));
+  }, [segments, speakersById]);
+
   // Deep-link from search: scroll to the target segment once loaded.
+  useEffect(() => {
+    focusedOnce.current = false;
+    setActiveIdx(-1);
+  }, [props.meetingId, props.focusSegmentId]);
+
   useEffect(() => {
     if (focusedOnce.current || !props.focusSegmentId || segments.length === 0) return;
     const idx = segments.findIndex((s) => s.id === props.focusSegmentId);
@@ -202,18 +257,22 @@ export function TranscriptView(props: {
     const name = renameText.trim();
     setRenaming(null);
     if (!name) return;
-    renameSpeaker(speakerId, name).then(() =>
-      setDetail((d) =>
-        d
-          ? {
-              ...d,
-              speakers: d.speakers.map((s) =>
-                s.id === speakerId ? { ...s, display_name: name } : s,
-              ),
-            }
-          : d,
-      ),
-    );
+    const currentName = detail?.speakers.find((speaker) => speaker.id === speakerId)?.display_name;
+    if (name === currentName?.trim()) return;
+    renameSpeaker(speakerId, name)
+      .then(() =>
+        setDetail((d) =>
+          d
+            ? {
+                ...d,
+                speakers: d.speakers.map((s) =>
+                  s.id === speakerId ? { ...s, display_name: name } : s,
+                ),
+              }
+            : d,
+        ),
+      )
+      .catch((error) => alert(`Could not rename speaker: ${String(error)}`));
   };
 
   const doRetranscribe = (engine?: Engine) => {
@@ -248,6 +307,9 @@ export function TranscriptView(props: {
     exportTranscript(props.meetingId, format).catch((e) => alert(String(e)));
   };
 
+  if (loadError) {
+    return <div class="error">Could not load meeting: {loadError}</div>;
+  }
   if (!detail) return <div class="empty">Loading…</div>;
   const m = detail.meeting;
 
@@ -258,29 +320,6 @@ export function TranscriptView(props: {
   const liveSorted = showLive
     ? [...props.liveLines!].sort((a, b) => a.start_ms - b.start_ms)
     : [];
-
-  // Per-speaker share for the stats bar (finished transcripts only).
-  const speakerStats = useMemo(() => {
-    if (segments.length === 0) return [];
-    const acc = new Map<string, { name: string; label: string; talk: number; words: number }>();
-    for (const seg of segments) {
-      const sp = seg.speaker_id != null ? speakersById.get(seg.speaker_id) : undefined;
-      const label = sp?.label ?? (seg.track === "mic" ? "me" : "S?");
-      const key = String(seg.speaker_id ?? label);
-      const entry = acc.get(key) ?? {
-        name: sp?.display_name ?? label,
-        label,
-        talk: 0,
-        words: 0,
-      };
-      entry.talk += seg.end_ms - seg.start_ms;
-      entry.words += seg.text.split(/\s+/).filter(Boolean).length;
-      acc.set(key, entry);
-    }
-    const list = [...acc.values()].sort((a, b) => b.talk - a.talk);
-    const total = list.reduce((s, x) => s + x.talk, 0) || 1;
-    return list.map((x) => ({ ...x, share: (x.talk / total) * 100 }));
-  }, [segments, speakersById]);
 
   return (
     <div class="transcript-view">
@@ -299,11 +338,15 @@ export function TranscriptView(props: {
                 setEditingTitle(false);
                 const title = titleText.trim();
                 if (title && title !== m.title) {
-                  renameMeeting(m.id, title).then(() =>
-                    setDetail((d) =>
-                      d ? { ...d, meeting: { ...d.meeting, title } } : d,
-                    ),
-                  );
+                  renameMeeting(m.id, title)
+                    .then(() =>
+                      setDetail((d) =>
+                        d ? { ...d, meeting: { ...d.meeting, title } } : d,
+                      ),
+                    )
+                    .catch((error) =>
+                      alert(`Could not rename meeting: ${String(error)}`),
+                    );
                 }
               }}
               onKeyDown={(e) => {
@@ -467,18 +510,22 @@ export function TranscriptView(props: {
                     onBlur={() => {
                       const note = bmEditing.text.trim();
                       setBmEditing(null);
-                      setBookmarkNote(bm.id, note).then(() =>
-                        setDetail((d) =>
-                          d
-                            ? {
-                                ...d,
-                                bookmarks: d.bookmarks.map((x) =>
-                                  x.id === bm.id ? { ...x, note } : x,
-                                ),
-                              }
-                            : d,
-                        ),
-                      );
+                      setBookmarkNote(bm.id, note)
+                        .then(() =>
+                          setDetail((d) =>
+                            d
+                              ? {
+                                  ...d,
+                                  bookmarks: d.bookmarks.map((x) =>
+                                    x.id === bm.id ? { ...x, note } : x,
+                                  ),
+                                }
+                              : d,
+                          ),
+                        )
+                        .catch((error) =>
+                          alert(`Could not save bookmark: ${String(error)}`),
+                        );
                     }}
                     onKeyDown={(e) => {
                       if (e.key === "Enter") (e.target as HTMLInputElement).blur();
@@ -502,13 +549,17 @@ export function TranscriptView(props: {
                   title="Remove bookmark"
                   onClick={(e) => {
                     e.stopPropagation();
-                    deleteBookmark(bm.id).then(() =>
-                      setDetail((d) =>
-                        d
-                          ? { ...d, bookmarks: d.bookmarks.filter((x) => x.id !== bm.id) }
-                          : d,
-                      ),
-                    );
+                    deleteBookmark(bm.id)
+                      .then(() =>
+                        setDetail((d) =>
+                          d
+                            ? { ...d, bookmarks: d.bookmarks.filter((x) => x.id !== bm.id) }
+                            : d,
+                        ),
+                      )
+                      .catch((error) =>
+                        alert(`Could not delete bookmark: ${String(error)}`),
+                      );
                   }}
                 >
                   <Trash size={14} />

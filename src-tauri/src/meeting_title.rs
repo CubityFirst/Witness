@@ -78,7 +78,10 @@ fn teams_windows() -> Vec<(isize, String)> {
             let mut buf = vec![0u16; len as usize + 1];
             let read = GetWindowTextW(hwnd, &mut buf);
             if read > 0 {
-                windows.push((hwnd.0 as isize, String::from_utf16_lossy(&buf[..read as usize])));
+                windows.push((
+                    hwnd.0 as isize,
+                    String::from_utf16_lossy(&buf[..read as usize]),
+                ));
             }
         }
         BOOL(1)
