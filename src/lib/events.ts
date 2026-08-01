@@ -14,6 +14,22 @@ export interface RecordingLevel {
   elapsed_ms: number;
 }
 
+export interface TrackHealth {
+  connected: boolean;
+  device_loss_count: number;
+  capture_overflow_count: number;
+  capture_dropped_ms: number;
+  live_dropped_ms: number;
+  live_disconnected: boolean;
+  fatal_error: string | null;
+}
+
+export interface RecordingHealth {
+  mic: TrackHealth;
+  loopback: TrackHealth;
+  writer_error: string | null;
+}
+
 export type Stage = "vad" | "asr" | "diarize" | "encode";
 
 export interface TranscriptionProgress {
@@ -42,6 +58,7 @@ const on = <T,>(event: string) => (cb: (payload: T) => void): Promise<UnlistenFn
 export const onRecordingStarted = on<RecordingStarted>("recording-started");
 export const onRecordingStopped = on<{ meeting_id: number }>("recording-stopped");
 export const onRecordingLevel = on<RecordingLevel>("recording-level");
+export const onRecordingHealth = on<RecordingHealth>("recording-health");
 export const onWatcherStatus = on<WatcherStatus>("watcher-status");
 export const onTranscriptionProgress = on<TranscriptionProgress>("transcription-progress");
 export const onTranscriptionComplete = on<TranscriptionDone>("transcription-complete");

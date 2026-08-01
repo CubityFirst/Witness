@@ -4,9 +4,9 @@
 
 use crate::db::{Db, NewSegment, NewSpeaker};
 use crate::settings::{Engine, Settings};
-use crate::{asr, diarize, encoder, models, resample, speaker_id, vad};
+use crate::{asr, diarize, encoder, ml_scheduler, models, resample, speaker_id, vad};
 use anyhow::{bail, Context, Result};
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, TrySendError};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -40,21 +40,63 @@ pub enum PipelineEvent {
 }
 
 pub struct Pipeline {
-    tx: Sender<Job>,
+    wake: Sender<()>,
     current: Arc<Mutex<Option<i64>>>,
+    control: Arc<Mutex<()>>,
+    db: Arc<Db>,
 }
 
 impl Pipeline {
-    pub fn enqueue(&self, job: Job) {
-        let _ = self.tx.send(job);
+    /// The database is the source of truth; the bounded channel only wakes
+    /// the worker. Re-enqueueing upgrades an encode-only job and increments
+    /// its revision, so a user retranscription request cannot be swallowed by
+    /// work that was already queued or running.
+    pub fn enqueue(&self, job: Job) -> Result<()> {
+        let engine = job.engine.map(|engine| engine.to_string());
+        self.db
+            .save_pipeline_job(job.meeting_id, job.transcribe, engine.as_deref())?;
+        match self.wake.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => Ok(()),
+            Err(TrySendError::Disconnected(())) => bail!("pipeline worker is unavailable"),
+        }
     }
 
     pub fn current_meeting(&self) -> Option<i64> {
         *self.current.lock().unwrap()
     }
 
+    /// Cancel queued/failed work. The dequeue gate closes the race where a
+    /// worker could otherwise claim the job between a purge check and delete.
+    pub fn cancel(&self, meeting_id: i64) -> Result<bool> {
+        let _control = self.control.lock().unwrap();
+        if self.current_meeting() == Some(meeting_id) {
+            bail!("meeting {meeting_id} is currently being processed");
+        }
+        self.db.cancel_pipeline_job(meeting_id)
+    }
+
     pub fn queue_len(&self) -> usize {
-        self.tx.len()
+        let count = self.db.pipeline_job_count().unwrap_or_default();
+        count.saturating_sub(usize::from(self.current_meeting().is_some()))
+    }
+}
+
+fn persisted_job(job: &crate::db::PersistedPipelineJob) -> Job {
+    Job {
+        meeting_id: job.meeting_id,
+        transcribe: job.transcribe,
+        engine: match job.engine.as_deref() {
+            Some("parakeet") => Some(Engine::Parakeet),
+            Some("whisper") => Some(Engine::Whisper),
+            Some(other) => {
+                log::warn!(
+                    "pipeline job {} has unknown engine {other:?}; using the configured default",
+                    job.meeting_id
+                );
+                None
+            }
+            None => None,
+        },
     }
 }
 
@@ -63,47 +105,187 @@ pub fn spawn(
     settings: Arc<Mutex<Settings>>,
     on_event: impl Fn(PipelineEvent) + Send + 'static,
 ) -> Pipeline {
-    let (tx, rx): (Sender<Job>, Receiver<Job>) = crossbeam_channel::unbounded();
+    let (wake, rx): (Sender<()>, Receiver<()>) = crossbeam_channel::bounded(1);
     let current = Arc::new(Mutex::new(None));
     let current_worker = current.clone();
+    let control = Arc::new(Mutex::new(()));
+    let worker_control = control.clone();
+    let worker_db = db.clone();
 
     std::thread::Builder::new()
         .name("pipeline".into())
         .spawn(move || {
-            while let Ok(job) = rx.recv() {
-                let meeting_id = job.meeting_id;
-                *current_worker.lock().unwrap() = Some(meeting_id);
-                let result = process(&db, &settings, &job, &on_event);
-                *current_worker.lock().unwrap() = None;
-                match result {
-                    Ok(rtf) => on_event(PipelineEvent::Complete { meeting_id, rtf }),
-                    Err(e) => {
-                        log::error!("pipeline job for meeting {meeting_id} failed: {e:#}");
-                        let _ = db.set_status(meeting_id, "failed");
-                        on_event(PipelineEvent::Failed {
-                            meeting_id,
-                            error: format!("{e:#}"),
-                        });
+            while rx.recv().is_ok() {
+                loop {
+                    let saved = {
+                        let _control = worker_control.lock().unwrap();
+                        match worker_db.next_pipeline_job() {
+                            Ok(Some(job)) => {
+                                *current_worker.lock().unwrap() = Some(job.meeting_id);
+                                job
+                            }
+                            Ok(None) => break,
+                            Err(error) => {
+                                log::error!("could not read the durable pipeline queue: {error:#}");
+                                break;
+                            }
+                        }
+                    };
+                    let job = persisted_job(&saved);
+                    let meeting_id = job.meeting_id;
+                    let result = process(
+                        &worker_db,
+                        &settings,
+                        &job,
+                        saved.revision,
+                        &on_event,
+                    );
+                    *current_worker.lock().unwrap() = None;
+                    match result {
+                        Ok(rtf) => match worker_db
+                            .complete_pipeline_job(meeting_id, saved.revision)
+                        {
+                            Ok(true) => {
+                                on_event(PipelineEvent::Complete { meeting_id, rtf });
+                            }
+                            Ok(false) => {
+                                log::info!(
+                                    "pipeline job {meeting_id} was updated while running; processing the new revision"
+                                );
+                            }
+                            Err(error) => {
+                                log::error!(
+                                    "pipeline job {meeting_id} completed but its queue record could not be removed: {error:#}"
+                                );
+                                on_event(PipelineEvent::Failed {
+                                    meeting_id,
+                                    error: format!("processing completed but queue commit failed: {error:#}"),
+                                });
+                                break;
+                            }
+                        },
+                        Err(error) => {
+                            let message = format!("{error:#}");
+                            log::error!("pipeline job for meeting {meeting_id} failed: {message}");
+                            match worker_db.fail_pipeline_job(
+                                meeting_id,
+                                saved.revision,
+                                &message,
+                            ) {
+                                Ok(true) => {
+                                    let transcript_committed = worker_db
+                                        .get_meeting(meeting_id)
+                                        .ok()
+                                        .flatten()
+                                        .is_some_and(|meeting| meeting.status == "transcribed");
+                                    if !transcript_committed {
+                                        let _ = worker_db.set_status(meeting_id, "failed");
+                                    }
+                                    on_event(PipelineEvent::Failed {
+                                        meeting_id,
+                                        error: message,
+                                    });
+                                }
+                                Ok(false) => log::info!(
+                                    "failed pipeline job {meeting_id} was superseded; retrying the new revision"
+                                ),
+                                Err(db_error) => {
+                                    let _ = worker_db.set_status(meeting_id, "failed");
+                                    on_event(PipelineEvent::Failed {
+                                        meeting_id,
+                                        error: format!(
+                                            "{message}; additionally could not save failure state: {db_error:#}"
+                                        ),
+                                    });
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             }
         })
         .expect("spawn pipeline thread");
 
-    Pipeline { tx, current }
+    if db.pipeline_job_count().unwrap_or_default() > 0 {
+        let _ = wake.try_send(());
+    }
+
+    Pipeline {
+        wake,
+        current,
+        control,
+        db,
+    }
 }
 
-fn load_wav_f32(path: &PathBuf) -> Result<Vec<f32>> {
+fn load_wav_16k(path: &PathBuf) -> Result<(Vec<f32>, f32)> {
     let mut reader =
         hound::WavReader::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let samples: Result<Vec<i16>, _> = reader.samples::<i16>().collect();
-    Ok(samples?.into_iter().map(|s| s as f32 / 32768.0).collect())
+    let spec = reader.spec();
+    anyhow::ensure!(spec.channels == 1, "{} is not mono", path.display());
+    anyhow::ensure!(
+        spec.sample_format == hound::SampleFormat::Int && spec.bits_per_sample == 16,
+        "{} is not 16-bit PCM",
+        path.display()
+    );
+    let audio_secs = reader.duration() as f32 / spec.sample_rate as f32;
+    let mut resampler = resample::StreamResampler::new(spec.sample_rate, 16_000)?;
+    let mut input = Vec::with_capacity(16_384);
+    let mut output = Vec::with_capacity((audio_secs * 16_000.0) as usize);
+    for sample in reader.samples::<i16>() {
+        input.push(sample? as f32 / 32768.0);
+        if input.len() == input.capacity() {
+            output.append(&mut resampler.push(&input)?);
+            input.clear();
+        }
+    }
+    output.append(&mut resampler.push(&input)?);
+    output.append(&mut resampler.finish()?);
+    Ok((output, audio_secs))
+}
+
+fn transcribe_chunks(
+    engine: &mut dyn asr::AsrEngine,
+    track: &[f32],
+    chunks: &[vad::SpeechChunk],
+    progress_base: f32,
+    progress_span: f32,
+    progress: &impl Fn(&'static str, f32),
+) -> Result<Vec<asr::AsrSegment>> {
+    let total_ms = vad::total_ms(chunks).max(1);
+    let mut done_ms = 0u64;
+    let mut segments = Vec::new();
+    for chunk in chunks {
+        let samples = chunk.samples(track);
+        let transcribed = {
+            let _permit = ml_scheduler::batch();
+            engine.transcribe(samples, chunk.start_ms)?
+        };
+        segments.extend(
+            transcribed
+                .into_iter()
+                .filter(|segment| !asr::is_junk_text(&segment.text)),
+        );
+        done_ms += samples.len() as u64 / 16;
+        progress(
+            "asr",
+            progress_base + progress_span * done_ms as f32 / total_ms as f32,
+        );
+    }
+    Ok(segments)
+}
+
+fn extend_capped(output: &mut Vec<f32>, input: &[f32], max_samples: usize) {
+    let remaining = max_samples.saturating_sub(output.len());
+    output.extend_from_slice(&input[..input.len().min(remaining)]);
 }
 
 fn process(
     db: &Db,
     settings: &Mutex<Settings>,
     job: &Job,
+    revision: i64,
     on_event: &(impl Fn(PipelineEvent) + Send),
 ) -> Result<Option<f32>> {
     let meeting_id = job.meeting_id;
@@ -133,69 +315,93 @@ fn process(
     let mut rtf: Option<f32> = None;
     let (mic_wav, loop_wav, meta_path) = crate::recorder::wav_paths(&rec_dir, meeting_id);
 
-    // ---- source audio: prefer raw WAVs, else decode the archived Opus ----
     let have_wavs = mic_wav.exists() && loop_wav.exists();
-    let (mic_48k, loop_48k) = if have_wavs {
-        (load_wav_f32(&mic_wav)?, load_wav_f32(&loop_wav)?)
-    } else if let Some(rel) = &meeting.audio_path {
-        let path = audio_dir.join(rel);
-        if !path.exists() {
-            bail!(
-                "no source audio: WAVs cleaned up and {} missing",
-                path.display()
-            );
-        }
-        encoder::decode_opus(&path)?
-    } else {
-        bail!("no source audio for meeting {meeting_id}");
-    };
 
     if job.transcribe {
         db.set_status(meeting_id, "processing")?;
         let engine_kind = job.engine.unwrap_or(default_engine);
         let work_started = std::time::Instant::now();
 
-        // ---- VAD ----
+        // ---- source audio + resampling ----
+        // Raw recordings are loaded and downsampled one track at a time so a
+        // long meeting never holds both 48 kHz WAVs and both 16 kHz copies in
+        // memory simultaneously. Encode-only jobs do not load audio at all.
         progress("vad", 0.0);
-        let mic_16k = resample::resample_all(&mic_48k, 48_000, 16_000)?;
-        let loop_16k = resample::resample_all(&loop_48k, 48_000, 16_000)?;
+        let archive_path = if have_wavs {
+            None
+        } else if let Some(relative) = &meeting.audio_path {
+            let path = audio_dir.join(relative);
+            if !path.exists() {
+                bail!(
+                    "no source audio: WAVs cleaned up and {} missing",
+                    path.display()
+                );
+            }
+            Some(path)
+        } else {
+            bail!("no source audio for meeting {meeting_id}");
+        };
+        let (mic_16k, audio_secs) = if have_wavs {
+            load_wav_16k(&mic_wav)?
+        } else {
+            let samples = encoder::decode_opus_track_16k(
+                archive_path.as_ref().unwrap(),
+                encoder::ArchiveTrack::Mic,
+            )?;
+            let seconds = samples.len() as f32 / 16_000.0;
+            (samples, seconds)
+        };
+
+        // ---- VAD ----
         let mic_chunks = vad::chunk_speech(&mic_16k);
         progress("vad", 0.5);
-        let loop_chunks = vad::chunk_speech(&loop_16k);
-        progress("vad", 1.0);
-        log::info!(
-            "meeting {meeting_id}: VAD kept {:.1}s mic / {:.1}s loopback of {:.1}s",
-            vad::total_ms(&mic_chunks) as f64 / 1000.0,
-            vad::total_ms(&loop_chunks) as f64 / 1000.0,
-            mic_48k.len() as f64 / 48_000.0
-        );
+        let mic_kept_ms = vad::total_ms(&mic_chunks);
 
         // ---- ASR (both tracks) ----
         progress("asr", 0.0);
-        let total_ms = (vad::total_ms(&mic_chunks) + vad::total_ms(&loop_chunks)).max(1);
-        let mut done_ms = 0u64;
-        let mut mic_segments = Vec::new();
-        let mut loop_segments = Vec::new();
-        {
-            let mut engine = asr::create_engine(engine_kind, &models_dir)?;
-            for (chunks, out) in [
-                (&mic_chunks, &mut mic_segments),
-                (&loop_chunks, &mut loop_segments),
-            ] {
-                for chunk in chunks.iter() {
-                    // Noise chunks the VAD let through make the engines
-                    // hallucinate ("Thank you." on a mic pop) — drop those.
-                    out.extend(
-                        engine
-                            .transcribe(&chunk.samples, chunk.start_ms)?
-                            .into_iter()
-                            .filter(|s| !asr::is_junk_text(&s.text)),
-                    );
-                    done_ms += chunk.samples.len() as u64 / 16;
-                    progress("asr", done_ms as f32 / total_ms as f32);
-                }
-            }
-        } // engine dropped here → VRAM freed before diarization
+        let (mic_segments, loop_segments, loop_16k, loop_chunks, loop_kept_ms) = {
+            let mut engine = {
+                let _permit = ml_scheduler::batch();
+                asr::create_engine(engine_kind, &models_dir)?
+            };
+            let mic_segments =
+                transcribe_chunks(engine.as_mut(), &mic_16k, &mic_chunks, 0.0, 0.5, &progress)?;
+            drop(mic_chunks);
+            drop(mic_16k);
+
+            let loop_16k = if have_wavs {
+                load_wav_16k(&loop_wav)?.0
+            } else {
+                encoder::decode_opus_track_16k(
+                    archive_path.as_ref().unwrap(),
+                    encoder::ArchiveTrack::Loopback,
+                )?
+            };
+            let loop_chunks = vad::chunk_speech(&loop_16k);
+            progress("vad", 1.0);
+            let loop_kept_ms = vad::total_ms(&loop_chunks);
+            let loop_segments = transcribe_chunks(
+                engine.as_mut(),
+                &loop_16k,
+                &loop_chunks,
+                0.5,
+                0.5,
+                &progress,
+            )?;
+            (
+                mic_segments,
+                loop_segments,
+                loop_16k,
+                loop_chunks,
+                loop_kept_ms,
+            )
+        }; // engine dropped here → VRAM freed before diarization
+        log::info!(
+            "meeting {meeting_id}: VAD kept {:.1}s mic / {:.1}s loopback of {:.1}s",
+            mic_kept_ms as f64 / 1000.0,
+            loop_kept_ms as f64 / 1000.0,
+            audio_secs
+        );
 
         // ---- diarization (loopback only; graceful without the model) ----
         progress("diarize", 0.0);
@@ -247,7 +453,7 @@ fn process(
                 let s = (d.start_ms as usize * 16).min(loop_16k.len());
                 let e = (d.end_ms as usize * 16).min(loop_16k.len());
                 if e > s {
-                    spk_audio[d.speaker].extend_from_slice(&loop_16k[s..e]);
+                    extend_capped(&mut spk_audio[d.speaker], &loop_16k[s..e], max_samples);
                 }
             }
         } else if seen[0] {
@@ -255,7 +461,7 @@ fn process(
                 if spk_audio[0].len() >= max_samples {
                     break;
                 }
-                spk_audio[0].extend_from_slice(&chunk.samples);
+                extend_capped(&mut spk_audio[0], chunk.samples(&loop_16k), max_samples);
             }
         }
 
@@ -286,13 +492,21 @@ fn process(
                 && models::speaker_id_path(&models_dir).is_some()
             {
                 if embedder.is_none() {
-                    match speaker_id::Embedder::new(&models_dir) {
+                    let created = {
+                        let _permit = ml_scheduler::batch();
+                        speaker_id::Embedder::new(&models_dir)
+                    };
+                    match created {
                         Ok(e) => embedder = Some(e),
                         Err(e) => log::warn!("speaker-ID model unavailable: {e:#}"),
                     }
                 }
                 if let Some(emb) = embedder.as_mut() {
-                    match emb.embed(&spk_audio[i]) {
+                    let embedded = {
+                        let _permit = ml_scheduler::batch();
+                        emb.embed(&spk_audio[i])
+                    };
+                    match embedded {
                         Ok(embedding) => {
                             if let Some((pid, name, sim)) =
                                 speaker_id::best_match(&people, &embedding, threshold)
@@ -342,7 +556,9 @@ fn process(
         }
 
         db.replace_transcript(meeting_id, &speakers, &segments, &engine_kind.to_string())?;
-        let audio_secs = mic_48k.len() as f32 / 48_000.0;
+        // Transcript and archive are separate durable phases. If encoding or
+        // cleanup fails from here on, the retry must not repeat expensive ASR.
+        db.mark_pipeline_transcription_complete(meeting_id, revision)?;
         let wall = work_started.elapsed().as_secs_f32().max(0.001);
         rtf = Some(audio_secs / wall);
         log::info!(
@@ -373,10 +589,36 @@ fn process(
                 .map(|m| m.status == "transcribed")
                 .unwrap_or(false);
         if transcribed_ok {
-            let _ = std::fs::remove_file(&mic_wav);
-            let _ = std::fs::remove_file(&loop_wav);
-            let _ = std::fs::remove_file(&meta_path);
+            let mut cleanup_errors = Vec::new();
+            for path in [&mic_wav, &loop_wav, &meta_path] {
+                if let Err(error) = std::fs::remove_file(path) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        cleanup_errors.push(format!("{}: {error}", path.display()));
+                    }
+                }
+            }
+            if !cleanup_errors.is_empty() {
+                bail!(
+                    "archive committed but raw recording cleanup failed: {}",
+                    cleanup_errors.join("; ")
+                );
+            }
         }
     }
     Ok(rtf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extend_capped;
+
+    #[test]
+    fn speaker_audio_never_exceeds_exact_cap() {
+        let mut output = vec![1.0; 7];
+        extend_capped(&mut output, &[2.0; 20], 10);
+        assert_eq!(output.len(), 10);
+        assert_eq!(&output[7..], &[2.0; 3]);
+        extend_capped(&mut output, &[3.0; 5], 10);
+        assert_eq!(output.len(), 10);
+    }
 }

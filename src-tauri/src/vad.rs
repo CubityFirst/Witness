@@ -24,20 +24,32 @@ pub const MIN_SPEECH_FRAMES: usize = 5;
 const PAD_FRAMES: usize = 12;
 /// Regions closer than this are merged (~500 ms).
 const MERGE_GAP_FRAMES: usize = 31;
-/// Hard cap per chunk (TDT limit), in frames: 240 s.
-const MAX_CHUNK_FRAMES: usize = (240_000 / FRAME_MS) as usize;
+/// Keep batch inference windows short enough to yield promptly to live
+/// captions. This is comfortably below Parakeet TDT's hard model limit.
+const MAX_CHUNK_FRAMES: usize = (30_000 / FRAME_MS) as usize;
 
 pub struct SpeechChunk {
     /// Offset of the chunk within the track.
     pub start_ms: u64,
-    /// Contiguous 16 kHz samples (internal short silences included so ASR
-    /// timestamps stay linear).
-    pub samples: Vec<f32>,
+    start_sample: usize,
+    end_sample: usize,
+}
+
+impl SpeechChunk {
+    /// Borrow this chunk from the original 16 kHz track. Keeping ranges here
+    /// avoids duplicating potentially hours of speech before ASR begins.
+    pub fn samples<'a>(&self, track: &'a [f32]) -> &'a [f32] {
+        &track[self.start_sample..self.end_sample]
+    }
+
+    pub fn len(&self) -> usize {
+        self.end_sample - self.start_sample
+    }
 }
 
 /// Total speech-ish duration in ms across chunks (for progress reporting).
 pub fn total_ms(chunks: &[SpeechChunk]) -> u64 {
-    chunks.iter().map(|c| c.samples.len() as u64 / 16).sum()
+    chunks.iter().map(|c| c.len() as u64 / 16).sum()
 }
 
 pub fn chunk_speech(samples_16k: &[f32]) -> Vec<SpeechChunk> {
@@ -63,7 +75,8 @@ pub fn chunk_speech(samples_16k: &[f32]) -> Vec<SpeechChunk> {
             let end = (start + MAX_CHUNK_FRAMES).min(e);
             chunks.push(SpeechChunk {
                 start_ms: start as u64 * FRAME_MS,
-                samples: samples_16k[start * FRAME..end * FRAME].to_vec(),
+                start_sample: start * FRAME,
+                end_sample: end * FRAME,
             });
             start = end;
         }
@@ -111,6 +124,18 @@ fn regions(speech: &[bool]) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speech_chunks_borrow_exact_track_ranges() {
+        let track = (0..32).map(|value| value as f32).collect::<Vec<_>>();
+        let chunk = SpeechChunk {
+            start_ms: 0,
+            start_sample: 7,
+            end_sample: 19,
+        };
+        assert_eq!(chunk.samples(&track), &track[7..19]);
+        assert_eq!(chunk.len(), 12);
+    }
 
     #[test]
     fn short_blips_are_not_speech() {
@@ -187,7 +212,7 @@ mod tests {
     #[test]
     fn chunks_never_exceed_tdt_cap() {
         // Loud broadband noise for 9 minutes; whatever the detector flags,
-        // no chunk may exceed 240 s.
+        // no chunk may exceed the scheduling window.
         let mut x = 0u32;
         let noise: Vec<f32> = (0..16_000 * 540)
             .map(|_| {
@@ -200,9 +225,9 @@ mod tests {
             .collect();
         for c in chunk_speech(&noise) {
             assert!(
-                c.samples.len() <= 240 * 16_000,
+                c.len() <= MAX_CHUNK_FRAMES * FRAME,
                 "chunk too long: {}",
-                c.samples.len()
+                c.len()
             );
         }
     }

@@ -17,6 +17,7 @@ mod events;
 mod live_transcribe;
 mod meeting_title;
 mod meeting_watcher;
+mod ml_scheduler;
 mod models;
 mod pipeline;
 mod recorder;
@@ -136,22 +137,29 @@ fn recover_orphans(db: &Db, settings: &Settings, pipeline: &pipeline::Pipeline) 
                     "recovered interrupted recording: meeting {} ({duration_ms} ms)",
                     meta.meeting_id
                 );
-                pipeline.enqueue(Job {
+                if let Err(error) = pipeline.enqueue(Job {
                     meeting_id: meta.meeting_id,
                     transcribe: settings.auto_transcribe,
                     engine: None,
-                });
+                }) {
+                    log::error!(
+                        "could not queue recovered meeting {}: {error:#}",
+                        meta.meeting_id
+                    );
+                }
             }
         }
     }
     if let Ok(processing) = db.meetings_with_status(&["processing"]) {
         for m in processing {
             log::info!("re-queueing interrupted transcription: meeting {}", m.id);
-            pipeline.enqueue(Job {
+            if let Err(error) = pipeline.enqueue(Job {
                 meeting_id: m.id,
                 transcribe: true,
                 engine: None,
-            });
+            }) {
+                log::error!("could not re-queue meeting {}: {error:#}", m.id);
+            }
         }
     }
     if let Ok(recorded) = db.meetings_with_status(&["recorded"]) {
@@ -160,11 +168,13 @@ fn recover_orphans(db: &Db, settings: &Settings, pipeline: &pipeline::Pipeline) 
             let (mic, lop, _) = recorder::wav_paths(&rec_dir, m.id);
             if mic.exists() && lop.exists() {
                 log::info!("re-queueing unencoded recording: meeting {}", m.id);
-                pipeline.enqueue(Job {
+                if let Err(error) = pipeline.enqueue(Job {
                     meeting_id: m.id,
                     transcribe: settings.auto_transcribe,
                     engine: None,
-                });
+                }) {
+                    log::error!("could not re-queue meeting {}: {error:#}", m.id);
+                }
             }
         }
     }
