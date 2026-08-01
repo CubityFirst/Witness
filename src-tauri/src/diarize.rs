@@ -23,16 +23,27 @@ pub fn diarize(
 ) -> Result<Vec<DiarSegment>> {
     let model_path = crate::models::sortformer_path(models_dir)
         .context("Sortformer model not downloaded — fetch it in Settings → Models")?;
-    let mut sortformer = Sortformer::with_config(&model_path, None, DiarizationConfig::callhome())
-        .with_context(|| format!("loading Sortformer from {}", model_path.display()))?;
+    let mut sortformer = {
+        let _permit = crate::ml_scheduler::batch();
+        Sortformer::with_config(&model_path, None, DiarizationConfig::callhome())
+            .with_context(|| format!("loading Sortformer from {}", model_path.display()))?
+    };
 
     let mut raw = Vec::new();
     let total = samples_16k.len().max(1);
     for (i, chunk) in samples_16k.chunks(FEED_CHUNK).enumerate() {
-        raw.extend(sortformer.feed(chunk).context("Sortformer feed")?);
+        let fed = {
+            let _permit = crate::ml_scheduler::batch();
+            sortformer.feed(chunk).context("Sortformer feed")?
+        };
+        raw.extend(fed);
         progress(((i + 1) * FEED_CHUNK).min(total) as f32 / total as f32);
     }
-    raw.extend(sortformer.flush().context("Sortformer flush")?);
+    let flushed = {
+        let _permit = crate::ml_scheduler::batch();
+        sortformer.flush().context("Sortformer flush")?
+    };
+    raw.extend(flushed);
 
     // SpeakerSegment start/end are in samples @ 16 kHz.
     let mut out: Vec<DiarSegment> = raw

@@ -127,11 +127,19 @@ pub struct NewSegment {
     pub text: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct PersistedPipelineJob {
+    pub meeting_id: i64,
+    pub transcribe: bool,
+    pub engine: Option<String>,
+    pub revision: i64,
+}
+
 pub struct Db {
     conn: Mutex<Connection>,
 }
 
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
@@ -274,6 +282,24 @@ impl Db {
                 "#,
             )?;
         }
+        if version < 5 {
+            conn.execute_batch(
+                r#"
+                BEGIN;
+                CREATE TABLE pipeline_jobs (
+                  meeting_id INTEGER PRIMARY KEY REFERENCES meetings(id) ON DELETE CASCADE,
+                  transcribe INTEGER NOT NULL,
+                  engine TEXT,
+                  queued_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                  attempts INTEGER NOT NULL DEFAULT 0,
+                  last_error TEXT,
+                  revision INTEGER NOT NULL DEFAULT 1
+                );
+                PRAGMA user_version = 5;
+                COMMIT;
+                "#,
+            )?;
+        }
         Ok(())
     }
 
@@ -313,6 +339,122 @@ impl Db {
             params![id, audio_path],
         )?;
         Ok(())
+    }
+
+    // ---------- durable processing queue ----------
+
+    pub fn save_pipeline_job(
+        &self,
+        meeting_id: i64,
+        transcribe: bool,
+        engine: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "INSERT INTO pipeline_jobs (meeting_id, transcribe, engine)
+             SELECT ?1, ?2, ?3
+             WHERE EXISTS (
+               SELECT 1 FROM meetings WHERE id = ?1 AND deleted_at IS NULL
+             )
+             ON CONFLICT(meeting_id) DO UPDATE SET
+               transcribe = MAX(pipeline_jobs.transcribe, excluded.transcribe),
+               engine = COALESCE(excluded.engine, pipeline_jobs.engine),
+               queued_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+               attempts = 0,
+               last_error = NULL,
+               revision = pipeline_jobs.revision + 1",
+            params![meeting_id, transcribe, engine],
+        )?;
+        anyhow::ensure!(changed == 1, "meeting {meeting_id} not found or is deleted");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn list_pipeline_jobs(&self) -> Result<Vec<PersistedPipelineJob>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT meeting_id, transcribe, engine, revision
+             FROM pipeline_jobs ORDER BY queued_at, meeting_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PersistedPipelineJob {
+                meeting_id: row.get(0)?,
+                transcribe: row.get(1)?,
+                engine: row.get(2)?,
+                revision: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn next_pipeline_job(&self) -> Result<Option<PersistedPipelineJob>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT meeting_id, transcribe, engine, revision
+                 FROM pipeline_jobs
+                 WHERE attempts = 0
+                 ORDER BY queued_at, meeting_id LIMIT 1",
+                [],
+                |row| {
+                    Ok(PersistedPipelineJob {
+                        meeting_id: row.get(0)?,
+                        transcribe: row.get(1)?,
+                        engine: row.get(2)?,
+                        revision: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn pipeline_job_count(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pipeline_jobs WHERE attempts = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    pub fn cancel_pipeline_job(&self, meeting_id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "DELETE FROM pipeline_jobs WHERE meeting_id = ?1",
+            params![meeting_id],
+        )? > 0)
+    }
+
+    pub fn mark_pipeline_transcription_complete(
+        &self,
+        meeting_id: i64,
+        revision: i64,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "UPDATE pipeline_jobs SET transcribe = 0
+             WHERE meeting_id = ?1 AND revision = ?2",
+            params![meeting_id, revision],
+        )? > 0)
+    }
+
+    pub fn complete_pipeline_job(&self, meeting_id: i64, revision: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "DELETE FROM pipeline_jobs WHERE meeting_id = ?1 AND revision = ?2",
+            params![meeting_id, revision],
+        )? > 0)
+    }
+
+    pub fn fail_pipeline_job(&self, meeting_id: i64, revision: i64, error: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "UPDATE pipeline_jobs
+             SET attempts = attempts + 1, last_error = ?2
+             WHERE meeting_id = ?1 AND revision = ?3",
+            params![meeting_id, error, revision],
+        )? > 0)
     }
 
     pub fn rename_meeting(&self, id: i64, title: &str) -> Result<()> {
@@ -988,6 +1130,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn version_four_database_gets_durable_pipeline_queue() {
+        let dir = std::env::temp_dir().join(format!("witness-db-v4-test-{}", std::process::id()));
+        let path = dir.join("t.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        drop(Db::open(&path).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("DROP TABLE pipeline_jobs; PRAGMA user_version = 4;")
+            .unwrap();
+        drop(connection);
+
+        let db = Db::open(&path).unwrap();
+        let id = db
+            .create_meeting("Migrated", "2026-08-01T12:00:00Z", "manual")
+            .unwrap();
+        db.save_pipeline_job(id, true, Some("parakeet")).unwrap();
+        assert_eq!(db.list_pipeline_jobs().unwrap().len(), 1);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn schema_transcript_and_search_roundtrip() {
         let dir = std::env::temp_dir().join(format!("witness-db-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1136,12 +1300,35 @@ mod tests {
         let binned = db.list_deleted_meetings().unwrap();
         assert_eq!(binned.len(), 1);
         assert_eq!(binned[0].0.id, id);
+        assert!(db.save_pipeline_job(id, true, None).is_err());
         db.restore_meeting(id).unwrap();
         assert_eq!(db.list_meetings(0, 10).unwrap().len(), 1);
         assert!(db.list_deleted_meetings().unwrap().is_empty());
 
+        // Processing jobs survive restarts, can be updated for an explicit
+        // retry, and are removed only after successful processing.
+        db.save_pipeline_job(id, true, Some("whisper")).unwrap();
+        let jobs = db.list_pipeline_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].meeting_id, id);
+        assert!(jobs[0].transcribe);
+        assert_eq!(jobs[0].engine.as_deref(), Some("whisper"));
+        let first_revision = jobs[0].revision;
+        db.fail_pipeline_job(id, first_revision, "temporary failure")
+            .unwrap();
+        db.save_pipeline_job(id, false, None).unwrap();
+        let jobs = db.list_pipeline_jobs().unwrap();
+        assert!(jobs[0].transcribe); // encode-only recovery cannot downgrade it
+        assert_eq!(jobs[0].engine.as_deref(), Some("whisper"));
+        assert!(jobs[0].revision > first_revision);
+        assert!(!db.complete_pipeline_job(id, first_revision).unwrap());
+        assert!(db.complete_pipeline_job(id, jobs[0].revision).unwrap());
+        assert!(db.list_pipeline_jobs().unwrap().is_empty());
+
         // Delete cascades through speakers/segments/FTS.
+        db.save_pipeline_job(id, false, None).unwrap();
         db.delete_meeting(id).unwrap();
+        assert!(db.list_pipeline_jobs().unwrap().is_empty());
         assert!(db
             .search("forecast", 0, 10, None, None, None, None)
             .unwrap()

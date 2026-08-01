@@ -13,6 +13,7 @@ import {
   onMeetingsChanged,
   onModelDownloadProgress,
   onRecordingLevel,
+  onRecordingHealth,
   onRecordingStarted,
   onRecordingStopped,
   onTranscriptionComplete,
@@ -23,6 +24,7 @@ import {
   type LiveTranscript,
   type ModelDownloadProgress,
   type RecordingLevel,
+  type RecordingHealth,
   type TranscriptionProgress,
 } from "./lib/events";
 import { MeetingsView } from "./views/meetings";
@@ -71,10 +73,29 @@ function fmtElapsed(ms: number): string {
   return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
 }
 
+function captureWarning(health: RecordingHealth | null): string | null {
+  if (!health) return null;
+  if (health.writer_error) return `Audio writer failed: ${health.writer_error}`;
+  for (const [name, track] of [
+    ["Microphone", health.mic],
+    ["System audio", health.loopback],
+  ] as const) {
+    if (track.fatal_error) return `${name} capture failed: ${track.fatal_error}`;
+    if (track.device_loss_count > 0) return `${name} device was lost during recording`;
+    if (track.capture_overflow_count > 0)
+      return `${name} capture dropped ${track.capture_dropped_ms} ms of audio`;
+    if (track.live_dropped_ms > 0)
+      return `Live captions skipped ${track.live_dropped_ms} ms to keep recording responsive`;
+    if (track.live_disconnected) return `Live captions stopped receiving ${name.toLowerCase()}`;
+  }
+  return null;
+}
+
 export function App() {
   const [view, setView] = useState<View>({ kind: "meetings" });
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [level, setLevel] = useState<RecordingLevel | null>(null);
+  const [health, setHealth] = useState<RecordingHealth | null>(null);
   const [progress, setProgress] = useState<TranscriptionProgress | null>(null);
   const [searchText, setSearchText] = useState("");
   const [refreshTick, setRefreshTick] = useState(0);
@@ -113,6 +134,7 @@ export function App() {
         }
       }),
       onRecordingStarted((e) => {
+        setHealth(null);
         setLiveLines([]);
         setLiveMeetingId(e.meeting_id);
         refreshStatus();
@@ -122,10 +144,12 @@ export function App() {
       ),
       onRecordingStopped(() => {
         setLevel(null);
+        setHealth(null);
         refreshStatus();
         setRefreshTick((t) => t + 1);
       }),
       onRecordingLevel(setLevel),
+      onRecordingHealth(setHealth),
       onWatcherStatus((w) =>
         setStatus((s) => (s ? { ...s, watcher: w } : s)),
       ),
@@ -148,6 +172,7 @@ export function App() {
   }, []);
 
   const recording = status?.recording ?? false;
+  const healthWarning = captureWarning(health);
 
   const onSearchInput = (q: string) => {
     setSearchText(q);
@@ -163,13 +188,14 @@ export function App() {
     statusPill = (
       <span
         class="pill pill-recording pill-click"
-        title="Open live captions"
+        title={healthWarning ?? "Open live captions"}
         onClick={() =>
           status?.meeting_id != null &&
           setView({ kind: "transcript", meetingId: status.meeting_id })
         }
       >
         <span class="rec-dot" /> Recording {fmtElapsed(level?.elapsed_ms ?? 0)}
+        {healthWarning && <span aria-live="polite"> ⚠</span>}
         <span class="level-meter" title="Mic / system levels">
           <span
             class="level-bar level-mic"

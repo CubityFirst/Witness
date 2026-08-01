@@ -6,6 +6,7 @@ use serde::Serialize;
 pub const RECORDING_STARTED: &str = "recording-started";
 pub const RECORDING_STOPPED: &str = "recording-stopped";
 pub const RECORDING_LEVEL: &str = "recording-level";
+pub const RECORDING_HEALTH: &str = "recording-health";
 pub const WATCHER_STATUS: &str = "watcher-status";
 pub const TRANSCRIPTION_PROGRESS: &str = "transcription-progress";
 pub const TRANSCRIPTION_COMPLETE: &str = "transcription-complete";

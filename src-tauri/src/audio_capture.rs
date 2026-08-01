@@ -9,7 +9,7 @@
 //! thread reopens the current default device; the writer fills the gap with
 //! silence using packet timestamps.
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{SendTimeoutError, Sender, TrySendError};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -41,11 +41,24 @@ pub enum CaptureMsg {
         /// QPC-derived timestamp of the first frame, 100 ns units (0 = unreliable).
         qpc_100ns: u64,
     },
+    /// Audio packets dropped because the bounded writer queue was full.
+    /// The writer inserts equivalent silence so both the timeline and the
+    /// user-visible health counters remain honest.
+    Overflow {
+        kind: TrackKind,
+        packets: u64,
+        samples: u64,
+        sample_rate: u32,
+    },
     /// Device lost; the thread is retrying with the current default device.
     DeviceLost { kind: TrackKind },
     /// Unrecoverable error (thread exits after sending this).
     Fatal { kind: TrackKind, error: String },
 }
+
+/// A little over two seconds at the normal 10 ms WASAPI packet cadence.
+/// This bounds memory without making ordinary scheduler stalls lossy.
+pub const CAPTURE_QUEUE_CAPACITY: usize = 256;
 
 /// ~200 ms shared-mode buffer: roomy enough to survive scheduling hiccups.
 #[cfg(windows)]
@@ -100,6 +113,12 @@ fn resolve_device(
     name: Option<&str>,
 ) -> Result<wasapi::Device, wasapi::WasapiError> {
     if let Some(wanted) = name.filter(|n| !n.trim().is_empty()) {
+        // Endpoint IDs are stable across friendly-name changes and can be
+        // persisted by newer callers. Keep friendly-name matching below for
+        // compatibility with existing settings and the current UI.
+        if let Ok(device) = enumerator.get_device(wanted) {
+            return Ok(device);
+        }
         let wanted_lower = wanted.to_lowercase();
         let collection = enumerator.get_device_collection(direction)?;
         let mut substring_hit = None;
@@ -121,6 +140,68 @@ fn resolve_device(
     enumerator.get_default_device(direction)
 }
 
+/// Control messages must not be silently discarded. A full audio queue is
+/// expected to drain; a disconnected queue means the writer has exited and
+/// the capture thread should stop promptly.
+fn send_control(stop: &AtomicBool, tx: &Sender<CaptureMsg>, mut msg: CaptureMsg) -> bool {
+    loop {
+        match tx.send_timeout(msg, Duration::from_millis(100)) {
+            Ok(()) => return true,
+            Err(SendTimeoutError::Timeout(returned)) => {
+                if stop.load(Ordering::Relaxed) {
+                    return false;
+                }
+                msg = returned;
+            }
+            Err(SendTimeoutError::Disconnected(_)) => return false,
+        }
+    }
+}
+
+#[derive(Default)]
+struct PendingOverflow {
+    packets: u64,
+    samples: u64,
+    sample_rate: u32,
+}
+
+impl PendingOverflow {
+    fn add(&mut self, samples: usize, sample_rate: u32) {
+        self.packets += 1;
+        self.samples += samples as u64;
+        self.sample_rate = sample_rate;
+    }
+
+    fn take_msg(&mut self, kind: TrackKind) -> Option<CaptureMsg> {
+        if self.packets == 0 {
+            return None;
+        }
+        let msg = CaptureMsg::Overflow {
+            kind,
+            packets: self.packets,
+            samples: self.samples,
+            sample_rate: self.sample_rate,
+        };
+        self.packets = 0;
+        self.samples = 0;
+        Some(msg)
+    }
+
+    fn restore(&mut self, msg: CaptureMsg) {
+        if let CaptureMsg::Overflow {
+            packets,
+            samples,
+            sample_rate,
+            ..
+        } = msg
+        {
+            self.packets += packets;
+            self.samples += samples;
+            self.sample_rate = sample_rate;
+        }
+    }
+}
+
 #[cfg(windows)]
 fn run_capture(
     kind: TrackKind,
@@ -136,6 +217,7 @@ fn run_capture(
         TrackKind::Loopback => Direction::Render,
     };
 
+    let mut overflow = PendingOverflow::default();
     'reopen: while !stop.load(Ordering::Relaxed) {
         let result: Result<(), wasapi::WasapiError> = (|| {
             let enumerator = DeviceEnumerator::new()?;
@@ -166,10 +248,16 @@ fn run_capture(
             let capture_client = audio_client.get_audiocaptureclient()?;
             audio_client.start_stream()?;
 
-            let _ = tx.send(CaptureMsg::Format {
-                kind,
-                sample_rate: rate,
-            });
+            if !send_control(
+                stop,
+                tx,
+                CaptureMsg::Format {
+                    kind,
+                    sample_rate: rate,
+                },
+            ) {
+                return Ok(());
+            }
             log::info!(
                 "{} capture open on '{}': {} Hz, {} ch",
                 kind.name(),
@@ -219,11 +307,37 @@ fn run_capture(
                     } else {
                         info.timestamp
                     };
-                    let _ = tx.send(CaptureMsg::Packet {
+                    if let Some(msg) = overflow.take_msg(kind) {
+                        match tx.try_send(msg) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(msg)) => {
+                                overflow.restore(msg);
+                                overflow.add(mono.len(), rate);
+                                continue;
+                            }
+                            Err(TrySendError::Disconnected(_)) => return Ok(()),
+                        }
+                    }
+
+                    let sample_count = mono.len();
+                    match tx.try_send(CaptureMsg::Packet {
                         kind,
                         samples: mono,
                         qpc_100ns: qpc,
-                    });
+                    }) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {
+                            overflow.add(sample_count, rate);
+                            if overflow.packets == 1 || overflow.packets.is_multiple_of(100) {
+                                log::warn!(
+                                    "{} capture writer queue full; {} packets dropped",
+                                    kind.name(),
+                                    overflow.packets
+                                );
+                            }
+                        }
+                        Err(TrySendError::Disconnected(_)) => return Ok(()),
+                    }
                 }
             }
             let _ = audio_client.stop_stream();
@@ -231,7 +345,7 @@ fn run_capture(
         })();
 
         match result {
-            Ok(()) => return Ok(()), // stop requested
+            Ok(()) => break 'reopen, // stop requested
             Err(e) => {
                 if stop.load(Ordering::Relaxed) {
                     return Ok(());
@@ -239,11 +353,19 @@ fn run_capture(
                 // Any stream error (device invalidated 0x88890004, unplugged,
                 // default changed) → reopen the current default device.
                 log::warn!("{} capture error, reopening: {}", kind.name(), e);
-                let _ = tx.send(CaptureMsg::DeviceLost { kind });
+                if !send_control(stop, tx, CaptureMsg::DeviceLost { kind }) {
+                    return Ok(());
+                }
                 std::thread::sleep(Duration::from_millis(500));
                 continue 'reopen;
             }
         }
+    }
+    if let Some(msg) = overflow.take_msg(kind) {
+        // Preserve a dropped tail in the recording timeline when possible.
+        // This is deliberately bounded so Stop cannot hang behind a failed
+        // writer.
+        let _ = tx.send_timeout(msg, Duration::from_millis(100));
     }
     Ok(())
 }
@@ -274,8 +396,23 @@ pub fn spawn_capture(
                 // Per-thread COM init; already-initialized is fine.
                 let _ = wasapi::initialize_mta();
             }
-            if let Err(e) = run_capture(kind, &stop, &tx, device_name.as_deref()) {
-                let _ = tx.send(CaptureMsg::Fatal { kind, error: e });
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_capture(kind, &stop, &tx, device_name.as_deref())
+            }));
+            let error = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(payload) => Some(
+                    payload
+                        .downcast_ref::<&str>()
+                        .map(|message| (*message).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "capture thread panicked".to_string()),
+                ),
+            };
+            if let Some(error) = error {
+                log::error!("{} capture stopped: {}", kind.name(), error);
+                let _ = send_control(&stop, &tx, CaptureMsg::Fatal { kind, error });
             }
         })
         .expect("spawn capture thread")
@@ -283,6 +420,24 @@ pub fn spawn_capture(
 
 #[cfg(test)]
 mod tests {
+    use super::{PendingOverflow, TrackKind};
+
+    #[test]
+    fn pending_overflow_is_losslessly_restored_when_queue_stays_full() {
+        let mut overflow = PendingOverflow::default();
+        overflow.add(480, 48_000);
+        overflow.add(960, 48_000);
+
+        let msg = overflow.take_msg(TrackKind::Mic).unwrap();
+        assert_eq!(overflow.packets, 0);
+        assert_eq!(overflow.samples, 0);
+        overflow.restore(msg);
+
+        assert_eq!(overflow.packets, 2);
+        assert_eq!(overflow.samples, 1_440);
+        assert_eq!(overflow.sample_rate, 48_000);
+    }
+
     /// Real-device enumeration: `cargo test list_devices_smoke -- --ignored --nocapture`
     #[test]
     #[ignore]

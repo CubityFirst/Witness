@@ -36,6 +36,10 @@ const MAX_BUFFER: usize = 15 * 16_000;
 const PAD_FRAMES: usize = 12;
 /// Drop speechless audio once it exceeds this (keep a small tail).
 const IDLE_DROP: usize = 3 * 16_000;
+/// Roughly five seconds at the usual 10 ms packet cadence. Model startup may
+/// lag capture briefly, but live inference must never grow memory without a
+/// ceiling or block the lossless recording writer.
+pub const LIVE_QUEUE_CAPACITY: usize = 512;
 
 struct TrackState {
     kind: TrackKind,
@@ -135,19 +139,22 @@ pub fn spawn(
     on_line: impl Fn(&'static str, u64, u64, String) + Send + 'static,
 ) -> Option<Sender<LiveMsg>> {
     crate::models::parakeet_dir(&models_dir)?;
-    let (tx, rx) = crossbeam_channel::unbounded::<LiveMsg>();
+    let (tx, rx) = crossbeam_channel::bounded::<LiveMsg>(LIVE_QUEUE_CAPACITY);
 
     std::thread::Builder::new()
         .name("live-transcribe".into())
         .spawn(move || {
-            let mut engine: Box<dyn AsrEngine> =
+            let _live_session = crate::ml_scheduler::live_session();
+            let mut engine: Box<dyn AsrEngine> = {
+                let _permit = crate::ml_scheduler::live();
                 match crate::asr::create_engine(Engine::Parakeet, &models_dir) {
                     Ok(e) => e,
                     Err(e) => {
                         log::warn!("live transcription disabled: {e:#}");
-                        return; // channel closes; recorder sends fail silently
+                        return; // channel closes; recorder reports worker health
                     }
-                };
+                }
+            };
             log::info!("live transcription ready");
 
             let mut mic = match TrackState::new(TrackKind::Mic) {
@@ -168,7 +175,11 @@ pub fn spawn(
             let mut transcribe = |track: &mut TrackState, cut: usize| {
                 let (start, chunk) = track.take_chunk(cut);
                 let start_ms = start * 1000 / 16_000;
-                match engine.transcribe(&chunk, start_ms) {
+                let result = {
+                    let _permit = crate::ml_scheduler::live();
+                    engine.transcribe(&chunk, start_ms)
+                };
+                match result {
                     Ok(segments) => {
                         for seg in segments {
                             if !crate::asr::is_junk_text(&seg.text) {

@@ -190,18 +190,16 @@ fn has_mix_tag(data: &[u8]) -> bool {
     false
 }
 
-/// Decode an archived stereo Ogg Opus file back into (mic, loopback) mono
-/// f32 tracks at 48 kHz, undoing the comfort mix when the file has one
-/// (legacy files were hard-panned L=mic / R=loopback).
-pub fn decode_opus(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
+fn decode_opus_chunks(
+    path: &Path,
+    mut on_pcm: impl FnMut(&[f32], &[f32]) -> Result<()>,
+) -> Result<()> {
     let file =
         BufReader::new(File::open(path).with_context(|| format!("opening {}", path.display()))?);
     let mut reader = PacketReader::new(file);
     let mut decoder =
         Decoder::new(SampleRate::Hz48000, Channels::Stereo).context("creating Opus decoder")?;
 
-    let mut mic = Vec::new();
-    let mut lop = Vec::new();
     let mut pre_skip: usize = 0;
     let mut header_packets = 0;
     let mut mixed = false;
@@ -210,6 +208,8 @@ pub fn decode_opus(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
 
     // Inverse of [main cross; cross main] (determinant 0.5).
     let det = MIX_MAIN * MIX_MAIN - MIX_CROSS * MIX_CROSS;
+    let mut mic = Vec::with_capacity(5760);
+    let mut lop = Vec::with_capacity(5760);
 
     while let Some(pkt) = reader.read_packet()? {
         if header_packets < 2 {
@@ -225,7 +225,13 @@ pub fn decode_opus(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
         let decoded = decoder
             .decode(Some(&pkt.data), &mut pcm, false)
             .context("Opus decode")?;
+        mic.clear();
+        lop.clear();
         for frame in pcm[..decoded * 2].chunks_exact(2) {
+            if pre_skip > 0 {
+                pre_skip -= 1;
+                continue;
+            }
             let left = frame[0] as f32 / 32768.0;
             let right = frame[1] as f32 / 32768.0;
             if mixed {
@@ -236,13 +242,49 @@ pub fn decode_opus(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
                 lop.push(right);
             }
         }
+        if !mic.is_empty() {
+            on_pcm(&mic, &lop)?;
+        }
     }
-    // Drop the encoder lookahead the granule accounting says to skip.
-    if pre_skip > 0 && pre_skip < mic.len() {
-        mic.drain(..pre_skip);
-        lop.drain(..pre_skip);
-    }
+    Ok(())
+}
+
+/// Decode an archived stereo Ogg Opus file back into (mic, loopback) mono
+/// f32 tracks at 48 kHz, undoing the comfort mix when the file has one
+/// (legacy files were hard-panned L=mic / R=loopback).
+#[cfg(test)]
+pub fn decode_opus(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
+    let mut mic = Vec::new();
+    let mut lop = Vec::new();
+    decode_opus_chunks(path, |mic_chunk, lop_chunk| {
+        mic.extend_from_slice(mic_chunk);
+        lop.extend_from_slice(lop_chunk);
+        Ok(())
+    })?;
     Ok((mic, lop))
+}
+
+#[derive(Clone, Copy)]
+pub enum ArchiveTrack {
+    Mic,
+    Loopback,
+}
+
+/// Decode one archived track at a time so long-meeting retranscription never
+/// retains both complete tracks concurrently.
+pub fn decode_opus_track_16k(path: &Path, track: ArchiveTrack) -> Result<Vec<f32>> {
+    let mut resampler = crate::resample::StreamResampler::new(48_000, 16_000)?;
+    let mut output = Vec::new();
+    decode_opus_chunks(path, |mic, loopback| {
+        let input = match track {
+            ArchiveTrack::Mic => mic,
+            ArchiveTrack::Loopback => loopback,
+        };
+        output.append(&mut resampler.push(input)?);
+        Ok(())
+    })?;
+    output.append(&mut resampler.finish()?);
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -343,6 +385,12 @@ mod tests {
             lop_rms < 0.05 && lop_rms < mic_rms / 6.0,
             "loopback track leaked audio after unmix (rms {lop_rms} vs mic {mic_rms})"
         );
+
+        let mic_16k = decode_opus_track_16k(&out, ArchiveTrack::Mic).unwrap();
+        let lop_16k = decode_opus_track_16k(&out, ArchiveTrack::Loopback).unwrap();
+        assert!((mic_16k.len() as i64 - 3 * 16_000).unsigned_abs() < 640);
+        assert!(rms(&mic_16k) > 0.1);
+        assert!(rms(&lop_16k) < 0.05);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

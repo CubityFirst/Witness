@@ -121,7 +121,10 @@ mod tests {
         let mut engine = ParakeetEngine::new(&models_dir).unwrap();
         let mut text = String::new();
         for chunk in &chunks {
-            for seg in engine.transcribe(&chunk.samples, chunk.start_ms).unwrap() {
+            for seg in engine
+                .transcribe(chunk.samples(&samples), chunk.start_ms)
+                .unwrap()
+            {
                 println!("[{} - {} ms] {}", seg.start_ms, seg.end_ms, seg.text);
                 text.push_str(&seg.text);
                 text.push(' ');

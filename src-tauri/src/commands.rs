@@ -84,7 +84,8 @@ pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64,
     let live_started = live_tx.is_some();
 
     let level_app = app.clone();
-    let handle = recorder::start(
+    let health_app = app.clone();
+    let handle = recorder::start_with_health(
         &rec_dir,
         id,
         mic_device,
@@ -99,6 +100,9 @@ pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64,
                     elapsed_ms,
                 },
             );
+        },
+        move |health| {
+            let _ = health_app.emit(events::RECORDING_HEALTH, health);
         },
     );
     let handle = match handle {
@@ -281,11 +285,18 @@ pub fn do_stop_recording(app: &AppHandle, by_user: bool) -> Result<(), String> {
     close_captions_overlay(app);
 
     let transcribe = state.settings.lock().unwrap().auto_transcribe;
-    state.pipeline.enqueue(Job {
-        meeting_id: id,
-        transcribe,
-        engine: None,
-    });
+    state
+        .pipeline
+        .enqueue(Job {
+            meeting_id: id,
+            transcribe,
+            engine: None,
+        })
+        .map_err(|error| {
+            format!(
+                "Recording was saved, but processing could not be queued: {error:#}. Restart Witness to retry it."
+            )
+        })?;
     log::info!("recording stopped: meeting {id} ({} ms)", stats.duration_ms);
     Ok(())
 }
@@ -437,6 +448,12 @@ pub fn delete_meeting(app: AppHandle, state: State<'_, AppState>, id: i64) -> Re
         return Err("Stop the recording before deleting this meeting".into());
     }
     state.db.soft_delete_meeting(id).map_err(err)?;
+    if let Err(error) = state.pipeline.cancel(id) {
+        // A worker already owns this meeting. Keep it visible and let the
+        // user retry deletion after processing reaches a safe boundary.
+        let _ = state.db.restore_meeting(id);
+        return Err(format!("Cannot delete this meeting yet: {error:#}"));
+    }
     let _ = app.emit(events::MEETINGS_CHANGED, ());
     Ok(())
 }
@@ -504,6 +521,10 @@ pub fn purge_meeting_data(state: &AppState, id: i64) -> Result<(), String> {
     if !is_binned {
         return Err("Only meetings in the recycle bin can be permanently deleted".into());
     }
+    state
+        .pipeline
+        .cancel(id)
+        .map_err(|error| format!("Cannot purge this meeting yet: {error:#}"))?;
     let meeting = state
         .db
         .get_meeting(id)
@@ -846,11 +867,14 @@ pub fn retranscribe(
     if meeting.status == "recording" {
         return Err("Meeting is still recording".into());
     }
-    state.pipeline.enqueue(Job {
-        meeting_id,
-        transcribe: true,
-        engine,
-    });
+    state
+        .pipeline
+        .enqueue(Job {
+            meeting_id,
+            transcribe: true,
+            engine,
+        })
+        .map_err(err)?;
     Ok(())
 }
 
