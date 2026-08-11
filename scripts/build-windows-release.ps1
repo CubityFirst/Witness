@@ -29,11 +29,26 @@ try {
 
     foreach ($dll in $runtimeDlls) {
         $path = Join-Path $releaseDirectory $dll
-        $item = Get-Item -LiteralPath $path -ErrorAction Stop
-        if ($item.Length -le 0) {
+        # ort-sys prefers symlinks when Windows Developer Mode is available.
+        # FileInfo.Length describes the link itself in Windows PowerShell 5.1,
+        # so open the path to validate the target content instead.
+        $stream = [System.IO.File]::Open(
+            $path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+        try {
+            $length = $stream.Length
+        }
+        finally {
+            $stream.Dispose()
+        }
+
+        if ($length -le 0) {
             throw "Generated runtime DLL is empty: $path"
         }
-        Write-Host "Verified generated runtime DLL: $dll ($($item.Length) bytes)"
+        Write-Host "Verified generated runtime DLL: $dll ($length bytes)"
     }
 
     # Tauri's bundle command consumes an already-built application. Only this
