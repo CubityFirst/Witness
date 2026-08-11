@@ -67,3 +67,6 @@ jobs:
       - name: Test locked Rust targets
         working-directory: src-tauri
         run: cargo test --locked
+
+      - name: Build and verify Windows installer
+        run: npm run release:windows

@@ -20,7 +20,9 @@
       explicit run/waiver record.
 - [ ] The documented `cargo audit --deny unsound …` gate passes and every
       ignored/non-blocking warning is rechecked against the Windows tree.
-- [ ] A release build succeeds with no machine-specific absolute tool paths.
+- [ ] `npm run release:windows` succeeds from a clean checkout with no
+      machine-specific absolute tool paths; its pre-bundle checks verify both
+      generated ONNX Runtime provider DLLs are present and non-empty.
 
 ## Windows manual matrix
 
