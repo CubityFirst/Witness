@@ -36,7 +36,7 @@ hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 sha2 = "0.10"
 hex = "0.4"
 parakeet-rs = { version = "0.3", features = ["cuda", "sortformer"] }
-whisper-rs = "0.14"
+whisper-rs = "0.16"
 # Speaker embeddings run through our own ort session; version MUST stay
 # pinned to whatever parakeet-rs uses (shared ort-sys).
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray"] }
