@@ -1,6 +1,7 @@
 import { useEffect, useState } from "preact/hooks";
 import type { RefObject } from "preact";
 import {
+  BookmarkSimple,
   DownloadSimple,
   FastForward,
   Pause,
@@ -29,9 +30,11 @@ function fmtClock(seconds: number): string {
 export function AudioPlayer(props: {
   src: string;
   audioRef: RefObject<HTMLAudioElement>;
-  /** Bookmark positions (ms) shown as ticks on the scrubber. */
-  markers?: number[];
+  /** Bookmarks shown as clickable ticks on the scrubber. */
+  markers?: { at_ms: number; note: string }[];
   onTimeUpdate: () => void;
+  /** When set, a transport button drops a bookmark at the playback position. */
+  onAddBookmark?: (atMs: number) => void;
   onDownload: () => void;
 }) {
   const [playing, setPlaying] = useState(false);
@@ -78,13 +81,13 @@ export function AudioPlayer(props: {
   // Keyboard: space = play/pause, ←/→ = ±5 s (ignored while typing).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // Space must keep activating focused interactive elements — only treat
+      // it as play/pause when nothing interactive has focus.
       const t = e.target as HTMLElement | null;
       if (
-        t &&
-        (t.tagName === "INPUT" ||
-          t.tagName === "TEXTAREA" ||
-          t.tagName === "SELECT" ||
-          t.isContentEditable)
+        t?.closest?.(
+          'button, a, summary, input, select, textarea, [contenteditable], [role="menuitem"]',
+        )
       ) {
         return;
       }
@@ -138,15 +141,26 @@ export function AudioPlayer(props: {
             max={duration || 0}
             step={0.1}
             value={current}
+            aria-label="Seek"
+            aria-valuetext={fmtClock(current)}
             onInput={(e) => seek(parseFloat((e.target as HTMLInputElement).value))}
           />
           {duration > 0 &&
-            (props.markers ?? []).map((ms) => (
-              <span
+            (props.markers ?? []).map((mark) => (
+              <button
+                type="button"
                 class="seek-marker"
-                key={ms}
-                style={{ left: `${Math.min(100, (ms / 1000 / duration) * 100)}%` }}
-                title={fmtClock(ms / 1000)}
+                key={mark.at_ms}
+                style={{ left: `${Math.min(100, (mark.at_ms / 1000 / duration) * 100)}%` }}
+                title={
+                  mark.note
+                    ? `${fmtClock(mark.at_ms / 1000)} — ${mark.note}`
+                    : fmtClock(mark.at_ms / 1000)
+                }
+                aria-label={`Go to bookmark at ${fmtClock(mark.at_ms / 1000)}${
+                  mark.note ? `: ${mark.note}` : ""
+                }`}
+                onClick={() => seek(mark.at_ms / 1000)}
               />
             ))}
         </div>
@@ -154,24 +168,53 @@ export function AudioPlayer(props: {
       </div>
       <div class="player-row player-controls">
         <div class="player-cluster">
-          <button class="player-btn" title="Back 10 s (←: 5 s)" onClick={() => skip(-10)}>
+          <button
+            type="button"
+            class="player-btn"
+            title="Back 10 s (←: 5 s)"
+            aria-label="Back 10 seconds"
+            onClick={() => skip(-10)}
+          >
             <Rewind size={15} />
           </button>
           <button
+            type="button"
             class="player-btn player-play"
             title={playing ? "Pause (space)" : "Play (space)"}
+            aria-label={playing ? "Pause" : "Play"}
             onClick={toggle}
           >
             {playing ? <Pause /> : <Play />}
           </button>
-          <button class="player-btn" title="Forward 10 s (→: 5 s)" onClick={() => skip(10)}>
+          <button
+            type="button"
+            class="player-btn"
+            title="Forward 10 s (→: 5 s)"
+            aria-label="Forward 10 seconds"
+            onClick={() => skip(10)}
+          >
             <FastForward size={15} />
           </button>
+          {props.onAddBookmark && (
+            <button
+              type="button"
+              class="player-btn"
+              title="Add bookmark here"
+              aria-label="Add bookmark at the current position"
+              onClick={() => {
+                const a = props.audioRef.current;
+                if (a) props.onAddBookmark!(Math.round(a.currentTime * 1000));
+              }}
+            >
+              <BookmarkSimple size={15} />
+            </button>
+          )}
         </div>
         <div class="player-cluster player-cluster-right">
           <select
             class="player-speed"
             title="Playback speed"
+            aria-label="Playback speed"
             value={String(speed)}
             onChange={(e) => {
               const v = parseFloat((e.target as HTMLSelectElement).value);
@@ -193,6 +236,8 @@ export function AudioPlayer(props: {
               max={1}
               step={0.05}
               value={volume}
+              aria-label="Volume"
+              aria-valuetext={`${Math.round(volume * 100)}%`}
               onInput={(e) => {
                 const v = parseFloat((e.target as HTMLInputElement).value);
                 setVolume(v);
@@ -200,7 +245,13 @@ export function AudioPlayer(props: {
               }}
             />
           </span>
-          <button class="player-btn" title="Save a copy…" onClick={props.onDownload}>
+          <button
+            type="button"
+            class="player-btn"
+            title="Save a copy…"
+            aria-label="Save a copy"
+            onClick={props.onDownload}
+          >
             <DownloadSimple />
           </button>
         </div>

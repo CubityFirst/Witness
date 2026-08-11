@@ -287,7 +287,7 @@ fn save_installed_manifest(models_dir: &Path, manifest: &InstalledManifest) -> R
     write_result
 }
 
-fn create_temporary_file(destination: &Path) -> Result<(PathBuf, File)> {
+pub(crate) fn create_temporary_file(destination: &Path) -> Result<(PathBuf, File)> {
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     let name = destination
         .file_name()
@@ -311,12 +311,12 @@ fn create_temporary_file(destination: &Path) -> Result<(PathBuf, File)> {
 }
 
 #[cfg(not(windows))]
-fn replace_file(temporary_path: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn replace_file(temporary_path: &Path, destination: &Path) -> io::Result<()> {
     std::fs::rename(temporary_path, destination)
 }
 
 #[cfg(windows)]
-fn replace_file(temporary_path: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn replace_file(temporary_path: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
@@ -375,7 +375,7 @@ fn full_sha256(path: &Path) -> Result<String> {
     digest_reader(BufReader::new(file)).with_context(|| format!("hashing {}", path.display()))
 }
 
-fn quick_sha256(path: &Path, size: u64) -> Result<String> {
+pub(crate) fn quick_sha256(path: &Path, size: u64) -> Result<String> {
     let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut hasher = Sha256::new();
     hasher.update(size.to_le_bytes());
@@ -611,6 +611,10 @@ pub fn status(models_dir: &Path) -> Vec<ModelInfo> {
 /// (model_id, file, downloaded, total).
 type DownloadProgress<'a> = dyn Fn(&str, &str, u64, Option<u64>) + 'a;
 
+/// Job-wide progress callback: adds the file's 1-based position and the
+/// total file count across every repo the download job covers.
+type JobProgress<'a> = dyn Fn(&str, &str, u64, Option<u64>, u32, u32) + 'a;
+
 struct ProgressBridge<'a> {
     model_id: &'a str,
     file: String,
@@ -747,7 +751,9 @@ fn download_repo(
     models_dir: &Path,
     spec: &ModelSpec,
     manifest: &mut InstalledManifest,
-    cb: &DownloadProgress<'_>,
+    file_offset: u32,
+    file_count: u32,
+    cb: &JobProgress<'_>,
 ) -> Result<()> {
     repair_pinned_ref(models_dir, spec)?;
     let api = ApiBuilder::new()
@@ -758,19 +764,23 @@ fn download_repo(
     let repo_api = api.repo(pinned_repo(spec));
     let mut paths = Vec::with_capacity(spec.files.len());
 
-    for expected in spec.files {
+    for (index, expected) in spec.files.iter().enumerate() {
+        let file_index = file_offset + index as u32 + 1;
+        let file_cb = |model_id: &str, file: &str, downloaded: u64, total: Option<u64>| {
+            cb(model_id, file, downloaded, total, file_index, file_count)
+        };
         let cached_path = pinned_cached(models_dir, spec, expected.path);
         let path = match cached_path {
             Some(path) => match verify_file(&path, expected, true) {
                 Ok(()) => path,
                 Err(_) => {
                     invalidate_cached_file(models_dir, spec, expected)?;
-                    fetch_and_verify_file(models_dir, spec, expected, &repo_api, cb)?
+                    fetch_and_verify_file(models_dir, spec, expected, &repo_api, &file_cb)?
                 }
             },
             None => match recover_orphaned_blob(models_dir, spec, expected)? {
                 Some(path) => path,
-                None => fetch_and_verify_file(models_dir, spec, expected, &repo_api, cb)?,
+                None => fetch_and_verify_file(models_dir, spec, expected, &repo_api, &file_cb)?,
             },
         };
         paths.push(path);
@@ -813,7 +823,9 @@ pub fn download_speaker_id(models_dir: &Path) -> Result<()> {
         models_dir,
         spec("speaker-id"),
         &mut manifest,
-        &|_, _, _, _| {},
+        0,
+        1,
+        &|_, _, _, _, _, _| {},
     )
 }
 
@@ -823,7 +835,7 @@ pub fn download_speaker_id(models_dir: &Path) -> Result<()> {
 pub fn download(
     engine: Engine,
     models_dir: &Path,
-    cb: impl Fn(&str, &str, u64, Option<u64>),
+    cb: impl Fn(&str, &str, u64, Option<u64>, u32, u32),
 ) -> Result<()> {
     let _guard = MODEL_INSTALL_LOCK
         .lock()
@@ -837,12 +849,31 @@ pub fn download(
     let mut manifest = manifest_for_download(models_dir);
     match engine {
         Engine::Parakeet => {
-            for id in ["parakeet", "sortformer", "speaker-id"] {
-                download_repo(models_dir, spec(id), &mut manifest, &cb)?;
+            let ids = ["parakeet", "sortformer", "speaker-id"];
+            let file_count: u32 = ids.iter().map(|id| spec(id).files.len() as u32).sum();
+            let mut file_offset = 0;
+            for id in ids {
+                download_repo(
+                    models_dir,
+                    spec(id),
+                    &mut manifest,
+                    file_offset,
+                    file_count,
+                    &cb,
+                )?;
+                file_offset += spec(id).files.len() as u32;
             }
         }
         Engine::Whisper => {
-            download_repo(models_dir, spec("whisper"), &mut manifest, &cb)?;
+            let file_count = spec("whisper").files.len() as u32;
+            download_repo(
+                models_dir,
+                spec("whisper"),
+                &mut manifest,
+                0,
+                file_count,
+                &cb,
+            )?;
         }
     }
     Ok(())

@@ -7,6 +7,7 @@ import {
   purgeMeeting,
   renameMeeting,
   restoreMeeting,
+  retranscribe,
   type DeletedMeeting,
   type Meeting,
 } from "../lib/api";
@@ -24,6 +25,9 @@ import { appConfirm } from "../lib/confirm";
 import { notifyError, notifySuccess } from "../lib/notify";
 
 const PAGE = 50;
+
+// Survives unmount so Back returns to the same number of loaded pages.
+let loadedCount = 0;
 
 export function fmtDate(iso: string): string {
   const d = new Date(iso);
@@ -95,15 +99,16 @@ export function MeetingsView(props: {
   const [loadError, setLoadError] = useState<string | null>(null);
   const listRequest = useRef(0);
   const binRequest = useRef(0);
+  const openTimer = useRef<number | null>(null);
 
-  const load = async (offset: number, append: boolean) => {
+  const load = async (offset: number, append: boolean, limit = PAGE) => {
     const request = ++listRequest.current;
     setLoading(true);
     try {
-      const rows = await listMeetings(offset, PAGE + 1);
+      const rows = await listMeetings(offset, limit + 1);
       if (request !== listRequest.current) return;
-      setHasMore(rows.length > PAGE);
-      const page = rows.slice(0, PAGE);
+      setHasMore(rows.length > limit);
+      const page = rows.slice(0, limit);
       setMeetings((prev) => (append ? [...prev, ...page] : page));
       setLoadError(null);
     } catch (error) {
@@ -127,13 +132,26 @@ export function MeetingsView(props: {
   };
 
   useEffect(() => {
-    void load(0, false);
+    // Re-request everything already loaded so background refreshes and
+    // back-navigation don't reset pagination to page 1.
+    void load(0, false, Math.max(PAGE, loadedCount));
     void loadBin();
     return () => {
       listRequest.current += 1;
       binRequest.current += 1;
     };
   }, [props.refreshTick]);
+
+  useEffect(() => {
+    if (meetings.length > 0) loadedCount = meetings.length;
+  }, [meetings]);
+
+  useEffect(
+    () => () => {
+      if (openTimer.current != null) window.clearTimeout(openTimer.current);
+    },
+    [],
+  );
 
   const commitRename = (m: Meeting) => {
     const title = editText.trim();
@@ -160,7 +178,18 @@ export function MeetingsView(props: {
     deleteMeeting(m.id).then(() => {
       setMeetings((prev) => prev.filter((x) => x.id !== m.id));
       void loadBin();
-      notifySuccess("Meeting moved to the recycle bin");
+      notifySuccess("Meeting moved to the recycle bin", {
+        label: "Undo",
+        onClick: () => {
+          restoreMeeting(m.id)
+            .then(() => {
+              void load(0, false, Math.max(PAGE, loadedCount));
+              void loadBin();
+              notifySuccess("Meeting restored");
+            })
+            .catch((error) => notifyError("Could not restore the meeting", error));
+        },
+      });
     }).catch((error) => notifyError("Could not move the meeting to the recycle bin", error));
   };
 
@@ -229,7 +258,8 @@ export function MeetingsView(props: {
             <div class="meeting-main">
               <span class="meeting-title">{m.title}</span>
               <span class="meeting-meta">
-                deleted {fmtDate(m.deleted_at)} · auto-removed after 30 days
+                {fmtDate(m.started_at)} · {fmtDuration(m.duration_ms)} · deleted{" "}
+                {fmtDate(m.deleted_at)} · auto-removed after 30 days
               </span>
             </div>
             <button
@@ -240,7 +270,7 @@ export function MeetingsView(props: {
               onClick={() =>
                 restoreMeeting(m.id)
                   .then(() => {
-                    void load(0, false);
+                    void load(0, false, Math.max(PAGE, loadedCount));
                     void loadBin();
                     notifySuccess("Meeting restored");
                   })
@@ -251,7 +281,7 @@ export function MeetingsView(props: {
             </button>
             <button
               type="button"
-              class="icon-btn"
+              class="icon-btn icon-btn-danger"
               title="Delete forever"
               aria-label={`Permanently delete ${m.title}`}
               onClick={(e) => onPurge(m, e.shiftKey)}
@@ -282,6 +312,7 @@ export function MeetingsView(props: {
   if (meetings.length === 0) {
     return (
       <div class="meeting-list">
+        <h2 class="sr-only">Meetings</h2>
         <div class="empty">
           <p>No meetings yet.</p>
           <p class="muted">Join a meeting or hit record.</p>
@@ -292,9 +323,10 @@ export function MeetingsView(props: {
   }
 
   return (
-    <div class="meeting-list">
+    <div class="meeting-list" role="list">
+      <h2 class="sr-only">Meetings</h2>
       {meetings.map((m) => (
-        <div class="meeting-row" key={m.id}>
+        <div class="meeting-row" role="listitem" key={m.id}>
           {editingId === m.id ? (
             <div class="meeting-main">
               <input
@@ -318,9 +350,26 @@ export function MeetingsView(props: {
             <button
               type="button"
               class="meeting-main meeting-open"
-              onClick={() => props.onOpen(m.id)}
+              onClick={(e) => {
+                // Delay single-click opens so the first click of a
+                // double-click (rename) doesn't navigate away.
+                if (e.detail > 1) return;
+                if (openTimer.current != null) window.clearTimeout(openTimer.current);
+                if (e.detail === 0) {
+                  props.onOpen(m.id); // keyboard activation
+                  return;
+                }
+                openTimer.current = window.setTimeout(() => {
+                  openTimer.current = null;
+                  props.onOpen(m.id);
+                }, 250);
+              }}
               onDblClick={(e) => {
                 e.preventDefault();
+                if (openTimer.current != null) {
+                  window.clearTimeout(openTimer.current);
+                  openTimer.current = null;
+                }
                 setEditingId(m.id);
                 setEditText(m.title);
               }}
@@ -338,7 +387,31 @@ export function MeetingsView(props: {
               </span>
             </button>
           )}
-          <StatusIcon status={m.status} />
+          {m.status === "failed" || m.status === "recorded" ? (
+            <button
+              type="button"
+              class={`icon-btn status-${m.status}`}
+              title={
+                m.status === "failed"
+                  ? "Transcription failed — click to retry"
+                  : "Not transcribed — click to transcribe"
+              }
+              aria-label={
+                m.status === "failed"
+                  ? `Retry transcription of ${m.title}`
+                  : `Transcribe ${m.title}`
+              }
+              onClick={() =>
+                retranscribe(m.id)
+                  .then(() => notifySuccess("Transcription queued"))
+                  .catch((error) => notifyError("Could not queue transcription", error))
+              }
+            >
+              {m.status === "failed" ? <WarningCircle size={16} /> : <Waveform size={16} />}
+            </button>
+          ) : (
+            <StatusIcon status={m.status} />
+          )}
           <button
             type="button"
             class="icon-btn"
@@ -360,7 +433,7 @@ export function MeetingsView(props: {
           </button>
           <button
             type="button"
-            class="icon-btn"
+            class="icon-btn icon-btn-danger"
             title="Delete"
             aria-label={`Move ${m.title} to the recycle bin`}
             onClick={(e) => onDelete(m, e.shiftKey)}

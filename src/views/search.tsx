@@ -11,6 +11,17 @@ import { notifyError } from "../lib/notify";
 
 const PAGE = 40;
 
+// Survives unmount so Back after opening a hit keeps the same filters.
+let lastFilters = { who: "", dateFrom: "", dateTo: "" };
+
+function fmtTs(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = String(s % 60).padStart(2, "0");
+  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
+}
+
 /**
  * Backend snippets delimit matches with \x01…\x02 (not HTML) so transcript
  * text can never inject markup; render the delimited runs as <mark>.
@@ -40,9 +51,9 @@ export function SearchView(props: {
   const [error, setError] = useState<string | null>(null);
   const [people, setPeople] = useState<Person[]>([]);
   // "" = anyone, "me"/"them" = track filter, "p<id>" = person filter.
-  const [who, setWho] = useState("");
-  const [dateFrom, setDateFrom] = useState("");
-  const [dateTo, setDateTo] = useState("");
+  const [who, setWho] = useState(lastFilters.who);
+  const [dateFrom, setDateFrom] = useState(lastFilters.dateFrom);
+  const [dateTo, setDateTo] = useState(lastFilters.dateTo);
   const [loading, setLoading] = useState(false);
   const requestGeneration = useRef(0);
 
@@ -90,6 +101,14 @@ export function SearchView(props: {
   }, []);
 
   useEffect(() => {
+    lastFilters = { who, dateFrom, dateTo };
+  }, [who, dateFrom, dateTo]);
+
+  useEffect(() => {
+    // Drop the previous query's results so they can't render under the
+    // new query's heading while the search is in flight.
+    setHits([]);
+    setHasMore(false);
     void load(0, false);
     return () => {
       requestGeneration.current += 1;
@@ -174,7 +193,7 @@ export function SearchView(props: {
       {!loading && !error && hits.length === 0 && (
         <div class="empty muted">No matches.</div>
       )}
-      {[...groups.entries()].map(([meetingId, group]) => (
+      {!error && [...groups.entries()].map(([meetingId, group]) => (
         <div class="search-group" key={meetingId}>
           <h3 class="search-group-title">
             {group[0].meeting_title}
@@ -190,13 +209,18 @@ export function SearchView(props: {
                 props.onOpen(h.meeting_id, h.segment_id > 0 ? h.segment_id : undefined)
               }
             >
+              {h.segment_id > 0 ? (
+                <span class="ts">[{fmtTs(h.start_ms)}]</span>
+              ) : (
+                <span class="chip chip-bookmark">note</span>
+              )}{" "}
               {h.speaker_name && <span class="muted">{h.speaker_name}: </span>}
               <Snippet text={h.snippet} />
             </button>
           ))}
         </div>
       ))}
-      {hasMore && (
+      {!error && hasMore && (
         <button
           type="button"
           class="btn btn-ghost"

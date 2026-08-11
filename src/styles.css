@@ -14,7 +14,7 @@
   --chip-me: #2f6fb2;
   --chip-s1: #7a4dbd;
   --chip-s2: #b0582a;
-  --chip-s3: #2e8f74;
+  --chip-s3: #23735d;
   --chip-s4: #b04a7e;
   --focus: #9acbff;
 }
@@ -138,6 +138,10 @@ button:disabled,
 
 .icon-btn:hover {
   background: var(--bg-hover);
+  color: var(--text);
+}
+
+.icon-btn-danger:hover {
   color: var(--rec);
 }
 
@@ -206,6 +210,15 @@ button.pill-recording {
 
   .pill {
     padding: 5px 9px;
+  }
+
+  /* Dot + time carry the meaning; the word "Recording" is dropped. */
+  .pill-label {
+    display: none;
+  }
+
+  .btn {
+    padding: 6px 10px;
   }
 
   .topbar {
@@ -349,6 +362,14 @@ button.pill-recording {
   background: var(--rec);
   border-color: var(--rec);
   color: #fff;
+  font-weight: 600;
+}
+
+/* Danger buttons darken within their own hue on hover (out-orders .btn:hover). */
+.btn-stop:hover,
+.btn-danger:hover {
+  border-color: #ff8589;
+  background: #d13539;
 }
 
 .model-banner {
@@ -460,6 +481,12 @@ button.pill-recording {
   padding: 16px 20px;
 }
 
+/* Programmatic view focus gives screen readers a useful navigation target;
+   the full-viewport outline is not a useful visual focus indicator. */
+.content:focus-visible {
+  outline: none;
+}
+
 .empty {
   text-align: center;
   padding: 60px 0;
@@ -472,6 +499,18 @@ button.pill-recording {
 .error {
   color: var(--rec);
   padding: 8px 0;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 /* ---------- meetings list ---------- */
@@ -718,6 +757,7 @@ button.meeting-main {
   background: var(--bg-raised);
   border: 1px solid var(--border);
   border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
   display: flex;
   flex-direction: column;
   z-index: 10;
@@ -827,13 +867,30 @@ button.meeting-main {
 
 .seek-marker {
   position: absolute;
-  top: -3px;
+  top: 50%;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  transform: translate(-12px, -50%);
+  cursor: pointer;
+}
+
+.seek-marker::after {
+  content: "";
+  position: absolute;
+  left: 10px;
+  top: 10px;
   width: 4px;
   height: 4px;
   border-radius: 50%;
   background: var(--warn);
-  pointer-events: none;
-  transform: translateX(-2px);
+}
+
+.seek-marker:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
 }
 
 .bookmark-row {
@@ -905,10 +962,6 @@ input[type="range"] {
 .rename-btn {
   padding: 2px 6px;
   vertical-align: middle;
-}
-
-.rename-btn:hover {
-  color: var(--accent);
 }
 
 .title-input {
@@ -996,6 +1049,9 @@ button.chip:disabled {
   border-radius: 999px;
   white-space: nowrap;
   flex-shrink: 0;
+  max-width: 16em;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .chip-me {
@@ -1018,6 +1074,16 @@ button.chip:disabled {
   background: var(--chip-s4);
 }
 
+/* Live-feed "Them": green = remote audio, matching the overlay and loopback meter. */
+.chip-them {
+  background: #2f7c3d;
+}
+
+/* After .chip so the dark glyph wins over its white default. */
+.chip-bookmark {
+  color: #1a1c20;
+}
+
 .ts {
   font-size: 12px;
   color: var(--text-muted);
@@ -1027,6 +1093,27 @@ button.chip:disabled {
 
 .segment-text {
   flex: 1;
+}
+
+/* Floating "Jump to current" pill while follow-along is suspended. */
+.jump-pill {
+  position: sticky;
+  bottom: 12px;
+  align-self: center;
+  z-index: 6;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-raised);
+  color: var(--text);
+  font-size: 12px;
+  padding: 5px 12px;
+  cursor: pointer;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+}
+
+.jump-pill:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent);
 }
 
 /* ---------- live captions & stats ---------- */
@@ -1256,8 +1343,11 @@ button.chip:disabled {
   margin: 0 auto;
 }
 
+/* View titles share one type-scale step (matches the transcript title). */
+.settings-view h2,
 .search-heading {
-  font-size: 16px;
+  font-size: 17px;
+  margin: 0 0 12px;
 }
 
 .search-group {
@@ -1302,6 +1392,22 @@ mark {
 .settings-view {
   max-width: 720px;
   margin: 0 auto;
+}
+
+/* Sticky heading row so the "saved" flash is visible from any scroll position. */
+.settings-head {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 4px 0 12px;
+  background: var(--bg);
+}
+
+.settings-head h2 {
+  margin-bottom: 0;
 }
 
 .settings-view section {

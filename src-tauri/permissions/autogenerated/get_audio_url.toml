@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-audio-url"
+description = "Enables the get_audio_url command without any pre-configured scope."
+commands.allow = ["get_audio_url"]
+
+[[permission]]
+identifier = "deny-get-audio-url"
+description = "Denies the get_audio_url command without any pre-configured scope."
+commands.deny = ["get_audio_url"]

@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
+  addBookmark,
   deleteBookmark,
   exportAudio,
   exportTranscript,
   getAudioUrl,
   getMeeting,
   getTranscriptText,
+  listPeople,
   renameMeeting,
   renameSpeaker,
   retranscribe,
@@ -14,6 +16,7 @@ import {
   type Bookmark,
   type Engine,
   type MeetingDetail,
+  type Person,
   type Segment,
   type TranscriptFormat,
 } from "../lib/api";
@@ -103,6 +106,11 @@ function handleMenuKey(
   } else if (event.key === "End") {
     event.preventDefault();
     items.at(-1)?.focus();
+  } else if (event.key === " ") {
+    // Space activates like Enter (the player's global handler would otherwise
+    // swallow it as play/pause).
+    event.preventDefault();
+    items[index]?.click();
   }
 }
 
@@ -114,6 +122,10 @@ export function TranscriptView(props: {
   refreshTick: number;
   /** Provisional captions while this meeting is being recorded. */
   liveLines: LiveTranscript[] | null;
+  /** Whether the live-caption worker actually started for this recording. */
+  liveCaptionsActive: boolean;
+  /** Pipeline progress for this meeting, null when it isn't transcribing. */
+  transcriptionProgress: { stage: string; pct: number } | null;
   onBack: () => void;
 }) {
   const [detail, setDetail] = useState<MeetingDetail | null>(null);
@@ -131,11 +143,22 @@ export function TranscriptView(props: {
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleText, setTitleText] = useState("");
   const [notesDraft, setNotesDraft] = useState("");
+  const [notesSave, setNotesSave] = useState<"idle" | "saving" | "saved">("idle");
   const [bmEditing, setBmEditing] = useState<{ id: number; text: string } | null>(null);
+  // Follow-along auto-scroll; suspended when the user scrolls away.
+  const [follow, setFollow] = useState(true);
+  const [people, setPeople] = useState<Person[]>([]);
   const audioRef = useRef<HTMLAudioElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const liveFeedRef = useRef<HTMLDivElement>(null);
+  const liveStick = useRef(true);
   const focusedOnce = useRef(false);
+  const pendingSeekMs = useRef<number | null>(null);
   const notesMeetingId = useRef<number | null>(null);
+  const notesDraftRef = useRef("");
+  const notesSavedRef = useRef("");
+  const notesWriteInFlight = useRef(false);
+  const notesTimer = useRef<number | undefined>(undefined);
   const copiedTimer = useRef<number | undefined>(undefined);
   const exportButtonRef = useRef<HTMLButtonElement>(null);
   const exportMenuRef = useRef<HTMLDivElement>(null);
@@ -156,7 +179,10 @@ export function TranscriptView(props: {
         setDetail(loaded);
         if (notesMeetingId.current !== props.meetingId) {
           notesMeetingId.current = props.meetingId;
+          notesDraftRef.current = loaded.meeting.notes;
+          notesSavedRef.current = loaded.meeting.notes;
           setNotesDraft(loaded.meeting.notes);
+          setNotesSave("idle");
         }
       })
       .catch((error) => {
@@ -170,10 +196,17 @@ export function TranscriptView(props: {
     };
   }, [props.meetingId, props.refreshTick, reloadTick]);
 
+  // Fetch the audio URL once the meeting has audio: keyed on audio_path so
+  // finishing a transcription (refreshTick reloads the detail and audio_path
+  // appears) brings the player up without remounting it on unrelated reloads,
+  // and no doomed request is made while the meeting is still recording.
+  const audioPath =
+    detail?.meeting.id === props.meetingId ? detail.meeting.audio_path : null;
   useEffect(() => {
     let cancelled = false;
     setAudioUrl(null);
     setAudioError(null);
+    if (!audioPath) return;
     getAudioUrl(props.meetingId)
       .then((url) => {
         if (!cancelled) setAudioUrl(url);
@@ -187,7 +220,7 @@ export function TranscriptView(props: {
     return () => {
       cancelled = true;
     };
-  }, [props.meetingId]);
+  }, [props.meetingId, audioPath, reloadTick]);
 
   useEffect(
     () => () => {
@@ -228,19 +261,73 @@ export function TranscriptView(props: {
     };
   }, [exportMenu, engineMenu]);
 
-  const saveNotes = () => {
-    if (detail && notesDraft !== detail.meeting.notes) {
-      setMeetingNotes(props.meetingId, notesDraft)
-        .then(() =>
-          setDetail((d) =>
-            d?.meeting.id === props.meetingId
-              ? { ...d, meeting: { ...d.meeting, notes: notesDraft } }
-              : d,
-          ),
-        )
-        .catch((error) => notifyError("Could not save notes", error));
+  // Enrolled people for the rename datalist — a typo would fork a new person.
+  useEffect(() => {
+    if (renaming == null) return;
+    listPeople()
+      .then(setPeople)
+      .catch(() => {});
+  }, [renaming != null]);
+
+  // Notes autosave: debounced on input and flushed best-effort on blur,
+  // tab-hide, and unmount. Only one database write runs at a time; when text
+  // changes during a write, its completion immediately flushes the newest
+  // draft so an older request can never overwrite newer notes.
+  const flushNotes = () => {
+    window.clearTimeout(notesTimer.current);
+    if (notesWriteInFlight.current) return;
+    const meetingId = notesMeetingId.current;
+    const draft = notesDraftRef.current;
+    if (meetingId == null || draft === notesSavedRef.current) {
+      setNotesSave((s) => (s === "saving" ? "saved" : s));
+      return;
     }
+    setNotesSave("saving");
+    notesWriteInFlight.current = true;
+    setMeetingNotes(meetingId, draft)
+      .then(() => {
+        notesWriteInFlight.current = false;
+        if (notesMeetingId.current !== meetingId) {
+          flushNotes();
+          return;
+        }
+        notesSavedRef.current = draft;
+        setDetail((d) =>
+          d?.meeting.id === meetingId
+            ? { ...d, meeting: { ...d.meeting, notes: draft } }
+            : d,
+        );
+        if (notesDraftRef.current !== draft) flushNotes();
+        else setNotesSave("saved");
+      })
+      .catch((error) => {
+        notesWriteInFlight.current = false;
+        setNotesSave("idle");
+        notifyError("Could not save notes", error);
+      });
   };
+
+  const queueNotesSave = (text: string) => {
+    notesDraftRef.current = text;
+    setNotesDraft(text);
+    if (text !== notesSavedRef.current) setNotesSave("saving");
+    window.clearTimeout(notesTimer.current);
+    notesTimer.current = window.setTimeout(flushNotes, 800);
+  };
+
+  useEffect(() => {
+    const onHidden = () => {
+      if (document.visibilityState === "hidden") flushNotes();
+    };
+    const onPageHide = () => flushNotes();
+    document.addEventListener("visibilitychange", onHidden);
+    window.addEventListener("pagehide", onPageHide);
+    return () => {
+      document.removeEventListener("visibilitychange", onHidden);
+      window.removeEventListener("pagehide", onPageHide);
+      flushNotes();
+    };
+  }, []);
 
   const speakersById = useMemo(() => {
     const m = new Map<
@@ -296,7 +383,9 @@ export function TranscriptView(props: {
   // Deep-link from search: scroll to the target segment once loaded.
   useEffect(() => {
     focusedOnce.current = false;
+    pendingSeekMs.current = null;
     setActiveIdx(-1);
+    setFollow(true);
   }, [props.meetingId, props.focusSegmentId]);
 
   useEffect(() => {
@@ -305,6 +394,11 @@ export function TranscriptView(props: {
     if (idx >= 0) {
       focusedOnce.current = true;
       setActiveIdx(idx);
+      // Position the audio (without playing) so Play resumes from the found
+      // moment instead of 0:00.
+      const a = audioRef.current;
+      if (a && a.readyState >= 1) a.currentTime = segments[idx].start_ms / 1000;
+      else pendingSeekMs.current = segments[idx].start_ms;
       requestAnimationFrame(() => {
         const target = listRef.current?.querySelector<HTMLElement>(
           `[data-idx="${idx}"]`,
@@ -315,13 +409,48 @@ export function TranscriptView(props: {
     }
   }, [segments, props.focusSegmentId]);
 
+  // Apply a deep-link seek once the audio element exists and has metadata.
+  useEffect(() => {
+    const a = audioRef.current;
+    if (!a || !audioUrl) return;
+    const apply = () => {
+      if (pendingSeekMs.current != null) {
+        a.currentTime = pendingSeekMs.current / 1000;
+        pendingSeekMs.current = null;
+      }
+    };
+    if (a.readyState >= 1) apply();
+    else a.addEventListener("loadedmetadata", apply, { once: true });
+    return () => a.removeEventListener("loadedmetadata", apply);
+  }, [audioUrl]);
+
+  // Suspend follow-along when the user scrolls the pane themselves (wheel /
+  // touch / scrollbar); programmatic scrollIntoView fires none of these.
+  useEffect(() => {
+    const container = listRef.current?.closest(".content");
+    if (!container) return;
+    const suspend = () => setFollow(false);
+    const onPointerDown = (event: Event) => {
+      // Scrollbar drags and track clicks target the container itself.
+      if (event.target === container) setFollow(false);
+    };
+    container.addEventListener("wheel", suspend, { passive: true });
+    container.addEventListener("touchmove", suspend, { passive: true });
+    container.addEventListener("pointerdown", onPointerDown);
+    return () => {
+      container.removeEventListener("wheel", suspend);
+      container.removeEventListener("touchmove", suspend);
+      container.removeEventListener("pointerdown", onPointerDown);
+    };
+  }, [detail != null]);
+
   const onTimeUpdate = () => {
     const a = audioRef.current;
     if (!a) return;
     const idx = segmentAt(segments, a.currentTime * 1000);
     if (idx !== activeIdx) {
       setActiveIdx(idx);
-      if (idx >= 0) {
+      if (idx >= 0 && follow) {
         listRef.current
           ?.querySelector(`[data-idx="${idx}"]`)
           ?.scrollIntoView({ block: "nearest", behavior: "smooth" });
@@ -335,6 +464,7 @@ export function TranscriptView(props: {
     a.currentTime = seg.start_ms / 1000;
     a.play().catch((error) => notifyError("Could not play the recording", error));
     setActiveIdx(idx);
+    setFollow(true);
   };
 
   const commitSpeakerRename = (speakerId: number) => {
@@ -399,6 +529,30 @@ export function TranscriptView(props: {
     );
   };
 
+  // Live captions take over while the meeting is still recording, and the held
+  // lines stay visible (clearly provisional) after stop until the diarized
+  // transcript replaces them — the pipeline can take minutes and the text is
+  // still in memory.
+  const meetingStatus = detail?.meeting.status;
+  const isRecording = meetingStatus === "recording";
+  const showLive =
+    props.liveLines != null &&
+    segments.length === 0 &&
+    (isRecording ||
+      ((meetingStatus === "processing" || meetingStatus === "recorded") &&
+        props.liveLines.length > 0));
+  const liveSorted = useMemo(
+    () =>
+      showLive ? [...props.liveLines!].sort((a, b) => a.start_ms - b.start_ms) : [],
+    [showLive, props.liveLines],
+  );
+
+  // Stick-to-bottom live feed: only autoscroll while the user is at the bottom.
+  useEffect(() => {
+    const el = liveFeedRef.current;
+    if (el && liveStick.current) el.scrollTop = el.scrollHeight;
+  }, [liveSorted.length, showLive]);
+
   if (loadError) {
     return (
       <div class="view-error" role="alert">
@@ -417,14 +571,6 @@ export function TranscriptView(props: {
   if (!detail) return <div class="empty" role="status">Loading…</div>;
   const m = detail.meeting;
 
-  // Live captions take over while the meeting is still recording (the final
-  // pipeline pass replaces them with the diarized transcript).
-  const showLive =
-    props.liveLines != null && segments.length === 0 && m.status === "recording";
-  const liveSorted = showLive
-    ? [...props.liveLines!].sort((a, b) => a.start_ms - b.start_ms)
-    : [];
-
   return (
     <div class="transcript-view">
       <div class="transcript-header">
@@ -435,6 +581,7 @@ export function TranscriptView(props: {
           {editingTitle ? (
             <input
               class="rename-input title-input"
+              aria-label="Meeting title"
               value={titleText}
               autoFocus
               onInput={(e) => setTitleText((e.target as HTMLInputElement).value)}
@@ -553,7 +700,9 @@ export function TranscriptView(props: {
         <div class="stats-bar" aria-label="Speaker statistics">
           {speakerStats.map((s) => (
             <span class="stat-chip" key={s.name}>
-              <span class={`chip ${CHIP_CLASS[s.label] ?? "chip-s1"}`}>{s.name}</span>
+              <span class={`chip ${CHIP_CLASS[s.label] ?? "chip-s1"}`} title={s.name}>
+                {s.name}
+              </span>
               {fmtDuration(s.talk)} · {s.words.toLocaleString()} words ·{" "}
               {Math.round(s.share)}%
             </span>
@@ -562,37 +711,62 @@ export function TranscriptView(props: {
       )}
 
       {showLive && (
-        <div class="live-feed" role="log" aria-live="polite" aria-relevant="additions">
+        <div
+          class="live-feed"
+          ref={liveFeedRef}
+          role="log"
+          aria-live="polite"
+          aria-relevant="additions"
+          onScroll={(e) => {
+            const el = e.currentTarget as HTMLDivElement;
+            liveStick.current =
+              el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+          }}
+        >
           <div class="live-header">
-            <span class="rec-dot" /> Live captions
+            {isRecording && <span class="rec-dot" />} Live captions
             <span class="muted">· provisional</span>
           </div>
-          {liveSorted.length === 0 && (
-            <p class="muted">Listening… captions appear a few seconds after speech.</p>
-          )}
+          {liveSorted.length === 0 &&
+            (!props.liveCaptionsActive ? (
+              <p class="muted">
+                Live captions are off — enable them in Settings / download the
+                transcription models. The full transcript is produced after the
+                recording.
+              </p>
+            ) : (
+              <p class="muted">Listening… captions appear a few seconds after speech.</p>
+            ))}
           {liveSorted.map((l) => (
             <div class="segment" key={`${l.track}-${l.start_ms}`}>
-              <span class={`chip ${l.track === "mic" ? "chip-me" : "chip-s1"}`}>
+              <span class={`chip ${l.track === "mic" ? "chip-me" : "chip-them"}`}>
                 {l.track === "mic" ? "Me" : "Them"}
               </span>
               <span class="ts">[{fmtTs(l.start_ms)}]</span>
               <span class="segment-text">{l.text}</span>
             </div>
           ))}
-          <div ref={(el) => el?.scrollIntoView({ block: "nearest" })} />
         </div>
       )}
 
       <div class="notes-panel">
         <details open={!!(detail.meeting.notes || notesDraft)}>
-          <summary class="muted">Notes</summary>
+          <summary class="muted">
+            Notes
+            {notesSave !== "idle" && (
+              <span class="muted" role="status">
+                {" "}
+                · {notesSave === "saving" ? "Saving…" : "Saved"}
+              </span>
+            )}
+          </summary>
           <textarea
             class="notes-input"
             aria-label="Meeting notes"
             placeholder="Meeting notes… (searchable)"
             value={notesDraft}
-            onInput={(e) => setNotesDraft((e.target as HTMLTextAreaElement).value)}
-            onBlur={saveNotes}
+            onInput={(e) => queueNotesSave((e.target as HTMLTextAreaElement).value)}
+            onBlur={flushNotes}
           />
         </details>
       </div>
@@ -606,15 +780,43 @@ export function TranscriptView(props: {
       <div class="segments" ref={listRef} aria-label="Transcript">
         {segments.length === 0 && !showLive && bookmarks.length === 0 && (
           <div class="empty">
-            <p class="muted">
-              {m.status === "recorded"
-                ? "Not transcribed yet."
-                : m.status === "processing"
-                  ? "Transcription in progress…"
-                  : m.status === "failed"
-                    ? "Transcription failed — use Retranscribe to retry."
-                    : "No transcript."}
-            </p>
+            {m.status === "recorded" ? (
+              <p class="muted">
+                {detail.pipeline_queued
+                  ? "Queued for transcription"
+                  : "Not transcribed yet."}
+              </p>
+            ) : m.status === "processing" ? (
+              <p class="muted">
+                {props.transcriptionProgress
+                  ? `Transcribing (${props.transcriptionProgress.stage}) ${Math.round(props.transcriptionProgress.pct)}%`
+                  : "Transcription in progress…"}
+              </p>
+            ) : m.status === "failed" ? (
+              <>
+                <p class="muted">
+                  {detail.last_error
+                    ? `Transcription failed: ${detail.last_error}`
+                    : "Transcription failed."}
+                </p>
+                <button type="button" class="btn" onClick={() => doRetranscribe()}>
+                  Retry
+                </button>
+              </>
+            ) : m.status === "transcribed" ? (
+              <>
+                <p class="muted">
+                  Transcription finished, but no speech was detected in this
+                  recording.
+                </p>
+                <p class="muted">
+                  If people were talking, check the microphone / meeting-audio
+                  devices in Settings.
+                </p>
+              </>
+            ) : (
+              <p class="muted">No transcript.</p>
+            )}
           </div>
         )}
         {rows.map((row) => {
@@ -637,6 +839,7 @@ export function TranscriptView(props: {
                     a.play().catch((error) =>
                       notifyError("Could not play the recording", error),
                     );
+                    setFollow(true);
                   }
                 }}
                 >
@@ -700,7 +903,7 @@ export function TranscriptView(props: {
                 )}
                 <button
                   type="button"
-                  class="icon-btn"
+                  class="icon-btn icon-btn-danger"
                   title="Remove bookmark"
                   aria-label={`Remove bookmark at ${fmtTs(bm.at_ms)}`}
                   onClick={() => {
@@ -733,8 +936,8 @@ export function TranscriptView(props: {
                 class={`chip ${CHIP_CLASS[label] ?? "chip-s1"}`}
                 title={
                   sp?.auto_labeled
-                    ? "Auto-matched by voice — click to rename/confirm"
-                    : "Click to rename speaker"
+                    ? `${sp?.display_name ?? label} — auto-matched by voice, click to rename/confirm`
+                    : `${sp?.display_name ?? label} — click to rename`
                 }
                 disabled={seg.speaker_id == null}
                 onClick={() => {
@@ -749,54 +952,109 @@ export function TranscriptView(props: {
                 {sp?.display_name ?? label}
               </button>
               {renaming != null && renaming.segId === seg.id && (
-                <input
-                  class="rename-input"
-                  value={renameText}
-                  autoFocus
-                  aria-label={`Rename ${sp?.display_name ?? label}`}
-                  onInput={(e) => setRenameText((e.target as HTMLInputElement).value)}
-                  onBlur={() => {
-                    if (speakerRenameCancel.current) {
-                      speakerRenameCancel.current = false;
-                    } else {
-                      commitSpeakerRename(renaming.speakerId);
-                    }
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") commitSpeakerRename(renaming.speakerId);
-                    if (e.key === "Escape") {
-                      speakerRenameCancel.current = true;
-                      setRenaming(null);
-                    }
-                  }}
-                />
+                <>
+                  <input
+                    class="rename-input"
+                    value={renameText}
+                    autoFocus
+                    aria-label={`Rename ${sp?.display_name ?? label}`}
+                    list="speaker-rename-people"
+                    onInput={(e) => setRenameText((e.target as HTMLInputElement).value)}
+                    onBlur={() => {
+                      if (speakerRenameCancel.current) {
+                        speakerRenameCancel.current = false;
+                      } else {
+                        commitSpeakerRename(renaming.speakerId);
+                      }
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") commitSpeakerRename(renaming.speakerId);
+                      if (e.key === "Escape") {
+                        speakerRenameCancel.current = true;
+                        setRenaming(null);
+                      }
+                    }}
+                  />
+                  <span class="muted" style={{ fontSize: "11px" }}>
+                    Saves this voice as {renameText.trim() || "this name"} for
+                    future meetings
+                  </span>
+                </>
               )}
               <button
                 type="button"
                 class="segment-seek"
+                style={{ flex: "0 0 auto" }}
                 data-idx={idx}
                 aria-current={idx === activeIdx ? "true" : undefined}
-                aria-label={`Play at ${fmtTs(seg.start_ms)}: ${seg.text}`}
+                aria-label={`Play at ${fmtTs(seg.start_ms)}`}
                 aria-disabled={!audioUrl}
                 onClick={() => seekTo(seg, idx)}
               >
                 <span class="ts">[{fmtTs(seg.start_ms)}]</span>
-                <span class="segment-text">
-                  <Highlighted text={seg.text} terms={props.highlight} />
-                </span>
               </button>
+              <span
+                class="segment-text"
+                // Plain span (not inside the button) so the text is selectable
+                // in WebView2; a completed selection must not trigger a seek.
+                style={{ userSelect: "text", cursor: "text" }}
+                onClick={() => {
+                  if (!window.getSelection()?.isCollapsed) return;
+                  seekTo(seg, idx);
+                }}
+              >
+                <Highlighted text={seg.text} terms={props.highlight} />
+              </span>
             </div>
           );
         })}
       </div>
+      <datalist id="speaker-rename-people">
+        {people.map((p) => (
+          <option value={p.name} key={p.id} />
+        ))}
+      </datalist>
 
+      {!follow && audioUrl && activeIdx >= 0 && (
+        <button
+          type="button"
+          class="jump-pill"
+          onClick={() => {
+            setFollow(true);
+            listRef.current
+              ?.querySelector(`[data-idx="${activeIdx}"]`)
+              ?.scrollIntoView({ block: "center", behavior: "smooth" });
+          }}
+        >
+          Jump to current
+        </button>
+      )}
       {audioUrl && (
         <div class="player-bar">
           <AudioPlayer
             src={audioUrl}
             audioRef={audioRef}
-            markers={bookmarks.map((b) => b.at_ms)}
+            markers={bookmarks.map((b) => ({ at_ms: b.at_ms, note: b.note }))}
             onTimeUpdate={onTimeUpdate}
+            onAddBookmark={(atMs) => {
+              addBookmark(m.id, atMs, "")
+                .then((id) => {
+                  setDetail((d) =>
+                    d?.meeting.id === props.meetingId
+                      ? {
+                          ...d,
+                          bookmarks: [
+                            ...d.bookmarks,
+                            { id, meeting_id: m.id, at_ms: atMs, note: "" },
+                          ],
+                        }
+                      : d,
+                  );
+                  bookmarkCancel.current = null;
+                  setBmEditing({ id, text: "" });
+                })
+                .catch((error) => notifyError("Could not add the bookmark", error));
+            }}
             onDownload={() =>
               exportAudio(m.id).catch((error) =>
                 notifyError("Could not export the audio", error),

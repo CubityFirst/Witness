@@ -21,10 +21,12 @@
         "resizable": true,
         "visible": true,
         "decorations": false,
+        "zoomHotkeysEnabled": true,
         "backgroundColor": "#14161a"
       }
     ],
     "security": {
+      "capabilities": ["main", "captions"],
       "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost; media-src 'self' asset: http://asset.localhost",
       "assetProtocol": {
         "enable": true,

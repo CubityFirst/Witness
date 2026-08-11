@@ -131,6 +131,12 @@ pub fn build(app: &App) -> tauri::Result<()> {
                 };
                 if let Err(e) = result {
                     log::warn!("tray record toggle: {e}");
+                    let body = if recording {
+                        e
+                    } else {
+                        format!("Recording could not start: {e}")
+                    };
+                    commands::toast(app, &body);
                 }
             }
             "quit" => {
@@ -172,6 +178,17 @@ pub fn build(app: &App) -> tauri::Result<()> {
 
     app.manage(TrayHandles { record, status });
     Ok(())
+}
+
+/// Reflect a capture problem (or its recovery) in the tray tooltip while
+/// recording; `update` resets the tooltip when the recording ends.
+pub fn set_recording_warning(app: &AppHandle, warning: Option<&str>) {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let _ = tray.set_tooltip(Some(match warning {
+            Some(text) => format!("Witness — recording — {text}"),
+            None => "Witness — recording".into(),
+        }));
+    }
 }
 
 /// Reflect recording state in the tray menu, tooltip and icon (red = live).

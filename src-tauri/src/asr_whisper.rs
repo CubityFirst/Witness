@@ -81,7 +81,7 @@ mod tests {
         crate::models::download(
             crate::settings::Engine::Whisper,
             &models_dir,
-            |m, f, d, t| {
+            |m, f, d, t, _, _| {
                 if let Some(t) = t {
                     println!("{m}/{f}: {} / {} MB", d / 1_000_000, t / 1_000_000);
                 }

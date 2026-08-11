@@ -5,8 +5,9 @@ backend, Preact frontend). Detects Teams calls via the mic consent store,
 records mic + system loopback as separate tracks, live-captions while
 recording, transcribes on-device (Parakeet TDT on CUDA / Whisper on CPU)
 with diarization and cross-meeting voice identification, and keeps a
-full-text-searchable archive. Nothing leaves the machine. Sibling project
-to Vigil (`G:\Scripts\vigil`) — same single-process, tray-first philosophy.
+full-text-searchable archive. Meeting content stays on the machine; only
+explicit model/GPU-library downloads use the network. It follows the same
+single-process, tray-first philosophy as the sibling Vigil project.
 
 PLAN.md is the original (implemented) design; this file is the living map.
 
@@ -51,7 +52,7 @@ The window is chrome-less: the top bar is the drag region + custom
 min/max/close (close hides to tray). A second webview window "captions"
 (`#captions` hash route) is the always-on-top live-caption overlay.
 
-## Data model (SQLite, WAL, `PRAGMA user_version` = 4)
+## Data model (SQLite, WAL, `PRAGMA user_version` = 5)
 
 - `meetings(id, started_at, ended_at, title, audio_path, duration_ms,
   status, engine, trigger, notes, deleted_at)` — status:
@@ -70,8 +71,8 @@ min/max/close (close hides to tray). A second webview window "captions"
 
 - **Device-level loopback, never per-process loopback on ms-teams.exe** —
   documented Windows bug records silence (Windows-classic-samples#414).
-  Teams isolation instead comes from per-app audio routing: the GoXLR
-  "Chat" output carries only Teams; Witness captures that device by name.
+  Teams isolation instead comes from routing Teams to a dedicated output
+  endpoint and selecting that stable endpoint in Witness.
 - **Two tracks (mic + loopback) = free Me/Them separation**; recorded as
   two mono WAVs, archived as one stereo Opus with an **invertible comfort
   mix** (L=0.75·mic+0.25·loop, R mirrored, `WITNESS_MIX=75` in OpusTags):
@@ -86,7 +87,19 @@ min/max/close (close hides to tray). A second webview window "captions"
 - **Engines load per pipeline job and drop after** → VRAM freed between
   meetings. Live captions hold their own Parakeet instance only while
   recording. ort silently falls back CUDA→CPU; the realtime factor in the
-  completion toast/log is the tell (single digits on this box = CPU).
+  completion toast/log is the tell (CPU fallback is substantially slower).
+  gpu.rs `preflight()` makes the fallback loud: it verifies the CUDA EP's
+  load-time imports resolve (app dir → System32 → PATH), prepends known
+  cuDNN install dirs (`CUDNN_PATH`, `NVIDIA\CUDNN` under Program Files /
+  LOCALAPPDATA) to the process PATH when that repairs a gap, and warns
+  naming exactly which DLLs are missing. Called at startup, before each
+  Parakeet pipeline job / live session, and by `get_gpu_status` (Settings).
+  gpu_libs.rs backs the Settings "Download GPU libraries" button (~1 GB):
+  pinned NVIDIA PyPI wheels (immutable files.pythonhosted.org URLs +
+  SHA-256), Range-resumable downloads, DLL extraction by basename into
+  `data_dir/cuda/`, an atomic install manifest with quick fingerprints, and
+  Repair — the verified dir is preflight's first candidate, so GPU kicks in
+  without a restart.
 - **Voice identification invariants**: auto-matches never mutate stored
   prints; only explicit renames enroll/update people. Renaming always
   creates/links a person (even print-less) so People stats unify.
@@ -135,7 +148,10 @@ min/max/close (close hides to tray). A second webview window "captions"
   =2.0.0-rc.10; parakeet-rs needs rc.12. earshot frames: exactly 256
   samples @ 16 kHz.
 - **Our direct `ort` dep is pinned `=2.0.0-rc.12`** to match parakeet-rs
-  (shared ort-sys). speaker_id.rs runs its own CPU session (3D-Speaker
+  (shared ort-sys). Its CUDA provider binaries hard-import
+  `cudnn64_9.dll` + `cublas64_13`/`cublasLt64_13`/`cufft64_12` (CUDA 13
+  runtime + cuDNN 9) — mirrored in gpu.rs `CUDA_EP_DLLS`; re-dump the
+  provider's imports when bumping ort. speaker_id.rs runs its own CPU session (3D-Speaker
   ERes2Net, input `x` [1,T,80] kaldi fbank — 80 mel, 25/10 ms, povey, CMN,
   samples in [-1,1]; output `embedding` [1,192], L2-normalize ourselves;
   threshold user-tunable, default 0.6).
@@ -151,15 +167,15 @@ min/max/close (close hides to tray). A second webview window "captions"
   expression is never parsed and invalid syntax slips through.
 - Whisper CUDA is behind the `whisper-cuda` cargo feature (needs the CUDA
   toolkit at build time); default build = CPU Whisper + CUDA Parakeet.
-- Tauri frontend window-state calls (minimize/hide/drag…) need explicit
-  ACL grants in `capabilities/default.json` — `core:default` is read-only.
-  The "captions" window must stay in that file's `windows` list.
+- Tauri frontend window-state calls (minimize/hide/drag…) need explicit ACL
+  grants. Keep main-window commands in `capabilities/default.json`; the
+  captions window remains isolated in `capabilities/captions.json`.
 
 ## Platform quirks encoded here
 
 - Global hotkeys walk candidate chains (record: ctrl+alt+r→w→shift+r;
-  bookmark: ctrl+alt+b→m) because other apps own combos system-wide; bound
-  combos live in AppState (get_hotkey). Ctrl+alt+r is taken on this box.
+  bookmark: ctrl+alt+b→m) because other apps can own combos system-wide;
+  bound combos live in AppState and are exposed through status commands.
 - Toasts are attributed to PowerShell in dev — unpackaged apps have no
   AUMID registration; the NSIS install shows "Witness" correctly.
 - `backgroundColor` on windows kills the white flash when resizing.
@@ -171,9 +187,10 @@ min/max/close (close hides to tray). A second webview window "captions"
 
 ## Building & testing
 
-cmake + libclang aren't on PATH; `.cargo/config.toml` `[env]` points cargo
-at them (VS BuildTools' cmake.exe, `C:\Program Files\LLVM\bin`). LLVM must
-stay **19.x** — bindgen 0.71 (whisper-rs-sys) miscompiles under LLVM 22.
+Install CMake and libclang through Visual Studio Build Tools/LLVM, put CMake
+on `PATH`, and set `LIBCLANG_PATH` when needed. Do not commit machine-local
+tool paths. LLVM stays on **19.x** because bindgen 0.71 (whisper-rs-sys) is
+not validated with newer LLVM releases.
 
 - `cargo test` (in src-tauri) — fast unit suite. Use
   `CARGO_TARGET_DIR=target-test` when `npm run tauri dev` is running (the
@@ -187,19 +204,18 @@ stay **19.x** — bindgen 0.71 (whisper-rs-sys) miscompiles under LLVM 22.
   `list_devices_smoke`.
 - `npm run tauri dev` / `npm run tauri build` (NSIS installer).
 
-## Settings & files (vigil layering)
+## Settings & files
 
 `WITNESS_SETTINGS` env var → `witness-settings.toml` (next to exe) →
 `data_dir`: `witness.db`, `audio/{id}.opus`, `rec-tmp/` (in-flight WAVs +
-`.meta.toml` crash sidecars), `models/hf-cache/`, `witness.log`.
+`.meta.toml` crash sidecars), `models/hf-cache/`, `cuda/` (optional managed
+GPU DLLs), `witness.log`.
 data_dir changes apply to db/log on restart (Settings offers the button).
-On this machine the GoXLR devices are configured: mic "Chat Mic
-(TC-HELICON GoXLR)", loopback "Chat (TC-HELICON GoXLR)".
 
 ## Known limitations (accepted)
 
-- No echo cancellation: speakers instead of a headset would bleed remote
-  audio into the mic track (fine on the GoXLR headset).
+- No echo cancellation: speakers instead of a headset can bleed remote audio
+  into the mic track; a headset is recommended.
 - Diarization caps at 4 remote speakers; voice matching on compressed
   Teams audio is good-but-not-perfect (hence the ≈ marker + rename flow).
 - DB and audio are unencrypted at rest (local-only threat model).

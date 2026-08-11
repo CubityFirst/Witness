@@ -363,7 +363,8 @@ fn process(
         let archive_path = if have_wavs {
             None
         } else if let Some(relative) = &meeting.audio_path {
-            let path = audio_dir.join(relative);
+            let path = crate::commands::safe_archive_path(&audio_dir, relative)
+                .map_err(anyhow::Error::msg)?;
             if !path.exists() {
                 bail!(
                     "no source audio: WAVs cleaned up and {} missing",
@@ -392,6 +393,11 @@ fn process(
 
         // ---- ASR (both tracks) ----
         progress("asr", 0.0);
+        if engine_kind == Engine::Parakeet {
+            // Repair/flag CUDA library resolution before ort can silently
+            // fall back to CPU; the warning lands next to this job's rtf line.
+            crate::gpu::preflight();
+        }
         let (mic_segments, loop_segments, loop_16k, loop_chunks, loop_kept_ms) = {
             let mut engine = {
                 let _permit = ml_scheduler::batch();

@@ -138,6 +138,7 @@ pub fn spawn(
     models_dir: PathBuf,
     junk_phrases: Vec<String>,
     on_line: impl Fn(&'static str, u64, u64, String) + Send + 'static,
+    on_status: impl FnOnce(Result<(), String>) + Send + 'static,
 ) -> Option<Sender<LiveMsg>> {
     crate::models::parakeet_dir(&models_dir)?;
     let (tx, rx) = crossbeam_channel::bounded::<LiveMsg>(LIVE_QUEUE_CAPACITY);
@@ -145,23 +146,25 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("live-transcribe".into())
         .spawn(move || {
+            let mut on_status = Some(on_status);
             let _live_session = crate::ml_scheduler::live_session();
+            crate::gpu::preflight();
             let mut engine: Box<dyn AsrEngine> = {
                 let _permit = crate::ml_scheduler::live();
                 match crate::asr::create_engine(Engine::Parakeet, &models_dir) {
                     Ok(e) => e,
                     Err(e) => {
                         log::warn!("live transcription disabled: {e:#}");
+                        on_status.take().unwrap()(Err(format!("{e:#}")));
                         return; // channel closes; recorder reports worker health
                     }
                 }
             };
-            log::info!("live transcription ready");
-
             let mut mic = match TrackState::new(TrackKind::Mic) {
                 Ok(t) => t,
                 Err(e) => {
                     log::warn!("live transcription disabled: {e:#}");
+                    on_status.take().unwrap()(Err(format!("{e:#}")));
                     return;
                 }
             };
@@ -169,9 +172,12 @@ pub fn spawn(
                 Ok(t) => t,
                 Err(e) => {
                     log::warn!("live transcription disabled: {e:#}");
+                    on_status.take().unwrap()(Err(format!("{e:#}")));
                     return;
                 }
             };
+            on_status.take().unwrap()(Ok(()));
+            log::info!("live transcription ready");
 
             let mut transcribe = |track: &mut TrackState, cut: usize| {
                 let (start, chunk) = track.take_chunk(cut);
@@ -266,14 +272,22 @@ mod tests {
         let samples_48k = crate::resample::resample_all(&samples_16k, 16_000, 48_000).unwrap();
 
         let (line_tx, line_rx) = crossbeam_channel::unbounded();
+        let (status_tx, status_rx) = crossbeam_channel::bounded(1);
         let tx = spawn(
             models_dir,
             crate::asr::default_junk_phrases(),
             move |track, start_ms, end_ms, text| {
                 let _ = line_tx.send((track, start_ms, end_ms, text));
             },
+            move |status| {
+                let _ = status_tx.send(status);
+            },
         )
         .expect("Parakeet model missing — run cuda_smoke first");
+        status_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("live-caption worker did not report readiness")
+            .expect("live-caption worker failed to initialize");
 
         for chunk in samples_48k.chunks(4800) {
             tx.send(LiveMsg::Audio {

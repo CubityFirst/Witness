@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-delete-person"
+description = "Enables the delete_person command without any pre-configured scope."
+commands.allow = ["delete_person"]
+
+[[permission]]
+identifier = "deny-delete-person"
+description = "Denies the delete_person command without any pre-configured scope."
+commands.deny = ["delete_person"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-bookmark-note"
+description = "Enables the set_bookmark_note command without any pre-configured scope."
+commands.allow = ["set_bookmark_note"]
+
+[[permission]]
+identifier = "deny-set-bookmark-note"
+description = "Denies the set_bookmark_note command without any pre-configured scope."
+commands.deny = ["set_bookmark_note"]

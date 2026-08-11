@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-bookmark-hotkey"
+description = "Enables the get_bookmark_hotkey command without any pre-configured scope."
+commands.allow = ["get_bookmark_hotkey"]
+
+[[permission]]
+identifier = "deny-get-bookmark-hotkey"
+description = "Denies the get_bookmark_hotkey command without any pre-configured scope."
+commands.deny = ["get_bookmark_hotkey"]

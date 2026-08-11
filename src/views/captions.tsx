@@ -1,6 +1,10 @@
 import { useEffect, useState } from "preact/hooks";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { onLiveTranscript, type LiveTranscript } from "../lib/events";
+import {
+  onLiveCaptionsStatus,
+  onLiveTranscript,
+  type LiveTranscript,
+} from "../lib/events";
 
 /**
  * Content of the small always-on-top captions window ("captions" webview,
@@ -17,20 +21,33 @@ export function CaptionsOverlay() {
       .catch((closeError) => setError(`Could not close captions: ${String(closeError)}`));
 
   useEffect(() => {
-    const un = onLiveTranscript((line) =>
-      setLines((prev) => [...prev.slice(-2), line]),
-    ).catch((listenError) => {
-      setError(`Live captions disconnected: ${String(listenError)}`);
-      return () => {};
-    });
+    // ~20 lines of history: the flex-end + overflow:hidden layout means window
+    // height controls how many are visible, so resizing taller shows more.
+    const listeners = [
+      onLiveTranscript((line) =>
+        setLines((prev) => [...prev.slice(-19), line]),
+      ),
+      onLiveCaptionsStatus((status) => {
+        if (!status.active) {
+          setError(status.error ?? "Live captions stopped");
+        }
+      }),
+    ].map((listener) =>
+      listener.catch((listenError) => {
+        setError(`Live captions disconnected: ${String(listenError)}`);
+        return () => {};
+      }),
+    );
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") void closeOverlay();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => {
-      un.then((u) => u()).catch((detachError) =>
-        console.error("Could not detach the live-caption listener", detachError),
-      );
+      for (const listener of listeners) {
+        listener.then((unlisten) => unlisten()).catch((detachError) =>
+          console.error("Could not detach a live-caption listener", detachError),
+        );
+      }
       window.removeEventListener("keydown", onKeyDown);
     };
   }, []);

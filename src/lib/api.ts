@@ -61,6 +61,8 @@ export interface MeetingDetail {
   speakers: Speaker[];
   segments: Segment[];
   bookmarks: Bookmark[];
+  last_error: string | null;
+  pipeline_queued: boolean;
 }
 
 export interface WatcherStatus {
@@ -74,6 +76,7 @@ export interface AppStatus {
   recording: boolean;
   meeting_id: number | null;
   recording_since: string | null;
+  live_captions: boolean;
   transcribing_meeting_id: number | null;
   queue_len: number;
   processing_stage: string | null;
@@ -139,6 +142,14 @@ export interface DiagnosticModel {
   integrity_error: string | null;
 }
 
+export interface DiagnosticGpu {
+  driver_present: boolean;
+  cuda_ready: boolean;
+  missing_dlls: string[];
+  managed_libraries_present: boolean;
+  managed_libraries_integrity_error: string | null;
+}
+
 export interface DiagnosticTrackHealth {
   connected: boolean;
   device_loss_count: number;
@@ -172,7 +183,15 @@ export interface Diagnostics {
   processing_pct: number | null;
   queue_len: number;
   models: DiagnosticModel[];
+  gpu: DiagnosticGpu;
   report: string;
+}
+
+export interface BackupSummary {
+  path: string;
+  created_at: string;
+  file_count: number;
+  total_bytes: number;
 }
 
 export interface SearchHit {
@@ -199,6 +218,15 @@ export interface ModelInfo {
 export interface GpuStatus {
   cuda_available: boolean;
   detail: string;
+}
+
+export interface GpuLibsInfo {
+  present: boolean;
+  size_mb: number | null;
+  integrity_error: string | null;
+  driver_present: boolean;
+  cuda_ready: boolean;
+  download_mb: number;
 }
 
 export const getStatus = () => invoke<AppStatus>("get_status");
@@ -266,10 +294,17 @@ export const pickDataDir = () => invoke<string | null>("pick_data_dir");
 export const listAudioDevices = () => invoke<AudioDevices>("list_audio_devices");
 export const getDiagnostics = () => invoke<Diagnostics>("get_diagnostics");
 export const exportDiagnostics = () => invoke<boolean>("export_diagnostics");
+export const createBackup = () =>
+  invoke<BackupSummary | null>("create_backup");
 export const getModelStatus = () => invoke<ModelInfo[]>("get_model_status");
 export const downloadModels = (engine: Engine) =>
   invoke<void>("download_models", { engine });
 export const getGpuStatus = () => invoke<GpuStatus>("get_gpu_status");
+export const getGpuLibsStatus = () =>
+  invoke<GpuLibsInfo>("get_gpu_libs_status");
+/** Installs the pinned CUDA runtime + cuDNN DLLs into the data directory.
+ * Progress arrives on the model-download event stream as id "gpu-libs". */
+export const downloadGpuLibs = () => invoke<void>("download_gpu_libs");
 
 /** Opens a native save dialog and copies the meeting audio there. */
 export const exportAudio = (meetingId: number) =>
@@ -286,6 +321,9 @@ export const confirmDialog = (message: string) =>
   invoke<boolean>("confirm_dialog", { message });
 
 export const getHotkey = () => invoke<string | null>("get_hotkey");
+export const getBookmarkHotkey = () => invoke<string | null>("get_bookmark_hotkey");
+/** Reopens (or focuses) the floating caption overlay; errors when not recording. */
+export const showCaptionsOverlay = () => invoke<void>("show_captions_overlay");
 export const getAutostart = () => invoke<boolean>("get_autostart");
 export const setAutostart = (enabled: boolean) =>
   invoke<void>("set_autostart", { enabled });
