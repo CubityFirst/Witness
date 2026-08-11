@@ -71,8 +71,30 @@ impl CudaStatus {
 /// it is only invoked per pipeline job, per live session, at startup and
 /// from the Settings GPU check, so repetition is signal, not spam).
 pub fn preflight() -> CudaStatus {
-    // env mutation + duplicated log suppression under one lock; concurrent
-    // callers (pipeline worker vs. live thread) otherwise race on PATH.
+    // This lock serializes preflight against *itself*. The repair below is a
+    // read-modify-write of PATH, and preflight runs on at least six threads:
+    // startup, the pipeline worker, the live-caption worker, the GPU-library
+    // download thread, and any Tauri command thread serving `get_gpu_status`
+    // or `get_diagnostics`.
+    //
+    // It does NOT make `prepend_to_path` sound, and no lock here could.
+    // `set_var` is only safe while nothing else in the process touches the
+    // environment, and we cannot promise that: any `getenv` racing us — the
+    // Windows DLL loader, ort, the CUDA runtime — is undefined behaviour, not
+    // just a lost update. Rust 2024 makes this explicit by marking `set_var`
+    // unsafe; this crate is still edition 2021 (Cargo.toml), so the call
+    // compiles without ceremony and the hazard is invisible at the call site.
+    // Hence this note.
+    //
+    // Why we accept it for now: writes only happen while a required DLL is
+    // still unresolved, so the steady state after a successful repair is
+    // read-only, and nothing else in Witness writes PATH. The alternative that
+    // actually fixes it is to stop mutating the environment — resolve the
+    // provider's dependencies through `AddDllDirectory` +
+    // `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_*)`, which is per-process
+    // loader state rather than a shared C global, and is what the "GPU kicks
+    // in without a restart" behaviour really wants. Do that before the edition
+    // 2024 bump, which will force an `unsafe` block and the decision with it.
     static LOCK: Mutex<()> = Mutex::new(());
     let _guard = LOCK.lock().unwrap();
 
@@ -252,6 +274,10 @@ fn numeric_key(path: &Path) -> Vec<u64> {
     key
 }
 
+/// Prepend `dir` to the process PATH so the DLL loader finds the CUDA runtime
+/// there. Callers must hold `preflight`'s lock — and see the note there: that
+/// lock orders our own writes but cannot make `set_var` sound against the rest
+/// of the process.
 fn prepend_to_path(dir: &Path) {
     let current = std::env::var_os("PATH").unwrap_or_default();
     let entries: Vec<PathBuf> = std::iter::once(dir.to_path_buf())
