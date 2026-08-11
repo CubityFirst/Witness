@@ -313,6 +313,11 @@ impl Settings {
         self.data_dir().join("models")
     }
 
+    /// App-managed CUDA/cuDNN runtime DLLs (gpu_libs.rs).
+    pub fn cuda_dir(&self) -> PathBuf {
+        self.data_dir().join("cuda")
+    }
+
     pub fn db_path(&self) -> PathBuf {
         self.data_dir().join("witness.db")
     }

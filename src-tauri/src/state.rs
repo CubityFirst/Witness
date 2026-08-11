@@ -7,7 +7,7 @@ use crate::pipeline::Pipeline;
 use crate::recorder::RecorderHandle;
 use crate::recorder::RecordingHealth;
 use crate::settings::Settings;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::{Arc, Mutex};
 
 /// Recording lifecycle guarded by one mutex.  The transitional variants are
@@ -65,6 +65,11 @@ pub struct AppState {
     /// most recently completed recording in this process.
     pub recording_health: Mutex<Option<RecordingHealth>>,
     pub recording_trigger: Mutex<&'static str>,
+    /// Whether the active recording started a live-caption session.
+    pub live_captions: AtomicBool,
+    /// Meeting allowed to publish asynchronous live-caption readiness. Zero
+    /// invalidates a worker that finishes initializing after its recording.
+    pub live_captions_meeting_id: AtomicI64,
     pub pipeline: Pipeline,
     pub watcher: Arc<WatcherControl>,
     pub last_watcher_status: Mutex<WatcherStatus>,
@@ -74,4 +79,8 @@ pub struct AppState {
     pub hotkey: Mutex<Option<String>>,
     /// Which bookmark-this-moment hotkey bound.
     pub bookmark_hotkey: Mutex<Option<String>>,
+    /// Serializes backup creation with recording starts and explicit
+    /// transcription requests so the published snapshot cannot race a new
+    /// archived recording.
+    pub backup_in_progress: Mutex<bool>,
 }

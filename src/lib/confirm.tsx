@@ -88,7 +88,7 @@ export function ConfirmHost() {
         ref={dialogRef}
         role="alertdialog"
         aria-modal="true"
-        aria-describedby="confirm-message"
+        aria-labelledby="confirm-message"
       >
         <p class="modal-message" id="confirm-message">
           {req.message}
@@ -106,6 +106,7 @@ export function ConfirmHost() {
             {req.okLabel}
           </button>
         </div>
+        <p class="muted modal-tip">Tip: hold Shift to skip this confirmation</p>
       </div>
     </div>
   );

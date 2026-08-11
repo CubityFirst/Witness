@@ -14,12 +14,15 @@ pub const TRANSCRIPTION_FAILED: &str = "transcription-failed";
 pub const MODEL_DOWNLOAD_PROGRESS: &str = "model-download-progress";
 pub const MEETINGS_CHANGED: &str = "meetings-changed";
 pub const LIVE_TRANSCRIPT: &str = "live-transcript";
+pub const LIVE_CAPTIONS_STATUS: &str = "live-captions-status";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RecordingStarted {
     pub meeting_id: i64,
     pub trigger: &'static str,
     pub started_at: String,
+    /// True iff the live-caption worker actually started for this recording.
+    pub live_captions: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,11 +70,22 @@ pub struct LiveTranscript {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct LiveCaptionsStatus {
+    pub meeting_id: i64,
+    pub active: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ModelDownloadProgress {
     pub model_id: String,
     pub file: String,
     pub downloaded_bytes: u64,
     pub total_bytes: Option<u64>,
+    /// 1-based position of the current file in the download job (0 when done).
+    pub file_index: u32,
+    /// Total files in the download job (0 when done).
+    pub file_count: u32,
     pub done: bool,
     pub error: Option<String>,
 }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-show-captions-overlay"
+description = "Enables the show_captions_overlay command without any pre-configured scope."
+commands.allow = ["show_captions_overlay"]
+
+[[permission]]
+identifier = "deny-show-captions-overlay"
+description = "Denies the show_captions_overlay command without any pre-configured scope."
+commands.deny = ["show_captions_overlay"]

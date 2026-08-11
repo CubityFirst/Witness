@@ -1,11 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
+  deletePerson,
   getPeopleStats,
   listMeetings,
+  listPeople,
   type Meeting,
+  type Person,
   type PersonMeetingStat,
 } from "../lib/api";
 import { fmtDate, fmtDuration } from "./meetings";
+import { appConfirm } from "../lib/confirm";
 import { notifyError } from "../lib/notify";
 
 const WEEKS = 12;
@@ -50,13 +54,13 @@ function WeeklyTrend({ meetings }: { meetings: Meeting[] }) {
         viewBox="0 0 100 34"
         preserveAspectRatio="none"
         class="trend-chart"
-        role="img"
-        aria-label={`Meeting duration over the last ${WEEKS} weeks`}
+        aria-hidden="true"
       >
         {weeks.map((w, i) => {
           const h = w.ms > 0 ? Math.max(2, (w.ms / maxMs) * 30) : 0.8;
           return (
             <rect
+              key={w.from.getTime()}
               x={i * barW + barW * 0.15}
               y={32 - h}
               width={barW * 0.7}
@@ -71,12 +75,21 @@ function WeeklyTrend({ meetings }: { meetings: Meeting[] }) {
           );
         })}
       </svg>
+      <ul class="sr-only">
+        {weeks.map((w) => (
+          <li key={w.from.getTime()}>
+            Week of {w.from.toLocaleDateString()}: {w.count} meeting
+            {w.count === 1 ? "" : "s"}, {fmtDuration(w.ms)}
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
 
 interface PersonAgg {
   key: string;
+  personId: number | null;
   name: string;
   isMe: boolean;
   meetings: PersonMeetingStat[];
@@ -92,6 +105,7 @@ export function PeopleView(props: {
 }) {
   const [stats, setStats] = useState<PersonMeetingStat[]>([]);
   const [meetings, setMeetings] = useState<Meeting[]>([]);
+  const [prints, setPrints] = useState<Person[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -109,13 +123,15 @@ export function PeopleView(props: {
           if (page.length < 500) return all;
         }
       };
-      const [nextStats, nextMeetings] = await Promise.all([
+      const [nextStats, nextMeetings, nextPeople] = await Promise.all([
         getPeopleStats(),
         loadAllMeetings(),
+        listPeople(),
       ]);
       if (generation !== requestGeneration.current) return;
       setStats(nextStats);
       setMeetings(nextMeetings);
+      setPrints(nextPeople);
       setLoadError(null);
     } catch (error) {
       if (generation !== requestGeneration.current) return;
@@ -139,6 +155,7 @@ export function PeopleView(props: {
       const key = row.person_id != null ? `p${row.person_id}` : "me";
       const agg = byPerson.get(key) ?? {
         key,
+        personId: row.person_id,
         name: row.person_name,
         isMe: row.person_id == null,
         meetings: [],
@@ -190,55 +207,83 @@ export function PeopleView(props: {
 
   return (
     <div class="people-view">
+      <h2 class="sr-only">People</h2>
       <WeeklyTrend meetings={meetings} />
-      {people.map((p) => (
-        <div class="person-card" key={p.key}>
-          <button
-            type="button"
-            class="person-head"
-            aria-expanded={expanded === p.key}
-            aria-controls={`person-meetings-${p.key}`}
-            onClick={() => setExpanded(expanded === p.key ? null : p.key)}
-          >
-            <span class={`chip ${p.isMe ? "chip-me" : "chip-s1"}`}>{p.name}</span>
-            <span class="person-stats">
-              {p.meetingCount} meeting{p.meetingCount === 1 ? "" : "s"}
-              {!p.isMe && <> · {fmtDuration(p.togetherMs)} together</>}
-              {" · "}
-              {fmtDuration(p.talkMs)} speaking · {p.words.toLocaleString()} words
-              {p.togetherMs > 0 && (
-                <> · {Math.round((p.talkMs / Math.max(1, p.togetherMs)) * 100)}% of meeting time</>
-              )}
-            </span>
-            <span class="muted" aria-hidden="true">{expanded === p.key ? "▾" : "▸"}</span>
-          </button>
-          {expanded === p.key && (
-            <div class="person-meetings" id={`person-meetings-${p.key}`}>
-              {p.meetings.map((m) => (
-                <button
-                  type="button"
-                  class="person-meeting-row"
-                  key={m.meeting_id}
-                  onClick={() => props.onOpen(m.meeting_id)}
-                >
-                  <span class="meeting-title">{m.meeting_title}</span>
-                  <span class="meeting-meta">
-                    {fmtDate(m.started_at)} · {fmtDuration(m.duration_ms)} meeting ·{" "}
-                    {fmtDuration(m.talk_ms)} speaking · {m.words.toLocaleString()} words
-                    {m.duration_ms > 0 && (
-                      <> · {Math.round((m.talk_ms / m.duration_ms) * 100)}%</>
-                    )}
-                  </span>
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
-      ))}
+      {people.map((p) => {
+        const pid = p.personId;
+        const print = pid != null ? prints.find((x) => x.id === pid) : undefined;
+        return (
+          <div class="person-card" key={p.key}>
+            <button
+              type="button"
+              class="person-head"
+              aria-expanded={expanded === p.key}
+              aria-controls={`person-meetings-${p.key}`}
+              onClick={() => setExpanded(expanded === p.key ? null : p.key)}
+            >
+              <span class={`chip ${p.isMe ? "chip-me" : "chip-s1"}`} title={p.name}>{p.name}</span>
+              <span class="person-stats">
+                {p.meetingCount} meeting{p.meetingCount === 1 ? "" : "s"}
+                {!p.isMe && <> · {fmtDuration(p.togetherMs)} together</>}
+                {" · "}
+                {fmtDuration(p.talkMs)} speaking · {p.words.toLocaleString()} words
+                {p.togetherMs > 0 && (
+                  <> · {Math.round((p.talkMs / Math.max(1, p.togetherMs)) * 100)}% of meeting time</>
+                )}
+                {print && (
+                  <> · {Math.round(print.sample_seconds / 60)} min of speech learned</>
+                )}
+              </span>
+              <span class="muted" aria-hidden="true">{expanded === p.key ? "▾" : "▸"}</span>
+            </button>
+            {expanded === p.key && (
+              <div class="person-meetings" id={`person-meetings-${p.key}`}>
+                {p.meetings.map((m) => (
+                  <button
+                    type="button"
+                    class="person-meeting-row"
+                    key={m.meeting_id}
+                    onClick={() => props.onOpen(m.meeting_id)}
+                  >
+                    <span class="meeting-title">{m.meeting_title}</span>
+                    <span class="meeting-meta">
+                      {fmtDate(m.started_at)} · {fmtDuration(m.duration_ms)} meeting ·{" "}
+                      {fmtDuration(m.talk_ms)} speaking · {m.words.toLocaleString()} words
+                      {m.duration_ms > 0 && (
+                        <> · {Math.round((m.talk_ms / m.duration_ms) * 100)}%</>
+                      )}
+                    </span>
+                  </button>
+                ))}
+                {!p.isMe && pid != null && (
+                  <button
+                    type="button"
+                    class="btn btn-ghost"
+                    title="Forget this voice — Shift-click to skip confirmation"
+                    onClick={async (e) => {
+                      if (
+                        !e.shiftKey &&
+                        !(await appConfirm(`Forget ${p.name}'s voice?\nExisting transcripts keep their names.`, "Forget voice"))
+                      )
+                        return;
+                      deletePerson(pid)
+                        .then(() => void load())
+                        .catch((error) => notifyError(`Could not forget ${p.name}`, error));
+                    }}
+                  >
+                    Forget voice…
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
       <p class="muted people-hint">
         "Speaking" totals come from transcribed segments; word counts are
         approximate. Unnamed speakers (Speaker 1…) aren't tracked across
-        meetings — rename them to a person to include them here.
+        meetings — rename them to a person to include them here. Enrolled
+        voices can also be managed in Settings.
       </p>
     </div>
   );

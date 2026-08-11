@@ -9,7 +9,7 @@ use crate::pipeline::Job;
 use crate::settings::{Engine, Settings};
 use crate::state::{AppState, RecorderState};
 use crate::{models, recorder, tray};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_notification::NotificationExt;
@@ -29,9 +29,52 @@ pub fn toast(app: &AppHandle, body: &str) {
 
 // ---------- shared recording control ----------
 
+/// The first user-visible problem in a degraded capture state, if any.
+/// Device loss is distinguished from "not connected yet" via the loss count.
+fn capture_warning(health: &crate::recorder::RecordingHealth) -> Option<String> {
+    if let Some(error) = &health.writer_error {
+        return Some(format!("Recording failed: {error}"));
+    }
+    for (name, track) in [
+        ("Microphone", &health.mic),
+        ("System audio", &health.loopback),
+    ] {
+        if let Some(error) = &track.fatal_error {
+            return Some(format!("{name} capture failed: {error}"));
+        }
+        if !track.connected && track.device_loss_count > 0 {
+            return Some(format!(
+                "{name} device lost — recording silence until it returns"
+            ));
+        }
+        if track.capture_overflow_count > 0 {
+            return Some(format!(
+                "{name} capture dropped {} ms of audio",
+                track.capture_dropped_ms
+            ));
+        }
+        if track.live_dropped_ms > 0 {
+            return Some(format!(
+                "Live captions skipped {} ms to keep recording responsive",
+                track.live_dropped_ms
+            ));
+        }
+        if track.live_disconnected {
+            return Some(format!(
+                "Live captions stopped receiving {}",
+                name.to_lowercase()
+            ));
+        }
+    }
+    None
+}
+
 pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64, String> {
     let state = app.state::<AppState>();
     let mut rec = state.recorder.lock().unwrap();
+    if *state.backup_in_progress.lock().unwrap() {
+        return Err("A backup is in progress".into());
+    }
     if rec.is_busy() {
         return Err("Already recording".into());
     }
@@ -60,9 +103,13 @@ pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64,
         )
     };
 
-    // Live captions: best-effort — needs the Parakeet model on disk.
+    // Live captions: best-effort — needs the Parakeet model on disk. The
+    // worker reports readiness only after its engine and track state exist.
+    state.live_captions.store(false, Ordering::Relaxed);
+    state.live_captions_meeting_id.store(id, Ordering::Relaxed);
     let live_tx = if live_enabled {
         let live_app = app.clone();
+        let status_app = app.clone();
         let tx = crate::live_transcribe::spawn(
             models_dir,
             junk_phrases,
@@ -78,6 +125,35 @@ pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64,
                     },
                 );
             },
+            move |result| {
+                let active = result.is_ok();
+                let status_state = status_app.state::<AppState>();
+                if status_state
+                    .live_captions_meeting_id
+                    .load(Ordering::Relaxed)
+                    != id
+                {
+                    return;
+                }
+                status_state.live_captions.store(active, Ordering::Relaxed);
+                let error = result.err();
+                let _ = status_app.emit(
+                    events::LIVE_CAPTIONS_STATUS,
+                    events::LiveCaptionsStatus {
+                        meeting_id: id,
+                        active,
+                        error: error.clone(),
+                    },
+                );
+                if active && overlay {
+                    open_captions_overlay(&status_app);
+                } else if let Some(error) = error {
+                    toast(
+                        &status_app,
+                        &format!("Live captions could not start: {error}"),
+                    );
+                }
+            },
         );
         if tx.is_none() {
             log::info!("live captions off: Parakeet model not downloaded");
@@ -86,8 +162,6 @@ pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64,
     } else {
         None
     };
-    let live_started = live_tx.is_some();
-
     let level_app = app.clone();
     let health_app = app.clone();
     *state.recording_health.lock().unwrap() = None;
@@ -108,11 +182,33 @@ pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64,
             );
         },
         move |health| {
-            *health_app
-                .state::<AppState>()
+            let health_state = health_app.state::<AppState>();
+            let previous = health_state
                 .recording_health
                 .lock()
-                .unwrap() = Some(health.clone());
+                .unwrap()
+                .replace(health.clone());
+            if (health.mic.live_disconnected || health.loopback.live_disconnected)
+                && health_state.live_captions.swap(false, Ordering::Relaxed)
+            {
+                let _ = health_app.emit(
+                    events::LIVE_CAPTIONS_STATUS,
+                    events::LiveCaptionsStatus {
+                        meeting_id: id,
+                        active: false,
+                        error: Some("The live-caption worker disconnected".into()),
+                    },
+                );
+            }
+            // Surface each new degradation outside the window too — it is
+            // usually hidden to the tray while an auto-recording runs.
+            let warning = capture_warning(&health);
+            if warning != previous.as_ref().and_then(capture_warning) {
+                tray::set_recording_warning(&health_app, warning.as_deref());
+                if let Some(text) = &warning {
+                    toast(&health_app, text);
+                }
+            }
             let _ = health_app.emit(events::RECORDING_HEALTH, health);
         },
     );
@@ -133,6 +229,9 @@ pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64,
             if let Err(db_err) = state.db.delete_meeting(id) {
                 log::error!("failed to roll back meeting {id}: {db_err:#}");
             }
+            state.live_captions.store(false, Ordering::Relaxed);
+            state.live_captions_meeting_id.store(0, Ordering::Relaxed);
+            close_captions_overlay(app);
             *state.recorder.lock().unwrap() = RecorderState::Idle;
             return Err(err(e));
         }
@@ -140,20 +239,19 @@ pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64,
     *state.recording_trigger.lock().unwrap() = trigger;
     *state.recorder.lock().unwrap() = RecorderState::Recording(handle);
 
+    let live_started = state.live_captions.load(Ordering::Relaxed);
+
     let _ = app.emit(
         events::RECORDING_STARTED,
         events::RecordingStarted {
             meeting_id: id,
             trigger,
             started_at: now.to_rfc3339(),
+            live_captions: live_started,
         },
     );
     let _ = app.emit(events::MEETINGS_CHANGED, ());
     tray::update(app, true);
-
-    if overlay && live_started {
-        open_captions_overlay(app);
-    }
 
     // Auto-recorded meetings: try to pick up the meeting subject from the
     // Teams window title (it settles a little after joining).
@@ -193,10 +291,84 @@ pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64,
 
 const CAPTIONS_WINDOW: &str = "captions";
 
+/// Outer position/size of the captions overlay, persisted per data_dir so
+/// the user's arrangement survives across recordings and restarts. Not a
+/// Settings field: update_settings round-trips through the frontend and
+/// would silently reset fields it does not know about.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct OverlayGeometry {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+static OVERLAY_GEOMETRY: std::sync::Mutex<Option<OverlayGeometry>> = std::sync::Mutex::new(None);
+
+fn overlay_geometry_path(app: &AppHandle) -> std::path::PathBuf {
+    let settings = app.state::<AppState>().settings.lock().unwrap().clone();
+    settings.data_dir().join("captions-overlay.toml")
+}
+
+/// Track the overlay's outer geometry while it is open (moved/resized).
+pub fn remember_overlay_geometry(
+    position: tauri::PhysicalPosition<i32>,
+    size: tauri::PhysicalSize<u32>,
+) {
+    *OVERLAY_GEOMETRY.lock().unwrap() = Some(OverlayGeometry {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+    });
+}
+
+/// Write the last known overlay geometry to disk (also called from the
+/// Destroyed window event, which covers the Escape / close-button path).
+pub fn save_overlay_geometry(app: &AppHandle) {
+    let Some(geometry) = *OVERLAY_GEOMETRY.lock().unwrap() else {
+        return;
+    };
+    match toml::to_string(&geometry) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(overlay_geometry_path(app), text) {
+                log::warn!("could not save overlay geometry: {e}");
+            }
+        }
+        Err(e) => log::warn!("could not serialize overlay geometry: {e}"),
+    }
+}
+
+fn load_overlay_geometry(app: &AppHandle) -> Option<OverlayGeometry> {
+    if let Some(geometry) = *OVERLAY_GEOMETRY.lock().unwrap() {
+        return Some(geometry);
+    }
+    let text = std::fs::read_to_string(overlay_geometry_path(app)).ok()?;
+    toml::from_str(&text).ok()
+}
+
 fn open_captions_overlay(app: &AppHandle) {
     if app.get_webview_window(CAPTIONS_WINDOW).is_some() {
         return;
     }
+    // Restore the last arrangement, clamped to its monitor's work area (same
+    // rule as the tray flyout) so a display change cannot strand it offscreen.
+    let restore = load_overlay_geometry(app).and_then(|g| {
+        let center_x = g.x as f64 + g.width as f64 / 2.0;
+        let center_y = g.y as f64 + g.height as f64 / 2.0;
+        let monitor = app.monitor_from_point(center_x, center_y).ok().flatten()?;
+        let area = monitor.work_area();
+        let (ax, ay) = (area.position.x, area.position.y);
+        let (aw, ah) = (area.size.width as i32, area.size.height as i32);
+        let width = (g.width as i32).min(aw).max(1);
+        let height = (g.height as i32).min(ah).max(1);
+        Some(OverlayGeometry {
+            x: g.x.clamp(ax, (ax + aw - width).max(ax)),
+            y: g.y.clamp(ay, (ay + ah - height).max(ay)),
+            width: width as u32,
+            height: height as u32,
+        })
+    });
     let result = tauri::WebviewWindowBuilder::new(
         app,
         CAPTIONS_WINDOW,
@@ -208,17 +380,58 @@ fn open_captions_overlay(app: &AppHandle) {
     .always_on_top(true)
     .decorations(false)
     .skip_taskbar(true)
+    // Auto-record fires right as the user joins a call; never take the
+    // keyboard focus away from Teams.
+    .focused(false)
+    .zoom_hotkeys_enabled(true)
     .background_color(tauri::webview::Color(12, 13, 16, 255))
     .build();
-    if let Err(e) = result {
-        log::warn!("captions overlay failed to open: {e}");
+    match result {
+        Ok(window) => {
+            if let Some(g) = restore {
+                let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
+                    width: g.width,
+                    height: g.height,
+                }));
+                let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
+                    x: g.x,
+                    y: g.y,
+                }));
+            }
+        }
+        Err(e) => log::warn!("captions overlay failed to open: {e}"),
     }
 }
 
 fn close_captions_overlay(app: &AppHandle) {
     if let Some(w) = app.get_webview_window(CAPTIONS_WINDOW) {
+        // Persist synchronously: on tray Quit the Destroyed event may never
+        // be processed before the process exits.
+        if let (Ok(position), Ok(size)) = (w.outer_position(), w.outer_size()) {
+            remember_overlay_geometry(position, size);
+        }
+        save_overlay_geometry(app);
         let _ = w.close();
     }
+}
+
+/// Re-open (or surface) the captions overlay after it was closed mid-meeting.
+#[tauri::command]
+pub fn show_captions_overlay(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    if !state.recorder.lock().unwrap().is_recording() {
+        return Err("Not recording".into());
+    }
+    if !state.live_captions.load(Ordering::Relaxed) {
+        return Err("Live captions are not available for this recording".into());
+    }
+    if let Some(w) = app.get_webview_window(CAPTIONS_WINDOW) {
+        let _ = w.show();
+        let _ = w.set_focus();
+    } else {
+        open_captions_overlay(&app);
+    }
+    Ok(())
 }
 
 pub fn do_stop_recording(app: &AppHandle, by_user: bool) -> Result<(), String> {
@@ -245,6 +458,8 @@ pub fn do_stop_recording(app: &AppHandle, by_user: bool) -> Result<(), String> {
         }
     };
     let id = handle.meeting_id;
+    state.live_captions.store(false, Ordering::Relaxed);
+    state.live_captions_meeting_id.store(0, Ordering::Relaxed);
 
     // Manual stop during a live call: don't auto-restart until the call ends.
     if by_user && state.last_watcher_status.lock().unwrap().mic_in_use {
@@ -287,7 +502,23 @@ pub fn do_stop_recording(app: &AppHandle, by_user: bool) -> Result<(), String> {
             e
         ));
     }
-    *state.recorder.lock().unwrap() = RecorderState::Idle;
+    let transcribe = state.settings.lock().unwrap().auto_transcribe;
+    // Keep the Idle transition and durable pipeline enqueue atomic with
+    // backup start. The global lock order is recorder -> backup_in_progress.
+    // Otherwise a backup could observe Idle + an empty queue in this narrow
+    // gap and copy the WAVs while the new encode job starts removing them.
+    let enqueue_result = {
+        let mut recorder = state.recorder.lock().unwrap();
+        let backup_in_progress = state.backup_in_progress.lock().unwrap();
+        *recorder = RecorderState::Idle;
+        let result = state.pipeline.enqueue(Job {
+            meeting_id: id,
+            transcribe,
+            engine: None,
+        });
+        drop(backup_in_progress);
+        result
+    };
     let _ = app.emit(
         events::RECORDING_STOPPED,
         events::RecordingStopped { meeting_id: id },
@@ -296,15 +527,7 @@ pub fn do_stop_recording(app: &AppHandle, by_user: bool) -> Result<(), String> {
     tray::update(app, false);
     close_captions_overlay(app);
 
-    let transcribe = state.settings.lock().unwrap().auto_transcribe;
-    state
-        .pipeline
-        .enqueue(Job {
-            meeting_id: id,
-            transcribe,
-            engine: None,
-        })
-        .map_err(|error| {
+    enqueue_result.map_err(|error| {
             format!(
                 "Recording was saved, but processing could not be queued: {error:#}. Restart Witness to retry it."
             )
@@ -320,6 +543,8 @@ pub struct AppStatus {
     pub recording: bool,
     pub meeting_id: Option<i64>,
     pub recording_since: Option<String>,
+    /// True iff the active recording has a live-caption session.
+    pub live_captions: bool,
     pub transcribing_meeting_id: Option<i64>,
     pub queue_len: usize,
     pub processing_stage: Option<String>,
@@ -335,6 +560,7 @@ pub fn get_status(state: State<'_, AppState>) -> AppStatus {
         recording: rec.is_recording(),
         meeting_id: rec.meeting_id(),
         recording_since: rec.started_at().map(|t| t.to_rfc3339()),
+        live_captions: rec.is_recording() && state.live_captions.load(Ordering::Relaxed),
         transcribing_meeting_id: state.pipeline.current_meeting(),
         queue_len: state.pipeline.queue_len(),
         processing_stage: progress.as_ref().map(|progress| progress.stage.clone()),
@@ -360,6 +586,15 @@ pub struct DiagnosticModel {
 }
 
 #[derive(Debug, Serialize)]
+pub struct DiagnosticGpu {
+    pub driver_present: bool,
+    pub cuda_ready: bool,
+    pub missing_dlls: Vec<String>,
+    pub managed_libraries_present: bool,
+    pub managed_libraries_integrity_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct Diagnostics {
     pub generated_at: String,
     pub app_version: String,
@@ -379,6 +614,7 @@ pub struct Diagnostics {
     pub processing_pct: Option<f32>,
     pub queue_len: usize,
     pub models: Vec<DiagnosticModel>,
+    pub gpu: DiagnosticGpu,
     /// A transcript/audio-free text representation suitable for support.
     pub report: String,
 }
@@ -487,16 +723,34 @@ fn render_diagnostics(diagnostics: &Diagnostics) -> String {
             model.integrity_error.as_deref().unwrap_or("ok")
         );
     }
+    let _ = writeln!(
+        text,
+        "GPU: driver={}, CUDA ready={}, missing DLLs={}, managed libraries={}, managed integrity={}",
+        diagnostics.gpu.driver_present,
+        diagnostics.gpu.cuda_ready,
+        if diagnostics.gpu.missing_dlls.is_empty() {
+            "none".into()
+        } else {
+            diagnostics.gpu.missing_dlls.join(", ")
+        },
+        diagnostics.gpu.managed_libraries_present,
+        diagnostics
+            .gpu
+            .managed_libraries_integrity_error
+            .as_deref()
+            .unwrap_or("ok")
+    );
     text
 }
 
 fn collect_diagnostics(state: &AppState) -> Diagnostics {
-    let (runtime_data_dir, db_path, models_dir) = {
+    let (runtime_data_dir, db_path, models_dir, cuda_dir) = {
         let settings = state.settings.lock().unwrap();
         (
             settings.data_dir(),
             settings.db_path(),
             settings.models_dir(),
+            settings.cuda_dir(),
         )
     };
     let configured_data_dir = state.configured_data_dir.lock().unwrap().clone();
@@ -530,6 +784,8 @@ fn collect_diagnostics(state: &AppState) -> Diagnostics {
             integrity_error: model.integrity_error,
         })
         .collect();
+    let gpu_preflight = crate::gpu::preflight();
+    let managed_gpu = crate::gpu_libs::status(&cuda_dir);
     let mut diagnostics = Diagnostics {
         generated_at: chrono::Local::now().to_rfc3339(),
         app_version: env!("CARGO_PKG_VERSION").into(),
@@ -549,6 +805,13 @@ fn collect_diagnostics(state: &AppState) -> Diagnostics {
         processing_pct: progress.map(|progress| progress.pct),
         queue_len: state.pipeline.queue_len(),
         models,
+        gpu: DiagnosticGpu {
+            driver_present: gpu_preflight.driver_present,
+            cuda_ready: gpu_preflight.ready(),
+            missing_dlls: gpu_preflight.missing_dlls,
+            managed_libraries_present: managed_gpu.present,
+            managed_libraries_integrity_error: managed_gpu.integrity_error,
+        },
         report: String::new(),
     };
     diagnostics.report = render_diagnostics(&diagnostics);
@@ -584,6 +847,74 @@ pub async fn export_diagnostics(app: AppHandle) -> Result<bool, String> {
     Ok(true)
 }
 
+struct BackupActivityGuard<'a>(&'a std::sync::Mutex<bool>);
+
+impl Drop for BackupActivityGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() = false;
+    }
+}
+
+/// Pick a parent folder and publish a complete, checksummed recovery snapshot.
+/// The native models are intentionally omitted; pinned model provenance is
+/// included and the binaries can be re-downloaded after a restore.
+#[tauri::command]
+pub async fn create_backup(app: AppHandle) -> Result<Option<crate::backup::BackupSummary>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("Choose where to create the Witness backup")
+        .blocking_pick_folder();
+    let Some(parent) = picked.and_then(|folder| folder.into_path().ok()) else {
+        return Ok(None);
+    };
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let recorder = state.recorder.lock().unwrap();
+        let mut backup_in_progress = state.backup_in_progress.lock().unwrap();
+        if *backup_in_progress {
+            return Err("A backup is already in progress".into());
+        }
+        if recorder.is_busy() {
+            return Err("Stop the current recording before creating a backup".into());
+        }
+        *backup_in_progress = true;
+        drop(backup_in_progress);
+        drop(recorder);
+        let _activity = BackupActivityGuard(&state.backup_in_progress);
+
+        if state.pipeline.current_meeting().is_some() || state.pipeline.queue_len() != 0 {
+            return Err(
+                "Wait for queued meeting processing to finish before creating a backup".into(),
+            );
+        }
+
+        let (mut settings, data_dir, models_dir) = {
+            let settings = state.settings.lock().unwrap();
+            (settings.clone(), settings.data_dir(), settings.models_dir())
+        };
+        settings.data_dir = state.configured_data_dir.lock().unwrap().clone();
+        let model_status = models::status(&models_dir);
+        crate::backup::create(
+            &parent,
+            &crate::backup::BackupInput {
+                db: &state.db,
+                settings: &settings,
+                data_dir: &data_dir,
+                model_status: &model_status,
+                app_version: env!("CARGO_PKG_VERSION"),
+            },
+        )
+        .map(Some)
+        .map_err(err)
+    })
+    .await
+    .map_err(|error| format!("backup task failed: {error}"))?
+}
+
 // ---------- recording commands ----------
 
 #[tauri::command]
@@ -616,6 +947,11 @@ pub struct MeetingDetail {
     pub speakers: Vec<Speaker>,
     pub segments: Vec<Segment>,
     pub bookmarks: Vec<crate::db::Bookmark>,
+    /// Why the most recent pipeline job for this meeting failed (None when
+    /// there is none or it succeeded).
+    pub last_error: Option<String>,
+    /// This meeting has a runnable job waiting in the durable pipeline queue.
+    pub pipeline_queued: bool,
 }
 
 #[tauri::command]
@@ -629,6 +965,8 @@ pub fn get_meeting(state: State<'_, AppState>, id: i64) -> Result<MeetingDetail,
         speakers: state.db.get_speakers(id).map_err(err)?,
         segments: state.db.get_segments(id).map_err(err)?,
         bookmarks: state.db.list_bookmarks(id).map_err(err)?,
+        last_error: state.db.pipeline_job_error(id).map_err(err)?,
+        pipeline_queued: state.db.pipeline_job_queued(id).map_err(err)?,
         meeting,
     })
 }
@@ -756,7 +1094,10 @@ fn remove_if_exists(path: &std::path::Path) -> Result<(), String> {
     }
 }
 
-fn safe_archive_path(root: &std::path::Path, relative: &str) -> Result<std::path::PathBuf, String> {
+pub(crate) fn safe_archive_path(
+    root: &std::path::Path,
+    relative: &str,
+) -> Result<std::path::PathBuf, String> {
     use std::path::{Component, Path};
 
     let relative = Path::new(relative);
@@ -1021,6 +1362,12 @@ pub fn get_hotkey(state: State<'_, AppState>) -> Option<String> {
     state.hotkey.lock().unwrap().clone()
 }
 
+/// Which bookmark-this-moment hotkey bound at startup (None = all taken).
+#[tauri::command]
+pub fn get_bookmark_hotkey(state: State<'_, AppState>) -> Option<String> {
+    state.bookmark_hotkey.lock().unwrap().clone()
+}
+
 #[tauri::command]
 pub fn get_autostart(app: AppHandle) -> Result<bool, String> {
     use tauri_plugin_autostart::ManagerExt;
@@ -1039,18 +1386,31 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
 
 /// Applies a changed data_dir immediately (db/log paths bind at startup).
 #[tauri::command]
-pub fn restart_app(app: AppHandle) {
-    // Finalize any active recording first.
-    if app
-        .state::<AppState>()
-        .recorder
-        .lock()
-        .unwrap()
-        .is_recording()
-    {
-        let _ = do_stop_recording(&app, true);
+pub fn restart_app(app: AppHandle) -> Result<(), String> {
+    let recording = {
+        let state = app.state::<AppState>();
+        let recording = state.recorder.lock().unwrap().is_recording();
+        recording
+    };
+    // Finalize any active recording first and preserve an actionable error
+    // instead of restarting over failed recorder finalization.
+    if recording {
+        do_stop_recording(&app, true)?;
     }
-    app.restart();
+
+    // Synchronize the last check with both recording start and backup start,
+    // then hold both guards across the diverging restart call. This prevents
+    // either operation from winning a check-to-restart race.
+    let state = app.state::<AppState>();
+    let recorder = state.recorder.lock().unwrap();
+    let backup_in_progress = state.backup_in_progress.lock().unwrap();
+    if recorder.is_busy() {
+        return Err("Wait for recording to stop before restarting Witness".into());
+    }
+    if *backup_in_progress {
+        return Err("Wait for the backup to finish before restarting Witness".into());
+    }
+    app.restart()
 }
 
 // ---------- transcription ----------
@@ -1061,6 +1421,10 @@ pub fn retranscribe(
     meeting_id: i64,
     engine: Option<Engine>,
 ) -> Result<(), String> {
+    let backup_in_progress = state.backup_in_progress.lock().unwrap();
+    if *backup_in_progress {
+        return Err("A backup is in progress".into());
+    }
     let meeting = state
         .db
         .get_meeting(meeting_id)
@@ -1077,6 +1441,7 @@ pub fn retranscribe(
             engine,
         })
         .map_err(err)?;
+    drop(backup_in_progress);
     Ok(())
 }
 
@@ -1140,10 +1505,15 @@ pub fn download_models(app: AppHandle, engine: Engine) -> Result<(), String> {
     }
     let models_dir = state.settings.lock().unwrap().models_dir();
     let thread_app = app.clone();
-    std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("model-download".into())
         .spawn(move || {
-            let emit = |model_id: &str, file: &str, downloaded: u64, total: Option<u64>| {
+            let emit = |model_id: &str,
+                        file: &str,
+                        downloaded: u64,
+                        total: Option<u64>,
+                        file_index: u32,
+                        file_count: u32| {
                 let _ = thread_app.emit(
                     events::MODEL_DOWNLOAD_PROGRESS,
                     events::ModelDownloadProgress {
@@ -1151,6 +1521,8 @@ pub fn download_models(app: AppHandle, engine: Engine) -> Result<(), String> {
                         file: file.to_string(),
                         downloaded_bytes: downloaded,
                         total_bytes: total,
+                        file_index,
+                        file_count,
                         done: false,
                         error: None,
                     },
@@ -1166,6 +1538,8 @@ pub fn download_models(app: AppHandle, engine: Engine) -> Result<(), String> {
                     file: String::new(),
                     downloaded_bytes: 0,
                     total_bytes: None,
+                    file_index: 0,
+                    file_count: 0,
                     done: true,
                     error: result.as_ref().err().map(|e| format!("{e:#}")),
                 },
@@ -1174,8 +1548,108 @@ pub fn download_models(app: AppHandle, engine: Engine) -> Result<(), String> {
                 Ok(()) => toast(&thread_app, "Model download complete."),
                 Err(e) => toast(&thread_app, &format!("Model download failed: {e:#}")),
             }
-        })
-        .map_err(err)?;
+        });
+    if let Err(error) = spawned {
+        state.downloading.store(false, Ordering::SeqCst);
+        return Err(err(error));
+    }
+    Ok(())
+}
+
+// ---------- GPU libraries ----------
+
+#[derive(Debug, Serialize)]
+pub struct GpuLibsInfo {
+    /// Verified app-managed install in `data_dir/cuda`.
+    pub present: bool,
+    pub size_mb: Option<f64>,
+    pub integrity_error: Option<String>,
+    /// NVIDIA driver present — without it the download is pointless.
+    pub driver_present: bool,
+    /// The CUDA EP already resolves everything (system install or managed).
+    pub cuda_ready: bool,
+    /// Total download size of the pinned archives, for the button label.
+    pub download_mb: u64,
+}
+
+#[tauri::command]
+pub fn get_gpu_libs_status(state: State<'_, AppState>) -> GpuLibsInfo {
+    let cuda_dir = state.settings.lock().unwrap().cuda_dir();
+    let libs = crate::gpu_libs::status(&cuda_dir);
+    let preflight = crate::gpu::preflight();
+    GpuLibsInfo {
+        present: libs.present,
+        size_mb: libs.size_mb,
+        integrity_error: libs.integrity_error,
+        driver_present: preflight.driver_present,
+        cuda_ready: preflight.ready(),
+        download_mb: crate::gpu_libs::download_size_bytes() / 1_000_000,
+    }
+}
+
+/// Download the pinned CUDA runtime + cuDNN DLLs into `data_dir/cuda`.
+/// Progress reuses the model-download event stream with id "gpu-libs".
+#[tauri::command]
+pub fn download_gpu_libs(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    if state.downloading.swap(true, Ordering::SeqCst) {
+        return Err("A download is already in progress".into());
+    }
+    let cuda_dir = state.settings.lock().unwrap().cuda_dir();
+    let thread_app = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("gpu-libs-download".into())
+        .spawn(move || {
+            let emit = |_: &str,
+                        file: &str,
+                        downloaded: u64,
+                        total: Option<u64>,
+                        file_index: u32,
+                        file_count: u32| {
+                let _ = thread_app.emit(
+                    events::MODEL_DOWNLOAD_PROGRESS,
+                    events::ModelDownloadProgress {
+                        model_id: "gpu-libs".into(),
+                        file: file.to_string(),
+                        downloaded_bytes: downloaded,
+                        total_bytes: total,
+                        file_index,
+                        file_count,
+                        done: false,
+                        error: None,
+                    },
+                );
+            };
+            let result = crate::gpu_libs::download(&cuda_dir, emit);
+            let state = thread_app.state::<AppState>();
+            state.downloading.store(false, Ordering::SeqCst);
+            if result.is_ok() {
+                // Put the fresh install on the loader path right away — the
+                // next transcription uses the GPU without a restart.
+                crate::gpu::preflight();
+            }
+            let _ = thread_app.emit(
+                events::MODEL_DOWNLOAD_PROGRESS,
+                events::ModelDownloadProgress {
+                    model_id: "gpu-libs".into(),
+                    file: String::new(),
+                    downloaded_bytes: 0,
+                    total_bytes: None,
+                    file_index: 0,
+                    file_count: 0,
+                    done: true,
+                    error: result.as_ref().err().map(|e| format!("{e:#}")),
+                },
+            );
+            match result {
+                Ok(()) => toast(&thread_app, "GPU libraries installed."),
+                Err(e) => toast(&thread_app, &format!("GPU library download failed: {e:#}")),
+            }
+        });
+    if let Err(error) = spawned {
+        state.downloading.store(false, Ordering::SeqCst);
+        return Err(err(error));
+    }
     Ok(())
 }
 
@@ -1201,17 +1675,24 @@ pub struct GpuStatus {
 
 #[tauri::command]
 pub fn get_gpu_status() -> GpuStatus {
-    // Cheap proxy: the NVIDIA CUDA driver DLL. The real test happens when a
-    // session is created; ort falls back to CPU (with a log warning) if the
-    // CUDA EP can't initialize.
-    let cuda = std::path::Path::new(r"C:\Windows\System32\nvcuda.dll").exists();
+    // Full preflight, not just the driver: an unresolvable cuDNN/CUDA runtime
+    // DLL makes ort fall back to CPU even with a working driver, and that is
+    // by far the most common way GPU transcription silently degrades.
+    let status = crate::gpu::preflight();
+    let detail = if !status.driver_present {
+        "No NVIDIA driver found — transcription will run on CPU".into()
+    } else if status.missing_dlls.is_empty() {
+        "NVIDIA driver and CUDA/cuDNN runtime found — Parakeet will attempt GPU acceleration".into()
+    } else {
+        format!(
+            "NVIDIA driver found, but {} missing — Parakeet will run on CPU. \
+             Use Download GPU libraries below, or install cuDNN 9 for CUDA 13 and set CUDNN_PATH; only system-level changes may require a restart.",
+            status.missing_dlls.join(", ")
+        )
+    };
     GpuStatus {
-        cuda_available: cuda,
-        detail: if cuda {
-            "NVIDIA driver found — CUDA is attempted for Parakeet (CPU fallback with a logged warning)".into()
-        } else {
-            "No NVIDIA driver found — transcription will run on CPU".into()
-        },
+        cuda_available: status.ready(),
+        detail,
     }
 }
 
@@ -1231,7 +1712,7 @@ pub async fn export_audio(app: AppHandle, meeting_id: i64) -> Result<bool, Strin
             .ok_or_else(|| format!("meeting {meeting_id} not found"))?;
         let rel = meeting.audio_path.ok_or("No audio for this meeting yet")?;
         let audio_dir = state.settings.lock().unwrap().audio_dir();
-        (audio_dir.join(rel), meeting.title)
+        (safe_archive_path(&audio_dir, &rel)?, meeting.title)
     };
     if !src.exists() {
         return Err("Audio file is missing".into());
@@ -1262,9 +1743,37 @@ pub fn get_audio_url(state: State<'_, AppState>, meeting_id: i64) -> Result<Stri
         .map_err(err)?
         .ok_or_else(|| format!("meeting {meeting_id} not found"))?;
     let rel = meeting.audio_path.ok_or("No audio for this meeting yet")?;
-    let path = state.settings.lock().unwrap().audio_dir().join(rel);
+    let path = safe_archive_path(&state.settings.lock().unwrap().audio_dir(), &rel)?;
     if !path.exists() {
         return Err("Audio file is missing".into());
     }
     Ok(path.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_archive_path;
+    use std::path::Path;
+
+    #[test]
+    fn archived_audio_paths_cannot_escape_the_audio_directory() {
+        let root = Path::new("audio-root");
+        assert_eq!(
+            safe_archive_path(root, "2026/meeting.opus").unwrap(),
+            root.join("2026/meeting.opus")
+        );
+        for invalid in [
+            "",
+            ".",
+            "../private.txt",
+            "folder/../private.txt",
+            "/absolute.opus",
+            r"C:\\absolute.opus",
+        ] {
+            assert!(
+                safe_archive_path(root, invalid).is_err(),
+                "accepted invalid archive path {invalid:?}"
+            );
+        }
+    }
 }

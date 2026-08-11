@@ -4,13 +4,16 @@ import {
   type AppStatus,
   bookmarkNow,
   downloadModels,
+  getBookmarkHotkey,
   getModelStatus,
   getStatus,
+  showCaptionsOverlay,
   startRecording,
   stopRecording,
 } from "./lib/api";
 import {
   onLiveTranscript,
+  onLiveCaptionsStatus,
   onMeetingsChanged,
   onModelDownloadProgress,
   onRecordingLevel,
@@ -39,7 +42,17 @@ import {
   notifyError,
   notifySuccess,
 } from "./lib/notify";
-import { BookmarkSimple, GearSix, Minus, Record, Square, Stop, X } from "./lib/icons";
+import {
+  BookmarkSimple,
+  CircleNotch,
+  ClosedCaptioning,
+  GearSix,
+  Minus,
+  Record,
+  Square,
+  Stop,
+  X,
+} from "./lib/icons";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 /** True when the event landed on an interactive element (skip window drag). */
@@ -65,7 +78,14 @@ function onResizeBorder(e: MouseEvent): boolean {
 export type View =
   | { kind: "meetings" }
   | { kind: "people" }
-  | { kind: "transcript"; meetingId: number; segmentId?: number; highlight?: string }
+  | {
+      kind: "transcript";
+      meetingId: number;
+      segmentId?: number;
+      highlight?: string;
+      /** The view Back returns to (set by every opener). */
+      from?: View;
+    }
   | { kind: "search"; query: string }
   | { kind: "settings" };
 
@@ -142,6 +162,10 @@ export function App() {
   // Provisional captions for the meeting currently being recorded.
   const [liveLines, setLiveLines] = useState<LiveTranscript[]>([]);
   const [liveMeetingId, setLiveMeetingId] = useState<number | null>(null);
+  // Whether the live-caption worker actually started (null until an event
+  // arrives; get_status covers page reloads mid-recording).
+  const [liveCaptions, setLiveCaptions] = useState<boolean | null>(null);
+  const [bookmarkHotkey, setBookmarkHotkey] = useState<string | null>(null);
   // First-run: prompt to fetch the transcription models.
   const [modelsMissing, setModelsMissing] = useState(false);
   const [modelDl, setModelDl] = useState<ModelDownloadProgress | null>(null);
@@ -150,14 +174,22 @@ export function App() {
   const [popupMode, setPopupMode] = useState(false);
   const searchDebounce = useRef<number | undefined>(undefined);
   const contentRef = useRef<HTMLElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const activeRecordingId = useRef<number | null>(null);
 
   const refreshStatus = () =>
     getStatus()
-      .then(setStatus)
+      .then((next) => {
+        activeRecordingId.current = next.recording ? next.meeting_id : null;
+        setStatus(next);
+      })
       .catch((error) => notifyError("Could not refresh application status", error));
 
   useEffect(() => {
     refreshStatus();
+    getBookmarkHotkey()
+      .then(setBookmarkHotkey)
+      .catch((error) => notifyError("Could not read bookmark hotkey status", error));
     // First-run banner: transcription models not fetched yet.
     if (localStorage.getItem("witness-model-banner-dismissed") !== "1") {
       getModelStatus()
@@ -182,22 +214,44 @@ export function App() {
         }
       }),
       onRecordingStarted((e) => {
+        activeRecordingId.current = e.meeting_id;
         setHealth(null);
         setLiveLines([]);
         setLiveMeetingId(e.meeting_id);
+        setLiveCaptions(e.live_captions);
         refreshStatus();
       }),
       onLiveTranscript((line) =>
-        setLiveLines((prev) => [...prev.slice(-499), line]),
+        line.meeting_id === activeRecordingId.current &&
+          setLiveLines((prev) => [...prev.slice(-499), line]),
       ),
-      onRecordingStopped(() => {
+      onLiveCaptionsStatus((event) => {
+        if (event.meeting_id !== activeRecordingId.current) return;
+        setLiveCaptions(event.active);
+        setStatus((current) =>
+          current?.meeting_id === event.meeting_id
+            ? { ...current, live_captions: event.active }
+            : current,
+        );
+        if (event.error) notifyError("Live captions stopped", event.error);
+      }),
+      onRecordingStopped((event) => {
+        if (activeRecordingId.current === event.meeting_id) {
+          activeRecordingId.current = null;
+        }
         setLevel(null);
         setHealth(null);
+        setLiveCaptions(null);
         refreshStatus();
         setRefreshTick((t) => t + 1);
       }),
       onRecordingLevel(setLevel),
-      onRecordingHealth(setHealth),
+      onRecordingHealth((next) => {
+        setHealth(next);
+        if (next.mic.live_disconnected || next.loopback.live_disconnected) {
+          setLiveCaptions(false);
+        }
+      }),
       onWatcherStatus((w) =>
         setStatus((s) => (s ? { ...s, watcher: w } : s)),
       ),
@@ -236,9 +290,32 @@ export function App() {
     view.kind === "transcript" ? `transcript-${view.meetingId}` : view.kind;
 
   useEffect(() => {
+    // Unmounting the focused element drops focus to <body>, not null.
     const active = document.activeElement;
-    if (!active || !document.contains(active)) contentRef.current?.focus();
+    if (!active || active === document.body || !document.contains(active))
+      contentRef.current?.focus();
   }, [viewKey]);
+
+  useEffect(() => {
+    // Ctrl+F (or "/" outside a text field) jumps to the archive search.
+    const onKeyDown = (e: KeyboardEvent) => {
+      const ctrlF =
+        e.ctrlKey && !e.altKey && !e.metaKey && e.key.toLowerCase() === "f";
+      const editable = (e.target as HTMLElement | null)?.closest(
+        "input, textarea, select, [contenteditable]",
+      );
+      const slash =
+        e.key === "/" && !e.ctrlKey && !e.altKey && !e.metaKey && !editable;
+      if (!ctrlF && !slash) return;
+      e.preventDefault();
+      setView((v) =>
+        v.kind === "meetings" || v.kind === "search" ? v : { kind: "meetings" },
+      );
+      requestAnimationFrame(() => searchInputRef.current?.focus());
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   const toggleRecording = async () => {
     if (recordingAction) return;
@@ -266,8 +343,16 @@ export function App() {
     }, 250);
   };
 
+  const queued = status?.queue_len ?? 0;
+  const queuedSuffix = queued > 0 ? ` · ${queued} queued` : "";
   let statusPill;
-  if (recording) {
+  if (recording && recordingAction) {
+    statusPill = (
+      <span class="pill pill-busy" role="status" aria-live="polite">
+        Stopping…
+      </span>
+    );
+  } else if (recording) {
     statusPill = (
       <button
         type="button"
@@ -278,10 +363,15 @@ export function App() {
         }`}
         onClick={() =>
           status?.meeting_id != null &&
-          setView({ kind: "transcript", meetingId: status.meeting_id })
+          setView({
+            kind: "transcript",
+            meetingId: status.meeting_id,
+            from: view.kind === "transcript" ? view.from : view,
+          })
         }
       >
-        <span class="rec-dot" /> Recording {fmtElapsed(level?.elapsed_ms ?? 0)}
+        <span class="rec-dot" /> <span class="pill-label">Recording</span>{" "}
+        {fmtElapsed(level?.elapsed_ms ?? 0)}
         {healthWarning && <span aria-hidden="true"> ⚠</span>}
         <span
           class="level-meter"
@@ -303,6 +393,7 @@ export function App() {
     statusPill = (
       <span class="pill pill-busy" role="status" aria-live="polite">
         Transcribing ({progress.stage}) {Math.round(progress.pct)}%
+        {queuedSuffix}
       </span>
     );
   } else if (status?.transcribing_meeting_id != null) {
@@ -316,6 +407,14 @@ export function App() {
     statusPill = (
       <span class="pill pill-busy" role="status">
         {persistedProgress}
+        {queuedSuffix}
+      </span>
+    );
+  } else if (queued > 0) {
+    // Between jobs: the next queued meeting hasn't emitted progress yet.
+    statusPill = (
+      <span class="pill pill-busy" role="status">
+        Transcribing…{queuedSuffix}
       </span>
     );
   } else {
@@ -351,13 +450,29 @@ export function App() {
           disabled={recordingAction}
           onClick={toggleRecording}
         >
-          {recording ? <Stop size={17} /> : <Record size={17} />}
+          {recording ? (
+            recordingAction ? (
+              <span
+                style={{ display: "inline-flex", animation: "spin 1s linear infinite" }}
+              >
+                <CircleNotch size={17} />
+              </span>
+            ) : (
+              <Stop size={17} />
+            )
+          ) : (
+            <Record size={17} />
+          )}
         </button>
-        {recording && (
+        {recording && (liveCaptions ?? status?.live_captions ?? false) && (
           <button
             type="button"
             class="btn btn-with-icon"
-            title="Bookmark this moment (Ctrl+Alt+B)"
+            title={
+              bookmarkHotkey
+                ? `Bookmark this moment (${bookmarkHotkey.toUpperCase()})`
+                : "Bookmark this moment"
+            }
             aria-label="Bookmark this moment"
             onClick={() =>
               bookmarkNow()
@@ -368,13 +483,34 @@ export function App() {
             <BookmarkSimple size={16} />
           </button>
         )}
+        {recording && (
+          <button
+            type="button"
+            class="btn btn-with-icon"
+            title="Show the caption overlay"
+            aria-label="Show the caption overlay"
+            onClick={() =>
+              showCaptionsOverlay().catch((error) =>
+                notifyError("Could not show the caption overlay", error),
+              )
+            }
+          >
+            <ClosedCaptioning size={16} />
+          </button>
+        )}
         {statusPill}
         <nav class="nav" aria-label="Primary navigation">
           <button
             type="button"
             class={view.kind === "meetings" ? "nav-btn active" : "nav-btn"}
             aria-current={view.kind === "meetings" ? "page" : undefined}
-            onClick={() => setView({ kind: "meetings" })}
+            onClick={() => {
+              // Explicit nav: abandon any in-flight search so the box
+              // matches the unfiltered list.
+              window.clearTimeout(searchDebounce.current);
+              setSearchText("");
+              setView({ kind: "meetings" });
+            }}
           >
             Meetings
           </button>
@@ -441,6 +577,11 @@ export function App() {
         </div>
         )}
       </header>
+      {recording && healthWarning && (
+        <div class="inline-warning" role="alert" style={{ margin: "8px 14px" }}>
+          {healthWarning}
+        </div>
+      )}
       <main class="content" ref={contentRef} tabIndex={-1}>
         {modelsMissing && (
           <div class="model-banner" role="status">
@@ -451,9 +592,11 @@ export function App() {
             </span>
             {modelDl && !modelDl.error ? (
               <span class="muted" aria-live="polite">
-                {modelDl.total_bytes
-                  ? `${Math.round((modelDl.downloaded_bytes / modelDl.total_bytes) * 100)}% of ${modelDl.file}`
-                  : "downloading…"}
+                {`file ${modelDl.file_index} of ${modelDl.file_count} — ${
+                  modelDl.total_bytes
+                    ? `${Math.round((modelDl.downloaded_bytes / modelDl.total_bytes) * 100)}%`
+                    : "downloading…"
+                }`}
               </span>
             ) : (
               <button
@@ -483,6 +626,7 @@ export function App() {
         {(view.kind === "meetings" || view.kind === "search") && (
           <div class="list-toolbar">
             <input
+              ref={searchInputRef}
               class="search-input"
               type="search"
               aria-label="Search meeting transcripts"
@@ -496,13 +640,17 @@ export function App() {
         {view.kind === "meetings" && (
           <MeetingsView
             refreshTick={refreshTick}
-            onOpen={(meetingId) => setView({ kind: "transcript", meetingId })}
+            onOpen={(meetingId) =>
+              setView({ kind: "transcript", meetingId, from: view })
+            }
           />
         )}
         {view.kind === "people" && (
           <PeopleView
             refreshTick={refreshTick}
-            onOpen={(meetingId) => setView({ kind: "transcript", meetingId })}
+            onOpen={(meetingId) =>
+              setView({ kind: "transcript", meetingId, from: view })
+            }
           />
         )}
         {view.kind === "transcript" && (
@@ -519,21 +667,31 @@ export function App() {
                 ? liveLines
                 : null
             }
-            onBack={() =>
-              // Return to the search results if a search is still active.
-              setView(
-                searchText.trim()
-                  ? { kind: "search", query: searchText }
-                  : { kind: "meetings" },
-              )
+            liveCaptionsActive={liveCaptions ?? status?.live_captions ?? false}
+            transcriptionProgress={
+              progress && progress.meeting_id === view.meetingId
+                ? { stage: progress.stage, pct: progress.pct }
+                : status?.transcribing_meeting_id === view.meetingId
+                  ? {
+                      stage: status.processing_stage ?? "starting",
+                      pct: status.processing_pct ?? 0,
+                    }
+                  : null
             }
+            onBack={() => setView(view.from ?? { kind: "meetings" })}
           />
         )}
         {view.kind === "search" && (
           <SearchView
             query={view.query}
             onOpen={(meetingId, segmentId) =>
-              setView({ kind: "transcript", meetingId, segmentId, highlight: view.query })
+              setView({
+                kind: "transcript",
+                meetingId,
+                segmentId,
+                highlight: view.query,
+                from: view,
+              })
             }
           />
         )}

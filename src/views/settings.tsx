@@ -1,14 +1,19 @@
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import {
+  createBackup,
   deletePerson,
+  downloadGpuLibs,
   downloadModels,
   exportDiagnostics,
   getAutostart,
+  getBookmarkHotkey,
   getDiagnostics,
+  getGpuLibsStatus,
   getGpuStatus,
   getHotkey,
   getModelStatus,
   getSettings,
+  getStatus,
   listAudioDevices,
   listPeople,
   pickDataDir,
@@ -16,8 +21,10 @@ import {
   setAutostart,
   updateSettings,
   type AudioDevices,
+  type BackupSummary,
   type Diagnostics,
   type Engine,
+  type GpuLibsInfo,
   type GpuStatus,
   type ModelInfo,
   type Person,
@@ -65,6 +72,7 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [gpu, setGpu] = useState<GpuStatus | null>(null);
+  const [gpuLibs, setGpuLibs] = useState<GpuLibsInfo | null>(null);
   const [dl, setDl] = useState<ModelDownloadProgress | null>(null);
   const [patternsText, setPatternsText] = useState("");
   const [junkPhrasesText, setJunkPhrasesText] = useState("");
@@ -75,14 +83,28 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
   const [autostart, setAutostartState] = useState<boolean | null>(null);
   const [needsRestart, setNeedsRestart] = useState(false);
   const [hotkey, setHotkey] = useState<string | null>(null);
+  const [bookmarkHotkey, setBookmarkHotkey] = useState<string | null>(null);
+  const [localThreshold, setLocalThreshold] = useState<number | null>(null);
   const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
   const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
   const [diagnosticsCopied, setDiagnosticsCopied] = useState(false);
+  const [backupRunning, setBackupRunning] = useState(false);
+  const [lastBackup, setLastBackup] = useState<BackupSummary | null>(null);
+  const settingsWriteTail = useRef<Promise<void>>(Promise.resolve());
+  const settingsRevision = useRef(0);
 
   const refreshModels = () =>
     getModelStatus()
       .then(setModels)
       .catch((error) => notifyError("Could not load model status", error));
+  const refreshGpu = () => {
+    getGpuStatus()
+      .then(setGpu)
+      .catch((error) => notifyError("Could not check GPU status", error));
+    getGpuLibsStatus()
+      .then(setGpuLibs)
+      .catch((error) => notifyError("Could not check GPU library status", error));
+  };
   const loadSettings = () => {
     setSettingsError(null);
     getSettings()
@@ -103,29 +125,39 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
       .then(setDiagnostics)
       .catch((error) => setDiagnosticsError(String(error)));
   };
+  const refreshDevices = () => {
+    setDevicesError(null);
+    listAudioDevices()
+      .then(setDevices)
+      .catch((error) => setDevicesError(String(error)));
+  };
 
   useEffect(() => {
     loadSettings();
     refreshModels();
-    getGpuStatus()
-      .then(setGpu)
-      .catch((error) => notifyError("Could not check GPU status", error));
+    refreshGpu();
     listPeople()
       .then(setPeople)
       .catch((error) => notifyError("Could not load enrolled people", error));
-    listAudioDevices()
-      .then(setDevices)
-      .catch((error) => setDevicesError(String(error)));
+    refreshDevices();
     getAutostart()
       .then(setAutostartState)
       .catch((error) => notifyError("Could not read autostart status", error));
     getHotkey()
       .then(setHotkey)
       .catch((error) => notifyError("Could not read hotkey status", error));
+    getBookmarkHotkey()
+      .then(setBookmarkHotkey)
+      .catch((error) => notifyError("Could not read hotkey status", error));
     refreshDiagnostics();
     const un = onModelDownloadProgress((p) => {
       setDl(p.done && !p.error ? null : p);
-      if (p.done) refreshModels();
+      if (p.done) {
+        refreshModels();
+        // A finished GPU-library install flips the GPU status immediately —
+        // the backend re-runs its preflight after extraction.
+        refreshGpu();
+      }
     }).catch((error) => {
       notifyError("Could not connect to model download updates", error);
       return () => {};
@@ -139,9 +171,11 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
 
   if (!settings) {
     return settingsError ? (
-      <div class="error-state" role="alert">
+      <div class="view-error" role="alert">
         <p>Could not load settings: {settingsError}</p>
-        <button class="btn" onClick={loadSettings}>Try again</button>
+        <div class="view-error-actions">
+          <button class="btn" onClick={loadSettings}>Try again</button>
+        </div>
       </div>
     ) : (
       <div class="empty" role="status">Loading…</div>
@@ -153,18 +187,32 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
     settings.loopback_device,
     devices?.render ?? [],
   );
+  const threshold = localThreshold ?? settings.speaker_match_threshold;
+  const dlActive = dl != null && !dl.done;
+  const engineModelMissing = models.some(
+    (mo) => mo.engine === settings.engine && !mo.present,
+  );
 
   const save = (next: SettingsData) => {
     const previous = settings;
+    const revision = ++settingsRevision.current;
     setSettings(next);
-    updateSettings(next)
+    const operation = settingsWriteTail.current
+      .catch(() => {})
+      .then(() => updateSettings(next));
+    settingsWriteTail.current = operation;
+    return operation
       .then(() => {
-        setSaved(true);
-        setTimeout(() => setSaved(false), 1500);
+        if (revision === settingsRevision.current) {
+          setSaved(true);
+          setTimeout(() => setSaved(false), 1500);
+        }
+        return true;
       })
       .catch((error) => {
-        setSettings(previous);
+        if (revision === settingsRevision.current) setSettings(previous);
         notifyError("Could not save settings", error);
+        return false;
       });
   };
 
@@ -186,42 +234,44 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
 
   const pickDir = () =>
     pickDataDir()
-      .then((dir) => {
+      .then(async (dir) => {
         if (dir && dir !== settings.data_dir) {
-          save({ ...settings, data_dir: dir });
-          setNeedsRestart(true);
+          if (await save({ ...settings, data_dir: dir })) {
+            refreshDiagnostics();
+            setNeedsRestart(true);
+          }
         }
       })
       .catch((error) => notifyError("Could not choose a data directory", error));
 
+  const restart = async () => {
+    const status = await getStatus().catch((error) => {
+      notifyError("Could not check recording status; restart cancelled", error);
+      return null;
+    });
+    if (!status) return;
+    if (
+      status?.recording &&
+      !(await appConfirm(
+        "Restarting will stop and save the current recording. Restart now?",
+        "Stop & restart",
+      ))
+    )
+      return;
+    restartApp().catch((error) => notifyError("Could not restart Witness", error));
+  };
+
+  const restartPending = needsRestart || (diagnostics?.restart_required ?? false);
+
   return (
     <div class="settings-view">
-      <h2>Settings {saved && <span class="saved-flash">saved ✓</span>}</h2>
+      <div class="settings-head">
+        <h2>Settings</h2>
+        <span class="saved-flash" role="status">{saved ? "saved ✓" : ""}</span>
+      </div>
 
       <section>
-        <h3>Storage</h3>
-        <div class="setting-row">
-          <label>Data directory</label>
-          <code class="path">{settings.data_dir ?? "(next to witness.exe)"}</code>
-          <button class="btn btn-ghost" onClick={pickDir}>
-            Change…
-          </button>
-        </div>
-        <p class="muted">
-          Holds the database, recordings and models. Changing it does not move
-          existing data.
-        </p>
-        {needsRestart && (
-          <div class="setting-row">
-            <span class="muted">The new data directory applies after a restart.</span>
-            <button
-              class="btn"
-              onClick={() => restartApp().catch((error) => notifyError("Could not restart Witness", error))}
-            >
-              Restart Witness
-            </button>
-          </div>
-        )}
+        <h3>Startup</h3>
         <div class="setting-row">
           <label>
             <input
@@ -241,6 +291,58 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
       </section>
 
       <section>
+        <h3>Storage</h3>
+        <div class="setting-row">
+          <label>Data directory</label>
+          <code class="path">{settings.data_dir ?? "(next to witness.exe)"}</code>
+          <button class="btn btn-ghost" onClick={pickDir}>
+            Change…
+          </button>
+        </div>
+        <p class="muted">
+          Holds the database, recordings and models. Changing it does not move
+          existing data.
+        </p>
+        <div class="setting-row">
+          <button
+            class="btn btn-ghost"
+            disabled={backupRunning}
+            onClick={() => {
+              setBackupRunning(true);
+              createBackup()
+                .then((backup) => {
+                  if (!backup) return;
+                  setLastBackup(backup);
+                  notifySuccess("Backup created");
+                })
+                .catch((error) => notifyError("Could not create backup", error))
+                .finally(() => setBackupRunning(false));
+            }}
+          >
+            {backupRunning ? "Creating backup..." : "Create backup..."}
+          </button>
+          <span class="muted">
+            Complete snapshot; recording and processing must be idle.
+          </span>
+        </div>
+        {lastBackup && (
+          <p class="muted" role="status">
+            Backup saved to <code class="path">{lastBackup.path}</code> ({lastBackup.file_count}{" "}
+            files, {(lastBackup.total_bytes / 1_048_576).toFixed(1)} MB). Models can be
+            re-downloaded and are not copied.
+          </p>
+        )}
+        {restartPending && (
+          <div class="setting-row">
+            <span class="muted">The new data directory applies after a restart.</span>
+            <button class="btn" onClick={restart}>
+              Restart Witness
+            </button>
+          </div>
+        )}
+      </section>
+
+      <section>
         <h3>Recording</h3>
         <div class="setting-row">
           <label>
@@ -255,8 +357,9 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
           </label>
         </div>
         <div class="setting-row">
-          <label>Watch patterns</label>
+          <label for="watch-patterns">Watch patterns</label>
           <input
+            id="watch-patterns"
             class="text-input"
             value={patternsText}
             onInput={(e) => setPatternsText((e.target as HTMLInputElement).value)}
@@ -285,7 +388,9 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
                   ? `${micDevice.device.name} (legacy name — reselect to pin this endpoint)`
                   : devices
                     ? `Missing configured device — ${settings.mic_device}`
-                    : `Configured device — checking availability…`}
+                    : devicesError
+                      ? `Configured device — device list unavailable`
+                      : `Configured device — checking availability…`}
               </option>
             )}
             {(devices?.capture ?? []).map((d) => (
@@ -321,7 +426,9 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
                   ? `${loopbackDevice.device.name} (legacy name — reselect to pin this endpoint)`
                   : devices
                     ? `Missing configured device — ${settings.loopback_device}`
-                    : `Configured device — checking availability…`}
+                    : devicesError
+                      ? `Configured device — device list unavailable`
+                      : `Configured device — checking availability…`}
               </option>
             )}
             {(devices?.render ?? []).map((d) => (
@@ -341,7 +448,13 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
             "Chat") to keep music &amp; game audio out of recordings
           </span>
         </div>
-        {devicesError && <p class="badge badge-failed">Audio devices could not be listed: {devicesError}</p>}
+        {devicesError && <p class="inline-warning">Audio devices could not be listed: {devicesError}</p>}
+        <div class="setting-row">
+          <button class="btn btn-ghost" onClick={refreshDevices}>
+            Refresh devices
+          </button>
+          <span class="muted">re-scan after plugging a device in</span>
+        </div>
         <div class="setting-row muted">
           Watcher: {props.watcher
             ? `Teams key found: ${props.watcher.teams_key_found ? "yes" : "no"} · mic in use: ${props.watcher.mic_in_use ? "yes" : "no"}${props.watcher.suppressed ? " · auto-restart suppressed" : ""}`
@@ -390,22 +503,28 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
           </label>
         </div>
         <div class="setting-row">
-          <label>Voice match strictness</label>
+          <label for="voice-match-strictness">Voice match strictness</label>
           <input
+            id="voice-match-strictness"
             type="range"
             min={0.4}
             max={0.8}
             step={0.05}
-            value={settings.speaker_match_threshold}
-            onChange={(e) =>
+            value={threshold}
+            aria-valuetext={`${threshold.toFixed(2)} — ${threshold < 0.55 ? "lenient" : threshold < 0.7 ? "balanced" : "strict"}`}
+            onInput={(e) =>
+              setLocalThreshold(parseFloat((e.target as HTMLInputElement).value))
+            }
+            onChange={(e) => {
               save({
                 ...settings,
                 speaker_match_threshold: parseFloat((e.target as HTMLInputElement).value),
-              })
-            }
+              });
+              setLocalThreshold(null);
+            }}
           />
           <span class="muted">
-            {settings.speaker_match_threshold.toFixed(2)} — lower = more
+            {threshold.toFixed(2)} — lower = more
             auto-labels (more mistakes), higher = fewer
           </span>
         </div>
@@ -428,7 +547,10 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
         <p class="muted">
           {hotkey
             ? `Global hotkey: ${hotkey.toUpperCase().replaceAll("+", " + ")} starts/stops recording.`
-            : "Global record hotkey unavailable (all candidate combos are taken by other apps)."}
+            : "Global record hotkey unavailable (all candidate combos are taken by other apps)."}{" "}
+          {bookmarkHotkey
+            ? `${bookmarkHotkey.toUpperCase().replaceAll("+", " + ")} bookmarks the current moment.`
+            : "Global bookmark hotkey unavailable (all candidate combos are taken by other apps)."}
         </p>
         <div class="setting-row">
           <label>Engine</label>
@@ -443,6 +565,24 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
               {eng === "parakeet" ? "Parakeet TDT v3 (fast, GPU)" : "Whisper large-v3-turbo"}
             </label>
           ))}
+          {engineModelMissing && (
+            <>
+              <span class="inline-warning">
+                model not downloaded — transcription will fail
+              </span>
+              <button
+                class="btn btn-ghost"
+                disabled={dlActive}
+                onClick={() =>
+                  downloadModels(settings.engine).catch((error) =>
+                    notifyError("Could not download models", error),
+                  )
+                }
+              >
+                Download
+              </button>
+            </>
+          )}
         </div>
         <div class="setting-row muted">
           GPU: {gpu ? gpu.detail : "checking…"}
@@ -463,13 +603,30 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
                 installed{mo.size_mb != null ? ` · ${Math.round(mo.size_mb)} MB` : ""}
               </span>
             ) : dl && dl.model_id === mo.id ? (
-              <span class="badge badge-processing">
-                {dl.error
-                  ? `failed: ${dl.error}`
-                  : dl.total_bytes
-                    ? `${Math.round((dl.downloaded_bytes / dl.total_bytes) * 100)}% of ${Math.round(dl.total_bytes / 1e6)} MB`
-                    : `${Math.round(dl.downloaded_bytes / 1e6)} MB…`}
-              </span>
+              dl.error ? (
+                <>
+                  <span class="badge badge-failed">failed: {dl.error}</span>
+                  <button
+                    class="btn btn-ghost"
+                    onClick={() => {
+                      setDl(null);
+                      downloadModels(mo.engine).catch((error) =>
+                        notifyError(`Could not download ${mo.display_name}`, error),
+                      );
+                    }}
+                  >
+                    Retry
+                  </button>
+                </>
+              ) : (
+                <span class="badge badge-processing">
+                  {dl.total_bytes
+                    ? `file ${dl.file_index} of ${dl.file_count} — ${Math.round((dl.downloaded_bytes / dl.total_bytes) * 100)}% of ${Math.round(dl.total_bytes / 1e6)} MB`
+                    : `file ${dl.file_index} of ${dl.file_count} — ${Math.round(dl.downloaded_bytes / 1e6)} MB…`}
+                </span>
+              )
+            ) : dlActive && dl?.model_id === mo.engine ? (
+              <span class="badge badge-processing">waiting…</span>
             ) : (
               <>
                 {mo.integrity_error && (
@@ -479,6 +636,7 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
                 )}
                 <button
                   class="btn btn-ghost"
+                  disabled={dlActive}
                   onClick={() =>
                     downloadModels(mo.engine).catch((error) =>
                       notifyError(`Could not download ${mo.display_name}`, error),
@@ -494,6 +652,63 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
             </code>
           </div>
         ))}
+        {gpuLibs && gpuLibs.driver_present && (
+          <div class="setting-row">
+            <label>CUDA runtime + cuDNN (GPU)</label>
+            {gpuLibs.present ? (
+              <span class="badge badge-transcribed">
+                installed
+                {gpuLibs.size_mb != null ? ` · ${Math.round(gpuLibs.size_mb)} MB` : ""}
+              </span>
+            ) : dl && dl.model_id === "gpu-libs" ? (
+              dl.error ? (
+                <>
+                  <span class="badge badge-failed">failed: {dl.error}</span>
+                  <button
+                    class="btn btn-ghost"
+                    onClick={() => {
+                      setDl(null);
+                      downloadGpuLibs().catch((error) =>
+                        notifyError("Could not download GPU libraries", error),
+                      );
+                    }}
+                  >
+                    Retry
+                  </button>
+                </>
+              ) : (
+                <span class="badge badge-processing">
+                  {dl.total_bytes
+                    ? `file ${dl.file_index} of ${dl.file_count} — ${Math.round((dl.downloaded_bytes / dl.total_bytes) * 100)}% of ${Math.round(dl.total_bytes / 1e6)} MB`
+                    : `file ${dl.file_index} of ${dl.file_count} — ${Math.round(dl.downloaded_bytes / 1e6)} MB…`}
+                </span>
+              )
+            ) : gpuLibs.cuda_ready ? (
+              <span class="muted">using system CUDA libraries</span>
+            ) : (
+              <>
+                {gpuLibs.integrity_error && (
+                  <span class="badge badge-failed" title={gpuLibs.integrity_error}>
+                    integrity check failed
+                  </span>
+                )}
+                <button
+                  class="btn btn-ghost"
+                  disabled={dlActive}
+                  onClick={() =>
+                    downloadGpuLibs().catch((error) =>
+                      notifyError("Could not download GPU libraries", error),
+                    )
+                  }
+                >
+                  {gpuLibs.integrity_error
+                    ? "Repair"
+                    : `Download (~${(gpuLibs.download_mb / 1000).toFixed(1)} GB)`}
+                </button>
+              </>
+            )}
+          </div>
+        )}
         <p class="muted">
           Recording works without models — they're only needed for
           transcription.
@@ -507,7 +722,7 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
           transcript text, notes, voice prints, or private settings.
         </p>
         {diagnosticsError && (
-          <p class="badge badge-failed">Diagnostics unavailable: {diagnosticsError}</p>
+          <p class="inline-warning">Diagnostics unavailable: {diagnosticsError}</p>
         )}
         {diagnostics ? (
           <>
@@ -575,6 +790,21 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
               </span>
             </div>
             <div class="setting-row">
+              <label>GPU runtime</label>
+              <span>
+                {diagnostics.gpu.cuda_ready
+                  ? "CUDA runtime ready"
+                  : diagnostics.gpu.driver_present
+                    ? `CPU fallback · missing ${diagnostics.gpu.missing_dlls.join(", ") || "runtime libraries"}`
+                    : "CPU fallback · no NVIDIA driver"}
+                {diagnostics.gpu.managed_libraries_integrity_error
+                  ? ` · managed install check failed: ${diagnostics.gpu.managed_libraries_integrity_error}`
+                  : diagnostics.gpu.managed_libraries_present
+                    ? " · managed libraries verified"
+                    : ""}
+              </span>
+            </div>
+            <div class="setting-row">
               <button class="btn btn-ghost" onClick={refreshDiagnostics}>
                 Refresh
               </button>
@@ -630,8 +860,8 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
               {Math.round(p.sample_seconds / 60)} min of speech learned
             </span>
             <button
-              class="icon-btn"
-              title="Forget this voice"
+              class="icon-btn icon-btn-danger"
+              title="Forget this voice — Shift-click to skip confirmation"
               onClick={async (e) => {
                 if (
                   !e.shiftKey &&

@@ -242,6 +242,38 @@ impl Db {
         Ok(db)
     }
 
+    /// Create a transactionally consistent, standalone SQLite snapshot using
+    /// SQLite's online backup API. The destination must not already exist.
+    pub fn backup_to(&self, destination: &Path) -> Result<()> {
+        use rusqlite::backup::Backup;
+        use rusqlite::OpenFlags;
+        use std::time::Duration;
+
+        anyhow::ensure!(
+            !destination.exists(),
+            "backup destination already exists: {}",
+            destination.display()
+        );
+        let source = self.conn.lock().unwrap();
+        let mut snapshot = Connection::open_with_flags(
+            destination,
+            OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("creating database snapshot {}", destination.display()))?;
+        {
+            let backup = Backup::new(&source, &mut snapshot)?;
+            backup.run_to_completion(128, Duration::from_millis(5), None)?;
+        }
+        let integrity: String = snapshot.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        anyhow::ensure!(
+            integrity == "ok",
+            "database snapshot failed its integrity check: {integrity}"
+        );
+        Ok(())
+    }
+
     fn migrate(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -539,6 +571,34 @@ impl Db {
              WHERE meeting_id = ?1 AND revision = ?3",
             params![meeting_id, error, revision],
         )? > 0)
+    }
+
+    /// Why the meeting's most recent pipeline job failed (None when there is
+    /// no job or it hasn't failed; successful jobs delete their row).
+    pub fn pipeline_job_error(&self, meeting_id: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT last_error FROM pipeline_jobs WHERE meeting_id = ?1",
+                params![meeting_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Whether this meeting has a runnable pipeline job waiting in the
+    /// durable queue. Failed jobs stay in the table for diagnostics but are
+    /// not described as queued until an explicit retry resets `attempts`.
+    pub fn pipeline_job_queued(&self, meeting_id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM pipeline_jobs WHERE meeting_id = ?1 AND attempts = 0
+             )",
+            params![meeting_id],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn rename_meeting(&self, id: i64, title: &str) -> Result<()> {
@@ -1738,6 +1798,7 @@ mod tests {
         // Processing jobs survive restarts, can be updated for an explicit
         // retry, and are removed only after successful processing.
         db.save_pipeline_job(id, true, Some("whisper")).unwrap();
+        assert!(db.pipeline_job_queued(id).unwrap());
         let jobs = db.list_pipeline_jobs().unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].meeting_id, id);
@@ -1746,7 +1807,9 @@ mod tests {
         let first_revision = jobs[0].revision;
         db.fail_pipeline_job(id, first_revision, "temporary failure")
             .unwrap();
+        assert!(!db.pipeline_job_queued(id).unwrap());
         db.save_pipeline_job(id, false, None).unwrap();
+        assert!(db.pipeline_job_queued(id).unwrap());
         let jobs = db.list_pipeline_jobs().unwrap();
         assert!(jobs[0].transcribe); // encode-only recovery cannot downgrade it
         assert_eq!(jobs[0].engine.as_deref(), Some("whisper"));

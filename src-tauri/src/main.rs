@@ -9,11 +9,14 @@ mod asr;
 mod asr_parakeet;
 mod asr_whisper;
 mod audio_capture;
+mod backup;
 mod commands;
 mod db;
 mod diarize;
 mod encoder;
 mod events;
+mod gpu;
+mod gpu_libs;
 mod live_transcribe;
 mod meeting_title;
 mod meeting_watcher;
@@ -193,6 +196,11 @@ fn setup(app: &tauri::App) -> anyhow::Result<()> {
     }
     init_logging(&data_dir);
     log::info!("Witness starting; data dir: {}", data_dir.display());
+    // Surface CUDA problems at startup, where they are easy to spot — ort
+    // would otherwise fall back to CPU without a word (gpu.rs). The managed
+    // GPU-library dir must register first so preflight can use it.
+    gpu::set_managed_libs_dir(settings.cuda_dir());
+    gpu::preflight();
 
     let db = Arc::new(Db::open(&settings.db_path())?);
 
@@ -274,6 +282,8 @@ fn setup(app: &tauri::App) -> anyhow::Result<()> {
         recorder: Mutex::new(RecorderState::Idle),
         recording_health: Mutex::new(None),
         recording_trigger: Mutex::new("manual"),
+        live_captions: std::sync::atomic::AtomicBool::new(false),
+        live_captions_meeting_id: std::sync::atomic::AtomicI64::new(0),
         pipeline,
         watcher: watcher.clone(),
         last_watcher_status: Mutex::new(events::WatcherStatus {
@@ -285,6 +295,7 @@ fn setup(app: &tauri::App) -> anyhow::Result<()> {
         downloading: std::sync::atomic::AtomicBool::new(false),
         hotkey: Mutex::new(None),
         bookmark_hotkey: Mutex::new(None),
+        backup_in_progress: Mutex::new(false),
     });
 
     tray::build(app)?;
@@ -314,7 +325,15 @@ fn setup(app: &tauri::App) -> anyhow::Result<()> {
                             commands::do_start_recording(app, "manual").map(|_| ())
                         };
                         if let Err(e) = result {
+                            // The hotkey is often pressed with the window
+                            // hidden; a silent failure looks like success.
                             log::warn!("hotkey record toggle: {e}");
+                            let body = if recording {
+                                e
+                            } else {
+                                format!("Recording could not start: {e}")
+                            };
+                            commands::toast(app, &body);
                         }
                     }
                 });
@@ -392,7 +411,11 @@ fn setup(app: &tauri::App) -> anyhow::Result<()> {
             WatcherCommand::StartMeeting => {
                 match commands::do_start_recording(&watch_app, "auto") {
                     Ok(_) => commands::toast(&watch_app, "Witness is recording this meeting."),
-                    Err(e) => log::warn!("auto-record start failed: {e}"),
+                    Err(e) => {
+                        // The user is in a call believing this is recorded.
+                        log::warn!("auto-record start failed: {e}");
+                        commands::toast(&watch_app, &format!("Recording could not start: {e}"));
+                    }
                 }
             }
             WatcherCommand::StopMeeting => {
@@ -406,7 +429,10 @@ fn setup(app: &tauri::App) -> anyhow::Result<()> {
                 if recording {
                     log::info!("meeting ended: stopping {trigger} recording");
                     if let Err(e) = commands::do_stop_recording(&watch_app, false) {
+                        // The stop errors are self-describing ("Restart
+                        // Witness to recover…") — show them verbatim.
                         log::warn!("auto-record stop failed: {e}");
+                        commands::toast(&watch_app, &e);
                     }
                 }
             }
@@ -486,6 +512,20 @@ fn main() {
                 {
                     tray::maybe_pin_popup(window.app_handle());
                 }
+                // The captions overlay remembers its arrangement across
+                // recordings; the flush on Destroyed covers the Escape /
+                // close-button path, which never goes through the backend.
+                tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Moved(_)
+                    if window.label() == "captions" =>
+                {
+                    if let (Ok(position), Ok(size)) = (window.outer_position(), window.outer_size())
+                    {
+                        commands::remember_overlay_geometry(position, size);
+                    }
+                }
+                tauri::WindowEvent::Destroyed if window.label() == "captions" => {
+                    commands::save_overlay_geometry(window.app_handle());
+                }
                 _ => {}
             }
         })
@@ -493,8 +533,10 @@ fn main() {
             commands::get_status,
             commands::get_diagnostics,
             commands::export_diagnostics,
+            commands::create_backup,
             commands::start_recording,
             commands::stop_recording,
+            commands::show_captions_overlay,
             commands::list_meetings,
             commands::get_meeting,
             commands::delete_meeting,
@@ -520,6 +562,8 @@ fn main() {
             commands::get_model_status,
             commands::download_models,
             commands::get_gpu_status,
+            commands::get_gpu_libs_status,
+            commands::download_gpu_libs,
             commands::list_audio_devices,
             commands::get_audio_url,
             commands::export_audio,
@@ -527,6 +571,7 @@ fn main() {
             commands::export_transcript,
             commands::confirm_dialog,
             commands::get_hotkey,
+            commands::get_bookmark_hotkey,
             commands::get_autostart,
             commands::set_autostart,
             commands::restart_app,

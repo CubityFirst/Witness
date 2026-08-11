@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-deleted-meetings"
+description = "Enables the list_deleted_meetings command without any pre-configured scope."
+commands.allow = ["list_deleted_meetings"]
+
+[[permission]]
+identifier = "deny-list-deleted-meetings"
+description = "Denies the list_deleted_meetings command without any pre-configured scope."
+commands.deny = ["list_deleted_meetings"]

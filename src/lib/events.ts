@@ -6,6 +6,7 @@ export interface RecordingStarted {
   meeting_id: number;
   trigger: "auto" | "manual";
   started_at: string;
+  live_captions: boolean;
 }
 
 export interface RecordingLevel {
@@ -46,6 +47,8 @@ export interface TranscriptionDone {
 export interface ModelDownloadProgress {
   model_id: string;
   file: string;
+  file_index: number; // 1-based position within the download job
+  file_count: number;
   downloaded_bytes: number;
   total_bytes: number | null;
   done: boolean;
@@ -75,6 +78,15 @@ export interface LiveTranscript {
 }
 
 export const onLiveTranscript = on<LiveTranscript>("live-transcript");
+
+export interface LiveCaptionsStatus {
+  meeting_id: number;
+  active: boolean;
+  error: string | null;
+}
+
+export const onLiveCaptionsStatus =
+  on<LiveCaptionsStatus>("live-captions-status");
 
 /** True when the window was just shown as a tray flyout (blur dismisses). */
 export const onTrayPopup = on<boolean>("tray-popup");

@@ -1,8 +1,0 @@
-# Machine-local build tool locations (neither is on PATH by default).
-# - CMAKE: used by whisper-rs-sys and audiopus_sys build scripts (the
-#   cmake crate honors this env var; VS BuildTools bundles cmake.exe).
-# - LIBCLANG_PATH: bindgen (whisper-rs-sys) needs libclang; LLVM must stay
-#   on 19.x — bindgen 0.71 miscompiles bindings under LLVM 22.
-[env]
-CMAKE = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
-LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'

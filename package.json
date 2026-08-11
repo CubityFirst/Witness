@@ -3,9 +3,17 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "engines": {
+    "node": ">=24.15 <25"
+  },
+  "packageManager": "npm@11.12.1",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && vite build",
+    "check:acl": "node scripts/check-tauri-acl.mjs",
+    "check": "npm run build && npm run check:acl",
+    "audit": "npm audit --audit-level=high",
     "preview": "vite preview",
     "tauri": "tauri"
   },

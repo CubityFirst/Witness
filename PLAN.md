@@ -1,24 +1,26 @@
 # Witness — Local Meeting Recorder & Transcriber
 
-> **Handoff note:** This plan was researched and approved in a prior Claude Code session. Nothing has been implemented yet — this file is the only thing in the repo. Start at Phase 1 (bottom of this file). All decisions below were confirmed with the user; items marked ⚠ VERIFY need checking against current crate docs before use.
+> **Historical document:** This is the original pre-implementation design.
+> The application is now implemented; use `README.md`, `CLAUDE.md`, and the
+> current source as the behavioral reference.
 
 ## Context
 
-A **local-only** voice transcription tool for meetings (primarily Microsoft Teams on Windows 11): detect when the user is in a meeting, record an audio copy, auto-transcribe with speaker labels, and provide a browsable, full-text-searchable archive of all past meetings. No cloud services — everything on-device. Named **Witness**, a sibling to the user's process-watcher **Vigil** (`G:\Scripts\vigil`).
+A **local-first** voice transcription tool for meetings (primarily Microsoft Teams on Windows 11): detect when the user is in a meeting, record an audio copy, auto-transcribe with speaker labels, and provide a browsable, full-text-searchable archive of all past meetings. Meeting processing is on-device. Named **Witness**, a sibling to the process-watcher **Vigil**.
 
 Confirmed decisions:
-- **Name:** Witness, project root `G:\Scripts\Witness`
+- **Name:** Witness
 - **UI:** Tauri 2 (Rust backend + webview frontend)
 - **ASR:** switchable engines — **Parakeet TDT 0.6B v3** primary (via `parakeet-rs`, ONNX Runtime + CUDA), **Whisper large-v3-turbo** secondary (via `whisper-rs`)
 - **Recording:** auto-starts when a Teams call is detected (with tray notification); manual record button too
-- **Hardware:** RTX 4080 (16 GB), Ryzen 7800X3D, Windows 11 build 26200
+- **Hardware target:** Windows 11 with an optional compatible NVIDIA GPU
 
 ## Key research findings (bake into implementation)
 
 - **Do NOT use per-process loopback** (`AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`) on `ms-teams.exe` — documented bug records silence (microsoft/Windows-classic-samples#414). Use **device-level WASAPI loopback** on the default render device instead, plus a separate default-mic capture. Two tracks = free "Me vs Them" separation.
 - **Meeting detection:** Windows Capability Access Manager consent store, `HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone` — new Teams is MSIX-packaged (`MSTeams_8wekyb3d8bbwe`) so it's a direct subkey (classic apps under `NonPackaged\`, exe paths with `\`→`#`). `LastUsedTimeStart != 0 && LastUsedTimeStop == 0` (REG_QWORD FILETIMEs) ⇔ mic actively in use. Teams holds the mic open for the whole call even while muted — tracks meeting membership exactly.
 - **`parakeet-rs` crate** (github.com/altunenes/parakeet-rs, actively maintained): Parakeet TDT via ONNX Runtime + **Sortformer speaker diarization (up to 4 speakers)**. Parakeet TDT v3: better English WER than Whisper large-v3 (6.3% vs 7.4%), ~40–50× faster, 25 European languages. TDT has a **~4–5 min per-inference audio limit** → VAD-based chunking with a hard 240 s cap.
-- **Vigil conventions to copy** (`G:\Scripts\vigil\CLAUDE.md`, `src/settings.rs`): single process + tray, **no detached windowless daemon** (trips AV heuristics), settings layering env var → `witness-settings.toml` next to exe → `data_dir`, flat module-per-file `src/`, release profile `lto=true, codegen-units=1, strip=true`, MIT license.
+- **Vigil conventions to copy**: single process + tray, **no detached windowless daemon** (trips AV heuristics), settings layering env var → `witness-settings.toml` next to exe → `data_dir`, flat module-per-file `src/`, release profile `lto=true, codegen-units=1, strip=true`, MIT license.
 
 ## Stack
 
@@ -137,6 +139,6 @@ Tray: Open / Record now ⇄ Stop / status / Quit (stops recording cleanly, final
 6. **Whisper engine + hardening** — second engine, retranscribe, device-change/drift, failure/retry UX, release build, README, icon. *Verify: retranscribe comparison; headset-yank survival; clean-machine release run incl. model download.*
 
 ## Reference files
-- `G:\Scripts\vigil\src\settings.rs` — settings layering to copy (s/VIGIL/WITNESS/)
-- `G:\Scripts\vigil\CLAUDE.md` — single-process/tray rationale, AV lesson
-- `G:\Scripts\toktrack\Cargo.toml` — release-profile & Rust conventions reference
+- Vigil settings — settings layering reference (s/VIGIL/WITNESS/)
+- Vigil contributor guide — single-process/tray rationale and AV lesson
+- TokTrack Cargo manifest — release-profile and Rust conventions reference

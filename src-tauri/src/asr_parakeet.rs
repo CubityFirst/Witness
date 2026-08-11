@@ -1,6 +1,7 @@
 //! Parakeet TDT 0.6B v3 via parakeet-rs (ONNX Runtime). CUDA EP requested;
-//! ort silently falls back to CPU if CUDA init fails, so we log a visible
-//! warning up front when the CUDA runtime looks absent.
+//! ort silently falls back to CPU if CUDA init fails, so callers run
+//! `gpu::preflight()` first — it repairs PATH for known cuDNN installs and
+//! logs a visible warning when the CUDA runtime is unresolvable.
 
 use crate::asr::{AsrEngine, AsrSegment};
 use anyhow::{Context, Result};
@@ -77,7 +78,7 @@ mod tests {
         crate::models::download(
             crate::settings::Engine::Parakeet,
             &models_dir,
-            |m, f, d, t| {
+            |m, f, d, t, _, _| {
                 if let Some(t) = t {
                     println!("{m}/{f}: {} / {} MB", d / 1_000_000, t / 1_000_000);
                 }
