@@ -464,7 +464,10 @@ export function App() {
             <Record size={17} />
           )}
         </button>
-        {recording && (liveCaptions ?? status?.live_captions ?? false) && (
+        {/* Bookmarking works for any recording; the overlay button only makes
+            sense when a live-caption session actually started (the backend
+            command rejects it otherwise). */}
+        {recording && (
           <button
             type="button"
             class="btn btn-with-icon"
@@ -483,7 +486,7 @@ export function App() {
             <BookmarkSimple size={16} />
           </button>
         )}
-        {recording && (
+        {recording && (liveCaptions ?? status?.live_captions ?? false) && (
           <button
             type="button"
             class="btn btn-with-icon"
