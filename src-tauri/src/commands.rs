@@ -29,40 +29,68 @@ pub fn toast(app: &AppHandle, body: &str) {
 
 // ---------- shared recording control ----------
 
-/// The first user-visible problem in a degraded capture state, if any.
-/// Device loss is distinguished from "not connected yet" via the loss count.
-fn capture_warning(health: &crate::recorder::RecordingHealth) -> Option<String> {
+/// Identity of a capture problem, independent of the numbers in its message.
+/// Health is re-evaluated every 500 ms and the dropped-audio counters only
+/// grow, so a message-level comparison would treat every tick of an ongoing
+/// problem as new — deduplicating the OS toast needs this stable key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarningKind {
+    WriterFailed,
+    CaptureFailed(&'static str),
+    DeviceLost(&'static str),
+    CaptureDropped(&'static str),
+    LiveDropped(&'static str),
+    LiveDisconnected(&'static str),
+}
+
+/// The first user-visible problem in a degraded capture state, if any, as
+/// (kind, message). Device loss is distinguished from "not connected yet"
+/// via the loss count.
+fn capture_warning(health: &crate::recorder::RecordingHealth) -> Option<(WarningKind, String)> {
     if let Some(error) = &health.writer_error {
-        return Some(format!("Recording failed: {error}"));
+        return Some((
+            WarningKind::WriterFailed,
+            format!("Recording failed: {error}"),
+        ));
     }
     for (name, track) in [
         ("Microphone", &health.mic),
         ("System audio", &health.loopback),
     ] {
         if let Some(error) = &track.fatal_error {
-            return Some(format!("{name} capture failed: {error}"));
+            return Some((
+                WarningKind::CaptureFailed(name),
+                format!("{name} capture failed: {error}"),
+            ));
         }
         if !track.connected && track.device_loss_count > 0 {
-            return Some(format!(
-                "{name} device lost — recording silence until it returns"
+            return Some((
+                WarningKind::DeviceLost(name),
+                format!("{name} device lost — recording silence until it returns"),
             ));
         }
         if track.capture_overflow_count > 0 {
-            return Some(format!(
-                "{name} capture dropped {} ms of audio",
-                track.capture_dropped_ms
+            return Some((
+                WarningKind::CaptureDropped(name),
+                format!(
+                    "{name} capture dropped {} ms of audio",
+                    track.capture_dropped_ms
+                ),
             ));
         }
         if track.live_dropped_ms > 0 {
-            return Some(format!(
-                "Live captions skipped {} ms to keep recording responsive",
-                track.live_dropped_ms
+            return Some((
+                WarningKind::LiveDropped(name),
+                format!(
+                    "Live captions skipped {} ms to keep recording responsive",
+                    track.live_dropped_ms
+                ),
             ));
         }
         if track.live_disconnected {
-            return Some(format!(
-                "Live captions stopped receiving {}",
-                name.to_lowercase()
+            return Some((
+                WarningKind::LiveDisconnected(name),
+                format!("Live captions stopped receiving {}", name.to_lowercase()),
             ));
         }
     }
@@ -201,11 +229,20 @@ pub fn do_start_recording(app: &AppHandle, trigger: &'static str) -> Result<i64,
                 );
             }
             // Surface each new degradation outside the window too — it is
-            // usually hidden to the tray while an auto-recording runs.
+            // usually hidden to the tray while an auto-recording runs. The
+            // tooltip follows the live numbers; the OS toast fires only when
+            // the *kind* of problem changes, otherwise an ongoing overflow
+            // would raise one notification per 500 ms health tick.
             let warning = capture_warning(&health);
-            if warning != previous.as_ref().and_then(capture_warning) {
-                tray::set_recording_warning(&health_app, warning.as_deref());
-                if let Some(text) = &warning {
+            let previous_warning = previous.as_ref().and_then(capture_warning);
+            let text = warning.as_ref().map(|(_, text)| text.as_str());
+            if text != previous_warning.as_ref().map(|(_, text)| text.as_str()) {
+                tray::set_recording_warning(&health_app, text);
+            }
+            if warning.as_ref().map(|(kind, _)| *kind)
+                != previous_warning.as_ref().map(|(kind, _)| *kind)
+            {
+                if let Some(text) = text {
                     toast(&health_app, text);
                 }
             }
