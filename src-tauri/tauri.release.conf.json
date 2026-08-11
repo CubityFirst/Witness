@@ -1,0 +1,9 @@
+{
+  "bundle": {
+    "active": true,
+    "resources": {
+      "target/release/onnxruntime_providers_cuda.dll": "",
+      "target/release/onnxruntime_providers_shared.dll": ""
+    }
+  }
+}

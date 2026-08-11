@@ -179,9 +179,13 @@ Set-Location ..
 npm run tauri dev
 ```
 
-Build the NSIS installer with `npm run tauri build`. The default Whisper build
-uses CPU; `--features whisper-cuda` requires a compatible CUDA toolkit. Runtime
-CUDA support for Parakeet also needs a compatible NVIDIA driver and cuDNN 9.
+Build the NSIS installer with `npm run release:windows`. The command compiles
+first, verifies the generated ONNX Runtime provider DLLs, and only then bundles
+them through the release configuration. The base Tauri configuration keeps
+bundling disabled so a one-phase `tauri build` cannot silently omit those DLLs.
+The default Whisper build uses CPU; `--features whisper-cuda` requires a
+compatible CUDA toolkit. Runtime CUDA support for Parakeet also needs a
+compatible NVIDIA driver and cuDNN 9.
 
 See [Contributing](CONTRIBUTING.md) and the
 [release checklist](docs/RELEASE_CHECKLIST.md) before proposing a change or
