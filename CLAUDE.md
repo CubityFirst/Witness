@@ -196,6 +196,11 @@ min/max/close (close hides to tray). A second webview window "captions"
 - Toasts are attributed to PowerShell in dev — unpackaged apps have no
   AUMID registration; the NSIS install shows "Witness" correctly.
 - `backgroundColor` on windows kills the white flash when resizing.
+- **No large stack arrays.** Sync Tauri commands run on the main thread,
+  which has Windows' 1 MB stack, and release inlining hoists a callee's
+  array into the caller's frame even when that branch never runs: a 1 MB
+  hash buffer in `digest_reader` made `get_model_status` overflow at launch
+  once models were installed (0.2.0). Buffers go on the heap (`vec!`).
 - witness.log rotates at 5 MB (one `.old`). Crash recovery patches WAV
   RIFF/data sizes from file length (`repair_wav_header`) before reading.
 - NSIS bundles the ort CUDA provider DLLs via `bundle.resources` — they

@@ -361,7 +361,11 @@ pub(crate) fn replace_file(temporary_path: &Path, destination: &Path) -> io::Res
 
 fn digest_reader(mut reader: impl Read) -> Result<String> {
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 1024 * 1024];
+    // Heap, not stack: release builds inline this into verify_file and on up
+    // into get_model_status, a sync command on the 1 MB main thread — a stack
+    // array here reserved the whole frame even when no hash ran and crashed
+    // the app at launch once models were installed.
+    let mut buffer = vec![0u8; 1024 * 1024];
     loop {
         let read = reader.read(&mut buffer).context("reading model file")?;
         if read == 0 {

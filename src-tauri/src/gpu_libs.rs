@@ -271,7 +271,8 @@ fn stream_sha256(path: &Path) -> Result<String> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 1024 * 1024];
+    // Heap, not stack — see models::digest_reader.
+    let mut buffer = vec![0u8; 1024 * 1024];
     loop {
         let read = reader
             .read(&mut buffer)
@@ -343,7 +344,7 @@ fn download_archive(
             let mut reader = response.into_reader();
             let mut written = existing;
             let mut last_report = 0u64;
-            let mut buffer = [0u8; 256 * 1024];
+            let mut buffer = vec![0u8; 256 * 1024];
             cb(archive.id, archive.file, written, Some(archive.size));
             loop {
                 let read = reader
@@ -436,7 +437,7 @@ fn extract_dlls(
         let extract_result = (|| -> Result<(u64, String)> {
             let mut hasher = Sha256::new();
             let mut size = 0u64;
-            let mut buffer = [0u8; 1024 * 1024];
+            let mut buffer = vec![0u8; 1024 * 1024];
             loop {
                 let read = entry
                     .read(&mut buffer)
