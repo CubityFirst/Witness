@@ -16,6 +16,10 @@
   --chip-s2: #b0582a;
   --chip-s3: #23735d;
   --chip-s4: #b04a7e;
+  --chip-s5: #8a6a12;
+  --chip-s6: #1d6a86;
+  --chip-s7: #5557b0;
+  --chip-s8: #7b5a3a;
   --focus: #9acbff;
 }
 
@@ -1072,6 +1076,22 @@ button.chip:disabled {
 
 .chip-s4 {
   background: var(--chip-s4);
+}
+
+.chip-s5 {
+  background: var(--chip-s5);
+}
+
+.chip-s6 {
+  background: var(--chip-s6);
+}
+
+.chip-s7 {
+  background: var(--chip-s7);
+}
+
+.chip-s8 {
+  background: var(--chip-s8);
 }
 
 /* Live-feed "Them": green = remote audio, matching the overlay and loopback meter. */

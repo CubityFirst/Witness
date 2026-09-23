@@ -86,6 +86,15 @@ mod tests {
         )
         .unwrap();
 
+        // Same order as the pipeline: preflight repairs PATH for cuDNN, and
+        // this test is pointless on a silent CPU fallback.
+        let cuda = crate::gpu::preflight();
+        assert!(
+            cuda.ready(),
+            "CUDA runtime not resolvable: {:?}",
+            cuda.missing_dlls
+        );
+
         let mut engine = ParakeetEngine::new(&models_dir).unwrap();
         // 2 s of silence — content doesn't matter, this exercises EP init +
         // the full encoder/decoder graph.

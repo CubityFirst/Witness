@@ -594,7 +594,8 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
         <div class="setting-row muted">
           GPU: {gpu ? gpu.detail : "checking…"}
         </div>
-        <p class="muted">Speaker separation covers up to 4 remote speakers.</p>
+        <p class="muted">Speaker separation covers up to 8 remote speakers (NVIDIA Nemotron 3
+          Diarization).</p>
       </section>
 
       <section>

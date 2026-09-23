@@ -39,7 +39,7 @@ recorder.rs writer thread                              floating overlay)
         ▼
 pipeline.rs (single FIFO worker; engines loaded per job, dropped after)
   WAV/Opus → 16 kHz → vad.rs chunks (≤240 s) → asr_{parakeet,whisper}.rs
-  → diarize.rs (Sortformer, loopback) → speaker_id.rs (voice prints,
+  → diarize.rs (Nemotron 3 Diarization, loopback) → speaker_id.rs (voice prints,
   auto-label vs enrolled people) → db.rs transaction (FTS via triggers)
   → encoder.rs (stereo Ogg Opus comfort mix) → WAV cleanup → events
 ```
@@ -60,7 +60,7 @@ min/max/close (close hides to tray). A second webview window "captions"
   recording→recorded→processing→transcribed|failed; `deleted_at` = recycle
   bin (purged after 30 days at startup); `notes` has its own FTS table.
 - `speakers(id, meeting_id, label, display_name, person_id, auto_labeled,
-  embedding, emb_seconds)` — label is immutable ('me', 'S1'..'S4');
+  embedding, emb_seconds)` — label is immutable ('me', 'S1'..'S8');
   `embedding` = this speaker's voice print in this meeting.
 - `people(id, name UNIQUE, embedding, sample_seconds, created_at)` —
   enrolled voice prints, L2-normalized f32 LE blobs.
@@ -146,13 +146,16 @@ min/max/close (close hides to tray). A second webview window "captions"
 ## Crate/version constraints (do not "upgrade" casually)
 
 - **VAD is earshot, not Silero** — `voice_activity_detector` pins ort
-  =2.0.0-rc.10; parakeet-rs needs rc.12. earshot frames: exactly 256
+  =2.0.0-rc.10; parakeet-rs needs rc.13. earshot frames: exactly 256
   samples @ 16 kHz.
-- **Our direct `ort` dep is pinned `=2.0.0-rc.12`** to match parakeet-rs
-  (shared ort-sys). Its CUDA provider binaries hard-import
-  `cudnn64_9.dll` + `cublas64_13`/`cublasLt64_13`/`cufft64_12` (CUDA 13
-  runtime + cuDNN 9) — mirrored in gpu.rs `CUDA_EP_DLLS`; re-dump the
-  provider's imports when bumping ort. speaker_id.rs runs its own CPU session (3D-Speaker
+- **Our direct `ort` dep is pinned `=2.0.0-rc.13`** to match parakeet-rs
+  (shared ort-sys). Its CUDA provider hard-imports `cublas64_13` /
+  `cublasLt64_13` and loads `cudnn64_9` / `cufft64_12` at runtime (CUDA 13
+  runtime + cuDNN 9) — mirrored in gpu.rs `CUDA_EP_DLLS`; re-check the
+  provider's imports and embedded DLL names when bumping ort. ort-sys only
+  copies its DLLs into a target dir when they are *absent* (cross-drive =
+  copy, not symlink), so after an ort bump delete the old
+  `onnxruntime_providers_*.dll` from local target dirs or they go stale. speaker_id.rs runs its own CPU session (3D-Speaker
   ERes2Net, input `x` [1,T,80] kaldi fbank — 80 mel, 25/10 ms, povey, CMN,
   samples in [-1,1]; output `embedding` [1,192], L2-normalize ourselves;
   threshold user-tunable, default 0.6).
@@ -162,7 +165,20 @@ min/max/close (close hides to tray). A second webview window "captions"
 - **wasapi 0.23**: loopback = *render* device opened with
   `Direction::Capture` + `StreamMode::EventsShared`; `initialize_mta()`
   per thread; wasapi objects are `!Send`.
-- **Sortformer output units = samples @ 16 kHz** (÷16 → ms); ≤4 speakers.
+- **Diarization = NVIDIA Nemotron 3 Diarization** (streaming Sortformer v3,
+  OpenMDW-1.1) via parakeet-rs, ONNX from `altunenes/parakeet-rs`
+  (`nemotron-3-diarization/`). Output units = samples @ 16 kHz (÷16 → ms);
+  ≤8 speakers; runs on CPU (no execution config), offline profile from the
+  ONNX metadata. **Never call `Sortformer::flush()`** — in 0.3.8 it hands
+  ORT a column-major mel array whenever the tail is a whole number of 80 ms
+  frames (~1 in 8 recordings); diarize.rs instead feeds one model window of
+  silence and clamps segments. Remove the workaround once upstream fixes it
+  (`diarize_tail_frame_multiple` is the regression test). Compared with v2
+  on real meetings, v3 stops splitting one person into two speakers, but it
+  merges the two stock SAPI voices (Hazel/Zira) — the TTS dialogue test
+  pitches one down.
+- **parakeet-rs is a git pin** (0.3.8 isn't on crates.io yet) — swap to the
+  crates.io release when it lands. 0.3.8 dropped Sortformer v2 support.
   **TDT ~4–5 min inference cap** → vad.rs hard-splits at 240 s.
 - **FTS5 probe queries need `LIMIT 1`** — with `LIMIT 0` the MATCH
   expression is never parsed and invalid syntax slips through.
@@ -196,9 +212,14 @@ not validated with newer LLVM releases.
 - `cargo test` (in src-tauri) — fast unit suite. Use
   `CARGO_TARGET_DIR=target-test` when `npm run tauri dev` is running (the
   dev app locks the ort DLLs the build script copies).
+  When ort-sys has to *copy* (not symlink) its DLLs it skips `deps/`, so
+  test binaries can't see `onnxruntime_providers_cuda.dll` and `cuda_smoke`
+  silently runs on CPU — copy the two provider DLLs into
+  `<target>/<profile>/deps/` for a real GPU check.
 - Ignored, real-world tests: `capture_smoke` (records 4 s from the real
   devices; WITNESS_TEST_MIC/LOOPBACK env override), `cuda_smoke`
-  (downloads Parakeet+Sortformer to target/debug/models, CUDA inference),
+  (downloads Parakeet+diarization to target/debug/models, CUDA inference),
+  `tts_dialogue_diarization` / `diarize_tail_frame_multiple` (diarization),
   `tts_transcribe` / `whisper_tts` (SAPI speech end-to-end, both engines),
   `voice_print_discrimination` (two TTS voices, same/cross cosine),
   `live_captions` (streams TTS through the live worker),
@@ -226,7 +247,6 @@ because on Windows the plugin launches the installer and
 `process::exit(0)`s (skipping tray-Quit finalization); persisted pipeline
 jobs resume on relaunch.
 
-
 ## Settings & files
 
 `WITNESS_SETTINGS` env var → `witness-settings.toml` (next to exe) →
@@ -239,7 +259,7 @@ data_dir changes apply to db/log on restart (Settings offers the button).
 
 - No echo cancellation: speakers instead of a headset can bleed remote audio
   into the mic track; a headset is recommended.
-- Diarization caps at 4 remote speakers; voice matching on compressed
+- Diarization caps at 8 remote speakers; voice matching on compressed
   Teams audio is good-but-not-perfect (hence the ≈ marker + rename flow).
 - DB and audio are unencrypted at rest (local-only threat model).
 - Live captions lost on page reload aren't backfilled (the final

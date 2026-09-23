@@ -33,7 +33,7 @@ export interface Bookmark {
 export interface Speaker {
   id: number;
   meeting_id: number;
-  label: string; // 'me' | 'S1'..'S4' (immutable)
+  label: string; // 'me' | 'S1'..'S8' (immutable)
   display_name: string;
   person_id: number | null;
   auto_labeled: boolean; // name came from voice matching, not the user

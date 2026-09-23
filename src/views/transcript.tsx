@@ -49,6 +49,10 @@ const CHIP_CLASS: Record<string, string> = {
   S2: "chip-s2",
   S3: "chip-s3",
   S4: "chip-s4",
+  S5: "chip-s5",
+  S6: "chip-s6",
+  S7: "chip-s7",
+  S8: "chip-s8",
 };
 
 /** Case-insensitive term highlighting for search deep-links. */

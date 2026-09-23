@@ -31,16 +31,18 @@ rubato = "0.16"
 audiopus = "0.2"
 ogg = "0.9"
 # Pure-Rust VAD: voice_activity_detector pins ort =2.0.0-rc.10 which clashes
-# with parakeet-rs (ort 2.0.0-rc.12), so we use earshot instead.
+# with parakeet-rs (ort 2.0.0-rc.13), so we use earshot instead.
 earshot = "1.1"
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 sha2 = "0.10"
 hex = "0.4"
-parakeet-rs = { version = "0.3", features = ["cuda", "sortformer"] }
+# Git pin until 0.3.8 (Nemotron 3 Diarization / Sortformer v3, which also
+# drops v2 support) reaches crates.io — swap back to `version = "0.3.8"` then.
+parakeet-rs = { git = "https://github.com/altunenes/parakeet-rs", rev = "4fa6bdae61aa27b67f1de9590d180ca7092577f0", features = ["cuda", "sortformer"] }
 whisper-rs = "0.14"
 # Speaker embeddings run through our own ort session; version MUST stay
 # pinned to whatever parakeet-rs uses (shared ort-sys).
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray"] }
 # GPU library installer (gpu_libs.rs): ureq matches hf-hub's major so the
 # tree keeps a single copy; zip reads the NVIDIA wheel archives (deflate).
 ureq = "2"

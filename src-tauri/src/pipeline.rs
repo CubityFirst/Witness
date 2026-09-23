@@ -457,12 +457,12 @@ fn process(
         } else if models::sortformer_path(&models_dir).is_some() {
             diarize::diarize(&models_dir, &loop_16k, |p| progress("diarize", p))?
         } else {
-            log::warn!("Sortformer model missing — labelling all remote speech S1");
+            log::warn!("Diarization model missing — labelling all remote speech S1");
             Vec::new()
         };
 
         // ---- merge segments ----
-        let mut seen = [false; 4];
+        let mut seen = [false; diarize::MAX_SPEAKERS];
         let mut segments: Vec<NewSegment> = Vec::new();
         for seg in &mic_segments {
             segments.push(NewSegment {
@@ -475,7 +475,7 @@ fn process(
         }
         for seg in &loop_segments {
             let spk = diarize::assign_speaker(&diar, seg.start_ms, seg.end_ms).unwrap_or(0);
-            let spk = spk.min(3);
+            let spk = spk.min(diarize::MAX_SPEAKERS - 1);
             seen[spk] = true;
             segments.push(NewSegment {
                 speaker_label: Some(format!("S{}", spk + 1)),
@@ -491,10 +491,10 @@ fn process(
         // Gather each remote speaker's audio (from diarization when present,
         // else everything the VAD kept — single-speaker fallback).
         let max_samples = (speaker_id::MAX_SPEECH_SECONDS * 16_000.0) as usize;
-        let mut spk_audio: [Vec<f32>; 4] = Default::default();
+        let mut spk_audio: [Vec<f32>; diarize::MAX_SPEAKERS] = Default::default();
         if !diar.is_empty() {
             for d in &diar {
-                if d.speaker >= 4 || spk_audio[d.speaker].len() >= max_samples {
+                if d.speaker >= diarize::MAX_SPEAKERS || spk_audio[d.speaker].len() >= max_samples {
                     continue;
                 }
                 let s = (d.start_ms as usize * 16).min(loop_16k.len());

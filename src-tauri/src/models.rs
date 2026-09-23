@@ -20,9 +20,11 @@ use std::sync::Mutex;
 
 pub const PARAKEET_REPO: &str = "istupakov/parakeet-tdt-0.6b-v3-onnx";
 pub const PARAKEET_REVISION: &str = "8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce";
+// NVIDIA Nemotron 3 Diarization (streaming Sortformer v3, 8 speakers),
+// OpenMDW-1.1; ONNX export by the parakeet-rs author, validated against NeMo.
 pub const SORTFORMER_REPO: &str = "altunenes/parakeet-rs";
-pub const SORTFORMER_REVISION: &str = "63b515f9fe053a47f8e5530d06ffdf7ae3afa049";
-pub const SORTFORMER_FILE: &str = "diar_streaming_sortformer_4spk-v2.onnx";
+pub const SORTFORMER_REVISION: &str = "52f2deee40f20d7dc1f459416e9cd213fb9472df";
+pub const SORTFORMER_FILE: &str = "nemotron-3-diarization/nemotron3_diar_v3.onnx";
 pub const WHISPER_REPO: &str = "ggerganov/whisper.cpp";
 pub const WHISPER_REVISION: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
 pub const WHISPER_FILE: &str = "ggml-large-v3-turbo-q5_0.bin";
@@ -88,9 +90,9 @@ const PARAKEET_EXPECTED_FILES: &[ExpectedFile] = &[
 
 const SORTFORMER_EXPECTED_FILES: &[ExpectedFile] = &[ExpectedFile {
     path: SORTFORMER_FILE,
-    size: 492_243_002,
-    sha256: "cc520901a8cc25a8d7f7c2c8561a465709b67dd4f1df0572a97530087f3fbc73",
-    cache_etag: "cc520901a8cc25a8d7f7c2c8561a465709b67dd4f1df0572a97530087f3fbc73",
+    size: 400_506_656,
+    sha256: "915e4fa23b0192ed9fadeb1cdd26847df986d50c92012d177be28d0343bbe03a",
+    cache_etag: "915e4fa23b0192ed9fadeb1cdd26847df986d50c92012d177be28d0343bbe03a",
 }];
 
 const WHISPER_EXPECTED_FILES: &[ExpectedFile] = &[ExpectedFile {
@@ -119,7 +121,7 @@ const MODEL_SPECS: &[ModelSpec] = &[
     ModelSpec {
         id: "sortformer",
         engine: Engine::Parakeet,
-        display_name: "Sortformer diarization (4 speakers)",
+        display_name: "Nemotron 3 Diarization (8 speakers)",
         repo: SORTFORMER_REPO,
         revision: SORTFORMER_REVISION,
         files: SORTFORMER_EXPECTED_FILES,

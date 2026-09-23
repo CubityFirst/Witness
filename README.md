@@ -61,7 +61,7 @@ or interrupted download remains incomplete and can be repaired from Settings.
 | Capability | Model | Approximate disk use |
 | --- | --- | ---: |
 | Fast ASR and live captions | Parakeet TDT 0.6B v3 | 2.6 GB |
-| Remote-speaker diarization | Sortformer | 470 MB |
+| Remote-speaker diarization (up to 8) | NVIDIA Nemotron 3 Diarization | 380 MB |
 | Cross-meeting speaker matching | ERes2Net | 26 MB |
 | Alternate ASR | Whisper large-v3-turbo q5 | 550 MB |
 
