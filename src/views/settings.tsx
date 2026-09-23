@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import {
   createBackup,
+  deleteModelCache,
   deletePerson,
   downloadGpuLibs,
   downloadModels,
@@ -11,6 +12,7 @@ import {
   getGpuLibsStatus,
   getGpuStatus,
   getHotkey,
+  getModelCacheSize,
   getModelStatus,
   getSettings,
   getStatus,
@@ -72,6 +74,8 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
   const [settings, setSettings] = useState<SettingsData | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
+  const [cacheBytes, setCacheBytes] = useState<number | null>(null);
+  const [deletingCache, setDeletingCache] = useState(false);
   const [gpu, setGpu] = useState<GpuStatus | null>(null);
   const [gpuLibs, setGpuLibs] = useState<GpuLibsInfo | null>(null);
   const [dl, setDl] = useState<ModelDownloadProgress | null>(null);
@@ -94,10 +98,14 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
   const settingsWriteTail = useRef<Promise<void>>(Promise.resolve());
   const settingsRevision = useRef(0);
 
-  const refreshModels = () =>
+  const refreshModels = () => {
     getModelStatus()
       .then(setModels)
       .catch((error) => notifyError("Could not load model status", error));
+    getModelCacheSize()
+      .then(setCacheBytes)
+      .catch((error) => notifyError("Could not measure the model cache", error));
+  };
   const refreshGpu = () => {
     getGpuStatus()
       .then(setGpu)
@@ -717,6 +725,39 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
             )}
           </div>
         )}
+        <div class="setting-row">
+          <label>Model cache</label>
+          <span class="muted">
+            {cacheBytes == null ? "…" : `${(cacheBytes / 1e9).toFixed(2)} GB on disk`}
+          </span>
+          <button
+            class="btn btn-ghost"
+            title="Deletes every downloaded model, including old versions — Shift-click to skip confirmation"
+            disabled={dlActive || deletingCache || !cacheBytes}
+            onClick={async (e) => {
+              if (
+                !e.shiftKey &&
+                !(await appConfirm(
+                  "Delete all downloaded models?\nTranscription stops working until you download them again.",
+                  "Delete models",
+                ))
+              )
+                return;
+              setDeletingCache(true);
+              deleteModelCache()
+                .then((freed) =>
+                  notifySuccess(`Deleted model cache — freed ${(freed / 1e9).toFixed(2)} GB`),
+                )
+                .catch((error) => notifyError("Could not delete the model cache", error))
+                .finally(() => {
+                  setDeletingCache(false);
+                  refreshModels();
+                });
+            }}
+          >
+            {deletingCache ? "Deleting…" : "Delete model cache"}
+          </button>
+        </div>
         <p class="muted">
           Recording works without models — they're only needed for
           transcription.

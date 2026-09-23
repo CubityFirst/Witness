@@ -1534,6 +1534,41 @@ pub fn get_model_status(state: State<'_, AppState>) -> Vec<ModelInfo> {
     models::status(&state.settings.lock().unwrap().models_dir())
 }
 
+/// Bytes the model cache occupies, including superseded downloads that no
+/// longer show up as a model row. Async: it walks the cache directory.
+#[tauri::command]
+pub async fn get_model_cache_size(app: AppHandle) -> Result<u64, String> {
+    let models_dir = app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .unwrap()
+        .models_dir();
+    Ok(models::cache_size(&models_dir))
+}
+
+/// Deletes every downloaded model and returns the bytes freed. Refused while
+/// anything may hold a model file open (Windows can't delete open files):
+/// a download, a recording (live captions run Parakeet), or a pipeline job.
+#[tauri::command]
+pub async fn delete_model_cache(app: AppHandle) -> Result<u64, String> {
+    let state = app.state::<AppState>();
+    if state.recorder.lock().unwrap().is_busy() {
+        return Err("Stop the recording before deleting models".into());
+    }
+    if state.pipeline.current_meeting().is_some() {
+        return Err("Wait for the current transcription to finish before deleting models".into());
+    }
+    // Claim the download flag so no download can start while files go.
+    if state.downloading.swap(true, Ordering::SeqCst) {
+        return Err("Wait for the download to finish before deleting models".into());
+    }
+    let models_dir = state.settings.lock().unwrap().models_dir();
+    let result = models::delete_cache(&models_dir).map_err(err);
+    state.downloading.store(false, Ordering::SeqCst);
+    result
+}
+
 #[tauri::command]
 pub fn download_models(app: AppHandle, engine: Engine) -> Result<(), String> {
     let state = app.state::<AppState>();

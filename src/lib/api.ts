@@ -300,6 +300,10 @@ export const createBackup = () =>
 export const getModelStatus = () => invoke<ModelInfo[]>("get_model_status");
 export const downloadModels = (engine: Engine) =>
   invoke<void>("download_models", { engine });
+/** Bytes on disk in the model cache, including superseded downloads. */
+export const getModelCacheSize = () => invoke<number>("get_model_cache_size");
+/** Deletes every downloaded model; resolves to the bytes freed. */
+export const deleteModelCache = () => invoke<number>("delete_model_cache");
 export const getGpuStatus = () => invoke<GpuStatus>("get_gpu_status");
 export const getGpuLibsStatus = () =>
   invoke<GpuLibsInfo>("get_gpu_libs_status");

@@ -33,6 +33,8 @@ permissions = [
   "allow-pick-data-dir",
   "allow-get-model-status",
   "allow-download-models",
+  "allow-get-model-cache-size",
+  "allow-delete-model-cache",
   "allow-get-gpu-status",
   "allow-get-gpu-libs-status",
   "allow-download-gpu-libs",

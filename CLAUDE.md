@@ -259,6 +259,9 @@ jobs resume on relaunch.
 `.meta.toml` crash sidecars), `models/hf-cache/`, `cuda/` (optional managed
 GPU DLLs), `witness.log`.
 data_dir changes apply to db/log on restart (Settings offers the button).
+Settings → Models → "Delete model cache" wipes `models/` (hf-cache +
+install manifest, superseded revisions included); refused while recording,
+transcribing or downloading, since Windows can't delete open model files.
 
 ## Known limitations (accepted)
 

@@ -613,6 +613,65 @@ pub fn status(models_dir: &Path) -> Vec<ModelInfo> {
         .collect()
 }
 
+/// Bytes on disk under the models directory, including files no current
+/// spec references (superseded revisions, abandoned partial downloads).
+/// Symlinks are not followed, so hf-hub snapshot links never double-count
+/// their blobs.
+pub fn cache_size(models_dir: &Path) -> u64 {
+    fn walk(dir: &Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|entry| match entry.path().symlink_metadata() {
+                Ok(meta) if meta.is_dir() => walk(&entry.path()),
+                Ok(meta) if meta.is_file() => meta.len(),
+                _ => 0,
+            })
+            .sum()
+    }
+    walk(models_dir)
+}
+
+/// Deletes every downloaded model file (the hf-hub cache and the install
+/// manifest) and returns the bytes freed. Serialized with downloads through
+/// the install lock; callers must also make sure no engine has a model open.
+/// A partial failure (a file still locked by another process) leaves the
+/// rest deleted — status() re-verifies from scratch, so the affected models
+/// simply show as not installed and re-download cleanly.
+pub fn delete_cache(models_dir: &Path) -> Result<u64> {
+    let _guard = MODEL_INSTALL_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("model install lock poisoned"))?;
+    let before = cache_size(models_dir);
+    let mut first_error = None;
+    if let Ok(entries) = std::fs::read_dir(models_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let result = match path.symlink_metadata() {
+                Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&path),
+                Ok(_) => std::fs::remove_file(&path),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                log::warn!("could not delete {}: {error}", path.display());
+                first_error.get_or_insert((path, error));
+            }
+        }
+    }
+    let freed = before.saturating_sub(cache_size(models_dir));
+    log::info!("model cache deleted: {:.1} MB freed", freed as f64 / 1e6);
+    match first_error {
+        Some((path, error)) => Err(anyhow::anyhow!(
+            "freed {:.0} MB, but {} could not be deleted: {error}",
+            freed as f64 / 1e6,
+            path.display()
+        )),
+        None => Ok(freed),
+    }
+}
+
 /// Bridges hf-hub's Progress trait onto a plain callback
 /// (model_id, file, downloaded, total).
 type DownloadProgress<'a> = dyn Fn(&str, &str, u64, Option<u64>) + 'a;
@@ -922,6 +981,37 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn delete_cache_removes_every_model_file_and_reports_bytes() {
+        let directory = TestDir::new();
+        let (manifest, _) = install_test_model(&directory.0);
+        save_installed_manifest(&directory.0, &manifest).unwrap();
+        // A superseded revision that no spec references any more.
+        let stale = cache_dir(&directory.0).join("models--old--repo/blobs/abc");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, vec![7u8; 4096]).unwrap();
+
+        let before = cache_size(&directory.0);
+        assert!(before >= 4096);
+        assert!(verified_paths(&directory.0, &TEST_SPEC, &manifest).is_ok());
+
+        assert_eq!(delete_cache(&directory.0).unwrap(), before);
+        assert_eq!(cache_size(&directory.0), 0);
+        assert!(load_installed_manifest(&directory.0)
+            .unwrap()
+            .models
+            .is_empty());
+        assert!(verified_paths(&directory.0, &TEST_SPEC, &manifest).is_err());
+        // The models dir itself stays so later downloads need no setup.
+        assert!(directory.0.is_dir());
+    }
+
+    #[test]
+    fn cache_size_of_missing_dir_is_zero() {
+        let directory = TestDir::new();
+        assert_eq!(cache_size(&directory.0.join("absent")), 0);
     }
 
     fn install_test_model(directory: &Path) -> (InstalledManifest, PathBuf) {

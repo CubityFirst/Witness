@@ -565,6 +565,8 @@ fn main() {
             commands::pick_data_dir,
             commands::get_model_status,
             commands::download_models,
+            commands::get_model_cache_size,
+            commands::delete_model_cache,
             commands::get_gpu_status,
             commands::get_gpu_libs_status,
             commands::download_gpu_libs,

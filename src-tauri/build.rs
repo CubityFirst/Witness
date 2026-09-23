@@ -31,6 +31,8 @@ const COMMANDS: &[&str] = &[
     "pick_data_dir",
     "get_model_status",
     "download_models",
+    "get_model_cache_size",
+    "delete_model_cache",
     "get_gpu_status",
     "get_gpu_libs_status",
     "download_gpu_libs",
