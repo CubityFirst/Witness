@@ -6,7 +6,8 @@ records mic + system loopback as separate tracks, live-captions while
 recording, transcribes on-device (Parakeet TDT on CUDA / Whisper on CPU)
 with diarization and cross-meeting voice identification, and keeps a
 full-text-searchable archive. Meeting content stays on the machine; only
-explicit model/GPU-library downloads use the network. It follows the same
+explicit model/GPU-library downloads and the (optional) update check use
+the network. It follows the same
 single-process, tray-first philosophy as the sibling Vigil project.
 
 PLAN.md is the original (implemented) design; this file is the living map.
@@ -202,7 +203,29 @@ not validated with newer LLVM releases.
   `voice_print_discrimination` (two TTS voices, same/cross cosine),
   `live_captions` (streams TTS through the live worker),
   `list_devices_smoke`.
-- `npm run tauri dev` / `npm run tauri build` (NSIS installer).
+- `npm run tauri dev` for development; `npm run release:windows` for the
+  (unsigned) NSIS installer.
+
+## Releases & updates
+
+Installed builds update themselves from GitHub Releases (updater.rs,
+tauri-plugin-updater). The NSIS installer is per-user (`currentUser`), so
+updates never need elevation. To release: `npm run version:set -- X.Y.Z`
+(bumps package.json, tauri.conf.json, Cargo.toml and both lockfiles),
+commit, push tag `vX.Y.Z` → `.github/workflows/release.yml` runs
+`build-windows-release.ps1 -Sign` (adds `tauri.updater.conf.json` →
+installer `.sig`, writes `latest.json`) and publishes the release. The
+updater reads `releases/latest/download/latest.json` and verifies the
+minisign signature against `plugins.updater.pubkey`; the private key lives
+outside the repo (`~/.tauri/witness-updater.key` + the
+`TAURI_SIGNING_PRIVATE_KEY` repo secret) — losing it means shipping a new
+pubkey through a manual reinstall. Startup check after 30 s
+(`check_for_updates` setting) only toasts; installing is always a click
+in Settings → Updates and is refused while recording or backing up,
+because on Windows the plugin launches the installer and
+`process::exit(0)`s (skipping tray-Quit finalization); persisted pipeline
+jobs resume on relaunch.
+
 
 ## Settings & files
 

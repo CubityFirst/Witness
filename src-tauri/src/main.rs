@@ -30,6 +30,7 @@ mod speaker_id;
 mod state;
 mod transcript_export;
 mod tray;
+mod updater;
 mod vad;
 
 use crate::db::Db;
@@ -460,12 +461,15 @@ fn main() {
         }))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(updater::PendingUpdate::default())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
         ))
         .setup(|app| {
             setup(app)?;
+            updater::spawn_startup_check(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -575,6 +579,8 @@ fn main() {
             commands::get_autostart,
             commands::set_autostart,
             commands::restart_app,
+            updater::check_for_update,
+            updater::install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Witness");

@@ -35,7 +35,7 @@ const handlerBody = capture(
   /\.invoke_handler\(tauri::generate_handler!\[(?<body>[\s\S]*?)\]\)/,
   "the Tauri invoke handler",
 );
-const handledCommands = [...handlerBody.matchAll(/commands::([a-z0-9_]+)/g)].map(
+const handledCommands = [...handlerBody.matchAll(/(?:commands|updater)::([a-z0-9_]+)/g)].map(
   (match) => match[1],
 );
 

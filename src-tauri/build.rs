@@ -45,6 +45,8 @@ const COMMANDS: &[&str] = &[
     "get_autostart",
     "set_autostart",
     "restart_app",
+    "check_for_update",
+    "install_update",
 ];
 
 fn main() {

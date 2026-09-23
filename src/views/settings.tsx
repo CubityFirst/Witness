@@ -34,6 +34,7 @@ import {
 import { onModelDownloadProgress, type ModelDownloadProgress } from "../lib/events";
 import { Trash } from "../lib/icons";
 import { appConfirm } from "../lib/confirm";
+import { UpdatesSection } from "./updates";
 import { notifyError, notifySuccess } from "../lib/notify";
 
 function configuredDeviceOption(
@@ -289,6 +290,12 @@ export function SettingsView(props: { watcher: WatcherStatus | null }) {
           </label>
         </div>
       </section>
+
+      <UpdatesSection
+        settings={settings}
+        save={save}
+        appVersion={diagnostics?.app_version ?? null}
+      />
 
       <section>
         <h3>Storage</h3>

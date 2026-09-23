@@ -1,0 +1,78 @@
+name: Release
+
+# Push a tag like v0.2.0 (after `npm run version:set -- 0.2.0` is committed).
+# Builds the signed NSIS installer and publishes it with latest.json, which
+# installed copies of Witness poll for in-app updates.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish signed installer
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: always
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install LLVM 19
+        shell: pwsh
+        run: choco install llvm --version=19.1.7 --allow-downgrade --yes --no-progress
+
+      - name: Install locked frontend dependencies
+        run: npm ci
+
+      - name: Validate frontend and release config
+        run: npm run check
+
+      - name: Check tag matches app version
+        shell: pwsh
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "Tag $env:GITHUB_REF_NAME does not match app version $version (run npm run version:set)"
+          }
+
+      - name: Test locked Rust targets
+        working-directory: src-tauri
+        run: cargo test --locked
+
+      - name: Build signed installer and update feed
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: ./scripts/build-windows-release.ps1 -Sign -Notes "See https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $dir = "src-tauri/target/release/bundle/nsis"
+          $installer = Get-ChildItem $dir -Filter "*-setup.exe" | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+          gh release create $env:GITHUB_REF_NAME `
+            $installer.FullName "$($installer.FullName).sig" "$dir/latest.json" `
+            --repo $env:GITHUB_REPOSITORY --title "Witness $env:GITHUB_REF_NAME" --generate-notes

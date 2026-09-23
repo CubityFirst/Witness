@@ -91,6 +91,7 @@ export interface SettingsData {
   auto_transcribe: boolean;
   live_transcribe: boolean;
   caption_overlay: boolean;
+  check_for_updates: boolean;
   speaker_match_threshold: number;
   watch_patterns: string[];
   junk_phrases: string[];
@@ -333,3 +334,15 @@ export async function getAudioUrl(meetingId: number): Promise<string> {
   const path = await invoke<string>("get_audio_url", { meetingId });
   return convertFileSrc(path);
 }
+
+export interface UpdateInfo {
+  current_version: string;
+  version: string;
+  notes: string | null;
+  date: string | null;
+}
+/** Asks the release feed for a newer signed build; null = up to date. */
+export const checkForUpdate = () => invoke<UpdateInfo | null>("check_for_update");
+/** Downloads and verifies the pending update, then hands over to the
+ * installer — Witness exits and the installer relaunches it. */
+export const installUpdate = () => invoke<void>("install_update");

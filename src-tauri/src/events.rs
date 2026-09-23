@@ -15,6 +15,7 @@ pub const MODEL_DOWNLOAD_PROGRESS: &str = "model-download-progress";
 pub const MEETINGS_CHANGED: &str = "meetings-changed";
 pub const LIVE_TRANSCRIPT: &str = "live-transcript";
 pub const LIVE_CAPTIONS_STATUS: &str = "live-captions-status";
+pub const UPDATE_PROGRESS: &str = "update-progress";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RecordingStarted {
@@ -88,4 +89,10 @@ pub struct ModelDownloadProgress {
     pub file_count: u32,
     pub done: bool,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateProgress {
+    pub downloaded: u64,
+    pub total: Option<u64>,
 }

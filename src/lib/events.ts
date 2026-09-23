@@ -90,3 +90,10 @@ export const onLiveCaptionsStatus =
 
 /** True when the window was just shown as a tray flyout (blur dismisses). */
 export const onTrayPopup = on<boolean>("tray-popup");
+
+export interface UpdateProgress {
+  downloaded: number;
+  total: number | null;
+}
+/** Byte progress while an app update downloads (install follows on its own). */
+export const onUpdateProgress = on<UpdateProgress>("update-progress");

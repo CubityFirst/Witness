@@ -17,6 +17,7 @@
     "audit": "npm audit --audit-level=high",
     "preview": "vite preview",
     "release:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-release.ps1",
+    "version:set": "node scripts/set-version.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

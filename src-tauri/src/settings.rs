@@ -105,6 +105,11 @@ pub struct Settings {
     /// Teams outputs to (e.g. "Chat") isolates meeting audio from music etc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loopback_device: Option<String>,
+
+    /// Look for a newer signed release on GitHub shortly after startup. The
+    /// request carries no meeting data; installing always needs a click.
+    #[serde(default = "default_true")]
+    pub check_for_updates: bool,
 }
 
 impl Default for Settings {
@@ -116,6 +121,7 @@ impl Default for Settings {
             auto_transcribe: true,
             live_transcribe: true,
             caption_overlay: true,
+            check_for_updates: true,
             speaker_match_threshold: 0.6,
             watch_patterns: default_patterns(),
             junk_phrases: crate::asr::default_junk_phrases(),

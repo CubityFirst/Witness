@@ -1,5 +1,11 @@
 [CmdletBinding()]
-param()
+param(
+    # Produce signed updater artifacts (.sig + latest.json) for a published
+    # release. Needs TAURI_SIGNING_PRIVATE_KEY or TAURI_SIGNING_PRIVATE_KEY_PATH.
+    [switch]$Sign,
+    # Release notes embedded in latest.json (shown in Settings → Updates).
+    [string]$Notes = ""
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -53,15 +59,25 @@ try {
 
     # Tauri's bundle command consumes an already-built application. Only this
     # phase applies the resource overlay, after the exact DLLs are present.
-    Invoke-Npm -Arguments @(
+    $bundleArguments = @(
         "run",
         "tauri",
         "--",
         "bundle",
         "--config",
-        "src-tauri/tauri.release.conf.json",
-        "--ci"
+        "src-tauri/tauri.release.conf.json"
     )
+    if ($Sign) {
+        if (-not ($env:TAURI_SIGNING_PRIVATE_KEY -or $env:TAURI_SIGNING_PRIVATE_KEY_PATH)) {
+            throw "-Sign needs TAURI_SIGNING_PRIVATE_KEY or TAURI_SIGNING_PRIVATE_KEY_PATH"
+        }
+        # The bundler itself only reads TAURI_SIGNING_PRIVATE_KEY.
+        if (-not $env:TAURI_SIGNING_PRIVATE_KEY) {
+            $env:TAURI_SIGNING_PRIVATE_KEY = (Get-Content -LiteralPath $env:TAURI_SIGNING_PRIVATE_KEY_PATH -Raw).Trim()
+        }
+        $bundleArguments += @("--config", "src-tauri/tauri.updater.conf.json")
+    }
+    Invoke-Npm -Arguments ($bundleArguments + @("--ci"))
 
     $nsisWorkDirectory = Join-Path $releaseDirectory "nsis"
     $nsisScript = Get-ChildItem -LiteralPath $nsisWorkDirectory -Filter "installer.nsi" -File -Recurse |
@@ -88,6 +104,36 @@ try {
     }
 
     Write-Host "Windows installer ready: $($installer.FullName) ($($installer.Length) bytes)"
+
+    if ($Sign) {
+        $signaturePath = "$($installer.FullName).sig"
+        if (-not (Test-Path -LiteralPath $signaturePath)) {
+            throw "Signed build did not produce an updater signature: $signaturePath"
+        }
+        $version = (Get-Content -LiteralPath (Join-Path $projectRoot "src-tauri\tauri.conf.json") -Raw |
+            ConvertFrom-Json).version
+        # GitHub serves release assets with spaces replaced by dots.
+        $assetName = $installer.Name -replace " ", "."
+        $feed = [ordered]@{
+            version   = $version
+            notes     = $Notes
+            pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = [ordered]@{
+                "windows-x86_64" = [ordered]@{
+                    signature = (Get-Content -LiteralPath $signaturePath -Raw).Trim()
+                    url       = "https://github.com/CubityFirst/Witness/releases/download/v$version/$assetName"
+                }
+            }
+        }
+        $feedPath = Join-Path $installerDirectory "latest.json"
+        # UTF-8 without BOM: the updater's JSON parser rejects a BOM.
+        [System.IO.File]::WriteAllText(
+            $feedPath,
+            ($feed | ConvertTo-Json -Depth 4),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Write-Host "Update feed ready: $feedPath"
+    }
 }
 finally {
     Pop-Location

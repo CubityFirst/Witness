@@ -47,4 +47,6 @@ permissions = [
   "allow-get-autostart",
   "allow-set-autostart",
   "allow-restart-app",
+  "allow-check-for-update",
+  "allow-install-update",
 ]
