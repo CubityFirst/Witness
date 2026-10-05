@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 const FILE_NAME: &str = "ui-state.toml";
 
@@ -80,6 +81,54 @@ impl UiPrefs {
     }
 }
 
+/// Saves `UiPrefs` off the UI thread as they change (like the TSX
+/// localStorage writes), so a Windows shutdown, crash or kill keeps them.
+/// Several writer threads may overlap; each takes the newest queued value
+/// under the write lock, so an older value never lands last.
+#[derive(Default)]
+pub struct PrefsWriter {
+    /// The newest prefs not yet taken by a writer (short holds only).
+    pending: Mutex<Option<UiPrefs>>,
+    /// Held across the file write.
+    write: Mutex<()>,
+}
+
+impl PrefsWriter {
+    /// Queue `prefs` as the newest value (UI thread; never waits on I/O).
+    pub fn queue(&self, prefs: UiPrefs) {
+        *lock(&self.pending) = Some(prefs);
+    }
+
+    /// Write the newest queued value, if a newer writer has not already
+    /// (worker thread).
+    pub fn write_pending(&self, data_dir: &Path) {
+        let _write = lock(&self.write);
+        let Some(prefs) = lock(&self.pending).take() else {
+            return;
+        };
+        if let Err(error) = prefs.save(data_dir) {
+            log::warn!("{error}");
+        }
+    }
+
+    /// Exit paths: drop anything queued and write `prefs` now, after any
+    /// in-progress write.
+    pub fn write_now(&self, prefs: &UiPrefs, data_dir: &Path) {
+        let _write = lock(&self.write);
+        lock(&self.pending).take();
+        if let Err(error) = prefs.save(data_dir) {
+            log::warn!("{error}");
+        }
+    }
+}
+
+/// A poisoned lock only means a writer panicked; the data is still usable.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +153,29 @@ mod tests {
         prefs.save(&dir).unwrap();
         assert_eq!(UiPrefs::load(&dir), prefs);
         assert!(!dir.join("ui-state.toml.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writer_saves_only_the_newest_queued_value() {
+        let dir = scratch("writer");
+        let writer = PrefsWriter::default();
+        let volume = |v: f32| UiPrefs {
+            volume: v,
+            ..UiPrefs::default()
+        };
+        writer.queue(volume(0.2));
+        writer.queue(volume(0.3));
+        writer.write_pending(&dir);
+        assert_eq!(UiPrefs::load(&dir), volume(0.3));
+        // A late writer for the 0.2 change finds nothing left to write.
+        writer.write_pending(&dir);
+        assert_eq!(UiPrefs::load(&dir), volume(0.3));
+
+        writer.queue(volume(0.4));
+        writer.write_now(&volume(0.5), &dir);
+        writer.write_pending(&dir);
+        assert_eq!(UiPrefs::load(&dir), volume(0.5), "exit value wins");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

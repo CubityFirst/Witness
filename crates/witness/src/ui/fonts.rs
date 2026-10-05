@@ -214,7 +214,8 @@ impl FontLoader {
                             bytes,
                             index,
                         });
-                        ctx.request_repaint();
+                        // The root installs the font in `logic()`.
+                        crate::bridge::wake_root(&ctx);
                         return;
                     }
                 }

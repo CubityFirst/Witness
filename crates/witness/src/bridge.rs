@@ -5,6 +5,10 @@
 //! — goes through ONE unbounded crossbeam channel of [`UiMsg`], drained in
 //! `WitnessApp::logic()` (which runs on every repaint, hidden or minimized).
 //! Each send is followed by a repaint request so the drain happens promptly.
+//! Those requests always target the ROOT viewport ([`wake_root`]): a plain
+//! `request_repaint()` from another thread resolves to whichever viewport is
+//! mid-pass, so while the captions overlay renders it would wake only the
+//! overlay, and the root's `logic()` would not drain the channel.
 //!
 //! Work never runs on the UI thread:
 //! - **Loads** (`Tasks::spawn`) return a view-owned [`Task`]; dropping the
@@ -48,6 +52,11 @@ pub enum OpDone {
     Models(Vec<ModelInfo>),
     /// A `SettingsStore` write finished.
     SettingsWritten { seq: u64, result: CoreResult<()> },
+    /// A `RefreshStatus` op that panicked or could not start: clears the
+    /// in-flight flag (the error is logged, not toasted).
+    StatusFailed(String),
+    /// Same for `RecheckModels`.
+    ModelsFailed(String),
     /// `UpdateFlow::check`.
     UpdateChecked(CoreResult<Option<UpdateInfo>>),
     /// `UpdateFlow::install` → the install exit path (§4.5).
@@ -95,6 +104,17 @@ impl OpHandle {
     }
 }
 
+/// Wake the root viewport (whose `logic()` drains the channel) from any
+/// thread.
+pub fn wake_root(ctx: &egui::Context) {
+    ctx.request_repaint_of(egui::ViewportId::ROOT);
+}
+
+/// [`wake_root`] after at most `delay`.
+pub fn wake_root_after(ctx: &egui::Context, delay: Duration) {
+    ctx.request_repaint_after_for(delay, egui::ViewportId::ROOT);
+}
+
 /// The core's `EventSink` and the shell handlers' way into the UI thread.
 #[derive(Clone)]
 pub struct UiSink {
@@ -121,7 +141,7 @@ impl UiSink {
         if self.ctx.set(ctx.clone()).is_err() {
             log::warn!("UI sink context set twice");
         }
-        ctx.request_repaint();
+        wake_root(&ctx);
     }
 
     /// Forward a tray / hotkey / single-instance event (any thread).
@@ -136,7 +156,7 @@ impl UiSink {
 
     fn repaint(&self) {
         if let Some(ctx) = self.ctx.get() {
-            ctx.request_repaint();
+            wake_root(ctx);
         }
     }
 }
@@ -148,9 +168,9 @@ impl EventSink for UiSink {
         if let Some(ctx) = self.ctx.get() {
             if high_rate {
                 // One pass drains a whole burst.
-                ctx.request_repaint_after(Duration::from_millis(100));
+                wake_root_after(ctx, Duration::from_millis(100));
             } else {
-                ctx.request_repaint();
+                wake_root(ctx);
             }
         }
     }
@@ -217,7 +237,7 @@ impl<T: Send + 'static> Task<T> {
                 if let Ok(value) = rx.recv() {
                     let _ = tx.send(Ok(value));
                 }
-                ctx.request_repaint();
+                wake_root(&ctx);
             });
         if let Err(error) = spawned {
             log::error!("could not start a reply waiter: {error}");
@@ -265,7 +285,7 @@ impl Tasks {
             .spawn(move || {
                 let result = catch_unwind(AssertUnwindSafe(|| f(&core)));
                 let _ = tx.send(result);
-                ctx.request_repaint();
+                wake_root(&ctx);
             });
         if let Err(error) = spawned {
             // The dropped sender makes the task report an internal error.
@@ -276,40 +296,57 @@ impl Tasks {
 
     /// ACTIONS: like `spawn`, but the `OpDone` goes to `logic()` as
     /// `UiMsg::Op`. A panic becomes an "internal error: …" error toast.
+    ///
+    /// Only for ops whose `OpDone` releases no waiting state. An op that a
+    /// state machine waits for (the status/models in-flight flags,
+    /// `SettingsStore`, `UpdateFlow`, quit, restart) uses
+    /// [`Tasks::spawn_op_or`] with its own typed failure instead.
     pub fn spawn_op(
         &self,
         name: &'static str,
         f: impl FnOnce(&AppCore) -> OpDone + Send + 'static,
     ) -> OpHandle {
+        self.spawn_op_or(name, f, |error| OpDone::Notice {
+            notice: Some(Notice::error_plain(error)),
+            refresh: false,
+        })
+    }
+
+    /// `spawn_op` with the op's own failure result: when the closure panics,
+    /// or its thread cannot start, `on_failure("internal error: …")` is sent
+    /// in place of the closure's `OpDone`, so whatever waits for that op is
+    /// always released.
+    pub fn spawn_op_or<F>(
+        &self,
+        name: &'static str,
+        f: impl FnOnce(&AppCore) -> OpDone + Send + 'static,
+        on_failure: F,
+    ) -> OpHandle
+    where
+        F: FnOnce(String) -> OpDone + Clone + Send + 'static,
+    {
         let handle = OpHandle::default();
         let finished = handle.clone();
         let core = self.core.clone();
         let ctx = self.ctx.clone();
         let tx = self.tx.clone();
+        // The worker gets a copy; the original covers a failed spawn.
+        let on_panic = on_failure.clone();
         let spawned = std::thread::Builder::new()
             .name(name.into())
             .spawn(move || {
-                let done = catch_unwind(AssertUnwindSafe(|| f(&core))).unwrap_or_else(|panic| {
-                    OpDone::Notice {
-                        notice: Some(Notice::error_plain(internal_error(panic.as_ref()))),
-                        refresh: false,
-                    }
-                });
+                let done = run_guarded(name, &*core, f, on_panic);
                 finished.finish();
                 let _ = tx.send(UiMsg::Op(done));
-                ctx.request_repaint();
+                wake_root(&ctx);
             });
         match spawned {
             Ok(_) => handle,
             Err(error) => {
                 log::error!("could not start operation {name}: {error}");
-                let _ = self.tx.send(UiMsg::Op(OpDone::Notice {
-                    notice: Some(Notice::error_plain(format!(
-                        "internal error: could not start {name}: {error}"
-                    ))),
-                    refresh: false,
-                }));
-                self.ctx.request_repaint();
+                let done = on_failure(format!("internal error: could not start {name}: {error}"));
+                let _ = self.tx.send(UiMsg::Op(done));
+                wake_root(&self.ctx);
                 OpHandle::done()
             }
         }
@@ -345,12 +382,27 @@ impl Tasks {
             .spawn(move || {
                 let done = map(rx.recv().ok());
                 let _ = tx.send(UiMsg::Op(done));
-                ctx.request_repaint();
+                wake_root(&ctx);
             });
         if let Err(error) = spawned {
             log::error!("could not start {name}: {error}");
         }
     }
+}
+
+/// An op body under `catch_unwind`: a panic is logged and mapped through
+/// `on_panic("internal error: …")`.
+pub(crate) fn run_guarded<A: ?Sized>(
+    name: &str,
+    arg: &A,
+    f: impl FnOnce(&A) -> OpDone,
+    on_panic: impl FnOnce(String) -> OpDone,
+) -> OpDone {
+    catch_unwind(AssertUnwindSafe(|| f(arg))).unwrap_or_else(|panic| {
+        let error = internal_error(panic.as_ref());
+        log::error!("operation {name} failed: {error}");
+        on_panic(error)
+    })
 }
 
 #[cfg(test)]
@@ -387,6 +439,34 @@ mod tests {
     fn panicking_task_reports_an_internal_error() {
         let mut task = task_from(|| -> u8 { panic!("boom") });
         assert_eq!(wait(&mut task), Err("internal error: boom".into()));
+    }
+
+    #[test]
+    fn run_guarded_maps_a_panic_to_the_ops_own_failure() {
+        let ok = run_guarded(
+            "status",
+            &7u8,
+            |n| OpDone::StatusFailed(n.to_string()),
+            |_| unreachable!("no panic"),
+        );
+        assert!(matches!(ok, OpDone::StatusFailed(s) if s == "7"));
+        let failed = run_guarded(
+            "status",
+            &(),
+            |_| -> OpDone { panic!("recorder mutex poisoned") },
+            OpDone::StatusFailed,
+        );
+        assert!(matches!(
+            failed,
+            OpDone::StatusFailed(e) if e == "internal error: recorder mutex poisoned"
+        ));
+        let quit = run_guarded(
+            "quit",
+            &(),
+            |_| -> OpDone { panic!("x") },
+            |_| OpDone::ShutdownDone,
+        );
+        assert!(matches!(quit, OpDone::ShutdownDone), "quit still exits");
     }
 
     #[test]

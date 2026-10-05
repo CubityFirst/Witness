@@ -147,10 +147,24 @@ impl SettingsStore {
 }
 
 fn start_write(tasks: &Tasks, seq: u64, settings: Settings) {
-    tasks.spawn_op("settings-write", move |c| OpDone::SettingsWritten {
+    // A panicking (or unstartable) write still completes `seq` — as a
+    // failed write — so `in_flight` is cleared and the queue never stalls.
+    tasks.spawn_op_or(
+        "settings-write",
+        move |c| OpDone::SettingsWritten {
+            seq,
+            result: c.update_settings(settings),
+        },
+        write_failed(seq),
+    );
+}
+
+/// The `SettingsWritten` reported when write `seq` panicked or never started.
+fn write_failed(seq: u64) -> impl FnOnce(String) -> OpDone + Clone + Send + 'static {
+    move |error| OpDone::SettingsWritten {
         seq,
-        result: c.update_settings(settings),
-    });
+        result: Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +220,31 @@ mod tests {
         store.enqueue(settings(false));
         store.finish(seq, Err("busy".into()), &mut toasts);
         assert!(!store.current().auto_record, "newer save still pending");
+    }
+
+    #[test]
+    fn a_panicking_write_releases_the_queue() {
+        let mut store = SettingsStore::from_settings(settings(true));
+        let mut toasts = Toasts::new();
+        let (seq, _) = store.enqueue(settings(false)).unwrap();
+        assert!(store.enqueue(settings(false)).is_none(), "queued behind");
+        // What `start_write`'s worker reports when `update_settings` panics.
+        let done = crate::bridge::run_guarded(
+            "settings-write",
+            &(),
+            |_| -> OpDone { panic!("poisoned") },
+            write_failed(seq),
+        );
+        let OpDone::SettingsWritten {
+            seq: done_seq,
+            result,
+        } = done
+        else {
+            panic!("expected SettingsWritten");
+        };
+        let (_, next) = store.finish(done_seq, result, &mut toasts);
+        assert!(next.is_some(), "the queued write still starts");
+        assert!(!toasts.is_empty(), "the failure is toasted");
     }
 
     #[test]

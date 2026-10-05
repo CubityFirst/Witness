@@ -248,19 +248,30 @@ pub struct UpdateFlow {
 }
 
 impl UpdateFlow {
-    /// Show the startup check's result straight away (Install button).
+    /// Show the startup check's result (Install button). The startup check
+    /// runs 30 s after launch and emits no event, so `app.rs` calls this
+    /// while Settings is showing (`pending_update` is [ui-ok]). Applies only
+    /// from Idle / Current: never interrupts a check or an install.
     pub fn init(&mut self, core: &AppCore) {
-        if let Some(info) = core.pending_update() {
-            self.phase = UpdatePhase::Available(info);
+        self.preload(core.pending_update());
+    }
+
+    fn preload(&mut self, pending: Option<UpdateInfo>) {
+        if let Some(info) = pending {
+            if matches!(self.phase, UpdatePhase::Idle | UpdatePhase::Current) {
+                self.phase = UpdatePhase::Available(info);
+            }
         }
     }
 
     /// Check for updates (no-op while checking or installing).
     pub fn check(&mut self, tasks: &Tasks) {
         if self.begin_check() {
-            tasks.spawn_op("update-check", |c| {
-                OpDone::UpdateChecked(c.check_for_update())
-            });
+            tasks.spawn_op_or(
+                "update-check",
+                |c| OpDone::UpdateChecked(c.check_for_update()),
+                |error| OpDone::UpdateChecked(Err(error)),
+            );
         }
     }
 
@@ -268,9 +279,11 @@ impl UpdateFlow {
     /// runs when `OpDone::UpdateDownloaded(Ok(..))` arrives.
     pub fn install(&mut self, tasks: &Tasks) {
         if self.begin_install() {
-            tasks.spawn_op("update-download", |c| {
-                OpDone::UpdateDownloaded(c.download_update())
-            });
+            tasks.spawn_op_or(
+                "update-download",
+                |c| OpDone::UpdateDownloaded(c.download_update()),
+                |error| OpDone::UpdateDownloaded(Err(error)),
+            );
         }
     }
 
@@ -344,6 +357,7 @@ impl UpdateFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::run_guarded;
     use witness_core::events::{
         LiveCaptionsStatus, RecordingStarted, RecordingStopped, TranscriptionDone, WatcherStatus,
     };
@@ -596,5 +610,53 @@ mod tests {
         );
         assert_eq!(m.update.phase, UpdatePhase::Available(info("0.3.0")));
         assert!(m.update.progress.is_none());
+    }
+
+    #[test]
+    fn preload_never_interrupts_a_check_or_an_install() {
+        let mut flow = UpdateFlow::default();
+        flow.preload(None);
+        assert_eq!(flow.phase, UpdatePhase::Idle);
+        flow.preload(Some(info("0.3.0")));
+        assert_eq!(flow.phase, UpdatePhase::Available(info("0.3.0")));
+
+        assert!(flow.begin_install());
+        flow.preload(Some(info("0.3.0")));
+        assert_eq!(flow.phase, UpdatePhase::Installing(info("0.3.0")));
+
+        let mut flow = UpdateFlow::default();
+        assert!(flow.begin_check());
+        flow.preload(Some(info("0.3.0")));
+        assert_eq!(flow.phase, UpdatePhase::Checking);
+        flow.on_op(&OpDone::UpdateChecked(Ok(None)));
+        flow.preload(Some(info("0.3.1")));
+        assert_eq!(flow.phase, UpdatePhase::Available(info("0.3.1")));
+    }
+
+    #[test]
+    fn panicking_update_ops_release_the_flow() {
+        let check = |_: &()| -> OpDone { panic!("feed parser") };
+        let mut flow = UpdateFlow::default();
+        assert!(flow.begin_check());
+        let done = run_guarded("update-check", &(), check, |e| {
+            OpDone::UpdateChecked(Err(e))
+        });
+        let notices = flow.on_op(&done);
+        assert_eq!(flow.phase, UpdatePhase::Idle, "Check button back");
+        assert_eq!(
+            notices,
+            vec![Notice::error_plain(
+                "Could not check for updates: internal error: feed parser"
+            )]
+        );
+
+        let download = |_: &()| -> OpDone { panic!("zip") };
+        flow.preload(Some(info("0.3.0")));
+        assert!(flow.begin_install());
+        let done = run_guarded("update-download", &(), download, |e| {
+            OpDone::UpdateDownloaded(Err(e))
+        });
+        flow.on_op(&done);
+        assert_eq!(flow.phase, UpdatePhase::Available(info("0.3.0")));
     }
 }

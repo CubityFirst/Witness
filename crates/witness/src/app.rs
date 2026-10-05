@@ -11,8 +11,8 @@
 //! an irreversible `teardown_and_exit`, so a failed restart spawn or
 //! installer launch leaves the app fully running.
 
-use crate::bridge::{OpDone, RecOrigin, Tasks, UiMsg, UiSink};
-use crate::model::{Effect, ShellModel};
+use crate::bridge::{wake_root, OpDone, RecOrigin, Tasks, UiMsg, UiSink};
+use crate::model::{Effect, ShellModel, UpdatePhase};
 use crate::platform::hotkeys::Hotkeys;
 use crate::platform::single_instance::InstanceGuard;
 use crate::platform::system;
@@ -28,9 +28,9 @@ use crate::ui::{
     icons, submit_recording, theme, topbar, views, widgets, ActiveView, Nav, UiCmd, UiCtx, View,
     ViewMemory,
 };
-use crate::ui_state::UiPrefs;
+use crate::ui_state::{PrefsWriter, UiPrefs};
 use crossbeam_channel::Receiver;
-use eframe::egui::{self, Key, Margin, Modifiers};
+use eframe::egui::{self, Event, Key, Margin, Modifiers};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -47,6 +47,12 @@ const ANIMATION_FRAME: Duration = Duration::from_millis(33);
 const NOTES_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 /// Keyboard zoom step (WebView2 used ~10 % steps).
 const ZOOM_STEP: f32 = 1.1;
+/// Delay before changed `UiPrefs` are written, so a volume drag (a change
+/// every frame) writes at most twice a second.
+const PREFS_SAVE_DELAY: Duration = Duration::from_millis(500);
+/// How often the Settings view re-reads `pending_update` (the startup check
+/// stores its result without an event).
+const PENDING_UPDATE_POLL: Duration = Duration::from_secs(5);
 
 /// What `main.rs` hands the app creator.
 pub struct StartParts {
@@ -84,6 +90,11 @@ pub struct WitnessApp {
     active: ActiveView,
     memory: ViewMemory,
     prefs: UiPrefs,
+    /// What is on disk (or queued for the writer); `prefs` differing from
+    /// it starts the save debounce.
+    saved_prefs: UiPrefs,
+    prefs_deadline: Option<Instant>,
+    prefs_writer: Arc<PrefsWriter>,
     player: Player,
     captions: CaptionsOverlay,
     fonts: FontLoader,
@@ -100,6 +111,9 @@ pub struct WitnessApp {
     quitting: bool,
     /// Last `logic()`'s minimized / focused state (edge detection).
     was_minimized: bool,
+    /// The app minimized the window itself (and already ran `will_hide`):
+    /// the next not-minimized → minimized edge is not an outside minimize.
+    minimized_by_app: bool,
     was_focused: bool,
     /// Since when `ensure_ui_pass` has been waiting for the overlay.
     ui_pass_since: Option<Instant>,
@@ -151,7 +165,7 @@ impl WitnessApp {
         let data_dir = core.runtime_data_dir();
         let prefs = UiPrefs::load(&data_dir);
         let repaint_ctx = ctx.clone();
-        let player = Player::spawn(Arc::new(move || repaint_ctx.request_repaint()));
+        let player = Player::spawn(Arc::new(move || wake_root(&repaint_ctx)));
 
         let tasks = Tasks::new(core.clone(), ctx.clone(), &sink);
         let mut shell = ShellModel::new();
@@ -183,6 +197,9 @@ impl WitnessApp {
             view,
             active,
             memory: ViewMemory::default(),
+            saved_prefs: prefs.clone(),
+            prefs_deadline: None,
+            prefs_writer: Arc::new(PrefsWriter::default()),
             prefs,
             player,
             fonts: FontLoader::new(),
@@ -194,6 +211,7 @@ impl WitnessApp {
             models_dirty: false,
             quitting: false,
             was_minimized: false,
+            minimized_by_app: false,
             was_focused: false,
             ui_pass_since: None,
             user_zoom: 1.0,
@@ -302,8 +320,11 @@ impl WitnessApp {
             return;
         }
         self.status_in_flight = true;
-        self.tasks
-            .spawn_op("status", |c| OpDone::Status(c.status()));
+        self.tasks.spawn_op_or(
+            "status",
+            |c| OpDone::Status(c.status()),
+            OpDone::StatusFailed,
+        );
     }
 
     /// Re-check the transcription models (first-run banner), coalesced.
@@ -313,8 +334,11 @@ impl WitnessApp {
             return;
         }
         self.models_in_flight = true;
-        self.tasks
-            .spawn_op("model-status", |c| OpDone::Models(c.model_status()));
+        self.tasks.spawn_op_or(
+            "model-status",
+            |c| OpDone::Models(c.model_status()),
+            OpDone::ModelsFailed,
+        );
     }
 
     fn handle_op(&mut self, done: OpDone) {
@@ -334,10 +358,24 @@ impl WitnessApp {
                     self.request_status();
                 }
             }
+            OpDone::StatusFailed(error) => {
+                log::error!("status refresh failed: {error}");
+                self.status_in_flight = false;
+                if std::mem::take(&mut self.status_dirty) {
+                    self.request_status();
+                }
+            }
             OpDone::Models(models) => {
                 self.shell.models_missing = models
                     .iter()
                     .any(|m| m.engine == Engine::Parakeet && !m.present);
+                self.models_in_flight = false;
+                if std::mem::take(&mut self.models_dirty) {
+                    self.request_models();
+                }
+            }
+            OpDone::ModelsFailed(error) => {
+                log::error!("model check failed: {error}");
                 self.models_in_flight = false;
                 if std::mem::take(&mut self.models_dirty) {
                     self.request_models();
@@ -461,8 +499,11 @@ impl WitnessApp {
                     }
                 }
                 UiCmd::Restart => {
-                    self.tasks
-                        .spawn_op("restart", |c| OpDone::RestartPrepared(c.prepare_restart()));
+                    self.tasks.spawn_op_or(
+                        "restart",
+                        |c| OpDone::RestartPrepared(c.prepare_restart()),
+                        |error| OpDone::RestartPrepared(Err(error)),
+                    );
                 }
                 UiCmd::CheckUpdate => self.shell.update.check(&self.tasks),
                 UiCmd::InstallUpdate => self.shell.update.install(&self.tasks),
@@ -490,10 +531,16 @@ impl WitnessApp {
             return;
         }
         self.quitting = true;
-        self.tasks.spawn_op("quit", |c| {
-            c.shutdown();
-            OpDone::ShutdownDone
-        });
+        // A failed shutdown (logged by `spawn_op_or`) still exits: the user
+        // asked to quit, and startup recovery finishes an interrupted stop.
+        self.tasks.spawn_op_or(
+            "quit",
+            |c| {
+                c.shutdown();
+                OpDone::ShutdownDone
+            },
+            |_| OpDone::ShutdownDone,
+        );
     }
 
     /// Reversible: safe to run and then keep running if a later step fails.
@@ -502,9 +549,31 @@ impl WitnessApp {
         self.core.flush_notes(NOTES_FLUSH_TIMEOUT);
         self.captions.close(&self.data_dir);
         self.player.unload();
-        if let Err(error) = self.prefs.save(&self.data_dir) {
-            log::warn!("{error}");
+        self.prefs_writer.write_now(&self.prefs, &self.data_dir);
+        self.saved_prefs = self.prefs.clone();
+        self.prefs_deadline = None;
+    }
+
+    /// Persist `UiPrefs` shortly after they change (views mutate
+    /// `cx.prefs` directly), off the UI thread.
+    fn persist_prefs(&mut self, ctx: &egui::Context) {
+        if self.prefs == self.saved_prefs {
+            self.prefs_deadline = None;
+            return;
         }
+        let now = Instant::now();
+        let due = *self.prefs_deadline.get_or_insert(now + PREFS_SAVE_DELAY);
+        if now < due {
+            ctx.request_repaint_after(due - now);
+            return;
+        }
+        self.prefs_deadline = None;
+        self.saved_prefs = self.prefs.clone();
+        self.prefs_writer.queue(self.prefs.clone());
+        let writer = self.prefs_writer.clone();
+        let data_dir = self.data_dir.clone();
+        self.tasks
+            .fire("ui-prefs-write", move |_| writer.write_pending(&data_dir));
     }
 
     /// Restart after a data_dir change: spawn the new process first; only on
@@ -603,11 +672,14 @@ impl WitnessApp {
     }
 
     /// Ctrl+F anywhere, or `/` outside a text field: go to the search box.
+    /// Modifiers are matched exactly as app.tsx does (no Alt for either, no
+    /// Ctrl for `/`): egui's `consume_key` ignores an extra Alt, which would
+    /// steal Ctrl+Alt+F / AltGr+F and Alt+/.
     fn handle_search_shortcuts(&mut self, ctx: &egui::Context) {
         let typing = ctx.egui_wants_keyboard_input();
         let jump = ctx.input_mut(|i| {
-            let ctrl_f = i.consume_key(Modifiers::COMMAND, Key::F);
-            let slash = !typing && i.consume_key(Modifiers::NONE, Key::Slash);
+            let ctrl_f = consume_key_exact(i, Key::F, |m| m.command && !m.alt);
+            let slash = !typing && consume_key_exact(i, Key::Slash, |m| !m.command && !m.alt);
             ctrl_f || slash
         });
         if jump {
@@ -643,6 +715,24 @@ impl WitnessApp {
             }
         }
     }
+}
+
+/// Consume presses of `key` whose modifiers satisfy `accept`; true if any.
+fn consume_key_exact(
+    input: &mut egui::InputState,
+    key: Key,
+    accept: impl Fn(Modifiers) -> bool,
+) -> bool {
+    let mut found = false;
+    input.events.retain(|event| {
+        let hit = matches!(
+            event,
+            Event::Key { key: k, pressed: true, modifiers, .. } if *k == key && accept(*modifiers)
+        );
+        found |= hit;
+        !hit
+    });
+    found
 }
 
 /// Irreversible: release the shell objects and exit. A free function so it
@@ -696,8 +786,11 @@ impl eframe::App for WitnessApp {
                 vp.close_requested(),
             )
         });
-        if minimized && !self.was_minimized && !self.window.ui_pass_in_progress() {
-            self.will_hide();
+        if minimized && !self.was_minimized {
+            // The minimize button already ran `will_hide`.
+            if !std::mem::take(&mut self.minimized_by_app) && !self.window.ui_pass_in_progress() {
+                self.will_hide();
+            }
         }
         self.was_minimized = minimized;
 
@@ -712,12 +805,32 @@ impl eframe::App for WitnessApp {
             }
         }
 
-        // Close (× or Alt+F4) hides to the tray; only Quit exits.
+        // Close (× or Alt+F4) hides to the tray; only Quit exits. While a
+        // Quit is shutting down the close is still cancelled (eframe ending
+        // the loop would skip `prepare_exit`), but the window is left alone.
         if close_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.will_hide();
-            self.window.hide_to_tray();
+            if !self.quitting {
+                self.will_hide();
+                self.window.hide_to_tray();
+            }
         }
+
+        // Settings → Updates: pick up the startup check's result, which is
+        // stored without an event (never interrupts a check or install).
+        if matches!(self.view, View::Settings) {
+            self.shell.update.init(&self.core);
+            if matches!(
+                self.shell.update.phase,
+                UpdatePhase::Idle | UpdatePhase::Current
+            ) && self.window.is_shown()
+                && !minimized
+            {
+                ctx.request_repaint_after(PENDING_UPDATE_POLL);
+            }
+        }
+
+        self.persist_prefs(ctx);
 
         // Re-read the Windows text size whenever the window gains focus.
         if focused && !self.was_focused {
@@ -778,6 +891,7 @@ impl eframe::App for WitnessApp {
 
         if topbar_out.minimize {
             self.will_hide();
+            self.minimized_by_app = true;
             self.window.minimize();
         }
         if topbar_out.close {
@@ -785,6 +899,8 @@ impl eframe::App for WitnessApp {
             self.window.hide_to_tray();
         }
         self.apply_navigation();
+        // Start the save timer in the pass that changed the prefs.
+        self.persist_prefs(&ctx);
 
         // Never animate a hidden or minimized window (design §4.2).
         if icons::take_animation_request(&ctx)
