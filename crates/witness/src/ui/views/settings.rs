@@ -1963,6 +1963,31 @@ mod tests {
         assert_eq!(threshold_edit(0.6, 0.8, true), Some(0.8));
     }
 
+    /// The real egui slider, untouched, over an off-grid stored value: it
+    /// rewrites the value and reports a change, which `threshold_edit`
+    /// must ignore.
+    #[test]
+    fn untouched_slider_over_an_off_grid_value_saves_nothing() {
+        let ctx = theme::test_context();
+        let mut edit = Some(f32::NAN);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let shown = 0.62_f32;
+                let mut value = shown;
+                let response = ui.add(
+                    egui::Slider::new(&mut value, THRESHOLD_MIN..=THRESHOLD_MAX)
+                        .step_by(THRESHOLD_STEP as f64)
+                        .show_value(false),
+                );
+                assert!(response.changed(), "egui reports its own rounding");
+                assert!((value - 0.6).abs() < 1e-6, "rounded to {value}");
+                edit = threshold_edit(shown, value, response.changed());
+            });
+        });
+        output.textures_delta.clear(); // no renderer to upload the font atlas
+        assert_eq!(edit, None);
+    }
+
     #[test]
     fn progress_text_with_and_without_a_total() {
         let mut p = progress("parakeet", false, None);
