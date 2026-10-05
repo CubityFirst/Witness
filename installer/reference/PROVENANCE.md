@@ -57,3 +57,15 @@ here (same CLI version at every 0.2.x commit, same output).
 `ESTIMATEDSIZE` is the Tauri bundler's sum of the installed files' sizes in
 bytes, divided by 1024 (integer): `(42695680 + 62276096 + 10752) / 1024 =
 102522` for this build. `cargo run -p xtask -- dist` computes it the same way.
+
+## VERSIONINFO test fixtures (`xtask/fixtures/versioninfo-*.bin`)
+
+The `VS_VERSIONINFO` resources, cut verbatim (from the `VS_VERSION_INFO` key
+back to its `wLength` header, `wLength` bytes) out of real 0.2.1 binaries.
+They let the `dist` / `sign` ProductVersion guards be tested against real
+resource layouts without checking in the binaries:
+
+| Fixture | Cut from | Source SHA-256 |
+|---|---|---|
+| `versioninfo-witness-0.2.1.bin` (464 bytes, tauri-build/winres) | `witness.exe` of the reference build above | `ae5c09dae193da59bc5294753d84933160ac94509e07660b234d429aff4892a5` |
+| `versioninfo-setup-0.2.1.bin` (456 bytes, NSIS `VIAddVersionKey`) | the shipped `Witness_0.2.1_x64-setup.exe` | `f586931a520fd6a16a587a3d44dad129dbb73a2900643afa3646573d927a8e6d` |
