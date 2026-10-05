@@ -1,7 +1,7 @@
 //! In-app updates from GitHub Releases, replacing tauri-plugin-updater 2.12.0
 //! with the same feed, the same minisign key and the same NSIS installer
-//! flags — every 0.2.x install updates through its Tauri updater, and every
-//! native build must keep consuming the very same `latest.json` (design §8.1).
+//! flags â€” every 0.2.x install updates through its Tauri updater, and every
+//! native build must keep consuming the very same `latest.json` (design Â§8.1).
 //!
 //! Flow:
 //! - **Check** (`check_for_update`, also run once 30 s after startup when
@@ -9,7 +9,7 @@
 //!   plugin (`name` alias, leading `v`, RFC 3339 `pub_date`,
 //!   `windows-x86_64-nsis` then `windows-x86_64`), and remember a strictly
 //!   newer release as `pending_update`.
-//! - **Download** (`download_update`, always a click in Settings → Updates):
+//! - **Download** (`download_update`, always a click in Settings â†’ Updates):
 //!   stream the installer into `%TEMP%\Witness-{ver}-updater-XXXXXX\`, then
 //!   check the `MZ` header and the minisign signature against the embedded
 //!   key, *requiring* the signed `version:` to match the feed. Any failure
@@ -21,9 +21,10 @@
 //!
 //! Network reach matches the plugin's reqwest defaults: TLS through SChannel
 //! (the Windows certificate store, so enterprise roots pushed by GPO and
-//! TLS-inspecting proxies work) and the WinINet system proxy, then the
-//! `HTTPS_PROXY`/`ALL_PROXY` environment. PAC/WPAD and NTLM proxy auth are
-//! unsupported — as they were with the plugin.
+//! TLS-inspecting proxies work) and the WinINet system proxy (honouring
+//! `ProxyOverride`), otherwise the `HTTPS_PROXY`/`ALL_PROXY` environment
+//! (honouring `NO_PROXY`). PAC/WPAD and NTLM proxy auth are unsupported â€” as
+//! they were with the plugin.
 
 use super::{AppCore, CoreEvent, CoreResult, UpdateInfo};
 use crate::events;
@@ -34,7 +35,7 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// `latest.json` of the newest (non-prerelease) GitHub release.
@@ -48,7 +49,7 @@ pub const UPDATER_PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYy
 /// recovery, model preflight, or an auto-started recording.
 pub(crate) const STARTUP_CHECK_DELAY: Duration = Duration::from_secs(30);
 
-/// Feed platform keys, most specific first — the plugin's lookup order for
+/// Feed platform keys, most specific first â€” the plugin's lookup order for
 /// a binary stamped as an NSIS bundle.
 const PLATFORM_KEYS: [&str; 2] = ["windows-x86_64-nsis", "windows-x86_64"];
 
@@ -186,7 +187,7 @@ fn fetch_release(
         .get(endpoint)
         .set("Accept", "application/json")
         .call()
-        .map_err(http_error)?;
+        .map_err(|e| http_error("Update check", e))?;
     // The plugin's convention for "no update" from a dynamic server.
     if response.status() == 204 {
         return Ok(None);
@@ -197,15 +198,35 @@ fn fetch_release(
     parse_feed(&body, current)
 }
 
-/// ureq reports 4xx/5xx as errors; say which status it was.
-fn http_error(error: ureq::Error) -> anyhow::Error {
+/// ureq reports 4xx/5xx as errors; say which status it was, in the plugin's
+/// wording (`what` is "Update check" or "Download").
+///
+/// The URL stays in the log only: after GitHub's redirect it is a signed CDN
+/// URL (SAS query string), which has no place in a toast. ureq's transport
+/// errors print their URL too, so they are rebuilt without it.
+fn http_error(what: &str, error: ureq::Error) -> anyhow::Error {
     match error {
-        ureq::Error::Status(code, response) => anyhow!(
-            "request failed with status: {code} {} ({})",
-            response.status_text(),
-            response.get_url()
-        ),
-        transport => anyhow::Error::new(transport),
+        ureq::Error::Status(code, response) => {
+            log::warn!(
+                "{what} request to {} failed with status {code}",
+                response.get_url()
+            );
+            anyhow!(
+                "{what} request failed with status: {code} {}",
+                response.status_text()
+            )
+        }
+        ureq::Error::Transport(transport) => {
+            log::warn!("{what} request failed: {transport}");
+            let mut message = transport.kind().to_string();
+            if let Some(detail) = transport.message() {
+                message.push_str(&format!(": {detail}"));
+            }
+            if let Some(source) = std::error::Error::source(&transport) {
+                message.push_str(&format!(": {source}"));
+            }
+            anyhow!("{what} request failed: {message}")
+        }
     }
 }
 
@@ -218,7 +239,7 @@ fn http_error(error: ureq::Error) -> anyhow::Error {
 /// `expected_version` (port of the plugin's `verify_signature`).
 ///
 /// A signed version that differs is always rejected; a missing one only
-/// when `require_signed_version` — the native updater requires it, because
+/// when `require_signed_version` â€” the native updater requires it, because
 /// every release from 0.3.0 on is signed by the xtask with `version:`.
 pub(crate) fn verify(
     installer: &[u8],
@@ -308,54 +329,139 @@ fn agent() -> anyhow::Result<ureq::Agent> {
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout_read(READ_TIMEOUT)
         .user_agent(&format!("{APP_NAME}/{}", current_version()))
-        // HTTPS_PROXY / ALL_PROXY when the system names no proxy for us.
-        .try_proxy_from_env(true);
-    if let Some(address) = system_proxy() {
-        match ureq::Proxy::new(&address) {
-            Ok(proxy) => {
-                log::info!("updater: using the system proxy {address}");
-                builder = builder.proxy(proxy);
-            }
-            Err(e) => log::warn!("updater: ignoring unusable system proxy {address:?}: {e}"),
+        // We pick the proxy ourselves: ureq's own environment lookup also
+        // takes HTTP_PROXY for HTTPS requests and ignores NO_PROXY.
+        .try_proxy_from_env(false);
+    let environment = || {
+        env_proxy(|name| std::env::var(name).ok(), &UPDATE_HOSTS)
+            .and_then(|address| usable_proxy("environment", &address))
+    };
+    let proxy = match system_proxy() {
+        // An unusable system proxy (e.g. an `https://` one, which ureq
+        // cannot speak): the environment or a direct connection is the best
+        // remaining try.
+        SystemProxy::Use(address) => usable_proxy("system", &address).or_else(environment),
+        SystemProxy::Direct => {
+            // WinINet says go direct; an environment proxy must not override it.
+            log::info!("updater: the system proxy is bypassed for the update hosts");
+            None
         }
+        SystemProxy::None => environment(),
+    };
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy);
     }
     Ok(builder.build())
 }
 
-/// The WinINet (Internet Options) proxy for the update hosts, if any.
-#[cfg(windows)]
-fn system_proxy() -> Option<String> {
-    use winreg::enums::HKEY_CURRENT_USER;
-    let settings = winreg::RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
-        .ok()?;
-    let enabled: u32 = settings.get_value("ProxyEnable").unwrap_or(0);
-    if enabled == 0 {
-        return None;
+/// `address` as a ureq proxy, or None (logged) when ureq cannot use it.
+fn usable_proxy(source: &str, address: &str) -> Option<ureq::Proxy> {
+    match ureq::Proxy::new(address) {
+        Ok(proxy) => {
+            log::info!("updater: using the {source} proxy {address}");
+            Some(proxy)
+        }
+        Err(e) => {
+            log::warn!("updater: ignoring the unusable {source} proxy {address:?}: {e}");
+            None
+        }
     }
-    let server: String = settings.get_value("ProxyServer").ok()?;
-    let overrides: String = settings.get_value("ProxyOverride").unwrap_or_default();
-    wininet_proxy(&server, &overrides, &UPDATE_HOSTS)
 }
 
-#[cfg(not(windows))]
-fn system_proxy() -> Option<String> {
-    None
-}
-
-/// Pure part of the WinINet lookup (ProxyEnable already checked): the proxy
-/// address to use for `hosts`, or None when there is no HTTPS proxy or the
-/// `ProxyOverride` list bypasses every one of them.
-fn wininet_proxy(server: &str, overrides: &str, hosts: &[&str]) -> Option<String> {
-    let address = https_proxy_server(server)?;
-    if hosts.iter().all(|host| bypasses_proxy(overrides, host)) {
+/// The environment proxy for HTTPS requests â€” `HTTPS_PROXY`, then
+/// `ALL_PROXY` (each upper case first, as reqwest read them) â€” unless
+/// `NO_PROXY` covers every one of `hosts`. `var` reads a variable (injected
+/// so tests need not touch the process environment).
+fn env_proxy(var: impl Fn(&str) -> Option<String>, hosts: &[&str]) -> Option<String> {
+    let first_set = |names: &[&str]| {
+        names
+            .iter()
+            .filter_map(|name| var(name))
+            .map(|value| value.trim().to_string())
+            .find(|value| !value.is_empty())
+    };
+    let address = first_set(&["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"])?;
+    let no_proxy = first_set(&["NO_PROXY", "no_proxy"]).unwrap_or_default();
+    if hosts.iter().all(|host| no_proxy_matches(&no_proxy, host)) {
+        log::info!("updater: NO_PROXY bypasses the environment proxy for the update hosts");
         return None;
     }
     Some(address)
 }
 
+/// `NO_PROXY` with reqwest's (and curl's) domain rules: comma-separated;
+/// `*` matches everything; `example.com` matches it and its subdomains;
+/// `.example.com` (or `*.example.com`) matches its subdomains and itself.
+fn no_proxy_matches(no_proxy: &str, host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    no_proxy
+        .split(',')
+        .map(|entry| entry.trim().to_ascii_lowercase())
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| {
+            if entry == "*" {
+                return true;
+            }
+            let domain = entry.trim_start_matches('*').trim_start_matches('.');
+            !domain.is_empty()
+                && (host == domain
+                    || host
+                        .strip_suffix(domain)
+                        .is_some_and(|prefix| prefix.ends_with('.')))
+        })
+}
+
+/// What the WinINet (Internet Options) settings say about the update hosts.
+#[derive(Debug, PartialEq, Eq)]
+enum SystemProxy {
+    /// Connect through this proxy address.
+    Use(String),
+    /// A proxy is configured, but `ProxyOverride` bypasses every update host.
+    Direct,
+    /// No usable WinINet proxy (disabled, or no HTTP/HTTPS entry).
+    None,
+}
+
+/// The WinINet proxy setting for the update hosts.
+#[cfg(windows)]
+fn system_proxy() -> SystemProxy {
+    use winreg::enums::HKEY_CURRENT_USER;
+    let Ok(settings) = winreg::RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+    else {
+        return SystemProxy::None;
+    };
+    let enabled: u32 = settings.get_value("ProxyEnable").unwrap_or(0);
+    if enabled == 0 {
+        return SystemProxy::None;
+    }
+    let Ok(server) = settings.get_value::<String, _>("ProxyServer") else {
+        return SystemProxy::None;
+    };
+    let overrides: String = settings.get_value("ProxyOverride").unwrap_or_default();
+    wininet_proxy(&server, &overrides, &UPDATE_HOSTS)
+}
+
+#[cfg(not(windows))]
+fn system_proxy() -> SystemProxy {
+    SystemProxy::None
+}
+
+/// Pure part of the WinINet lookup (ProxyEnable already checked): the proxy
+/// address to use for `hosts`, `Direct` when the `ProxyOverride` list
+/// bypasses every one of them, `None` when there is no HTTP(S) proxy.
+fn wininet_proxy(server: &str, overrides: &str, hosts: &[&str]) -> SystemProxy {
+    let Some(address) = https_proxy_server(server) else {
+        return SystemProxy::None;
+    };
+    if hosts.iter().all(|host| bypasses_proxy(overrides, host)) {
+        return SystemProxy::Direct;
+    }
+    SystemProxy::Use(address)
+}
+
 /// `ProxyServer` is either one `host:port` for every protocol, or the
-/// per-protocol `http=host:port;https=host:port;…` form. We only ever make
+/// per-protocol `http=host:port;https=host:port;â€¦` form. We only ever make
 /// HTTPS requests, so `https=` wins; `http=` is the fallback.
 fn https_proxy_server(server: &str) -> Option<String> {
     let server = server.trim();
@@ -440,7 +546,7 @@ fn download_release(
         .get(&release.url)
         .set("Accept", "application/octet-stream")
         .call()
-        .map_err(http_error)?;
+        .map_err(|e| http_error("Download", e))?;
     let total = response
         .header("Content-Length")
         .and_then(|value| value.trim().parse::<u64>().ok());
@@ -457,8 +563,8 @@ fn download_release(
 
 /// Stream `body` into `temp_root\Witness-{ver}-updater-XXXXXX\Witness-{ver}-installer.exe`
 /// (the plugin's layout), then check the `MZ` header and the signature.
-/// On ANY error once the dir exists — a network read, a short body, a bad
-/// header or signature — the dir is removed before returning, so no
+/// On ANY error once the dir exists â€” a network read, a short body, a bad
+/// header or signature â€” the dir is removed before returning, so no
 /// unverified executable stays on disk. It survives only on success,
 /// because the installer must still exist when ShellExecute runs.
 fn save_and_verify(
@@ -591,20 +697,57 @@ fn random_suffix(salt: u32) -> String {
 // ---------------------------------------------------------------------------
 
 /// A downloaded, verified installer ready to launch.
-#[derive(Debug, Clone)]
+///
+/// Dropping it without a successful [`launch`](Self::launch) â€” the exit
+/// guard refused (a recording started during the download, a backup), the
+/// launch failed, or the app quit first â€” removes its temp dir, so the
+/// ~100 MB installer never piles up in %TEMP% across retries (0.2.x checked
+/// those guards before writing any file). After a successful launch the
+/// installer must outlive this process, so it is kept (and `process::exit`
+/// skips destructors anyway). Not `Clone`: one value owns the dir.
+#[derive(Debug)]
 pub struct PreparedUpdate {
     pub version: String,
     pub installer: PathBuf,
+    /// The `Witness-{ver}-updater-XXXXXX` dir to remove on drop; `None`
+    /// once launched (or for a value that owns no dir).
+    temp_dir: Mutex<Option<PathBuf>>,
+}
+
+impl Drop for PreparedUpdate {
+    fn drop(&mut self) {
+        let dir = self
+            .temp_dir
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(dir) = dir {
+            log::info!("discarding the unlaunched update {}", self.version);
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                log::warn!("could not remove {}: {e}", dir.display());
+            }
+        }
+    }
 }
 
 impl PreparedUpdate {
+    /// Owns `installer`'s parent dir, a fresh `create_temp_dir` result.
+    fn owning_temp_dir(version: String, installer: PathBuf) -> Self {
+        let temp_dir = installer.parent().map(Path::to_path_buf);
+        Self {
+            version,
+            installer,
+            temp_dir: Mutex::new(temp_dir),
+        }
+    }
+
     /// ShellExecuteW "open" installer "/P /UPDATE /R /ARGS <escaped args>":
     /// passive install over the current `$INSTDIR`, no shortcut/AUMID
     /// rewrite, relaunch with this process's arguments (e.g. `--minimized`).
     ///
     /// Err (the bare reason; the caller prefixes "Installing the update
-    /// failed: ") when ShellExecute reports failure (≤ 32) — the process
-    /// keeps running in that case (design §4.5).
+    /// failed: ") when ShellExecute reports failure (â‰¤ 32) â€” the process
+    /// keeps running in that case (design Â§4.5).
     pub fn launch(&self, relaunch_args: &[OsString]) -> CoreResult<()> {
         let parameters = nsis_parameters(relaunch_args);
         log::info!(
@@ -613,7 +756,13 @@ impl PreparedUpdate {
             self.installer.display(),
             parameters.to_string_lossy()
         );
-        shell_execute_open(&self.installer, &parameters)
+        shell_execute_open(&self.installer, &parameters)?;
+        // Launched: the installer must survive this value.
+        self.temp_dir
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        Ok(())
     }
 }
 
@@ -738,12 +887,12 @@ pub(crate) fn spawn_startup_check(core: Arc<AppCore>) {
                         info.version
                     );
                     core.toast(&format!(
-                        "Witness {} is available — install it from Settings → Updates.",
+                        "Witness {} is available â€” install it from Settings â†’ Updates.",
                         info.version
                     ));
                 }
                 Ok(None) => log::info!("update check: up to date"),
-                // Offline, feed not published yet, etc. — never worth a toast.
+                // Offline, feed not published yet, etc. â€” never worth a toast.
                 Err(e) => log::warn!("update check failed: {e}"),
             }
         });
@@ -754,7 +903,7 @@ pub(crate) fn spawn_startup_check(core: Arc<AppCore>) {
 
 impl AppCore {
     /// Fetch the feed and remember a newer release as pending (or clear the
-    /// pending one when up to date). ⏳
+    /// pending one when up to date). â³
     pub fn check_for_update(&self) -> CoreResult<Option<UpdateInfo>> {
         super::assert_off_ui_thread("check_for_update");
         let current = semver::Version::parse(current_version()).map_err(super::err)?;
@@ -777,7 +926,7 @@ impl AppCore {
 
     /// Download and verify the pending installer into %TEMP%, emitting
     /// `UpdateProgress`. Fails fast while the recorder is busy (re-checked
-    /// under the locks by `exit_guard` before launch). ⏳
+    /// under the locks by `exit_guard` before launch). â³
     pub fn download_update(&self) -> CoreResult<PreparedUpdate> {
         super::assert_off_ui_thread("download_update");
         let release = self
@@ -785,7 +934,7 @@ impl AppCore {
             .lock()
             .unwrap()
             .clone()
-            .ok_or("No update is pending — check for updates first")?;
+            .ok_or("No update is pending â€” check for updates first")?;
         // Fail fast before a ~100 MB download.
         if self.state.recorder.lock().unwrap().is_busy() {
             return Err("Stop the recording before installing the update".into());
@@ -814,10 +963,10 @@ impl AppCore {
             release.version,
             installer.display()
         );
-        Ok(PreparedUpdate {
-            version: release.version.to_string(),
+        Ok(PreparedUpdate::owning_temp_dir(
+            release.version.to_string(),
             installer,
-        })
+        ))
     }
 }
 
@@ -945,7 +1094,7 @@ mod tests {
 
     // --- signatures --------------------------------------------------------
 
-    /// A throwaway key pair, plus its public key as base64 of the key box —
+    /// A throwaway key pair, plus its public key as base64 of the key box â€”
     /// the form the feed config (and `UPDATER_PUBKEY`) carries.
     fn throwaway_key() -> (minisign::KeyPair, String) {
         let pair = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
@@ -1223,24 +1372,137 @@ mod tests {
 
     #[test]
     fn wininet_proxy_bypasses_only_when_every_update_host_matches() {
-        assert_eq!(
-            wininet_proxy("proxy:8080", "<local>", &UPDATE_HOSTS).as_deref(),
-            Some("proxy:8080")
-        );
+        let proxy = SystemProxy::Use("proxy:8080".into());
+        assert_eq!(wininet_proxy("proxy:8080", "<local>", &UPDATE_HOSTS), proxy);
         // github.com alone bypassed: the CDN still needs the proxy.
         assert_eq!(
-            wininet_proxy("proxy:8080", "github.com", &UPDATE_HOSTS).as_deref(),
-            Some("proxy:8080")
+            wininet_proxy("proxy:8080", "github.com", &UPDATE_HOSTS),
+            proxy
         );
+        // Every host bypassed: an explicit "go direct", which the agent
+        // must not turn into an environment proxy.
         assert_eq!(
             wininet_proxy(
                 "proxy:8080",
                 "github.com;*.githubusercontent.com",
                 &UPDATE_HOSTS
             ),
+            SystemProxy::Direct
+        );
+        assert_eq!(
+            wininet_proxy("ftp=f:21", "", &UPDATE_HOSTS),
+            SystemProxy::None
+        );
+    }
+
+    // --- environment proxy -------------------------------------------------
+
+    fn env_of<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        }
+    }
+
+    #[test]
+    fn env_proxy_reads_https_then_all_proxy_only() {
+        let hosts = &UPDATE_HOSTS;
+        assert_eq!(env_proxy(env_of(&[]), hosts), None);
+        // HTTP_PROXY is for plain-HTTP requests; ours are all HTTPS.
+        assert_eq!(env_proxy(env_of(&[("HTTP_PROXY", "h:1")]), hosts), None);
+        assert_eq!(
+            env_proxy(
+                env_of(&[("ALL_PROXY", "a:1"), ("HTTPS_PROXY", "s:1")]),
+                hosts
+            )
+            .as_deref(),
+            Some("s:1")
+        );
+        assert_eq!(
+            env_proxy(
+                env_of(&[("all_proxy", " a:1 "), ("HTTPS_PROXY", "  ")]),
+                hosts
+            )
+            .as_deref(),
+            Some("a:1")
+        );
+        assert_eq!(
+            env_proxy(
+                env_of(&[("https_proxy", "l:1"), ("HTTPS_PROXY", "u:1")]),
+                hosts
+            )
+            .as_deref(),
+            Some("u:1")
+        );
+    }
+
+    #[test]
+    fn env_proxy_honours_no_proxy_for_every_update_host() {
+        let hosts = &UPDATE_HOSTS;
+        let with = |no_proxy: &'static str| {
+            env_proxy(
+                env_of(&[("HTTPS_PROXY", "p:1"), ("NO_PROXY", no_proxy)]),
+                hosts,
+            )
+        };
+        assert_eq!(with("*"), None);
+        assert_eq!(with("github.com, githubusercontent.com"), None);
+        assert_eq!(with("GitHub.com,.githubusercontent.com"), None);
+        assert_eq!(with("github.com,*.githubusercontent.com"), None);
+        // Only part of the redirect chain bypassed: keep the proxy.
+        assert_eq!(with("github.com").as_deref(), Some("p:1"));
+        assert_eq!(with("localhost,127.0.0.1").as_deref(), Some("p:1"));
+        assert_eq!(
+            env_proxy(env_of(&[("HTTPS_PROXY", "p:1"), ("no_proxy", "*")]), hosts),
             None
         );
-        assert_eq!(wininet_proxy("ftp=f:21", "", &UPDATE_HOSTS), None);
+    }
+
+    #[test]
+    fn no_proxy_domain_rules() {
+        assert!(no_proxy_matches("github.com", "github.com"));
+        assert!(no_proxy_matches("github.com", "api.github.com"));
+        assert!(!no_proxy_matches("github.com", "notgithub.com"));
+        assert!(no_proxy_matches(".github.com", "github.com"));
+        assert!(no_proxy_matches(".github.com", "a.b.github.com"));
+        assert!(no_proxy_matches("*.github.com", "a.github.com"));
+        assert!(!no_proxy_matches("hub.com", "github.com"));
+        assert!(!no_proxy_matches("", "github.com"));
+        assert!(!no_proxy_matches(" , .", "github.com"));
+        assert!(no_proxy_matches("x , * ", "github.com"));
+    }
+
+    // --- user-facing HTTP errors -------------------------------------------
+
+    #[test]
+    fn status_errors_use_the_plugin_wording_without_the_url() {
+        let response = ureq::Response::new(403, "Forbidden", "denied").unwrap();
+        let error = http_error("Download", ureq::Error::Status(403, response));
+        assert_eq!(
+            format!("{error:#}"),
+            "Download request failed with status: 403 Forbidden"
+        );
+    }
+
+    #[test]
+    fn transport_errors_name_the_cause_once_and_no_url() {
+        // Nothing listens on port 1: connection refused, fast and offline.
+        let agent = ureq::AgentBuilder::new().try_proxy_from_env(false).build();
+        let error = agent
+            .get("http://127.0.0.1:1/asset?sp=r&sig=SECRET")
+            .call()
+            .unwrap_err();
+        let source = std::error::Error::source(&error).map(ToString::to_string);
+        let text = format!("{:#}", http_error("Update check", error));
+        assert!(text.starts_with("Update check request failed: "), "{text}");
+        assert!(
+            !text.contains("http://") && !text.contains("SECRET"),
+            "{text}"
+        );
+        if let Some(source) = source {
+            assert_eq!(text.matches(source.as_str()).count(), 1, "{text}");
+        }
     }
 
     #[test]
@@ -1484,13 +1746,40 @@ mod tests {
 
     // --- AppCore surface ---------------------------------------------------
 
+    /// Best-effort cleanup of `scratch_core` data dirs. The core's worker
+    /// threads keep its database open (and the process-wide logger the first
+    /// core's witness.log) until the test process exits, so this run's dir
+    /// usually survives; the dirs that earlier runs of this `tag` left are
+    /// free by now and removed here, so at most one stays in %TEMP%.
+    fn discard_scratch_core(core: Arc<AppCore>, dir: PathBuf, tag: &str) {
+        drop(core);
+        let _ = std::fs::remove_dir_all(&dir);
+        let prefix = format!("witness-core-{tag}-");
+        let own_pid = std::process::id().to_string();
+        let Ok(siblings) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        for entry in siblings.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some((pid, _nanos)) = name
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.split_once('-'))
+            else {
+                continue;
+            };
+            if pid != own_pid && pid.bytes().all(|b| b.is_ascii_digit()) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+
     #[test]
     fn core_pending_update_and_download_preconditions() {
-        let (core, _sink, _dir) = super::super::testing::scratch_core("updater");
+        let (core, _sink, dir) = super::super::testing::scratch_core("updater");
         assert!(core.pending_update().is_none());
         assert_eq!(
             core.download_update().unwrap_err(),
-            "No update is pending — check for updates first"
+            "No update is pending â€” check for updates first"
         );
         *core.pending_update.lock().unwrap() = parse_feed(FEED, &v("0.0.1")).unwrap();
         let info = core.pending_update().unwrap();
@@ -1503,14 +1792,55 @@ mod tests {
             "Stop the recording before installing the update"
         );
         *core.state.recorder.lock().unwrap() = crate::state::RecorderState::Idle;
+        discard_scratch_core(core, dir, "updater");
+    }
+
+    /// A downloaded-and-verified layout under `root`, owned like
+    /// `download_update` returns it.
+    fn prepared_in(root: &Path) -> PreparedUpdate {
+        let dir = create_temp_dir(root, &v("0.3.0")).unwrap();
+        let installer = dir.join("Witness-0.3.0-installer.exe");
+        std::fs::write(&installer, b"MZ").unwrap();
+        PreparedUpdate::owning_temp_dir("0.3.0".into(), installer)
+    }
+
+    #[test]
+    fn unlaunched_update_removes_its_temp_dir_on_drop() {
+        let root = scratch_dir("discard");
+        let prepared = prepared_in(&root);
+        assert!(prepared.installer.exists());
+        drop(prepared);
+        assert!(
+            entries(&root).is_empty(),
+            "left behind: {:?}",
+            entries(&root)
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn failed_launch_keeps_ownership_until_drop() {
+        let root = scratch_dir("launchfail");
+        let prepared = prepared_in(&root);
+        // Make ShellExecute fail: the installer is gone, its dir remains.
+        std::fs::remove_file(&prepared.installer).unwrap();
+        let dir = prepared.installer.parent().unwrap().to_path_buf();
+        assert!(prepared.launch(&[]).is_err());
+        assert!(dir.exists());
+        drop(prepared);
+        assert!(!dir.exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     #[cfg(windows)]
     fn launch_reports_a_missing_installer() {
+        // Owns no dir: dropping it must never touch %TEMP% itself.
         let prepared = PreparedUpdate {
             version: "0.3.0".into(),
             installer: std::env::temp_dir().join("witness-no-such-installer-7f3a.exe"),
+            temp_dir: Mutex::new(None),
         };
         assert!(prepared.launch(&[]).is_err());
     }
@@ -1550,13 +1880,14 @@ mod tests {
             .starts_with("https://github.com/CubityFirst/Witness/releases/download/"));
 
         // And through AppCore, which also records the pending release.
-        let (core, _sink, _dir) = super::super::testing::scratch_core("live-update");
+        let (core, _sink, dir) = super::super::testing::scratch_core("live-update");
         let info = core.check_for_update().unwrap();
         assert_eq!(info.is_some(), live > current);
         assert_eq!(
             core.pending_update().map(|i| i.version),
             info.map(|i| i.version)
         );
+        discard_scratch_core(core, dir, "live-update");
     }
 
     /// Downloads the real, Tauri-signed 0.2.1 installer and verifies it
