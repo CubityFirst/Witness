@@ -65,7 +65,14 @@ fn on_dialog_thread<F>(kind: &str, show: F) -> Option<PathBuf>
 where
     F: FnOnce() -> Option<PathBuf> + Send,
 {
-    witness_core::service::assert_off_ui_thread("native dialog (platform::dialogs)");
+    // The UI thread is the process's main thread (eframe/winit run there
+    // and `main()` marks it), so this is the core's off-UI-thread guard with
+    // a message that names the dialog rather than an AppCore method.
+    debug_assert!(
+        std::thread::current().name() != Some("main"),
+        "the {kind} dialog blocks and must not be opened on the UI thread \
+         (open it from a Tasks worker)"
+    );
     let picked = std::thread::scope(|scope| {
         let spawned = std::thread::Builder::new()
             .name(format!("dialog-{kind}"))
@@ -141,6 +148,55 @@ fn is_window(_hwnd: isize) -> bool {
 mod tests {
     use super::*;
 
+    /// Minimal COM imports for the tests (the bin's `windows` features do not
+    /// include Win32_System_Com, and the tests should not widen them).
+    #[cfg(windows)]
+    mod com {
+        pub const COINIT_MULTITHREADED: u32 = 0x0;
+        pub const COINIT_APARTMENTTHREADED: u32 = 0x2;
+        /// What rfd's STA init gets on a thread already in the MTA.
+        pub const RPC_E_CHANGED_MODE: i32 = 0x8001_0106_u32 as i32;
+        #[link(name = "ole32")]
+        extern "system" {
+            pub fn CoInitializeEx(reserved: *const core::ffi::c_void, coinit: u32) -> i32;
+            pub fn CoUninitialize();
+        }
+    }
+
+    /// The reason for `on_dialog_thread`: a worker that already joined the
+    /// multithreaded apartment (as WASAPI device listing does) cannot host
+    /// rfd's single-threaded COM, but the dialog thread it hops to can.
+    #[cfg(windows)]
+    #[test]
+    fn dialog_thread_gets_a_fresh_apartment_from_an_mta_worker() {
+        std::thread::Builder::new()
+            .name("tasks-worker".into())
+            .spawn(|| {
+                // SAFETY: plain COM init/uninit pairs on threads we own.
+                unsafe {
+                    assert!(com::CoInitializeEx(std::ptr::null(), com::COINIT_MULTITHREADED) >= 0);
+                    // The worker itself is stuck in the MTA...
+                    let here = com::CoInitializeEx(std::ptr::null(), com::COINIT_APARTMENTTHREADED);
+                    assert_eq!(here, com::RPC_E_CHANGED_MODE);
+                    let worker = std::thread::current().id();
+                    // ...but the dialog thread starts clean.
+                    let picked = on_dialog_thread("probe", move || {
+                        assert_ne!(std::thread::current().id(), worker);
+                        let hr =
+                            com::CoInitializeEx(std::ptr::null(), com::COINIT_APARTMENTTHREADED);
+                        assert!(hr >= 0, "STA init failed on the dialog thread: {hr:#x}");
+                        com::CoUninitialize();
+                        Some(PathBuf::from("ok"))
+                    });
+                    assert_eq!(picked, Some(PathBuf::from("ok")));
+                    com::CoUninitialize();
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[test]
     fn owner_requires_a_live_window() {
         assert!(Owner::new(OwnerHwnd(0)).is_none());
@@ -163,9 +219,10 @@ mod tests {
     }
 
     /// The real thing, in process: an owner window pumped by its own "UI"
-    /// thread, both dialogs opened from a worker thread. Each must be owned
-    /// by that window and disable it while up (= modal), and re-enable it
-    /// on cancel. Shows windows, so it needs a desktop session.
+    /// thread, both dialogs opened from a worker thread — plain, and one that
+    /// already joined the MTA like a Tasks worker after a WASAPI call. Each
+    /// must be owned by that window and disable it while up (= modal), and
+    /// re-enable it on cancel. Shows windows, so it needs a desktop session.
     /// `WITNESS_TEST_DIALOG_HOLD_MS` keeps each dialog up for a screenshot.
     #[cfg(windows)]
     #[test]
@@ -253,70 +310,83 @@ mod tests {
             search.found
         }
 
-        let check =
-            |kind: &str, title: Option<&str>, open: Box<dyn FnOnce() -> Option<PathBuf> + Send>| {
-                let worker = std::thread::spawn(open);
-                let deadline = Instant::now() + Duration::from_secs(15);
-                let dialog = loop {
-                    if let Some(dialog) = owned_by(owner) {
-                        break dialog;
-                    }
-                    assert!(
-                        Instant::now() < deadline,
-                        "{kind} dialog never appeared owned by the window"
-                    );
-                    std::thread::sleep(Duration::from_millis(50));
-                };
-                let dialog_hwnd = HWND(dialog as *mut core::ffi::c_void);
-                // SAFETY: plain queries / posts on live windows.
-                unsafe {
-                    assert!(
-                        !IsWindowEnabled(owner_hwnd).as_bool(),
-                        "{kind} dialog is not modal"
-                    );
-                    if let Some(title) = title {
-                        let mut buf = [0u16; 256];
-                        let n = GetWindowTextW(dialog_hwnd, &mut buf) as usize;
-                        assert_eq!(String::from_utf16_lossy(&buf[..n]), title);
-                    }
-                    println!("{kind} dialog {dialog:#x} owned by {owner:#x}, owner disabled");
-                    std::thread::sleep(Duration::from_millis(hold));
-                    PostMessageW(
-                        Some(dialog_hwnd),
-                        WM_COMMAND,
-                        WPARAM(2 /* IDCANCEL */),
-                        LPARAM(0),
-                    )
-                    .unwrap();
+        let check = |kind: &str,
+                     mta: bool,
+                     title: Option<&str>,
+                     open: Box<dyn FnOnce() -> Option<PathBuf> + Send>| {
+            let worker = std::thread::spawn(move || {
+                if mta {
+                    // SAFETY: COM init on this worker, undone below.
+                    let hr =
+                        unsafe { com::CoInitializeEx(std::ptr::null(), com::COINIT_MULTITHREADED) };
+                    assert!(hr >= 0, "MTA init failed: {hr:#x}");
                 }
-                assert_eq!(worker.join().unwrap(), None, "cancel reads as None");
-                // SAFETY: plain query.
+                let picked = open();
+                if mta {
+                    // SAFETY: pairs the CoInitializeEx above.
+                    unsafe { com::CoUninitialize() };
+                }
+                picked
+            });
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let dialog = loop {
+                if let Some(dialog) = owned_by(owner) {
+                    break dialog;
+                }
                 assert!(
-                    unsafe { IsWindowEnabled(owner_hwnd) }.as_bool(),
-                    "owner re-enabled"
+                    Instant::now() < deadline,
+                    "{kind} dialog never appeared owned by the window"
                 );
+                std::thread::sleep(Duration::from_millis(50));
             };
-
-        check(
-            "save",
-            None,
-            Box::new(move || {
-                save_file_blocking(
-                    OwnerHwnd(owner),
-                    SaveFileRequest {
-                        file_name: "Weekly sync.opus".into(),
-                        filter_name: "Ogg Opus audio".into(),
-                        extensions: vec!["opus".into()],
-                    },
+            let dialog_hwnd = HWND(dialog as *mut core::ffi::c_void);
+            // SAFETY: plain queries / posts on live windows.
+            unsafe {
+                assert!(
+                    !IsWindowEnabled(owner_hwnd).as_bool(),
+                    "{kind} dialog is not modal"
+                );
+                if let Some(title) = title {
+                    let mut buf = [0u16; 256];
+                    let n = GetWindowTextW(dialog_hwnd, &mut buf) as usize;
+                    assert_eq!(String::from_utf16_lossy(&buf[..n]), title);
+                }
+                println!(
+                        "{kind} dialog (mta worker: {mta}) {dialog:#x} owned by {owner:#x}, owner disabled"
+                    );
+                std::thread::sleep(Duration::from_millis(hold));
+                PostMessageW(
+                    Some(dialog_hwnd),
+                    WM_COMMAND,
+                    WPARAM(2 /* IDCANCEL */),
+                    LPARAM(0),
                 )
-            }),
-        );
+                .unwrap();
+            }
+            assert_eq!(worker.join().unwrap(), None, "cancel reads as None");
+            // SAFETY: plain query.
+            assert!(
+                unsafe { IsWindowEnabled(owner_hwnd) }.as_bool(),
+                "owner re-enabled"
+            );
+        };
+
+        let save = move || {
+            save_file_blocking(
+                OwnerHwnd(owner),
+                SaveFileRequest {
+                    file_name: "Weekly sync.opus".into(),
+                    filter_name: "Ogg Opus audio".into(),
+                    extensions: vec!["opus".into()],
+                },
+            )
+        };
         let title = "Choose where to create the Witness backup";
-        check(
-            "folder",
-            Some(title),
-            Box::new(move || pick_folder_blocking(OwnerHwnd(owner), Some(title))),
-        );
+        let folder = move || pick_folder_blocking(OwnerHwnd(owner), Some(title));
+        for mta in [false, true] {
+            check("save", mta, None, Box::new(save));
+            check("folder", mta, Some(title), Box::new(folder));
+        }
 
         // SAFETY: ends the owner thread's message loop.
         unsafe { PostThreadMessageW(ui_tid, WM_QUIT, WPARAM(0), LPARAM(0)).unwrap() };

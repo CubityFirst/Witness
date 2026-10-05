@@ -56,8 +56,11 @@ const REAL_KEYS: Keys<'static> = Keys {
 };
 
 /// Whether Witness starts with Windows.
+///
+/// Errors are the bare OS error text, as 0.2.x returned them: the Settings
+/// notice adds the context ("Could not read autostart status: …").
 pub fn is_enabled() -> Result<bool, String> {
-    let enabled = is_enabled_at(REAL_KEYS).map_err(|e| format!("Could not read autostart: {e}"))?;
+    let enabled = is_enabled_at(REAL_KEYS).map_err(|e| e.to_string())?;
     if enabled {
         // Diagnostics only (no repair, see the module docs): a Run value
         // left by another build of Witness still counts as enabled.
@@ -77,16 +80,16 @@ pub fn is_enabled() -> Result<bool, String> {
 }
 
 /// Turn starting with Windows on or off. Only ever called from the Settings
-/// checkbox.
+/// checkbox, whose notice prefixes the bare error ("Could not update
+/// autostart: …").
 pub fn set_enabled(enabled: bool) -> Result<(), String> {
     if enabled {
-        let exe =
-            std::env::current_exe().map_err(|e| format!("Could not locate witness.exe: {e}"))?;
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let data = run_command(&exe);
-        enable_at(REAL_KEYS, &data).map_err(|e| format!("Could not enable autostart: {e}"))?;
+        enable_at(REAL_KEYS, &data).map_err(|e| e.to_string())?;
         log::info!("autostart enabled: {data}");
     } else {
-        disable_at(REAL_KEYS).map_err(|e| format!("Could not disable autostart: {e}"))?;
+        disable_at(REAL_KEYS).map_err(|e| e.to_string())?;
         log::info!("autostart disabled");
     }
     Ok(())
@@ -101,8 +104,10 @@ fn run_command(exe: &Path) -> String {
 /// approved (auto-launch 0.5 `enable`).
 fn enable_at(keys: Keys<'_>, data: &str) -> io::Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    hkcu.open_subkey_with_flags(keys.run, KEY_SET_VALUE)?
-        .set_value(VALUE_NAME, &data)?;
+    // The standard per-user Run key is missing on some fresh or cleaned
+    // profiles; creating it is harmless (auto-launch failed there instead).
+    let (run, _) = hkcu.create_subkey_with_flags(keys.run, KEY_SET_VALUE)?;
+    run.set_value(VALUE_NAME, &data)?;
     // The key only exists once Explorer has created it; never create it.
     if let Ok(approved) = hkcu.open_subkey_with_flags(keys.approved, KEY_SET_VALUE) {
         approved.set_raw_value(
@@ -223,6 +228,11 @@ mod tests {
     impl Scratch {
         /// `with_approved`: whether Explorer's StartupApproved key "exists".
         fn new(tag: &str, with_approved: bool) -> Scratch {
+            Scratch::with_keys(tag, true, with_approved)
+        }
+
+        /// Like [`Scratch::new`], but the Run key itself may be missing too.
+        fn with_keys(tag: &str, with_run: bool, with_approved: bool) -> Scratch {
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -234,7 +244,11 @@ mod tests {
                 root,
             };
             let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-            hkcu.create_subkey(&scratch.run).unwrap();
+            // The root always exists so Drop has something to delete.
+            hkcu.create_subkey(&scratch.root).unwrap();
+            if with_run {
+                hkcu.create_subkey(&scratch.run).unwrap();
+            }
             if with_approved {
                 hkcu.create_subkey(&scratch.approved).unwrap();
             }
@@ -342,6 +356,22 @@ mod tests {
         enable_at(s.keys(), r#""C:\w\witness.exe" --minimized"#).unwrap();
         assert!(!s.approved_key_exists());
         assert!(is_enabled_at(s.keys()).unwrap());
+    }
+
+    #[test]
+    fn enable_creates_a_missing_run_key() {
+        let s = Scratch::with_keys("norun", false, false);
+        // Nothing registered, and disabling is a no-op, without the key.
+        assert!(!is_enabled_at(s.keys()).unwrap());
+        disable_at(s.keys()).unwrap();
+        assert_eq!(registered_exe_at(s.keys()).unwrap(), None);
+        enable_at(s.keys(), r#""C:\w\witness.exe" --minimized"#).unwrap();
+        assert_eq!(
+            s.run_data().as_deref(),
+            Some(r#""C:\w\witness.exe" --minimized"#)
+        );
+        assert!(is_enabled_at(s.keys()).unwrap());
+        assert!(!s.approved_key_exists());
     }
 
     #[test]
@@ -487,29 +517,65 @@ mod tests {
         ));
     }
 
+    /// Snapshot of the user's real Run / StartupApproved values, put back
+    /// on drop — including when an assert in the test panics, so a failed
+    /// run never leaves autostart pointing at the test binary.
+    struct RealValues {
+        run: Option<RegValue>,
+        approved: Option<RegValue>,
+    }
+
+    impl RealValues {
+        fn snapshot() -> RealValues {
+            RealValues {
+                run: Self::read(RUN_KEY),
+                approved: Self::read(APPROVED_KEY),
+            }
+        }
+
+        fn read(key: &str) -> Option<RegValue> {
+            RegKey::predef(HKEY_CURRENT_USER)
+                .open_subkey(key)
+                .ok()?
+                .get_raw_value(VALUE_NAME)
+                .ok()
+        }
+
+        fn restore(key: &str, value: Option<&RegValue>) {
+            let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+            let Ok(k) = hkcu.open_subkey_with_flags(key, KEY_SET_VALUE) else {
+                return;
+            };
+            let result = match value {
+                Some(value) => k.set_raw_value(VALUE_NAME, value),
+                None => match k.delete_value(VALUE_NAME) {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                    other => other,
+                },
+            };
+            // Never panic here (Drop may already be unwinding); shout instead.
+            if let Err(e) = result {
+                eprintln!(r"COULD NOT RESTORE HKCU\{key}\{VALUE_NAME}: {e}");
+            }
+        }
+    }
+
+    impl Drop for RealValues {
+        fn drop(&mut self) {
+            Self::restore(RUN_KEY, self.run.as_ref());
+            Self::restore(APPROVED_KEY, self.approved.as_ref());
+        }
+    }
+
     /// The public API against the user's REAL Run key (manual acceptance:
     /// the value `reg query` shows). Whatever was there before — a 0.2.x
-    /// entry, Task Manager's switch, or nothing — is put back afterwards.
+    /// entry, Task Manager's switch, or nothing — is put back afterwards,
+    /// even if the test fails.
     #[test]
     #[ignore]
     fn real_registry_round_trip() {
+        let _restore = RealValues::snapshot();
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let read = |key: &str| {
-            hkcu.open_subkey(key)
-                .ok()
-                .and_then(|k| k.get_raw_value(VALUE_NAME).ok())
-        };
-        let restore = |key: &str, value: Option<RegValue>| {
-            if let Ok(k) = hkcu.open_subkey_with_flags(key, KEY_SET_VALUE) {
-                match value {
-                    Some(value) => k.set_raw_value(VALUE_NAME, &value).unwrap(),
-                    None => {
-                        let _ = k.delete_value(VALUE_NAME);
-                    }
-                }
-            }
-        };
-        let (old_run, old_approved) = (read(RUN_KEY), read(APPROVED_KEY));
 
         set_enabled(true).unwrap();
         assert!(is_enabled().unwrap());
@@ -520,19 +586,22 @@ mod tests {
             .unwrap();
         let exe = std::env::current_exe().unwrap();
         assert_eq!(data, format!("\"{}\" --minimized", exe.display()));
-        // What `reg query` (i.e. Windows' own view of the value) shows.
+        // What `reg query` (i.e. Windows' own view of the value) shows. Its
+        // output is in the console code page, not UTF-8, so only the ASCII
+        // tail (exe name + argument) is compared: the profile path may not be.
         let query = std::process::Command::new("reg")
             .args(["query", &format!(r"HKCU\{RUN_KEY}"), "/v", VALUE_NAME])
             .output()
             .unwrap();
         let shown = String::from_utf8_lossy(&query.stdout);
         println!("{shown}");
-        assert!(shown.contains(&data), "reg query shows the quoted command");
+        let exe_name = exe.file_name().unwrap().to_string_lossy();
+        assert!(
+            shown.contains(&format!("{exe_name}\" --minimized")),
+            "reg query shows the quoted command"
+        );
         set_enabled(false).unwrap();
         assert!(!is_enabled().unwrap());
         set_enabled(false).unwrap();
-
-        restore(RUN_KEY, old_run);
-        restore(APPROVED_KEY, old_approved);
     }
 }
