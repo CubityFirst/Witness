@@ -154,6 +154,12 @@ struct SettingsState {
     forgetting: Vec<OpHandle>,
     /// The person a pending "Forget voice" confirmation is about.
     confirm_forget: Option<(i64, String)>,
+    /// This view asked the "Delete models" / "Stop & restart" confirms.
+    /// The modal is app-level and outlives the view (Ctrl+F navigates while
+    /// it shows), so an answer given after leaving must not fire on a later
+    /// visit: answers are drained every pass and acted on only when asked.
+    asked_cache: bool,
+    asked_restart: bool,
 }
 
 impl SettingsState {
@@ -188,6 +194,8 @@ impl SettingsState {
             deleting_cache: None,
             forgetting: Vec::new(),
             confirm_forget: None,
+            asked_cache: false,
+            asked_restart: false,
         }
     }
 
@@ -417,11 +425,15 @@ impl SettingsState {
     }
 
     fn answer_confirms(&mut self, cx: &mut UiCtx) {
-        if cx.confirm.answer(cache_confirm_id()) == Some(true) {
-            self.delete_cache(cx);
+        if let Some(yes) = cx.confirm.answer(cache_confirm_id()) {
+            if std::mem::take(&mut self.asked_cache) && yes {
+                self.delete_cache(cx);
+            }
         }
-        if cx.confirm.answer(restart_confirm_id()) == Some(true) {
-            cx.cmds.push(UiCmd::Restart);
+        if let Some(yes) = cx.confirm.answer(restart_confirm_id()) {
+            if std::mem::take(&mut self.asked_restart) && yes {
+                cx.cmds.push(UiCmd::Restart);
+            }
         }
         if let Some((id, name)) = self.confirm_forget.clone() {
             match cx.confirm.answer(forget_confirm_id(id)) {
@@ -564,18 +576,23 @@ impl SettingsState {
         }
 
         row(ui, |ui| {
-            row_label(ui, "Watch patterns");
+            let label = row_label(ui, "Watch patterns");
             let width = input_width(ui, INPUT_WIDTH);
             wrap_for(ui, width);
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.patterns_text)
-                    .id(patterns_id())
-                    .desired_width(width),
-            );
+            let response = ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.patterns_text)
+                        .id(patterns_id())
+                        .desired_width(width),
+                )
+                .labelled_by(label);
             widgets::text_edit_menu(&response);
             self.patterns_dirty |= response.changed();
-            // Enter surrenders focus too, so this covers blur and Enter.
-            if response.lost_focus() {
+            // Enter surrenders focus too, so this covers blur and Enter. A
+            // clean buffer was already committed (or re-synced): skipping it
+            // keeps a draft that `flush` committed — and the store reverted
+            // — from failing a second time when the field finally blurs.
+            if response.lost_focus() && self.patterns_dirty {
                 self.commit_patterns(cx, parse_patterns(&self.patterns_text));
             }
             muted(ui, "comma-separated, matched against mic-using app names");
@@ -667,9 +684,10 @@ impl SettingsState {
 
         row(ui, |ui| {
             row_label(ui, "Voice match strictness");
-            let mut value = self
+            let shown_before = self
                 .local_threshold
                 .unwrap_or(settings.speaker_match_threshold);
+            let mut value = shown_before;
             let enabled = ui.is_enabled();
             let response = ui.add(
                 egui::Slider::new(&mut value, THRESHOLD_MIN..=THRESHOLD_MAX)
@@ -684,8 +702,8 @@ impl SettingsState {
                     format!("Voice match strictness: {}", threshold_value_text(shown)),
                 )
             });
-            if response.changed() {
-                self.local_threshold = Some(snap_threshold(value));
+            if let Some(edit) = threshold_edit(shown_before, value, response.changed()) {
+                self.local_threshold = Some(edit);
             }
             // Commit once the pointer lets go (a keyboard change commits at
             // once), like the range input's `onChange`.
@@ -715,23 +733,26 @@ impl SettingsState {
         };
         ui.with_layout(layout, |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            row_label(ui, label);
+            let label = row_label(ui, label);
             let room = if side_by_side {
                 ui.available_width()
             } else {
                 row_width(ui)
             };
             let width = room.min(320.0);
-            let response = ui.add(
-                egui::TextEdit::multiline(&mut self.junk_text)
-                    .id(junk_id())
-                    .desired_rows(4)
-                    .desired_width(width),
-            );
+            let response = ui
+                .add(
+                    egui::TextEdit::multiline(&mut self.junk_text)
+                        .id(junk_id())
+                        .desired_rows(4)
+                        .desired_width(width),
+                )
+                .labelled_by(label);
             widgets::text_edit_menu(&response);
             self.junk_dirty |= response.changed();
-            // Blur only (Enter inserts a line).
-            if response.lost_focus() {
+            // Blur only (Enter inserts a line); a clean buffer is skipped as
+            // for the watch patterns.
+            if response.lost_focus() && self.junk_dirty {
                 self.commit_junk(cx, parse_lines(&self.junk_text));
             }
         });
@@ -856,11 +877,7 @@ impl SettingsState {
                             badge(ui, BadgeKind::Failed, "integrity check failed")
                                 .on_hover_text(error);
                         }
-                        if ui
-                            .add_enabled_ui(!active, |ui| ghost(ui, label.as_str()))
-                            .inner
-                            .clicked()
-                        {
+                        if ghost_enabled(ui, !active, label.as_str()).clicked() {
                             start_gpu_libs_download(cx);
                         }
                     }
@@ -891,6 +908,7 @@ impl SettingsState {
                         "Delete all downloaded models?\nTranscription stops working until you download them again.",
                         "Delete models",
                     );
+                    self.asked_cache = true;
                 }
             }
         });
@@ -1090,11 +1108,14 @@ impl SettingsState {
                 "Could not check recording status; restart cancelled",
                 "status not loaded yet",
             ),
-            Some(status) if status.recording => cx.confirm.ask(
-                restart_confirm_id(),
-                "Restarting will stop and save the current recording. Restart now?",
-                "Stop & restart",
-            ),
+            Some(status) if status.recording => {
+                cx.confirm.ask(
+                    restart_confirm_id(),
+                    "Restarting will stop and save the current recording. Restart now?",
+                    "Stop & restart",
+                );
+                self.asked_restart = true;
+            }
             Some(_) => cx.cmds.push(UiCmd::Restart),
         }
     }
@@ -1215,9 +1236,9 @@ fn device_row(
     );
     let kind = configured_device(spec.configured, spec.devices.unwrap_or(&[]));
     row(ui, |ui| {
-        row_label(ui, spec.label);
+        let label = row_label(ui, spec.label);
         let selected = spec.configured.unwrap_or("");
-        if let Some(value) = device_picker(ui, spec.id, &options, selected) {
+        if let Some(value) = device_picker(ui, spec.id, label, &options, selected) {
             let value = (!value.is_empty()).then_some(value);
             save(cx, |s| set(s, value));
         }
@@ -1302,8 +1323,10 @@ fn text_width(ui: &egui::Ui, text: &str, font: egui::FontId) -> f32 {
 }
 
 /// The row's leading label, at least 140 pt wide (a pseudo label column
-/// that grows with longer labels, like `min-width`).
-pub(super) fn row_label(ui: &mut egui::Ui, text: &str) {
+/// that grows with longer labels, like `min-width`). Returns the label's
+/// id, so a control can name itself after it (`<label for=…>`) through
+/// `Response::labelled_by`.
+pub(super) fn row_label(ui: &mut egui::Ui, text: &str) -> egui::Id {
     let needed = text_width(ui, text, theme::regular(theme::BASE_SIZE));
     let width = needed.max(LABEL_WIDTH).min(row_width(ui));
     ui.allocate_ui_with_layout(
@@ -1311,9 +1334,11 @@ pub(super) fn row_label(ui: &mut egui::Ui, text: &str) {
         Layout::left_to_right(Align::Center),
         |ui| {
             ui.set_min_width(width);
-            ui.add(egui::Label::new(RichText::new(text).color(TEXT)).wrap());
+            ui.add(egui::Label::new(RichText::new(text).color(TEXT)).wrap())
+                .id
         },
-    );
+    )
+    .inner
 }
 
 /// Inline muted text (`span.muted`): next to the previous item when it
@@ -1404,10 +1429,12 @@ fn input_width(ui: &egui::Ui, max: f32) -> f32 {
     max.min(row_width(ui)).max(INPUT_WIDTH.min(row_width(ui)))
 }
 
-/// A device `<select>`; returns the newly picked value ("" = default).
+/// A device `<select>` named by the row label `label`; returns the newly
+/// picked value ("" = default).
 fn device_picker(
     ui: &mut egui::Ui,
     id: &str,
+    label_id: egui::Id,
     options: &[DeviceOption],
     selected: &str,
 ) -> Option<String> {
@@ -1438,7 +1465,9 @@ fn device_picker(
                         picked = Some(option.value.clone());
                     }
                 }
-            });
+            })
+            .response
+            .labelled_by(label_id);
     });
     picked
 }
@@ -1518,6 +1547,16 @@ fn snap_threshold(value: f32) -> f32 {
     let clamped = value.clamp(THRESHOLD_MIN, THRESHOLD_MAX);
     let snapped = (clamped / THRESHOLD_STEP).round() * THRESHOLD_STEP;
     (snapped * 100.0).round() / 100.0
+}
+
+/// The user's slider edit, if any. egui's `Slider` (clamping `Always` plus
+/// `step_by`) rounds an off-grid value such as a hand-edited 0.62 to the
+/// step as it draws and reports that as a change; the range input never
+/// rewrote the value untouched. The slider already *shows* the snapped
+/// value, so a real edit always lands on a different grid position.
+fn threshold_edit(shown: f32, value: f32, changed: bool) -> Option<f32> {
+    let snapped = snap_threshold(value);
+    (changed && snapped != snap_threshold(shown)).then_some(snapped)
 }
 
 fn threshold_readout(t: f32) -> String {
@@ -1912,6 +1951,19 @@ mod tests {
     }
 
     #[test]
+    fn slider_rounding_an_off_grid_value_is_not_an_edit() {
+        // egui snapped a hand-edited 0.62 to 0.60 while drawing and
+        // reported a change: not the user's doing, so nothing is saved.
+        assert_eq!(threshold_edit(0.62, 0.6, true), None);
+        assert_eq!(threshold_edit(0.6, 0.6, true), None);
+        assert_eq!(threshold_edit(0.62, 0.65, false), None);
+        // Real edits, also away from an off-grid start.
+        assert_eq!(threshold_edit(0.62, 0.650_000_1, true), Some(0.65));
+        assert_eq!(threshold_edit(0.62, 0.55, true), Some(0.55));
+        assert_eq!(threshold_edit(0.6, 0.8, true), Some(0.8));
+    }
+
+    #[test]
     fn progress_text_with_and_without_a_total() {
         let mut p = progress("parakeet", false, None);
         assert_eq!(download_progress_text(&p), "file 2 of 5 — 25% of 1000 MB");
@@ -2210,11 +2262,11 @@ mod tests {
             egui::CentralPanel::default().show(ui, |ui| {
                 section(ui, "Models", |ui| {
                     row(ui, |ui| {
-                        row_label(ui, "Parakeet TDT 0.6B v3 (ONNX)");
+                        let label = row_label(ui, "Parakeet TDT 0.6B v3 (ONNX)");
                         path_code(ui, "C:\\Users\\me\\AppData\\Local\\Witness");
                         warning_chip(ui, "model not downloaded — transcription will fail");
                         let options = device_options(None, Some(&[]), false, "Default");
-                        assert_eq!(device_picker(ui, "test-picker", &options, ""), None);
+                        assert_eq!(device_picker(ui, "test-picker", label, &options, ""), None);
                         muted(ui, "muted");
                     });
                     muted_paragraph(ui, "paragraph");
