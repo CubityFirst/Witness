@@ -14,3 +14,6 @@
 
 *.ico binary
 *.png binary
+
+# Verbatim Tauri NSIS output kept as reference (CRLF + BOM as generated).
+installer/reference/** -text

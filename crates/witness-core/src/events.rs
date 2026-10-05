@@ -1,21 +1,7 @@
-//! Event names + payload types emitted to the frontend. Keep in sync with
-//! `src/lib/events.ts`.
+//! Event payload types. They travel inside `service::CoreEvent` to the UI;
+//! the `Serialize` derives stay for diagnostics and tests.
 
 use serde::Serialize;
-
-pub const RECORDING_STARTED: &str = "recording-started";
-pub const RECORDING_STOPPED: &str = "recording-stopped";
-pub const RECORDING_LEVEL: &str = "recording-level";
-pub const RECORDING_HEALTH: &str = "recording-health";
-pub const WATCHER_STATUS: &str = "watcher-status";
-pub const TRANSCRIPTION_PROGRESS: &str = "transcription-progress";
-pub const TRANSCRIPTION_COMPLETE: &str = "transcription-complete";
-pub const TRANSCRIPTION_FAILED: &str = "transcription-failed";
-pub const MODEL_DOWNLOAD_PROGRESS: &str = "model-download-progress";
-pub const MEETINGS_CHANGED: &str = "meetings-changed";
-pub const LIVE_TRANSCRIPT: &str = "live-transcript";
-pub const LIVE_CAPTIONS_STATUS: &str = "live-captions-status";
-pub const UPDATE_PROGRESS: &str = "update-progress";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RecordingStarted {

@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/witness-core", "xtask"]
+default-members = ["crates/witness-core"]
+
+[workspace.package]
+version = "0.2.1"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

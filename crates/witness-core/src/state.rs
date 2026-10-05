@@ -1,4 +1,4 @@
-//! Shared application state managed by Tauri.
+//! Shared application state, owned by `service::AppCore` as `Arc<AppState>`.
 
 use crate::db::Db;
 use crate::events::WatcherStatus;

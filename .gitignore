@@ -8,3 +8,6 @@ witness-settings.toml
 # Machine-local build tool locations (CMAKE, LIBCLANG_PATH). CONTRIBUTING.md
 # asks developers to supply their own; they must never be committed.
 .cargo/config.toml
+/target/
+/target-test/
+/.worktrees/

@@ -45,6 +45,10 @@ impl SpeechChunk {
     pub fn len(&self) -> usize {
         self.end_sample - self.start_sample
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.end_sample == self.start_sample
+    }
 }
 
 /// Total speech-ish duration in ms across chunks (for progress reporting).

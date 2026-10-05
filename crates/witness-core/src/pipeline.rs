@@ -363,7 +363,7 @@ fn process(
         let archive_path = if have_wavs {
             None
         } else if let Some(relative) = &meeting.audio_path {
-            let path = crate::commands::safe_archive_path(&audio_dir, relative)
+            let path = crate::service::library::safe_archive_path(&audio_dir, relative)
                 .map_err(anyhow::Error::msg)?;
             if !path.exists() {
                 bail!(

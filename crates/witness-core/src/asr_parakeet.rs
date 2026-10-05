@@ -70,9 +70,7 @@ mod tests {
     #[test]
     #[ignore]
     fn cuda_smoke() {
-        let models_dir = std::env::var("WITNESS_MODELS_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("target/debug/models"));
+        let models_dir = crate::test_support::models_dir();
         std::fs::create_dir_all(&models_dir).unwrap();
 
         crate::models::download(
@@ -114,9 +112,7 @@ mod tests {
     #[test]
     #[ignore]
     fn tts_transcribe() {
-        let models_dir = std::env::var("WITNESS_MODELS_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("target/debug/models"));
+        let models_dir = crate::test_support::models_dir();
         let wav = std::env::temp_dir().join("witness-tts.wav");
         let mut reader = hound::WavReader::open(&wav).expect("run the TTS generation step first");
         assert_eq!(reader.spec().sample_rate, 16_000);

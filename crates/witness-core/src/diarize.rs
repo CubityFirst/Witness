@@ -139,9 +139,7 @@ mod tests {
     #[test]
     #[ignore]
     fn diarize_tail_frame_multiple() {
-        let models_dir = std::env::var("WITNESS_MODELS_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("target/debug/models"));
+        let models_dir = crate::test_support::models_dir();
         let tone: Vec<f32> = (0..35_680).map(|i| (i as f32 * 0.05).sin() * 0.1).collect();
         diarize(&models_dir, &tone, |_| {}).unwrap();
     }
@@ -156,9 +154,7 @@ mod tests {
     #[test]
     #[ignore]
     fn tts_dialogue_diarization() {
-        let models_dir = std::env::var("WITNESS_MODELS_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("target/debug/models"));
+        let models_dir = crate::test_support::models_dir();
         const GAP: usize = 16_000 / 2;
         let mut audio = Vec::new();
         let mut turns = Vec::new();

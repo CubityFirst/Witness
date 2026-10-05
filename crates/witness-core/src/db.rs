@@ -653,6 +653,23 @@ impl Db {
         Ok(rows)
     }
 
+    /// Live (not binned) meetings that started at or after `from`, newest
+    /// first. `from` is compared as text against the stored RFC 3339
+    /// `started_at`, so a bare `YYYY-MM-DD` date works as an inclusive day
+    /// bound. Backs the People weekly trend without paging every meeting.
+    pub fn list_meetings_started_since(&self, from: &str) -> Result<Vec<Meeting>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM meetings WHERE deleted_at IS NULL AND started_at >= ?1
+             ORDER BY started_at DESC",
+            Self::MEETING_COLS
+        ))?;
+        let rows = stmt
+            .query_map(params![from], Self::row_to_meeting)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Recycle-bin contents: (meeting, deleted_at), newest first.
     pub fn list_deleted_meetings(&self) -> Result<Vec<(Meeting, String)>> {
         let conn = self.conn.lock().unwrap();
@@ -1642,6 +1659,40 @@ mod tests {
         assert_eq!(db.list_pipeline_jobs().unwrap().len(), 1);
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn meetings_started_since_filters_bin_and_orders_newest_first() {
+        let (db, dir) = test_db("started-since");
+        let old = db
+            .create_meeting("Old", "2026-07-01T09:00:00+01:00", "manual")
+            .unwrap();
+        let boundary = db
+            .create_meeting("Boundary", "2026-07-10T00:00:00+01:00", "manual")
+            .unwrap();
+        let newer = db
+            .create_meeting("Newer", "2026-07-12T15:30:00+01:00", "auto")
+            .unwrap();
+        let binned = db
+            .create_meeting("Binned", "2026-07-11T10:00:00+01:00", "manual")
+            .unwrap();
+        db.soft_delete_meeting(binned).unwrap();
+
+        let ids = |from: &str| -> Vec<i64> {
+            db.list_meetings_started_since(from)
+                .unwrap()
+                .into_iter()
+                .map(|meeting| meeting.id)
+                .collect()
+        };
+        // A bare date is an inclusive day bound; binned meetings never count.
+        assert_eq!(ids("2026-07-10"), vec![newer, boundary]);
+        assert_eq!(ids("2026-07-10T00:00:00+01:00"), vec![newer, boundary]);
+        assert_eq!(ids("2026-01-01"), vec![newer, boundary, old]);
+        assert!(ids("2026-08-01").is_empty());
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

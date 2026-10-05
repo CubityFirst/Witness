@@ -73,10 +73,11 @@ impl CudaStatus {
 /// it is only invoked per pipeline job, per live session, at startup and
 /// from the Settings GPU check, so repetition is signal, not spam).
 pub fn preflight() -> CudaStatus {
-    // env mutation + duplicated log suppression under one lock; concurrent
-    // callers (pipeline worker vs. live thread) otherwise race on PATH.
-    static LOCK: Mutex<()> = Mutex::new(());
-    let _guard = LOCK.lock().unwrap();
+    // env mutation + duplicated log suppression under one lock, held for the
+    // whole check: several worker threads (pipeline, live captions, Settings
+    // loads, downloads) call this and would otherwise race on PATH.
+    static PREFLIGHT: Mutex<()> = Mutex::new(());
+    let _guard = PREFLIGHT.lock().unwrap();
 
     let driver_present = system32_dir().join("nvcuda.dll").exists();
 

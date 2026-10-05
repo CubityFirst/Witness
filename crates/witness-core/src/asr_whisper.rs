@@ -74,9 +74,7 @@ mod tests {
     #[test]
     #[ignore]
     fn whisper_tts() {
-        let models_dir = std::env::var("WITNESS_MODELS_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("target/debug/models"));
+        let models_dir = crate::test_support::models_dir();
         std::fs::create_dir_all(&models_dir).unwrap();
         crate::models::download(
             crate::settings::Engine::Whisper,

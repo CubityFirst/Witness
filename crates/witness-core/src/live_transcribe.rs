@@ -260,9 +260,7 @@ mod tests {
     #[test]
     #[ignore]
     fn live_captions() {
-        let models_dir = std::env::var("WITNESS_MODELS_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("target/debug/models"));
+        let models_dir = crate::test_support::models_dir();
         let wav = std::env::temp_dir().join("witness-tts.wav");
         let mut reader = hound::WavReader::open(&wav).expect("generate TTS wav first");
         let samples_16k: Vec<f32> = reader
