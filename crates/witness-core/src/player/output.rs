@@ -44,7 +44,7 @@ pub(crate) enum SinkError {
     Timeout,
     /// The endpoint went away (unplugged, disabled, audio service restart).
     DeviceLost(String),
-    /// Anything else; also handled by reopening, but logged as unexpected.
+    /// Anything else: playback stops with a play error (no reopen loop).
     Other(String),
 }
 
@@ -168,6 +168,9 @@ struct Session {
     total: u64,
     duration_ms: u64,
     sink: Option<Box<dyn Sink>>,
+    /// The sink is started (`IAudioClient::Start` succeeded and no stop
+    /// since). Starting a running stream fails with AUDCLNT_E_NOT_STOPPED.
+    running: bool,
     /// Device frames written to the current sink.
     written: u64,
     fifo: PositionFifo,
@@ -176,7 +179,7 @@ struct Session {
     stretcher: Wsola,
     /// Source frame where the stretcher was last flushed.
     anchor: u64,
-    /// Speed the current anchor runs at.
+    /// Speed new output is produced at (prepared output keeps its own).
     speed: f32,
     eof: bool,
     ended: bool,
@@ -195,6 +198,7 @@ impl Session {
             duration_ms: reader.duration_ms(),
             reader,
             sink: None,
+            running: false,
             written: 0,
             fifo: PositionFifo::new(),
             chunks: VecDeque::new(),
@@ -215,8 +219,30 @@ impl Session {
         ((self.position / (RATE / 1000) as f64) as u64).min(self.duration_ms)
     }
 
-    /// Restart decoding at `source` (no device change): drops prepared
-    /// output and the stretcher's state.
+    /// Use a freshly opened (stopped, empty) stream.
+    fn attach(&mut self, sink: Box<dyn Sink>) {
+        self.sink = Some(sink);
+        self.running = false;
+        self.written = 0;
+    }
+
+    /// Release the stream (Drop stops and releases the client).
+    fn detach(&mut self) {
+        self.sink = None;
+        self.running = false;
+        self.written = 0;
+    }
+
+    /// Stop the stream, keeping what is queued.
+    fn stop_sink(&mut self) {
+        if let Some(sink) = self.sink.as_mut() {
+            let _ = sink.stop();
+        }
+        self.running = false;
+    }
+
+    /// Restart decoding at `source` (seek, reopen): drops prepared output
+    /// and the stretcher's state.
     fn reanchor(&mut self, source: u64, speed: f32) {
         let source = source.min(self.total);
         if let Err(e) = self.reader.seek(source) {
@@ -245,13 +271,16 @@ impl Session {
         };
         let before = self.stretcher.emitted_source_frames();
         let mut data = Vec::with_capacity(self.scratch.len() + 1920);
-        if got == 0 {
+        let after = if got == 0 {
             self.eof = true;
+            // `finish` covers everything fed, then resets the counters.
+            let end = before + self.stretcher.latency_frames() as f64;
             self.stretcher.finish(self.speed, &mut data);
+            end
         } else {
             self.stretcher.process(&self.scratch, self.speed, &mut data);
-        }
-        let after = before + (data.len() / 2) as f64 * self.speed as f64;
+            self.stretcher.emitted_source_frames()
+        };
         if data.is_empty() {
             return;
         }
@@ -304,8 +333,8 @@ impl Drop for Session {
 /// What the render loop should do after a device step.
 enum Step {
     Continue,
-    /// The device is gone (or misbehaving): reopen the default endpoint.
-    Lost(SinkError),
+    /// The device failed; [`Engine::sink_failed`] decides what to do.
+    Failed(SinkError),
 }
 
 pub(crate) struct Engine<B: Backend> {
@@ -316,6 +345,8 @@ pub(crate) struct Engine<B: Backend> {
     /// Generation / seek sequence of the last Load/Unload/Seek processed.
     generation: u64,
     seq: u64,
+    /// UI commands processed (all but `Wake`); see `Shared::cmd_seq`.
+    handled: u64,
     /// Play intent (the UI's `playing`).
     playing: bool,
     last_device_check: Instant,
@@ -335,6 +366,7 @@ impl<B: Backend> Engine<B> {
             session: None,
             generation: 0,
             seq: 0,
+            handled: 0,
             playing: false,
             last_device_check: Instant::now(),
             device_check_every: DEVICE_CHECK_EVERY,
@@ -365,7 +397,18 @@ impl<B: Backend> Engine<B> {
         }
     }
 
+    /// Publish the engine's `playing`/`ended` (dropped while UI commands are
+    /// still queued; see [`Shared::publish_state`]).
+    fn publish_state(&self) -> bool {
+        let ended = self.session.as_ref().is_some_and(|s| s.ended);
+        self.shared
+            .publish_state(self.generation, self.handled, self.playing, ended)
+    }
+
     pub(crate) fn handle(&mut self, cmd: Cmd) {
+        if !matches!(cmd, Cmd::Wake) {
+            self.handled += 1;
+        }
         match cmd {
             Cmd::Load {
                 path,
@@ -414,44 +457,57 @@ impl<B: Backend> Engine<B> {
                     let source = (ms.saturating_mul(RATE / 1000)).min(s.total);
                     self.seek_to(source);
                     self.publish_position();
+                    self.publish_state();
                 }
             }
-            Cmd::Play => self.play(),
+            Cmd::Play => {
+                self.play();
+                self.publish_state();
+            }
             Cmd::Pause => {
                 self.playing = false;
-                if let Some(sink) = self.session.as_mut().and_then(|s| s.sink.as_mut()) {
-                    let _ = sink.stop();
+                if let Some(s) = self.session.as_mut() {
+                    s.stop_sink();
                 }
                 self.update_position();
+                self.publish_state();
             }
             // Speed and volume are read from Shared on every fill.
             Cmd::Wake => {}
         }
     }
 
+    /// HTML `play()`: starts a stopped stream, restarts an ended one at 0,
+    /// and leaves a stream that is already running alone (a segment click
+    /// sends seek + play while playing; the seek already restarted it).
     fn play(&mut self) {
         self.playing = true;
         let Some(s) = self.session.as_mut() else {
             // Nothing (valid) loaded: the intent cannot be honoured.
             self.playing = false;
-            self.shared.publish_stopped(self.generation, false);
             (self.on_change)();
             return;
         };
         if s.ended {
             s.position = 0.0;
         }
+        if s.reopen.is_some() {
+            // The pending reopen resumes playback once the device is back.
+            return;
+        }
         if s.sink.is_some() && !s.ended {
-            if let Step::Lost(e) = self.resume() {
-                self.device_lost(e);
+            if !s.running {
+                if let Step::Failed(e) = self.resume() {
+                    self.sink_failed(e);
+                }
             }
             return;
         }
-        if s.sink.is_none() && s.reopen.is_none() {
+        if s.sink.is_none() {
             match self.backend.open() {
-                Ok(sink) => s.sink = Some(sink),
+                Ok(sink) => s.attach(sink),
                 Err(e) => {
-                    self.fail(format!("could not open the audio output: {e}"));
+                    self.output_failed(format!("could not open the audio output: {e}"));
                     return;
                 }
             }
@@ -461,17 +517,26 @@ impl<B: Backend> Engine<B> {
         self.publish_position();
     }
 
-    /// Prefill and start an already-positioned stream.
+    /// Prefill and start an already-positioned, stopped stream.
     fn resume(&mut self) -> Step {
-        if let Step::Lost(e) = self.fill() {
-            return Step::Lost(e);
+        if let Step::Failed(e) = self.fill() {
+            return Step::Failed(e);
         }
-        let Some(sink) = self.session.as_mut().and_then(|s| s.sink.as_mut()) else {
+        let Some(s) = self.session.as_mut() else {
             return Step::Continue;
         };
+        let Some(sink) = s.sink.as_mut() else {
+            return Step::Continue;
+        };
+        if s.running || s.ended {
+            return Step::Continue;
+        }
         match sink.start() {
-            Ok(()) => Step::Continue,
-            Err(e) => Step::Lost(e),
+            Ok(()) => {
+                s.running = true;
+                Step::Continue
+            }
+            Err(e) => Step::Failed(e),
         }
     }
 
@@ -481,8 +546,8 @@ impl<B: Backend> Engine<B> {
         let Some(s) = self.session.as_mut() else {
             return;
         };
+        s.stop_sink();
         if let Some(sink) = s.sink.as_mut() {
-            let _ = sink.stop();
             let _ = sink.reset();
         }
         s.reanchor(source, speed);
@@ -490,8 +555,8 @@ impl<B: Backend> Engine<B> {
         s.position = s.anchor as f64;
         s.fifo.reset(s.written, s.position);
         if s.sink.is_some() && self.playing && s.reopen.is_none() {
-            if let Step::Lost(e) = self.resume() {
-                self.device_lost(e);
+            if let Step::Failed(e) = self.resume() {
+                self.sink_failed(e);
             }
         }
     }
@@ -519,32 +584,35 @@ impl<B: Backend> Engine<B> {
             return Step::Continue;
         };
         let step = (|| {
-            // A failed padding query means the device is gone.
-            let padding = sink.padding()? as u64;
+            // A failed padding query means the device is gone, whatever the
+            // code (design §6.3).
+            let padding = sink.padding().map_err(|e| match e {
+                SinkError::Other(m) => SinkError::DeviceLost(m),
+                e => e,
+            })? as u64;
             s.position = s.fifo.position(s.written.saturating_sub(padding));
 
             if s.eof && s.queued == 0 {
                 if padding == 0 && !s.ended {
                     // Drained: the HTML `ended` event.
                     let _ = sink.stop();
+                    s.running = false;
                     s.ended = true;
                     s.position = s.total as f64;
                 }
                 return Ok(());
             }
             if speed != s.speed {
-                // Re-decode from the end of what is already queued; queued
-                // frames keep the speed they were made at (the FIFO knows).
-                // The input still buffered in the stretcher is discarded
-                // and decoded again at the new speed.
-                let from = s.fifo.last_source().round() as u64;
+                // No re-decode and no flush: output already prepared keeps
+                // the speed it was made at (the FIFO knows), and the
+                // stretcher carries its state into the new speed, so the
+                // change is seamless.
                 log::debug!(
-                    "player: speed {}× → {speed}× at source frame {from} \
-                     (re-decoding {} buffered frames)",
+                    "player: speed {}× → {speed}× ({} source frames buffered in WSOLA)",
                     s.speed,
                     s.stretcher.latency_frames()
                 );
-                s.reanchor(from, speed);
+                s.speed = speed;
             }
             let space = (sink.buffer_frames() as u64).saturating_sub(padding) as usize;
             if space == 0 {
@@ -568,17 +636,31 @@ impl<B: Backend> Engine<B> {
         let just_ended = s.ended && self.playing;
         match step {
             Ok(()) => {
-                if just_ended {
+                self.publish_position();
+                // While UI commands are queued the end is not announced:
+                // they decide the state (a seek clears `ended` and, with the
+                // play intent still set, resumes).
+                if just_ended
+                    && self
+                        .shared
+                        .publish_state(self.generation, self.handled, false, true)
+                {
                     self.playing = false;
-                    self.publish_position();
-                    self.shared.publish_stopped(self.generation, true);
                     (self.on_change)();
-                } else {
-                    self.publish_position();
                 }
                 Step::Continue
             }
-            Err(e) => Step::Lost(e),
+            Err(e) => Step::Failed(e),
+        }
+    }
+
+    /// Route a device error: a vanished endpoint is reopened, anything else
+    /// stops playback with a play error the next `play` can recover from.
+    fn sink_failed(&mut self, e: SinkError) {
+        match e {
+            SinkError::Timeout => {}
+            SinkError::DeviceLost(_) => self.device_lost(e),
+            SinkError::Other(_) => self.output_failed(format!("audio output error: {e}")),
         }
     }
 
@@ -588,14 +670,8 @@ impl<B: Backend> Engine<B> {
         let Some(s) = self.session.as_mut() else {
             return;
         };
-        match &reason {
-            SinkError::Other(_) => {
-                log::warn!("player: unexpected device error, reopening: {reason}")
-            }
-            _ => log::info!("player: {reason}; reopening the default output"),
-        }
-        s.sink = None; // Drop releases the client
-        s.written = 0;
+        log::info!("player: {reason}; reopening the default output");
+        s.detach();
         s.reopen = Some((Instant::now(), 0));
     }
 
@@ -608,13 +684,13 @@ impl<B: Backend> Engine<B> {
         };
         match self.backend.open() {
             Ok(sink) => {
-                s.sink = Some(sink);
+                s.attach(sink);
                 s.reopen = None;
                 let at = s.position.round() as u64;
                 self.seek_to(at);
             }
             Err(e) if failures + 1 >= MAX_REOPEN_FAILURES => {
-                self.fail(format!("could not open the audio output: {e}"));
+                self.output_failed(format!("could not open the audio output: {e}"));
             }
             Err(e) => {
                 log::debug!("player: reopen attempt {} failed: {e}", failures + 1);
@@ -623,13 +699,18 @@ impl<B: Backend> Engine<B> {
         }
     }
 
-    /// Playback cannot continue: surface `message` as the load error.
-    fn fail(&mut self, message: String) {
+    /// The output cannot play right now: pause, keep the file and position,
+    /// and report `message` as a play error (the next `play` reopens).
+    fn output_failed(&mut self, message: String) {
         log::warn!("player: {message}");
-        self.session = None;
+        if let Some(s) = self.session.as_mut() {
+            s.detach();
+            s.reopen = None;
+        }
         self.playing = false;
-        self.shared
-            .publish_load(self.generation, PlayerLoad::Error(message), 0);
+        self.shared.publish_play_error(self.generation, message);
+        self.publish_position();
+        self.publish_state();
         (self.on_change)();
     }
 
@@ -654,10 +735,10 @@ impl<B: Backend> Engine<B> {
         // errors mean the device is gone.
         match sink.wait(EVENT_WAIT_MS) {
             Ok(()) | Err(SinkError::Timeout) => {}
-            Err(e) => return self.device_lost(e),
+            Err(e) => return self.sink_failed(e),
         }
-        if let Step::Lost(e) = self.fill() {
-            return self.device_lost(e);
+        if let Step::Failed(e) = self.fill() {
+            return self.sink_failed(e);
         }
         if self.last_device_check.elapsed() >= self.device_check_every {
             self.last_device_check = Instant::now();
@@ -687,6 +768,9 @@ pub(crate) fn run<B, F>(
 {
     #[cfg(windows)]
     let _ = wasapi::initialize_mta();
+    // Transcription can saturate every core; keep the render thread ahead.
+    #[cfg(windows)]
+    let _mmcss = wasapi_out::Mmcss::register();
     let mut engine = Engine::new(make_backend(), shared, on_change);
     loop {
         let cmd = if engine.rendering() {
@@ -764,8 +848,42 @@ mod wasapi_out {
         StreamMode, WasapiError, WaveFormat,
     };
 
-    /// 20 ms device buffer (the engine period is ~10 ms).
-    const BUFFER_DURATION_HNS: i64 = 200_000;
+    /// 50 ms device buffer (the engine period is ~10 ms): headroom against
+    /// CPU contention from transcription. Latency does not affect position
+    /// accuracy (the FIFO accounts for it) nor seeks (they reset the
+    /// buffer); only speed/volume changes take up to 50 ms longer to land.
+    const BUFFER_DURATION_HNS: i64 = 500_000;
+    /// AUDCLNT_E_NOT_STOPPED: `Start` on a running stream (harmless).
+    const NOT_STOPPED: u32 = 0x8889_0005;
+
+    /// MMCSS "Playback" registration for the player thread, reverted on drop.
+    pub(crate) struct Mmcss(windows::Win32::Foundation::HANDLE);
+
+    impl Mmcss {
+        pub(crate) fn register() -> Option<Mmcss> {
+            use windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW;
+            let mut index = 0u32;
+            // SAFETY: a static task name and a valid out-pointer.
+            match unsafe {
+                AvSetMmThreadCharacteristicsW(windows::core::w!("Playback"), &mut index)
+            } {
+                Ok(handle) => Some(Mmcss(handle)),
+                Err(e) => {
+                    log::debug!("player: MMCSS registration failed: {e}");
+                    None
+                }
+            }
+        }
+    }
+
+    impl Drop for Mmcss {
+        fn drop(&mut self) {
+            use windows::Win32::System::Threading::AvRevertMmThreadCharacteristics;
+            // SAFETY: the handle came from AvSetMmThreadCharacteristicsW on
+            // this thread and is reverted once.
+            let _ = unsafe { AvRevertMmThreadCharacteristics(self.0) };
+        }
+    }
 
     #[derive(Default)]
     pub(crate) struct WasapiBackend {
@@ -863,7 +981,10 @@ mod wasapi_out {
         }
 
         fn start(&mut self) -> Result<(), SinkError> {
-            self.client.start_stream().map_err(|e| classify(&e))
+            match self.client.start_stream() {
+                Err(WasapiError::Windows(e)) if e.code().0 as u32 == NOT_STOPPED => Ok(()),
+                r => r.map_err(|e| classify(&e)),
+            }
         }
 
         fn stop(&mut self) -> Result<(), SinkError> {
@@ -912,7 +1033,9 @@ pub(crate) mod fake {
         pub default_endpoint: String,
         pub timeouts: u32,
         pub padding_error: Option<SinkError>,
+        pub wait_error: Option<SinkError>,
         pub played: u64,
+        pub starts: usize,
         pub peak: f32,
         /// Sleep a little per period (end-to-end tests through the thread,
         /// so state can be observed between periods).
@@ -1003,8 +1126,14 @@ pub(crate) mod fake {
             Ok(())
         }
 
+        /// Like raw WASAPI: starting a running stream is an error.
         fn start(&mut self) -> Result<(), SinkError> {
-            self.device.state().running = true;
+            let mut st = self.device.state();
+            if st.running {
+                return Err(SinkError::Other("AUDCLNT_E_NOT_STOPPED".into()));
+            }
+            st.running = true;
+            st.starts += 1;
             Ok(())
         }
 
@@ -1023,6 +1152,9 @@ pub(crate) mod fake {
         /// "Plays" one period per call while running.
         fn wait(&mut self, _timeout_ms: u32) -> Result<(), SinkError> {
             let mut st = self.device.state();
+            if let Some(e) = st.wait_error.take() {
+                return Err(e);
+            }
             if st.timeouts > 0 {
                 st.timeouts -= 1;
                 return Err(SinkError::Timeout);
@@ -1129,6 +1261,7 @@ mod tests {
             );
             shared.generation.store(1, Ordering::Release);
             shared.seek_seq.store(1, Ordering::Release);
+            shared.cmd_seq.store(1, Ordering::Release);
             shared
                 .position
                 .store(pack_position(1, 0), Ordering::Release);
@@ -1153,17 +1286,68 @@ mod tests {
             self.engine.session.as_ref().unwrap().position
         }
 
-        fn seek(&mut self, ms: u64) {
+        /// What `Player::seek_ms` does on the UI thread; returns the command
+        /// it would send.
+        fn ui_seek(&self, ms: u64) -> Cmd {
+            let _meta = self.shared.meta();
+            self.shared.cmd_seq.fetch_add(1, Ordering::AcqRel);
             let seq = self.shared.seek_seq.fetch_add(1, Ordering::AcqRel) + 1;
+            self.shared.ended.store(false, Ordering::Release);
             self.shared
                 .position
                 .store(pack_position(seq, ms), Ordering::Release);
-            self.engine.handle(Cmd::Seek { ms, seq });
+            Cmd::Seek { ms, seq }
+        }
+
+        /// What `Player::play` does on the UI thread.
+        fn ui_play(&self) -> Cmd {
+            let _meta = self.shared.meta();
+            self.shared.cmd_seq.fetch_add(1, Ordering::AcqRel);
+            self.shared.playing.store(true, Ordering::Release);
+            Cmd::Play
+        }
+
+        fn ui_pause(&self) -> Cmd {
+            let _meta = self.shared.meta();
+            self.shared.cmd_seq.fetch_add(1, Ordering::AcqRel);
+            self.shared.playing.store(false, Ordering::Release);
+            Cmd::Pause
+        }
+
+        fn seek(&mut self, ms: u64) {
+            let cmd = self.ui_seek(ms);
+            self.engine.handle(cmd);
         }
 
         fn play(&mut self) {
-            self.shared.playing.store(true, Ordering::Release);
-            self.engine.handle(Cmd::Play);
+            let cmd = self.ui_play();
+            self.engine.handle(cmd);
+        }
+
+        fn pause(&mut self) {
+            let cmd = self.ui_pause();
+            self.engine.handle(cmd);
+        }
+
+        fn playing(&self) -> bool {
+            self.shared.playing.load(Ordering::Acquire)
+        }
+
+        fn ended(&self) -> bool {
+            self.shared.ended.load(Ordering::Acquire)
+        }
+
+        fn play_error(&self) -> Option<String> {
+            self.shared.meta().play_error.take()
+        }
+
+        /// Make a scheduled reopen attempt due now.
+        fn reopen_now(&mut self) {
+            if let Some(s) = self.engine.session.as_mut() {
+                if let Some((_, f)) = s.reopen {
+                    s.reopen = Some((Instant::now(), f));
+                }
+            }
         }
 
         fn ticks(&mut self, n: usize) {
@@ -1200,7 +1384,7 @@ mod tests {
         assert_eq!(rig.position_ms(), 1_350);
 
         // Pause holds the position; resume continues from it.
-        rig.engine.handle(Cmd::Pause);
+        rig.pause();
         rig.ticks(5);
         assert_eq!(rig.position_ms(), 1_350);
         rig.play();
@@ -1284,11 +1468,7 @@ mod tests {
         assert_eq!(rig.device.opens(), 1);
         // Retries are scheduled (500 ms backoff); force them due.
         for _ in 0..3 {
-            if let Some(s) = rig.engine.session.as_mut() {
-                if let Some((_, f)) = s.reopen {
-                    s.reopen = Some((Instant::now(), f));
-                }
-            }
+            rig.reopen_now();
             rig.ticks(1);
         }
         assert_eq!(rig.device.opens(), 2, "reopened once the device came back");
@@ -1311,19 +1491,144 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A segment click while playing sends seek + play. The seek restarts
+    /// the stream; the play must then leave it alone (real WASAPI rejects
+    /// `Start` on a running stream, and the fake does too).
     #[test]
-    fn no_device_reports_an_error() {
-        let dir = scratch("engine-nodev");
-        let path = make_archive(&dir, "n", 48_000);
+    fn seek_and_play_while_playing_keeps_the_stream() {
+        let dir = scratch("engine-seekplay");
+        let path = make_archive(&dir, "sp", 3 * 48_000);
         let mut rig = Rig::new(&path);
+        rig.play();
+        rig.ticks(10);
+        assert_eq!(rig.device.state().starts, 1);
+
+        rig.seek(500);
+        rig.play();
+        rig.play(); // and a stray extra play
+        assert_eq!(rig.device.opens(), 1, "seek + play reopened the device");
+        assert_eq!(rig.device.state().starts, 2, "only the seek restarts");
+        assert!(rig.engine.session.as_ref().unwrap().reopen.is_none());
+        assert!(rig.engine.rendering());
+        assert!(rig.playing() && rig.play_error().is_none());
+        assert_eq!(rig.position_ms(), 500);
+        rig.ticks(10);
+        assert_eq!(rig.position_ms(), 600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No usable output: the file stays loaded at its position, `playing`
+    /// drops back, the view gets a play error, and the next play retries.
+    #[test]
+    fn no_device_is_a_recoverable_play_error() {
+        let dir = scratch("engine-nodev");
+        let path = make_archive(&dir, "n", 2 * 48_000);
+        let mut rig = Rig::new(&path);
+        rig.seek(500);
         rig.device.state().open_failures = 1;
         rig.play();
-        let load = rig.shared.meta().load.clone();
+        assert_eq!(rig.shared.meta().load, PlayerLoad::Ready);
+        assert!(!rig.playing());
+        let err = rig.play_error();
         assert!(
-            matches!(load, PlayerLoad::Error(ref e) if e.contains("audio output")),
-            "{load:?}"
+            err.as_deref().is_some_and(|e| e.contains("audio output")),
+            "{err:?}"
         );
-        assert!(!rig.shared.playing.load(Ordering::Acquire));
+        assert_eq!(rig.position_ms(), 500);
+
+        // The headset is back: play just works, from where it was.
+        rig.play();
+        assert_eq!(rig.device.opens(), 1);
+        assert!(rig.engine.rendering() && rig.playing());
+        assert_eq!(rig.position_ms(), 500);
+        rig.ticks(5);
+        assert_eq!(rig.position_ms(), 550);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exhausted_reopens_and_other_errors_pause_recoverably() {
+        let dir = scratch("engine-exhaust");
+        let path = make_archive(&dir, "x", 3 * 48_000);
+        let mut rig = Rig::new(&path);
+        rig.play();
+        rig.ticks(20);
+        let before = rig.position_ms();
+
+        // The device vanishes and does not come back within the retries.
+        rig.device.state().padding_error = Some(SinkError::DeviceLost("gone".into()));
+        rig.device.state().open_failures = 100;
+        rig.ticks(1);
+        for _ in 0..MAX_REOPEN_FAILURES {
+            rig.reopen_now();
+            rig.ticks(1);
+        }
+        assert!(!rig.playing() && !rig.engine.rendering());
+        assert!(rig.play_error().is_some());
+        assert_eq!(rig.shared.meta().load, PlayerLoad::Ready);
+        assert!(rig.engine.session.as_ref().unwrap().reopen.is_none());
+        let held = rig.position_ms();
+        assert!(held.abs_diff(before) <= 10, "{held} vs {before}");
+
+        rig.device.state().open_failures = 0;
+        rig.play();
+        assert!(rig.engine.rendering());
+        assert_eq!(rig.position_ms(), held);
+
+        // An unexpected (non device-loss) error pauses instead of looping
+        // through reopens.
+        let opens = rig.device.opens();
+        rig.device.state().wait_error = Some(SinkError::Other("E_UNEXPECTED".into()));
+        rig.ticks(3);
+        assert_eq!(rig.device.opens(), opens);
+        assert!(!rig.playing() && rig.play_error().is_some());
+        rig.play();
+        assert!(rig.engine.rendering());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The end of the file is detected in the same instant the user clicks
+    /// a segment (seek + play queued): the click wins, and the snapshot
+    /// says playing at the click target, not paused and ended.
+    #[test]
+    fn end_racing_a_segment_click_leaves_a_consistent_snapshot() {
+        let dir = scratch("engine-endrace");
+        let path = make_archive(&dir, "e", 2 * 48_000);
+        let mut rig = Rig::new(&path);
+        rig.seek(1_900);
+        rig.play();
+        let seek = rig.ui_seek(200);
+        let play = rig.ui_play();
+        for _ in 0..100 {
+            if rig.engine.session.as_ref().unwrap().ended {
+                break;
+            }
+            rig.engine.tick();
+        }
+        assert!(rig.engine.session.as_ref().unwrap().ended);
+        assert!(
+            rig.playing() && !rig.ended(),
+            "end published over the click"
+        );
+        rig.engine.handle(seek);
+        rig.engine.handle(play);
+        assert!(rig.engine.rendering());
+        assert!(rig.playing() && !rig.ended());
+        assert_eq!(rig.position_ms(), 200);
+
+        // A seek alone (UI still playing) resumes playback at the target.
+        rig.seek(1_950);
+        let seek = rig.ui_seek(300);
+        rig.ticks(100);
+        assert!(rig.playing() && !rig.ended());
+        rig.engine.handle(seek);
+        assert!(rig.engine.rendering() && rig.playing() && !rig.ended());
+        assert_eq!(rig.position_ms(), 300);
+
+        // With nothing queued the end is published as before.
+        rig.seek(1_950);
+        rig.ticks(100);
+        assert!(!rig.playing() && rig.ended());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1350,8 +1655,11 @@ mod tests {
             (800..=1_200).contains(&p1),
             "after 1 s of playback position is {p1} ms"
         );
+        // A segment click: seek + play while already playing.
         player.seek_ms(4_000);
+        player.play();
         std::thread::sleep(Duration::from_millis(1_000));
+        assert!(player.take_play_error().is_none());
         let p2 = player.snapshot().position_ms;
         assert!((4_800..=5_200).contains(&p2), "after seek + 1 s: {p2} ms");
         player.set_speed(1.5);

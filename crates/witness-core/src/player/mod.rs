@@ -14,6 +14,13 @@
 //! state the UI sets (seek target, speed, volume, play intent) is visible in
 //! the very next snapshot, and the thread only ever publishes positions for
 //! the latest seek, so a slider never snaps back to a stale value.
+//!
+//! The `playing`/`ended` flags follow the same rule through a command
+//! counter: the UI bumps it (under the meta lock) with every command it
+//! sends, and the thread only publishes its own view of those flags when it
+//! has processed every command sent so far. A thread-side "ended" racing a
+//! segment click (seek + play) therefore never leaves the snapshot paused
+//! while audio plays: the click's commands republish the real state.
 
 pub(crate) mod archive;
 mod output;
@@ -90,6 +97,9 @@ fn unpack_position(word: u64) -> (u64, u64) {
 struct Meta {
     load: PlayerLoad,
     path: Option<PathBuf>,
+    /// Why the last `play` could not start (no usable output device), until
+    /// the UI takes it. The file stays loaded; the next `play` retries.
+    play_error: Option<String>,
 }
 
 /// State shared between the handle (UI thread) and the player thread.
@@ -102,6 +112,9 @@ pub(crate) struct Shared {
     position: AtomicU64,
     /// Last seek sequence handed out by the UI (the thread echoes it back).
     seek_seq: AtomicU64,
+    /// Play/Pause/Seek/Load/Unload commands sent so far; bumped under the
+    /// meta lock together with the UI's own flag updates.
+    cmd_seq: AtomicU64,
     duration_ms: AtomicU64,
     speed_bits: AtomicU32,
     volume_bits: AtomicU32,
@@ -113,12 +126,14 @@ impl Shared {
             meta: Mutex::new(Meta {
                 load: PlayerLoad::Unloaded,
                 path: None,
+                play_error: None,
             }),
             generation: AtomicU64::new(0),
             playing: AtomicBool::new(false),
             ended: AtomicBool::new(false),
             position: AtomicU64::new(0),
             seek_seq: AtomicU64::new(0),
+            cmd_seq: AtomicU64::new(0),
             duration_ms: AtomicU64::new(0),
             speed_bits: AtomicU32::new(1.0f32.to_bits()),
             volume_bits: AtomicU32::new(1.0f32.to_bits()),
@@ -184,21 +199,39 @@ impl Shared {
         meta.load = load;
     }
 
-    /// Thread side: playback stopped on its own (end of file or a device
-    /// error). `ended` mirrors `HTMLMediaElement.ended`.
-    pub(crate) fn publish_stopped(&self, generation: u64, ended: bool) {
+    /// Thread side: the engine's `playing`/`ended` after it processed
+    /// `handled` commands. Dropped (returns false) when the UI has sent
+    /// commands since: their handling republishes, and until then the UI's
+    /// own flags are the newer truth. `ended` mirrors `HTMLMediaElement.ended`.
+    pub(crate) fn publish_state(
+        &self,
+        generation: u64,
+        handled: u64,
+        playing: bool,
+        ended: bool,
+    ) -> bool {
         let _meta = self.meta();
-        if self.generation() != generation {
-            return;
+        if self.generation() != generation || self.cmd_seq.load(Ordering::Acquire) != handled {
+            return false;
         }
-        self.playing.store(false, Ordering::Release);
+        self.playing.store(playing, Ordering::Release);
         self.ended.store(ended, Ordering::Release);
+        true
+    }
+
+    /// Thread side: `play` failed for want of an output device.
+    pub(crate) fn publish_play_error(&self, generation: u64, message: String) {
+        let mut meta = self.meta();
+        if self.generation() == generation {
+            meta.play_error = Some(message);
+        }
     }
 }
 
 /// Commands to the player thread, processed strictly in order.
 #[derive(Debug)]
 pub(crate) enum Cmd {
+    // Every variant but `Wake` pairs with one `Shared::cmd_seq` bump.
     Load {
         path: PathBuf,
         generation: u64,
@@ -268,6 +301,12 @@ impl Player {
         }
     }
 
+    /// Count a command about to be sent (call with the meta lock held,
+    /// before updating the flags it changes).
+    fn bump(&self) {
+        self.shared.cmd_seq.fetch_add(1, Ordering::AcqRel);
+    }
+
     fn next_seq(&self) -> u64 {
         (self.shared.seek_seq.fetch_add(1, Ordering::AcqRel) + 1) & SEQ_MASK
     }
@@ -278,6 +317,7 @@ impl Player {
         let seq = self.next_seq();
         meta.load = load;
         meta.path = path;
+        meta.play_error = None;
         self.shared.playing.store(false, Ordering::Release);
         self.shared.ended.store(false, Ordering::Release);
         self.shared.duration_ms.store(0, Ordering::Release);
@@ -287,14 +327,16 @@ impl Player {
         (generation, seq)
     }
 
-    /// Open `path` (no-op if the same path is already loaded). Seeks and
-    /// `play` issued before it is ready apply once it is.
+    /// Open `path` (no-op if the same path is already loaded, unless that
+    /// load failed: then it retries). Seeks and `play` issued before it is
+    /// ready apply once it is.
     pub fn load(&self, path: PathBuf) {
         let (generation, seq) = {
             let mut meta = self.shared.meta();
-            if meta.path.as_ref() == Some(&path) {
+            if meta.path.as_ref() == Some(&path) && !matches!(meta.load, PlayerLoad::Error(_)) {
                 return;
             }
+            self.bump();
             self.reset(&mut meta, PlayerLoad::Loading, Some(path.clone()))
         };
         self.send(Cmd::Load {
@@ -312,24 +354,36 @@ impl Player {
             if meta.path.is_none() && meta.load == PlayerLoad::Unloaded {
                 return;
             }
+            self.bump();
             self.reset(&mut meta, PlayerLoad::Unloaded, None)
         };
         self.send(Cmd::Unload { generation, seq });
         (self.on_change)();
     }
 
-    /// Start (or resume) playback; after `ended` it restarts at 0.
+    /// Start (or resume) playback; after `ended` it restarts at 0. A no-op
+    /// for the device while already playing (HTML `play()` semantics). If no
+    /// output device can be opened, `playing` drops back to false and
+    /// [`Player::take_play_error`] says why.
     pub fn play(&self) {
         if self.shared.ended.load(Ordering::Acquire) {
             self.seek_ms(0);
         }
-        self.shared.playing.store(true, Ordering::Release);
+        {
+            let _meta = self.shared.meta();
+            self.bump();
+            self.shared.playing.store(true, Ordering::Release);
+        }
         self.send(Cmd::Play);
         (self.on_change)();
     }
 
     pub fn pause(&self) {
-        self.shared.playing.store(false, Ordering::Release);
+        {
+            let _meta = self.shared.meta();
+            self.bump();
+            self.shared.playing.store(false, Ordering::Release);
+        }
         self.send(Cmd::Pause);
         (self.on_change)();
     }
@@ -346,17 +400,21 @@ impl Player {
     /// Clamped to [0, duration]; works while paused or before ready
     /// (deferred: the thread clamps once the duration is known).
     pub fn seek_ms(&self, ms: u64) {
-        let ready = self.shared.meta().load == PlayerLoad::Ready;
-        let ms = if ready {
-            ms.min(self.shared.duration_ms())
-        } else {
-            ms
+        let (ms, seq) = {
+            let meta = self.shared.meta();
+            let ms = if meta.load == PlayerLoad::Ready {
+                ms.min(self.shared.duration_ms())
+            } else {
+                ms
+            };
+            self.bump();
+            let seq = self.next_seq();
+            self.shared.ended.store(false, Ordering::Release);
+            self.shared
+                .position
+                .store(pack_position(seq, ms), Ordering::Release);
+            (ms, seq)
         };
-        let seq = self.next_seq();
-        self.shared.ended.store(false, Ordering::Release);
-        self.shared
-            .position
-            .store(pack_position(seq, ms), Ordering::Release);
         self.send(Cmd::Seek { ms, seq });
         (self.on_change)();
     }
@@ -394,6 +452,13 @@ impl Player {
             .store(volume.to_bits(), Ordering::Relaxed);
         self.send(Cmd::Wake);
         (self.on_change)();
+    }
+
+    /// The reason the last `play` could not start (no usable audio output),
+    /// once: the view toasts "Could not play recording". The file stays
+    /// loaded at its position and the next `play` tries the device again.
+    pub fn take_play_error(&self) -> Option<String> {
+        self.shared.meta().play_error.take()
     }
 
     /// Current state. [ui-ok]
@@ -559,8 +624,14 @@ mod tests {
         assert!(changes.load(Ordering::Relaxed) >= 4);
 
         // A broken file reports an error the view can show.
-        player.load(dir.join("missing.opus"));
+        let missing = dir.join("missing.opus");
+        player.load(missing.clone());
         wait_until(&player, "error", |s| matches!(s.load, PlayerLoad::Error(_)));
+        // Loading the same path again after an error retries.
+        std::fs::copy(&path, &missing).unwrap();
+        player.load(missing);
+        wait_until(&player, "retry ready", |s| s.load == PlayerLoad::Ready);
+        assert_eq!(player.snapshot().generation, 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

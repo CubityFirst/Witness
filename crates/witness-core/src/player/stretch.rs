@@ -11,6 +11,12 @@
 //! both channels so the stereo image is untouched.
 //!
 //! Input and output are interleaved stereo f32 at 48 kHz.
+//!
+//! Speed changes are seamless: the state carries across them, entering
+//! WSOLA from the 1× bypass primes the overlap tail with the very input
+//! that follows (so the first hop reproduces it exactly instead of fading
+//! in from silence), and returning to 1× cross-fades the last segment into
+//! the input over one hop before handing back to the bit-exact bypass.
 
 /// Analysis/synthesis window: 20 ms.
 const WINDOW: usize = 960;
@@ -43,6 +49,9 @@ pub struct Wsola {
     /// Source frames (since the last flush) represented by the output
     /// emitted so far.
     emitted_src: f64,
+    /// The bypass already emitted audio: the next segment must continue it
+    /// rather than fade in from silence.
+    prime: bool,
 }
 
 impl Default for Wsola {
@@ -65,6 +74,7 @@ impl Wsola {
             template: None,
             received: 0,
             emitted_src: 0.0,
+            prime: false,
         }
     }
 
@@ -74,16 +84,22 @@ impl Wsola {
     }
 
     /// Feed interleaved stereo `input` and append whatever output is ready
-    /// to `out`. `speed` may change between calls (the player flushes on a
-    /// change anyway). At exactly 1.0× with no WSOLA state in flight the
-    /// input passes through bit-exact.
+    /// to `out`. `speed` may change between calls without a glitch. At
+    /// exactly 1.0× with no WSOLA state in flight the input passes through
+    /// bit-exact; switching back to 1.0× returns to that bypass after one
+    /// cross-faded hop.
     pub fn process(&mut self, input: &[f32], speed: f32, out: &mut Vec<f32>) {
         let frames_in = (input.len() / 2) as u64;
         self.received += frames_in;
-        if speed == 1.0 && !self.active() {
-            out.extend_from_slice(input);
-            self.emitted_src += frames_in as f64;
-            return;
+        let unity = speed == 1.0;
+        if !self.active() {
+            if unity {
+                out.extend_from_slice(input);
+                self.emitted_src += frames_in as f64;
+                return;
+            }
+            // Leaving the bypass mid-stream: continue its output exactly.
+            self.prime = self.emitted_src > 0.0;
         }
         self.input.extend_from_slice(input);
         self.mono
@@ -99,7 +115,21 @@ impl Wsola {
                 break; // need more input
             }
             let x = match self.template {
-                None => nominal,
+                None => {
+                    if std::mem::take(&mut self.prime) {
+                        // Pretend the bypass output came from a segment
+                        // ending at `nominal`: its windowed second half is
+                        // the input right here, so `tail + w_in·input`
+                        // below reproduces the input sample for sample.
+                        for j in 0..HOP {
+                            for c in 0..2 {
+                                self.tail[j * 2 + c] =
+                                    self.window[HOP + j] * self.input[(nominal + j) * 2 + c];
+                            }
+                        }
+                    }
+                    nominal
+                }
                 Some(template) => self.best_offset(template, lo, hi),
             };
 
@@ -111,6 +141,15 @@ impl Wsola {
                     out.push(self.tail[j * 2 + c] + w_in * self.input[(x + j) * 2 + c]);
                     self.tail[j * 2 + c] = w_out * self.input[(x + HOP + j) * 2 + c];
                 }
+            }
+            if unity {
+                // Back at 1×: that hop cross-faded the previous segment into
+                // the input at `x`, so from `x + HOP` on the input continues
+                // untouched. Hand everything buffered to the bypass.
+                out.extend_from_slice(&self.input[(x + HOP) * 2..]);
+                self.emitted_src = self.received as f64;
+                self.clear_buffers();
+                return;
             }
             self.template = Some(x + HOP);
             self.ana_pos += HOP as f64 * speed;
@@ -148,15 +187,22 @@ impl Wsola {
         self.flush();
     }
 
-    /// Drop all state (seek, speed change, unload).
+    /// Drop all state (seek, unload). The next output fades in from
+    /// silence, which suits a stream that restarts somewhere else.
     pub fn flush(&mut self) {
+        self.clear_buffers();
+        self.received = 0;
+        self.emitted_src = 0.0;
+    }
+
+    /// Drop buffered input and overlap state but keep the source accounting.
+    fn clear_buffers(&mut self) {
         self.input.clear();
         self.mono.clear();
         self.tail.fill(0.0);
         self.ana_pos = 0.0;
         self.template = None;
-        self.received = 0;
-        self.emitted_src = 0.0;
+        self.prime = false;
     }
 
     /// Source frames received but not yet represented in the output.
@@ -284,6 +330,44 @@ mod tests {
         assert_eq!(out, input);
         assert_eq!(w.latency_frames(), 0);
         assert_eq!(w.emitted_source_frames(), 48_000.0);
+    }
+
+    /// 1× → 1.5× → 2× → 1× mid-stream, as the player does it: no fade to
+    /// silence and no waveform jump at any switch, and back at 1× the output
+    /// is the input again, bit for bit.
+    #[test]
+    fn speed_changes_are_seamless() {
+        let input = sine_stereo(440.0, 3 * 48_000);
+        let packets: Vec<&[f32]> = input.chunks(960 * 2).collect();
+        let mut w = Wsola::new();
+        let mut out = Vec::new();
+        for (i, packet) in packets.iter().enumerate() {
+            let speed = match i {
+                0..=19 => 1.0,
+                20..=59 => 1.5,
+                60..=99 => 2.0,
+                _ => 1.0,
+            };
+            w.process(packet, speed, &mut out);
+        }
+        let left: Vec<f32> = out.chunks_exact(2).map(|f| f[0]).collect();
+        // Largest step a clean 0.5-amplitude 440 Hz sine takes per sample.
+        let max_step = 0.5 * std::f32::consts::TAU * 440.0 / 48_000.0;
+        for (i, pair) in left.windows(2).enumerate() {
+            let step = (pair[1] - pair[0]).abs();
+            assert!(step < max_step * 1.5, "jump of {step} at output frame {i}");
+        }
+        // 120 frames is just over one period: every block must reach full
+        // level (a fade-in from silence would not).
+        for (i, block) in left[..left.len() - 120].chunks(120).enumerate() {
+            let peak = block.iter().fold(0f32, |m, &v| m.max(v.abs()));
+            assert!(peak > 0.45, "level dip in block {i}: peak {peak}");
+        }
+        // Back in the bypass: the last packets came through untouched.
+        assert_eq!(w.latency_frames(), 0);
+        let tail = 20 * 960 * 2;
+        assert_eq!(out[out.len() - tail..], input[input.len() - tail..]);
+        assert_eq!(w.emitted_source_frames(), (3 * 48_000) as f64);
     }
 
     #[test]
