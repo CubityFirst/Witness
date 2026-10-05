@@ -6,6 +6,12 @@
 //! replaces a queued older one — and the single thread takes a draft out
 //! before writing it, so writes for one meeting happen in seq order and an
 //! in-flight write can never land after a newer one.
+//!
+//! Durability: `AppCore::flush_notes` (called on every exit path) is the
+//! only guarantee that queued drafts reach the database. The thread reaches
+//! the core through a `Weak`, and the writer is dropped together with the
+//! core, so drafts still queued when the core itself is dropped are logged
+//! and discarded, not written.
 
 use super::{AppCore, CoreEvent, CoreResult};
 use std::collections::BTreeMap;
@@ -50,8 +56,9 @@ pub(crate) struct NotesWriter {
 }
 
 impl NotesWriter {
-    /// Start the "notes-writer" thread. It exits once the writer is dropped
-    /// and every queued draft has been written.
+    /// Start the "notes-writer" thread. Once the writer is dropped the thread
+    /// drains what is queued — writing it only while `target` is still alive
+    /// (never the case for `AppCore`, see the module docs) — then exits.
     pub(crate) fn spawn<T: NotesTarget>(target: Weak<T>) -> NotesWriter {
         let shared = Arc::new(Shared {
             queue: Mutex::new(NotesQueue::default()),
@@ -303,8 +310,10 @@ mod tests {
         )));
     }
 
+    /// Writer semantics only: the fake target outlives the writer here. With
+    /// the real core both go together, so `flush_notes` is what exits rely on.
     #[test]
-    fn dropping_the_writer_still_writes_queued_drafts() {
+    fn dropped_writer_drains_queue_while_target_lives() {
         let (db, _entered) = fake(None);
         let writer = NotesWriter::spawn(Arc::downgrade(&db));
         writer.queue(4, "last words".into());

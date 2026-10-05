@@ -4,10 +4,12 @@
 //! UI thread never joins capture threads itself. The meeting watcher keeps
 //! calling the direct `AppCore` methods on its own thread, as before.
 
+use super::recording::{ALREADY_STOPPING, STILL_STARTING};
 use super::{AppCore, CoreResult, Trigger};
 use crossbeam_channel::{Receiver, Sender};
 use std::panic::AssertUnwindSafe;
 use std::sync::Weak;
+use std::time::{Duration, Instant};
 
 /// A recording-control request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,15 +139,40 @@ pub(crate) fn submit(tx: &Sender<Request>, cmd: RecCmd) -> Receiver<CoreResult<R
     reply_rx
 }
 
+/// How long tray Quit waits for a start or stop already running on another
+/// thread (the meeting watcher) before giving up and exiting anyway.
+pub(crate) const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
+/// Re-ask interval while that other start/stop is in flight.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
+
 /// Tray Quit: stop the recording through the queue — behind any pending
-/// toggle — and wait for it. "Not recording" is the normal idle answer;
-/// other failures are logged, never returned (quit proceeds regardless).
-pub(crate) fn shutdown(tx: &Sender<Request>) {
-    match submit(tx, RecCmd::Stop { by_user: true }).recv() {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) if e == "Not recording" => {}
-        Ok(Err(e)) => log::error!("stopping recording on quit: {e}"),
-        Err(_) => log::error!("stopping recording on quit: recording control is unavailable"),
+/// toggle — and wait for it. "Not recording" is the normal idle answer.
+/// If the watcher is mid-start or mid-stop on its own thread, the stop is
+/// re-queued until that settles (up to `wait`), so Quit never exits while
+/// the WAVs are still being finalized. Other failures are logged, never
+/// returned (quit proceeds regardless).
+pub(crate) fn shutdown(tx: &Sender<Request>, wait: Duration) {
+    let deadline = Instant::now() + wait;
+    loop {
+        match submit(tx, RecCmd::Stop { by_user: true }).recv() {
+            Ok(Ok(_)) => return,
+            Ok(Err(e)) if e == "Not recording" => return,
+            Ok(Err(e)) if e == STILL_STARTING || e == ALREADY_STOPPING => {
+                if Instant::now() >= deadline {
+                    log::error!("stopping recording on quit: {e} after {wait:?}; exiting anyway");
+                    return;
+                }
+                std::thread::sleep(SHUTDOWN_POLL);
+            }
+            Ok(Err(e)) => {
+                log::error!("stopping recording on quit: {e}");
+                return;
+            }
+            Err(_) => {
+                log::error!("stopping recording on quit: recording control is unavailable");
+                return;
+            }
+        }
     }
 }
 
@@ -167,10 +194,11 @@ impl AppCore {
     }
 
     /// Tray Quit: stop the recording if one runs (failures are logged, not
-    /// returned). Queued behind any pending toggle and blocks until done. ⏳
+    /// returned). Queued behind any pending toggle and blocks until done —
+    /// including a watcher start/stop already in flight (up to 30 s). ⏳
     pub fn shutdown(&self) {
         super::assert_off_ui_thread("shutdown");
-        shutdown(&self.rec_tx);
+        shutdown(&self.rec_tx, SHUTDOWN_WAIT);
     }
 
     /// Tray menu + record hotkey: stop if recording (by the user), else start
@@ -198,6 +226,9 @@ mod tests {
         toasts: Mutex<Vec<String>>,
         sink: CollectSink,
         fail_start: bool,
+        /// Stops answered with ALREADY_STOPPING (another thread finalizing)
+        /// before the fake reports the outcome of that other stop.
+        stopping_replies: Mutex<u32>,
     }
 
     impl FakeRecorder {
@@ -211,6 +242,7 @@ mod tests {
                 toasts: Mutex::new(Vec::new()),
                 sink: CollectSink::default(),
                 fail_start,
+                stopping_replies: Mutex::new(0),
             })
         }
         fn calls(&self) -> Vec<String> {
@@ -250,6 +282,16 @@ mod tests {
         fn stop_recording(&self, by_user: bool) -> CoreResult<()> {
             std::thread::sleep(Duration::from_millis(10));
             self.calls.lock().unwrap().push(format!("stop({by_user})"));
+            let mut stopping = self.stopping_replies.lock().unwrap();
+            if *stopping > 0 {
+                *stopping -= 1;
+                if *stopping == 0 {
+                    // The other thread's stop has now finished.
+                    *self.recording.lock().unwrap() = false;
+                }
+                return Err(ALREADY_STOPPING.into());
+            }
+            drop(stopping);
             let mut recording = self.recording.lock().unwrap();
             if !*recording {
                 return Err("Not recording".into());
@@ -359,12 +401,35 @@ mod tests {
         // A toggle (start) is still queued when Quit arrives: the quit stop
         // must run after it, so the new recording is finalized too.
         let _dropped_reply = submit(&tx, RecCmd::ToggleWithToast);
-        shutdown(&tx);
+        shutdown(&tx, SHUTDOWN_WAIT);
         assert_eq!(fake.calls(), ["start(manual)", "stop(true)"]);
         assert!(!fake.is_recording());
         // Idle quit: "Not recording" is fine and nothing else happens.
-        shutdown(&tx);
+        shutdown(&tx, SHUTDOWN_WAIT);
         assert_eq!(fake.calls().len(), 3);
+    }
+
+    #[test]
+    fn shutdown_waits_for_a_stop_already_in_flight() {
+        // The watcher is finalizing on its own thread: the first three quit
+        // stops see "already stopping", then the recorder is idle.
+        let fake = FakeRecorder::new(true);
+        *fake.stopping_replies.lock().unwrap() = 3;
+        let tx = spawn(Arc::downgrade(&fake));
+        shutdown(&tx, SHUTDOWN_WAIT);
+        assert_eq!(fake.calls(), ["stop(true)"; 4]);
+        assert!(!fake.is_recording());
+    }
+
+    #[test]
+    fn shutdown_gives_up_on_a_stuck_stop_after_the_wait() {
+        let fake = FakeRecorder::new(true);
+        *fake.stopping_replies.lock().unwrap() = u32::MAX;
+        let tx = spawn(Arc::downgrade(&fake));
+        let started = std::time::Instant::now();
+        shutdown(&tx, Duration::from_millis(250));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(fake.calls().len() >= 2);
     }
 
     #[test]

@@ -42,10 +42,15 @@ impl Notifier for WinToastNotifier {
 #[cfg(windows)]
 fn show_toast(body: &str) {
     use tauri_winrt_notification::{Duration, Toast};
+    // `.sound(None)` writes `<audio silent="true"/>`. 0.2.x toasts were
+    // silent (notify-rust maps "no sound name" to None), and the crate's
+    // default chime would play on the default render endpoint mid-call —
+    // where device-level loopback can record it into the meeting.
     if let Err(error) = Toast::new(app_id())
         .title("Witness")
         .text1(body)
         .duration(Duration::Short)
+        .sound(None)
         .show()
     {
         log::debug!("toast failed: {error:?}");
@@ -79,8 +84,10 @@ pub fn app_id() -> &'static str {
 /// (default value) names `$INSTDIR`, so a dev build in any target dir —
 /// shared, `target-test`, a worktree — is never mistaken for the installed
 /// app while one is installed. Without that key the Tauri plugin's rule
-/// applies: installed unless the exe sits in `…\target\debug` or
-/// `…\target\release`.
+/// applies (installed unless the exe sits in `…\target\debug` or
+/// `…\target\release`), widened to any cargo profile dir — one holding
+/// `deps\` or `.fingerprint\`, which an NSIS install dir never does — so
+/// shared and `target-test` target dirs stay on the PowerShell ID too.
 pub fn is_installed_build() -> bool {
     static INSTALLED: OnceLock<bool> = OnceLock::new();
     *INSTALLED.get_or_init(|| {
@@ -125,8 +132,12 @@ fn installed_by_rule(exe_dir: &Path, install_dir: Option<&Path>) -> bool {
             // tauri-plugin-notification 2.3.3 desktop.rs:197-205.
             let sep = std::path::MAIN_SEPARATOR;
             let dir = exe_dir.display().to_string();
-            !(dir.ends_with(&format!("{sep}target{sep}debug"))
-                || dir.ends_with(&format!("{sep}target{sep}release")))
+            let tauri_dev = dir.ends_with(&format!("{sep}target{sep}debug"))
+                || dir.ends_with(&format!("{sep}target{sep}release"));
+            // Any other cargo profile dir (shared CARGO_TARGET_DIR, target-test).
+            let cargo_profile =
+                exe_dir.join("deps").is_dir() || exe_dir.join(".fingerprint").is_dir();
+            !(tauri_dev || cargo_profile)
         }
     }
 }
@@ -176,10 +187,30 @@ mod tests {
             Path::new(r"C:\Users\x\AppData\Local\Witness"),
             None
         ));
-        // Not covered by the plugin's rule: a shared target dir's profile.
-        assert!(installed_by_rule(
-            Path::new(r"C:\witness-port\target\f0\debug"),
-            None
+    }
+
+    #[test]
+    fn cargo_profile_dirs_are_dev_without_registry() {
+        // A shared target dir's profile is outside the plugin's suffix rule
+        // but holds `deps\` — e.g. the profile dir this test binary sits under.
+        let deps_dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let profile_dir = deps_dir.parent().unwrap();
+        assert!(profile_dir.join("deps").is_dir());
+        assert!(!installed_by_rule(profile_dir, None));
+
+        let scratch = std::env::temp_dir().join(format!(
+            "witness-notify-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        assert!(installed_by_rule(&scratch, None));
+        std::fs::create_dir(scratch.join(".fingerprint")).unwrap();
+        assert!(!installed_by_rule(&scratch, None));
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }

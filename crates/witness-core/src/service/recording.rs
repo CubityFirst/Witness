@@ -11,6 +11,13 @@ use crate::state::RecorderState;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+/// `stop_recording`'s answer while another thread (the watcher) is still
+/// starting the recording. Transient: tray Quit waits it out.
+pub(crate) const STILL_STARTING: &str = "Recording is still starting";
+/// `stop_recording`'s answer while another thread is finalizing the WAVs.
+/// Transient: tray Quit waits it out.
+pub(crate) const ALREADY_STOPPING: &str = "Recording is already stopping";
+
 /// Identity of a capture problem, independent of the numbers in its message.
 /// Health is re-evaluated every 500 ms and the dropped-audio counters only
 /// grow, so a message-level comparison would treat every tick of an ongoing
@@ -254,14 +261,12 @@ impl AppCore {
 
         let live_started = state.live_captions.load(Ordering::Relaxed);
 
-        self.emit(CoreEvent::RecordingStarted(events::RecordingStarted {
+        self.emit_started(events::RecordingStarted {
             meeting_id: id,
             trigger,
             started_at: now.to_rfc3339(),
             live_captions: live_started,
-        }));
-        self.emit(CoreEvent::MeetingsChanged);
-        self.emit(CoreEvent::TrayRecording(true));
+        });
 
         // Auto-recorded meetings: try to pick up the meeting subject from the
         // Teams window title (it settles a little after joining).
@@ -305,6 +310,13 @@ impl AppCore {
             .ok();
     }
 
+    /// Emitted by a successful start, in this order.
+    fn emit_started(&self, started: events::RecordingStarted) {
+        self.emit(CoreEvent::RecordingStarted(started));
+        self.emit(CoreEvent::MeetingsChanged);
+        self.emit(CoreEvent::TrayRecording(true));
+    }
+
     /// Emitted by every stop exit path, in this order.
     fn emit_stopped(&self, meeting_id: i64) {
         self.emit(CoreEvent::RecordingStopped(events::RecordingStopped {
@@ -332,11 +344,11 @@ impl AppCore {
                 }
                 RecorderState::Starting => {
                     *recorder = RecorderState::Starting;
-                    return Err("Recording is still starting".into());
+                    return Err(STILL_STARTING.into());
                 }
                 stopping @ RecorderState::Stopping { .. } => {
                     *recorder = stopping;
-                    return Err("Recording is already stopping".into());
+                    return Err(ALREADY_STOPPING.into());
                 }
                 RecorderState::Idle => return Err("Not recording".into()),
             }
@@ -509,6 +521,49 @@ impl AppCore {
 mod tests {
     use super::*;
     use crate::recorder::TrackHealth;
+    use crate::service::testing::scratch_core;
+
+    /// Compact names for the lifecycle events §3.2 orders.
+    fn lifecycle(events: &[CoreEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| match event {
+                CoreEvent::RecordingStarted(e) => format!("started({})", e.meeting_id),
+                CoreEvent::RecordingStopped(e) => format!("stopped({})", e.meeting_id),
+                CoreEvent::MeetingsChanged => "meetings".into(),
+                CoreEvent::TrayRecording(on) => format!("tray({on})"),
+                CoreEvent::CloseCaptionsOverlay => "close-overlay".into(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn start_and_stop_emit_lifecycle_events_in_order() {
+        let (core, sink, _dir) = scratch_core("lifecycle");
+        let before = sink.events().len();
+        core.emit_started(events::RecordingStarted {
+            meeting_id: 42,
+            trigger: "manual",
+            started_at: String::new(),
+            live_captions: false,
+        });
+        // Every stop exit path (normal, WAV failure, DB failure) goes
+        // through emit_stopped.
+        core.emit_stopped(42);
+        assert_eq!(
+            lifecycle(&sink.events()[before..]),
+            [
+                "started(42)",
+                "meetings",
+                "tray(true)",
+                "stopped(42)",
+                "meetings",
+                "tray(false)",
+                "close-overlay",
+            ]
+        );
+    }
 
     #[test]
     fn capture_warning_kind_is_stable_while_counters_grow() {

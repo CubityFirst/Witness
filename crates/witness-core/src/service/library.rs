@@ -62,12 +62,17 @@ pub(crate) fn purge_meeting_data(state: &AppState, id: i64) -> Result<(), String
         .get_meeting(id)
         .map_err(err)?
         .ok_or_else(|| format!("meeting {id} not found"))?;
-    let s = state.settings.lock().unwrap();
+    // Copy the dirs out: the settings mutex is [ui-ok] only because no
+    // thread holds it across I/O, and deleting files can be slow (AV scans,
+    // network data dirs).
+    let (audio_dir, rec_tmp_dir) = {
+        let s = state.settings.lock().unwrap();
+        (s.audio_dir(), s.rec_tmp_dir())
+    };
     if let Some(rel) = meeting.audio_path {
-        remove_if_exists(&safe_archive_path(&s.audio_dir(), &rel)?)?;
+        remove_if_exists(&safe_archive_path(&audio_dir, &rel)?)?;
     }
-    let (mic, lop, meta) = recorder::wav_paths(&s.rec_tmp_dir(), id);
-    drop(s);
+    let (mic, lop, meta) = recorder::wav_paths(&rec_tmp_dir, id);
     for p in [mic, lop, meta] {
         remove_if_exists(&p)?;
     }

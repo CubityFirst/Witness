@@ -466,20 +466,7 @@ mod tests {
     /// off, so the real watcher never starts a capture).
     #[test]
     fn core_starts_and_serves_notes_status_and_recording_control() {
-        let dir = std::env::temp_dir().join(format!(
-            "witness-core-start-{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        let settings = Settings {
-            data_dir: Some(dir.display().to_string()),
-            auto_record: false,
-            check_for_updates: false,
-            ..Settings::default()
-        };
-        let sink = Arc::new(testing::CollectSink::default());
-        let core = AppCore::start(settings, sink.clone(), Arc::new(testing::NullNotifier))
-            .expect("core starts");
+        let (core, sink, dir) = testing::scratch_core("start");
         assert_eq!(core.runtime_data_dir(), dir);
         assert!(dir.join("witness.db").exists());
 
