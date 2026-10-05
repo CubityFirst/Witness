@@ -10,23 +10,25 @@
 
 /// Comfort-mix coefficients (main/cross). Determinant 0.5, so the unmix is
 /// well-conditioned; a convex combination, so it can never clip.
-const MIX_MAIN: f32 = 0.75;
-const MIX_CROSS: f32 = 0.25;
+pub(crate) const MIX_MAIN: f32 = 0.75;
+pub(crate) const MIX_CROSS: f32 = 0.25;
 const MIX_TAG: &str = "WITNESS_MIX=75";
 
+use crate::player::OpusArchiveReader;
 use anyhow::{bail, Context, Result};
-use audiopus::coder::{Decoder, Encoder};
+use audiopus::coder::Encoder;
 use audiopus::{Application, Channels, SampleRate};
 use ogg::writing::PacketWriteEndInfo;
-use ogg::{PacketReader, PacketWriter};
+use ogg::PacketWriter;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
-/// 20 ms @ 48 kHz.
-const FRAME: usize = 960;
+/// 20 ms @ 48 kHz. Every archived packet is exactly one FRAME — the
+/// player's page index (`player::archive`) relies on it.
+pub(crate) const FRAME: usize = 960;
 /// Recommended max packet size per RFC.
-const MAX_PACKET: usize = 4000;
+pub(crate) const MAX_PACKET: usize = 4000;
 
 /// Encode `mic` + `loopback` (48 kHz mono i16 WAVs of equal length) into a
 /// stereo Ogg Opus file. `progress` gets 0..1.
@@ -159,7 +161,7 @@ pub fn encode_opus(
 }
 
 /// True when an OpusTags packet carries our comfort-mix marker.
-fn has_mix_tag(data: &[u8]) -> bool {
+pub(crate) fn has_mix_tag(data: &[u8]) -> bool {
     // OpusTags: magic(8) + vendor_len(u32) + vendor + count(u32) + comments.
     if data.len() < 16 || &data[..8] != b"OpusTags" {
         return false;
@@ -190,61 +192,41 @@ fn has_mix_tag(data: &[u8]) -> bool {
     false
 }
 
+/// Stream an archive as unmixed (mic, loopback) 48 kHz mono chunks, one
+/// Opus packet at a time. Decoding (pre-skip, end trim, EOF) is the player's
+/// `OpusArchiveReader`, so playback and retranscription share one timeline.
 fn decode_opus_chunks(
     path: &Path,
     mut on_pcm: impl FnMut(&[f32], &[f32]) -> Result<()>,
 ) -> Result<()> {
-    let file =
-        BufReader::new(File::open(path).with_context(|| format!("opening {}", path.display()))?);
-    let mut reader = PacketReader::new(file);
-    let mut decoder =
-        Decoder::new(SampleRate::Hz48000, Channels::Stereo).context("creating Opus decoder")?;
-
-    let mut pre_skip: usize = 0;
-    let mut header_packets = 0;
-    let mut mixed = false;
-    // Max Opus frame is 120 ms = 5760 samples/channel.
-    let mut pcm = vec![0i16; 5760 * 2];
+    let mut reader = OpusArchiveReader::open(path)?;
+    let mixed = reader.mixed();
 
     // Inverse of [main cross; cross main] (determinant 0.5).
     let det = MIX_MAIN * MIX_MAIN - MIX_CROSS * MIX_CROSS;
+    // Max Opus frame is 120 ms = 5760 samples/channel.
+    let mut stereo = Vec::with_capacity(5760 * 2);
     let mut mic = Vec::with_capacity(5760);
     let mut lop = Vec::with_capacity(5760);
 
-    while let Some(pkt) = reader.read_packet()? {
-        if header_packets < 2 {
-            if header_packets == 0 && pkt.data.len() >= 19 && &pkt.data[..8] == b"OpusHead" {
-                pre_skip = u16::from_le_bytes([pkt.data[10], pkt.data[11]]) as usize;
-            }
-            if header_packets == 1 {
-                mixed = has_mix_tag(&pkt.data);
-            }
-            header_packets += 1;
-            continue;
+    loop {
+        stereo.clear();
+        if reader.read_stereo(&mut stereo)? == 0 {
+            break;
         }
-        let decoded = decoder
-            .decode(Some(&pkt.data), &mut pcm, false)
-            .context("Opus decode")?;
         mic.clear();
         lop.clear();
-        for frame in pcm[..decoded * 2].chunks_exact(2) {
-            if pre_skip > 0 {
-                pre_skip -= 1;
-                continue;
-            }
-            let left = frame[0] as f32 / 32768.0;
-            let right = frame[1] as f32 / 32768.0;
+        for frame in stereo.chunks_exact(2) {
+            let (left, right) = (frame[0], frame[1]);
             if mixed {
                 mic.push(((MIX_MAIN * left - MIX_CROSS * right) / det).clamp(-1.0, 1.0));
                 lop.push(((MIX_MAIN * right - MIX_CROSS * left) / det).clamp(-1.0, 1.0));
             } else {
-                mic.push(left);
-                lop.push(right);
+                mic.push(left.clamp(-1.0, 1.0));
+                lop.push(right.clamp(-1.0, 1.0));
             }
         }
-        if !mic.is_empty() {
-            on_pcm(&mic, &lop)?;
-        }
+        on_pcm(&mic, &lop)?;
     }
     Ok(())
 }
@@ -290,6 +272,9 @@ pub fn decode_opus_track_16k(path: &Path, track: ArchiveTrack) -> Result<Vec<f32
 #[cfg(test)]
 mod tests {
     use super::*;
+    use audiopus::coder::Decoder;
+    use ogg::PacketReader;
+    use std::io::BufReader;
 
     fn write_test_wav(path: &Path, seconds: u32, tone_hz: Option<f32>) {
         let spec = hound::WavSpec {
