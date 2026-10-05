@@ -2,10 +2,25 @@
 //! block, so they only ever run inside a worker closure (`Tasks::spawn` /
 //! `spawn_op`), never on the UI thread (design §7).
 //!
-//! STUB (F0.2): the signatures are final; the OS-services unit (U9)
-//! implements them. Until then every dialog reports "cancelled".
+//! 0.2.x showed these unparented (tauri-plugin-dialog), so they could fall
+//! behind the window and their focus change dismissed the tray flyout.
+//! Parenting to the main HWND makes them modal: the shell disables the
+//! owner while the dialog is up (the UI thread keeps pumping, so egui keeps
+//! painting), and it stays in front of Witness. Callers get the owner from
+//! `UiCtx::dialog_owner`, which pins the flyout first.
+//!
+//! Each dialog runs on its own short-lived thread. rfd initialises COM as
+//! single-threaded and silently reports "cancelled" when the calling thread
+//! already joined the multithreaded apartment (any core call that touched
+//! WASAPI, e.g. the device list, does that), so the worker closure's thread
+//! is never trusted with it.
 
 use super::OwnerHwnd;
+use raw_window_handle::{
+    DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawWindowHandle,
+    Win32WindowHandle, WindowHandle,
+};
+use std::num::NonZeroIsize;
 use std::path::PathBuf;
 
 /// A save-file dialog request, e.g. `{stem}.opus` / "Ogg Opus audio" / ["opus"].
@@ -19,12 +34,292 @@ pub struct SaveFileRequest {
     pub extensions: Vec<String>,
 }
 
-/// Show a modal save dialog; None when cancelled. TODO(U9)
-pub fn save_file_blocking(_owner: OwnerHwnd, _request: SaveFileRequest) -> Option<PathBuf> {
-    None
+/// Show a modal save dialog; None when cancelled. The first extension is
+/// also the default one, so a typed name without one still gets it.
+pub fn save_file_blocking(owner: OwnerHwnd, request: SaveFileRequest) -> Option<PathBuf> {
+    on_dialog_thread("save", move || {
+        let mut dialog = with_owner(rfd::FileDialog::new(), owner).set_file_name(request.file_name);
+        if !request.extensions.is_empty() {
+            dialog = dialog.add_filter(request.filter_name, &request.extensions);
+        }
+        dialog.save_file()
+    })
 }
 
-/// Show a modal folder picker; None when cancelled. TODO(U9)
-pub fn pick_folder_blocking(_owner: OwnerHwnd, _title: Option<&str>) -> Option<PathBuf> {
-    None
+/// Show a modal folder picker; None when cancelled. `title` replaces the
+/// shell's default caption ("Select Folder").
+pub fn pick_folder_blocking(owner: OwnerHwnd, title: Option<&str>) -> Option<PathBuf> {
+    let title = title.map(str::to_owned);
+    on_dialog_thread("folder", move || {
+        let mut dialog = with_owner(rfd::FileDialog::new(), owner);
+        if let Some(title) = title {
+            dialog = dialog.set_title(title);
+        }
+        dialog.pick_folder()
+    })
+}
+
+/// Run `show` on a fresh thread (clean COM apartment) and wait for it. A
+/// panic inside the dialog reads as "cancelled" after being logged.
+fn on_dialog_thread<F>(kind: &str, show: F) -> Option<PathBuf>
+where
+    F: FnOnce() -> Option<PathBuf> + Send,
+{
+    witness_core::service::assert_off_ui_thread("native dialog (platform::dialogs)");
+    let picked = std::thread::scope(|scope| {
+        let spawned = std::thread::Builder::new()
+            .name(format!("dialog-{kind}"))
+            .spawn_scoped(scope, show);
+        match spawned {
+            Ok(handle) => handle.join().unwrap_or_else(|_| {
+                log::error!("{kind} dialog panicked");
+                None
+            }),
+            Err(error) => {
+                log::error!("could not start the {kind} dialog thread: {error}");
+                None
+            }
+        }
+    });
+    match &picked {
+        Some(path) => log::debug!("{kind} dialog: {}", path.display()),
+        None => log::debug!("{kind} dialog cancelled"),
+    }
+    picked
+}
+
+/// Parent the dialog to `owner` when it is still a live window; otherwise
+/// show it unparented rather than not at all.
+fn with_owner(dialog: rfd::FileDialog, owner: OwnerHwnd) -> rfd::FileDialog {
+    match Owner::new(owner) {
+        Some(owner) => dialog.set_parent(&owner),
+        None => dialog,
+    }
+}
+
+/// A raw HWND presented through raw-window-handle, which is what rfd's
+/// `set_parent` takes.
+struct Owner(NonZeroIsize);
+
+impl Owner {
+    fn new(owner: OwnerHwnd) -> Option<Owner> {
+        let hwnd = NonZeroIsize::new(owner.0)?;
+        is_window(hwnd.get()).then_some(Owner(hwnd))
+    }
+}
+
+impl HasWindowHandle for Owner {
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        let raw = RawWindowHandle::Win32(Win32WindowHandle::new(self.0));
+        // SAFETY: the HWND was checked with IsWindow and belongs to the main
+        // window, which lives for the whole process; rfd only reads the
+        // value to pass it to IFileDialog::Show.
+        Ok(unsafe { WindowHandle::borrow_raw(raw) })
+    }
+}
+
+impl HasDisplayHandle for Owner {
+    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+        Ok(DisplayHandle::windows())
+    }
+}
+
+#[cfg(windows)]
+fn is_window(hwnd: isize) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+    // SAFETY: IsWindow accepts any value and only reports validity.
+    unsafe { IsWindow(Some(HWND(hwnd as *mut core::ffi::c_void))).as_bool() }
+}
+
+#[cfg(not(windows))]
+fn is_window(_hwnd: isize) -> bool {
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_requires_a_live_window() {
+        assert!(Owner::new(OwnerHwnd(0)).is_none());
+        // A value that is not a window handle: shown unparented instead.
+        assert!(Owner::new(OwnerHwnd(0x7fff_fff0)).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owner_exposes_the_hwnd_to_rfd() {
+        use windows::Win32::UI::WindowsAndMessaging::GetDesktopWindow;
+        // SAFETY: plain query.
+        let desktop = unsafe { GetDesktopWindow() }.0 as isize;
+        let owner = Owner::new(OwnerHwnd(desktop)).expect("the desktop is a window");
+        match owner.window_handle().unwrap().as_raw() {
+            RawWindowHandle::Win32(handle) => assert_eq!(handle.hwnd.get(), desktop),
+            other => panic!("unexpected handle {other:?}"),
+        }
+        assert!(owner.display_handle().is_ok());
+    }
+
+    /// The real thing, in process: an owner window pumped by its own "UI"
+    /// thread, both dialogs opened from a worker thread. Each must be owned
+    /// by that window and disable it while up (= modal), and re-enable it
+    /// on cancel. Shows windows, so it needs a desktop session.
+    /// `WITNESS_TEST_DIALOG_HOLD_MS` keeps each dialog up for a screenshot.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn dialogs_are_modal_over_the_owner_from_a_worker() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        use windows::core::w;
+        use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
+        use windows::Win32::UI::WindowsAndMessaging::*;
+
+        unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+            // SAFETY: default handling for a plain test window.
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+        }
+
+        // The owner, created and pumped on its own thread like eframe's.
+        let (tx, rx) = mpsc::channel();
+        let ui = std::thread::spawn(move || {
+            // SAFETY: standard window creation and message loop on this thread.
+            unsafe {
+                let module = GetModuleHandleW(None).unwrap();
+                let class = WNDCLASSW {
+                    lpfnWndProc: Some(wndproc),
+                    hInstance: module.into(),
+                    lpszClassName: w!("WitnessDialogTestOwner"),
+                    ..Default::default()
+                };
+                RegisterClassW(&class);
+                let hwnd = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("WitnessDialogTestOwner"),
+                    w!("Witness dialog owner (test)"),
+                    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                    200,
+                    200,
+                    460,
+                    620,
+                    None,
+                    None,
+                    Some(module.into()),
+                    None,
+                )
+                .unwrap();
+                tx.send((hwnd.0 as isize, GetCurrentThreadId())).unwrap();
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+        });
+        let (owner, ui_tid) = rx.recv().unwrap();
+        let owner_hwnd = HWND(owner as *mut core::ffi::c_void);
+        let hold = std::env::var("WITNESS_TEST_DIALOG_HOLD_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0u64);
+
+        /// The visible top-level window owned by `owner`, if any.
+        fn owned_by(owner: isize) -> Option<isize> {
+            struct Search {
+                owner: isize,
+                found: Option<isize>,
+            }
+            unsafe extern "system" fn each(hwnd: HWND, lp: LPARAM) -> windows::core::BOOL {
+                // SAFETY: lp points at the Search below for the whole enumeration.
+                unsafe {
+                    let search = &mut *(lp.0 as *mut Search);
+                    let owned =
+                        GetWindow(hwnd, GW_OWNER).is_ok_and(|o| o.0 as isize == search.owner);
+                    if owned && IsWindowVisible(hwnd).as_bool() {
+                        search.found = Some(hwnd.0 as isize);
+                        return false.into();
+                    }
+                    true.into()
+                }
+            }
+            let mut search = Search { owner, found: None };
+            // SAFETY: the callback only runs during this call.
+            let _ = unsafe { EnumWindows(Some(each), LPARAM(&mut search as *mut Search as isize)) };
+            search.found
+        }
+
+        let check =
+            |kind: &str, title: Option<&str>, open: Box<dyn FnOnce() -> Option<PathBuf> + Send>| {
+                let worker = std::thread::spawn(open);
+                let deadline = Instant::now() + Duration::from_secs(15);
+                let dialog = loop {
+                    if let Some(dialog) = owned_by(owner) {
+                        break dialog;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "{kind} dialog never appeared owned by the window"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                };
+                let dialog_hwnd = HWND(dialog as *mut core::ffi::c_void);
+                // SAFETY: plain queries / posts on live windows.
+                unsafe {
+                    assert!(
+                        !IsWindowEnabled(owner_hwnd).as_bool(),
+                        "{kind} dialog is not modal"
+                    );
+                    if let Some(title) = title {
+                        let mut buf = [0u16; 256];
+                        let n = GetWindowTextW(dialog_hwnd, &mut buf) as usize;
+                        assert_eq!(String::from_utf16_lossy(&buf[..n]), title);
+                    }
+                    println!("{kind} dialog {dialog:#x} owned by {owner:#x}, owner disabled");
+                    std::thread::sleep(Duration::from_millis(hold));
+                    PostMessageW(
+                        Some(dialog_hwnd),
+                        WM_COMMAND,
+                        WPARAM(2 /* IDCANCEL */),
+                        LPARAM(0),
+                    )
+                    .unwrap();
+                }
+                assert_eq!(worker.join().unwrap(), None, "cancel reads as None");
+                // SAFETY: plain query.
+                assert!(
+                    unsafe { IsWindowEnabled(owner_hwnd) }.as_bool(),
+                    "owner re-enabled"
+                );
+            };
+
+        check(
+            "save",
+            None,
+            Box::new(move || {
+                save_file_blocking(
+                    OwnerHwnd(owner),
+                    SaveFileRequest {
+                        file_name: "Weekly sync.opus".into(),
+                        filter_name: "Ogg Opus audio".into(),
+                        extensions: vec!["opus".into()],
+                    },
+                )
+            }),
+        );
+        let title = "Choose where to create the Witness backup";
+        check(
+            "folder",
+            Some(title),
+            Box::new(move || pick_folder_blocking(OwnerHwnd(owner), Some(title))),
+        );
+
+        // SAFETY: ends the owner thread's message loop.
+        unsafe { PostThreadMessageW(ui_tid, WM_QUIT, WPARAM(0), LPARAM(0)).unwrap() };
+        ui.join().unwrap();
+    }
 }
