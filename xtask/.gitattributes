@@ -1,0 +1,2 @@
+# Release-asset fixtures are compared byte for byte (CRLF, no final newline).
+fixtures/** -text

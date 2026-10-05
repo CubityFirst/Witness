@@ -1,7 +1,8 @@
 version: 2
 
 updates:
-  - package-ecosystem: npm
+  - package-ecosystem: cargo
+    # The workspace root: witness-core, witness and xtask share one Cargo.lock.
     directory: /
     schedule:
       interval: weekly
@@ -11,17 +12,36 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(deps)"
-
-  - package-ecosystem: cargo
-    directory: /src-tauri
-    schedule:
-      interval: weekly
-      day: monday
-      time: "05:00"
-      timezone: Europe/London
-    open-pull-requests-limit: 5
-    commit-message:
-      prefix: "chore(deps)"
+    # Mirrors CLAUDE.md "do not upgrade casually": these move only by hand,
+    # together and deliberately (patch updates still come through).
+    ignore:
+      # Updater signing/verification must match what installed copies use.
+      - dependency-name: minisign
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: minisign-verify
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      # egui/eframe minor releases break the API; winit and wgpu must match eframe.
+      - dependency-name: eframe
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "egui*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: egui-phosphor
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: winit
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: wgpu
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      # ML/audio stack: pinned for shared ort-sys, CUDA provider imports and APIs.
+      - dependency-name: ort
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: hf-hub
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: parakeet-rs
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: whisper-rs
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: wasapi
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
 
   - package-ecosystem: github-actions
     directory: /
