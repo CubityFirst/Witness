@@ -1,16 +1,34 @@
 //! The custom title bar (map-ui-shell §4): record/stop, bookmark and CC
 //! buttons, the status pill, navigation and the window controls; plus the
-//! invisible resize edges and the health and model banners below it.
+//! invisible resize edges and the health and model banners below it (§5).
 //!
-//! STUB (F0.2): a minimal, usable bar — background drag, double-click
-//! maximize, nav buttons and window buttons. The app-chrome unit (U7)
-//! implements the rest.
+//! The bar reproduces the CSS `flex-wrap: wrap` row: each item (a button,
+//! the pill, the nav group, the window-control group) is a wrap unit; the
+//! nav group carries `margin-left: auto`, so on whichever line it lands it
+//! and everything after it on that line sit at the right edge. Line breaks
+//! are computed from the unit widths measured in the previous pass; when a
+//! width change moves a unit to another line the pass is discarded and
+//! re-run, so a stale layout is never shown.
 
-use super::icons::ph;
-use super::theme::{BG_RAISED, BORDER};
-use super::widgets;
+use super::format::{capture_warning, fmt_elapsed};
+use super::icons::{self, ph};
+use super::theme::{
+    self, narrow, ACCENT, BANNER_BG, BANNER_BORDER, BG, BG_RAISED, BORDER, OK, REC, REC_LIGHT,
+    TEXT, TEXT_MUTED, WHITE,
+};
+use super::widgets::{self, PillKind, Politeness};
 use super::{UiCtx, View};
-use eframe::egui::{self, Margin, Sense, Stroke};
+use crate::bridge::OpDone;
+use crate::model::ShellModel;
+use crate::ui::toasts::Notice;
+use eframe::egui::{
+    self, Align, Color32, CornerRadius, CursorIcon, FontId, Frame, Layout, Margin, Order, Rect,
+    ResizeDirection, RichText, Sense, Stroke,
+};
+use std::ops::Range;
+use witness_core::events::ModelDownloadProgress;
+use witness_core::settings::Engine;
+use witness_core::{RecCmd, Trigger};
 
 /// Window actions that `app.rs` performs (it runs `will_hide()` first).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -23,50 +41,172 @@ pub struct TopBarOutput {
 /// Presses this close to the window's top/left/right edge resize instead
 /// of dragging (CSS `clientY<8 || clientX<8 || innerWidth-clientX<8`).
 const EDGE_GRAB: f32 = 8.0;
+/// Invisible resize zones: 6 pt edge strips, 12 pt corner squares.
+const RESIZE_EDGE: f32 = 6.0;
+const RESIZE_CORNER: f32 = 12.0;
+/// `.topbar` row gap; the column gap is 12 (8 at the narrow width).
+const ROW_GAP: f32 = 8.0;
+/// `.nav` gap; `.window-controls` gap and margin-left.
+const NAV_GAP: f32 = 4.0;
+const CONTROLS_GAP: f32 = 2.0;
+const CONTROLS_MARGIN: f32 = 4.0;
+/// Level meter: 48 pt wide, two 4 pt bars 2 pt apart, each ≥ 2 pt.
+const METER_WIDTH: f32 = 48.0;
+const METER_BAR: f32 = 4.0;
+/// `.level-bar { transition: width 0.15s linear }`.
+const METER_TRANSITION: f32 = 0.15;
+
+// ---------------------------------------------------------------------------
+// The bar
+
+/// One flex item of the bar, in DOM order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unit {
+    Record,
+    Bookmark,
+    Captions,
+    Pill,
+    Nav,
+    Controls,
+}
+
+impl Unit {
+    /// First-frame width guesses (pt); replaced by measurements after one pass.
+    fn estimate(self) -> f32 {
+        match self {
+            Unit::Record | Unit::Bookmark | Unit::Captions => 40.0,
+            Unit::Pill => 60.0,
+            Unit::Nav => 190.0,
+            Unit::Controls => 100.0,
+        }
+    }
+}
+
+/// Unit widths measured in the previous pass (egui temp data).
+#[derive(Debug, Clone, Default)]
+struct MeasuredWidths(Vec<(Unit, f32)>);
+
+impl MeasuredWidths {
+    fn get(&self, unit: Unit) -> f32 {
+        self.0
+            .iter()
+            .find(|(u, _)| *u == unit)
+            .map_or_else(|| unit.estimate(), |(_, w)| *w)
+    }
+
+    fn set(&mut self, unit: Unit, width: f32) {
+        match self.0.iter_mut().find(|(u, _)| *u == unit) {
+            Some(slot) => slot.1 = width,
+            None => self.0.push((unit, width)),
+        }
+    }
+}
+
+/// CSS flex-wrap line breaking: items keep their order, a line takes items
+/// while they fit (`gap` between neighbours), and an item wider than the
+/// whole row still gets a line of its own.
+pub(crate) fn wrap_lines(widths: &[f32], available: f32, gap: f32) -> Vec<Range<usize>> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut used = 0.0;
+    for (i, &w) in widths.iter().enumerate() {
+        if i == start {
+            used = w;
+        } else if used + gap + w > available + 0.5 {
+            lines.push(start..i);
+            start = i;
+            used = w;
+        } else {
+            used += gap + w;
+        }
+    }
+    if start < widths.len() {
+        lines.push(start..widths.len());
+    }
+    lines
+}
 
 /// Draw the bar inside `Panel::top("topbar")`.
 pub fn show(ui: &mut egui::Ui, cx: &mut UiCtx) -> TopBarOutput {
     let mut out = TopBarOutput::default();
     let screen = ui.ctx().content_rect();
+    let column_gap = if narrow(ui) { 8.0 } else { 12.0 };
+
+    let recording = cx.shell.recording();
+    let mut units = vec![Unit::Record];
+    if recording {
+        // Bookmarking works for any recording; the overlay button only
+        // makes sense when a live-caption session actually started (the
+        // core rejects it otherwise).
+        units.push(Unit::Bookmark);
+        if cx.shell.live_captions_active() {
+            units.push(Unit::Captions);
+        }
+    }
+    units.push(Unit::Pill);
+    units.push(Unit::Nav);
+    if !cx.flyout.is_popup() {
+        units.push(Unit::Controls);
+    }
+
+    let widths_id = ui.id().with("topbar-unit-widths");
+    let mut measured: MeasuredWidths = ui.data(|d| d.get_temp(widths_id).unwrap_or_default());
+    let widths_of = |m: &MeasuredWidths| -> Vec<f32> {
+        units
+            .iter()
+            .map(|&u| {
+                // `.window-controls { margin-left: 4px }` is part of its
+                // outer size.
+                m.get(u)
+                    + if u == Unit::Controls {
+                        CONTROLS_MARGIN
+                    } else {
+                        0.0
+                    }
+            })
+            .collect()
+    };
+
     // The bar's own response is registered behind the widgets, so buttons
     // keep their clicks and only the background drags the window.
     let bar = ui.scope_builder(
         egui::UiBuilder::new().sense(Sense::click_and_drag()),
         |ui| {
             ui.set_min_width(ui.available_width());
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                ui.label(egui::RichText::new("Witness").color(super::theme::TEXT_MUTED));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    if !cx.flyout.is_popup() {
-                        if widgets::win_btn(ui, ph::X, 14.0, "Close to tray", true).clicked() {
-                            out.close = true;
-                        }
-                        if widgets::win_btn(ui, ph::SQUARE, 12.0, "Maximize", false).clicked() {
-                            cx.window.toggle_maximize();
-                        }
-                        if widgets::win_btn(ui, ph::MINUS, 14.0, "Minimize", false).clicked() {
-                            out.minimize = true;
-                        }
-                        ui.add_space(4.0);
+            let available = ui.available_width();
+            let lines = wrap_lines(&widths_of(&measured), available, column_gap);
+            ui.spacing_mut().item_spacing.y = ROW_GAP;
+            for line in &lines {
+                let line_units = &units[line.clone()];
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = column_gap;
+                    let nav_at = line_units.iter().position(|u| *u == Unit::Nav);
+                    for &unit in &line_units[..nav_at.unwrap_or(line_units.len())] {
+                        let width = draw_unit(ui, unit, cx, &mut out);
+                        measured.set(unit, width);
                     }
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    let settings = matches!(cx.view, View::Settings);
-                    if widgets::nav_icon_btn(ui, ph::GEAR_SIX, settings, "Settings").clicked() {
-                        cx.nav.go(View::Settings);
-                    }
-                    if widgets::nav_btn(ui, "People", matches!(cx.view, View::People)).clicked() {
-                        cx.nav.go(View::People);
-                    }
-                    if widgets::nav_btn(ui, "Meetings", matches!(cx.view, View::Meetings)).clicked()
-                    {
-                        cx.go_meetings_clear_search();
+                    if let Some(at) = nav_at {
+                        // `margin-left: auto`: the rest of the line hugs the
+                        // right edge (drawn right to left).
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = column_gap + CONTROLS_MARGIN;
+                            for &unit in line_units[at..].iter().rev() {
+                                let width = draw_unit(ui, unit, cx, &mut out);
+                                measured.set(unit, width);
+                            }
+                        });
                     }
                 });
-            });
+            }
+            // A new measurement moved a unit to another line: redo the pass
+            // so the stale layout is never shown.
+            if wrap_lines(&widths_of(&measured), available, column_gap) != lines {
+                ui.ctx().request_discard("top bar wrap changed");
+            }
         },
     );
+    ui.data_mut(|d| d.insert_temp(widths_id, measured));
+
     let response = bar.response;
     if response.drag_started_by(egui::PointerButton::Primary) {
         let near_edge = response.interact_pointer_pos().is_some_and(|p| {
@@ -75,6 +215,7 @@ pub fn show(ui: &mut egui::Ui, cx: &mut UiCtx) -> TopBarOutput {
                 || screen.right() - p.x < EDGE_GRAB
         });
         if !near_edge {
+            // Our own title-bar drag turns the tray flyout into a window.
             cx.flyout.pin();
             cx.window.start_drag();
         }
@@ -83,6 +224,375 @@ pub fn show(ui: &mut egui::Ui, cx: &mut UiCtx) -> TopBarOutput {
         cx.window.toggle_maximize();
     }
     out
+}
+
+/// Draw one wrap unit; returns its width.
+fn draw_unit(ui: &mut egui::Ui, unit: Unit, cx: &mut UiCtx, out: &mut TopBarOutput) -> f32 {
+    match unit {
+        Unit::Record => record_button(ui, cx).rect.width(),
+        Unit::Bookmark => bookmark_button(ui, cx).rect.width(),
+        Unit::Captions => captions_button(ui, cx).rect.width(),
+        Unit::Pill => status_pill(ui, cx).rect.width(),
+        Unit::Nav => nav_group(ui, cx).rect.width(),
+        Unit::Controls => window_controls(ui, cx, out).rect.width(),
+    }
+}
+
+/// The order to draw a group's `n` items in: reversed inside a
+/// right-to-left layout, so they still read left to right.
+fn draw_order(ui: &egui::Ui, n: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..n).collect();
+    if ui.layout().main_dir() == egui::Direction::RightToLeft {
+        order.reverse();
+    }
+    order
+}
+
+/// Record (idle) / Stop (recording) / spinner (stop in flight). Disabled
+/// while a start or stop is in flight; both go through the ordered
+/// rec-control worker, and a failure becomes an in-app error toast
+/// (`app.rs`, on the reply).
+fn record_button(ui: &mut egui::Ui, cx: &mut UiCtx) -> egui::Response {
+    let recording = cx.shell.recording();
+    let busy = cx.shell.recording_action;
+    let label = if recording {
+        "Stop recording"
+    } else {
+        "Start recording"
+    };
+    let spinning = recording && busy;
+    let content = if spinning {
+        // Keeps the button's size; the spinner is painted over it.
+        icons::icon(ph::CIRCLE_NOTCH, 17.0).color(Color32::TRANSPARENT)
+    } else if recording {
+        icons::icon(ph::STOP, 17.0)
+    } else {
+        icons::icon(ph::RECORD, 17.0)
+    };
+    let response = ui
+        .add_enabled_ui(!busy, |ui| {
+            let response = widgets::btn_record(ui, recording, content, label);
+            if spinning {
+                icons::paint_spinner(ui, response.rect, 17.0, WHITE);
+            }
+            response
+        })
+        .inner;
+    if response.clicked() {
+        cx.submit_rec(if recording {
+            RecCmd::Stop { by_user: true }
+        } else {
+            RecCmd::Start(Trigger::Manual)
+        });
+    }
+    response
+}
+
+/// "Bookmark this moment (CTRL+ALT+B)": `app.rs` toasts "Bookmark added"
+/// or the error when the reply arrives.
+fn bookmark_button(ui: &mut egui::Ui, cx: &mut UiCtx) -> egui::Response {
+    let tooltip = bookmark_tooltip(cx.shell.bookmark_hotkey.as_deref());
+    let response = widgets::btn(ui, icons::icon(ph::BOOKMARK_SIMPLE, 16.0)).on_hover_text(&tooltip);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Bookmark this moment")
+    });
+    if response.clicked() {
+        cx.submit_rec(RecCmd::BookmarkNow);
+    }
+    response
+}
+
+fn bookmark_tooltip(hotkey: Option<&str>) -> String {
+    match hotkey {
+        Some(combo) => format!("Bookmark this moment ({})", combo.to_uppercase()),
+        None => "Bookmark this moment".to_owned(),
+    }
+}
+
+/// Re-open (or focus) the captions overlay. The core check is ⏳, so it
+/// runs as an op; `OpDone::CaptionsCheck` shows the overlay or toasts
+/// "Could not show the caption overlay: …".
+fn captions_button(ui: &mut egui::Ui, cx: &mut UiCtx) -> egui::Response {
+    let label = "Show the caption overlay";
+    let response = widgets::btn(ui, icons::icon(ph::CLOSED_CAPTIONING, 16.0)).on_hover_text(label);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    if response.clicked() {
+        cx.tasks.spawn_op_or(
+            "captions-check",
+            |c| OpDone::CaptionsCheck(c.check_captions_overlay()),
+            |error| OpDone::CaptionsCheck(Err(error)),
+        );
+    }
+    response
+}
+
+/// What the status pill shows (map-ui-shell §4, first match wins).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PillState {
+    /// Recording with a stop in flight.
+    Stopping,
+    Recording {
+        elapsed: String,
+        warning: Option<String>,
+    },
+    Busy(String),
+    Idle,
+}
+
+impl PillState {
+    pub(crate) fn of(shell: &ShellModel) -> PillState {
+        let recording = shell.recording();
+        if recording && shell.recording_action {
+            return PillState::Stopping;
+        }
+        if recording {
+            return PillState::Recording {
+                elapsed: fmt_elapsed(shell.level.as_ref().map_or(0, |l| l.elapsed_ms)),
+                warning: shell.health.as_ref().and_then(capture_warning),
+            };
+        }
+        let queued = shell.status.as_ref().map_or(0, |s| s.queue_len);
+        let suffix = if queued > 0 {
+            format!(" · {queued} queued")
+        } else {
+            String::new()
+        };
+        if let Some(p) = &shell.progress {
+            return PillState::Busy(format!(
+                "Transcribing ({}) {}%{suffix}",
+                p.stage,
+                p.pct.round()
+            ));
+        }
+        if let Some(status) = shell
+            .status
+            .as_ref()
+            .filter(|s| s.transcribing_meeting_id.is_some())
+        {
+            // Opened mid-job: the durable progress snapshot from the core.
+            let text = match &status.processing_stage {
+                None => "Transcribing…".to_owned(),
+                Some(stage) => match status.processing_pct {
+                    Some(pct) => format!("Transcribing ({stage}) {}%", pct.round()),
+                    None => format!("Transcribing ({stage})"),
+                },
+            };
+            return PillState::Busy(format!("{text}{suffix}"));
+        }
+        if queued > 0 {
+            // Between jobs: the next queued meeting has no progress yet.
+            return PillState::Busy(format!("Transcribing…{suffix}"));
+        }
+        PillState::Idle
+    }
+
+    /// The live-region text. The recording pill was not a live region in
+    /// the web UI (its time changes every second), so it announces the
+    /// state and any warning, not the time.
+    fn announcement(&self) -> String {
+        match self {
+            PillState::Stopping => "Stopping…".into(),
+            PillState::Recording { warning, .. } => match warning {
+                Some(w) => format!("Recording. {w}"),
+                None => "Recording".into(),
+            },
+            PillState::Busy(text) => text.clone(),
+            PillState::Idle => "Idle".into(),
+        }
+    }
+}
+
+fn status_pill(ui: &mut egui::Ui, cx: &mut UiCtx) -> egui::Response {
+    let state = PillState::of(cx.shell);
+    widgets::announce(
+        ui.ctx(),
+        egui::Id::new("witness-status-pill-live"),
+        &state.announcement(),
+        Politeness::Polite,
+    );
+    match state {
+        PillState::Stopping => widgets::pill(ui, PillKind::Busy, "Stopping…"),
+        PillState::Busy(text) => widgets::pill(ui, PillKind::Busy, text),
+        PillState::Idle => widgets::pill(ui, PillKind::Idle, "Idle"),
+        PillState::Recording { elapsed, warning } => {
+            recording_pill(ui, cx, &elapsed, warning.as_deref())
+        }
+    }
+}
+
+/// The clickable recording pill: pulsing dot, "Recording" (wide only),
+/// elapsed time, ⚠ on a capture warning, and the level meter (wide only).
+/// A click opens the recording's transcript.
+fn recording_pill(
+    ui: &mut egui::Ui,
+    cx: &mut UiCtx,
+    elapsed: &str,
+    warning: Option<&str>,
+) -> egui::Response {
+    let wide = !narrow(ui);
+    let font = theme::regular(13.0);
+    let inner = widgets::pill_frame(ui, PillKind::Recording).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), Sense::hover());
+            let alpha = icons::pulse_alpha(ui.ctx());
+            ui.painter()
+                .circle_filled(dot.center(), 4.0, REC.gamma_multiply(alpha));
+            let text = |ui: &mut egui::Ui, s: &str| {
+                ui.label(RichText::new(s).font(font.clone()).color(REC_LIGHT));
+            };
+            if wide {
+                text(ui, "Recording");
+            }
+            text(ui, elapsed);
+            if warning.is_some() {
+                text(ui, "⚠");
+            }
+            if wide {
+                level_meter(ui, cx);
+            }
+        });
+    });
+    let rect = inner.response.rect;
+    let response = ui
+        .interact(rect, ui.id().with("recording-pill"), Sense::click())
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text(warning.unwrap_or("Open live captions"));
+    let name = format!(
+        "{elapsed} recording. {}",
+        warning.unwrap_or("Open live transcript")
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name));
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect.expand(2.0),
+            CornerRadius::same(255),
+            Stroke::new(2.0, theme::FOCUS),
+            egui::StrokeKind::Outside,
+        );
+    }
+    if response.clicked() {
+        if let Some(meeting_id) = cx.shell.status.as_ref().and_then(|s| s.meeting_id) {
+            // Transcripts never nest: from a transcript, Back goes to where
+            // that transcript came from.
+            let from = match cx.view {
+                View::Transcript { from, .. } => from.clone(),
+                other => Some(Box::new(other.clone())),
+            };
+            cx.nav.go(View::Transcript {
+                meeting_id,
+                segment_id: None,
+                highlight: None,
+                from,
+            });
+        }
+    }
+    response
+}
+
+/// Two stacked bars: microphone (accent) and system audio (ok), each
+/// `min(100, rms·300)` % of 48 pt, at least 2 pt, easing over 0.15 s.
+fn level_meter(ui: &mut egui::Ui, cx: &UiCtx) {
+    let label = "Microphone and system audio levels";
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(METER_WIDTH, METER_BAR * 2.0 + 2.0),
+        Sense::hover(),
+    );
+    response
+        .on_hover_text(label)
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label));
+    let (mic, loopback) = cx
+        .shell
+        .level
+        .as_ref()
+        .map_or((0.0, 0.0), |l| (l.mic_rms, l.loopback_rms));
+    // Never animate a hidden window: a hidden root still runs full passes.
+    let animate = cx.window.is_shown() && !cx.window.is_minimized() && icons::animations_enabled();
+    for (row, (rms, color)) in [(mic, ACCENT), (loopback, OK)].into_iter().enumerate() {
+        let target = meter_width(rms);
+        let width = if animate {
+            ui.ctx().animate_value_with_time(
+                ui.id().with(("level-bar", row)),
+                target,
+                METER_TRANSITION,
+            )
+        } else {
+            target
+        };
+        let top = rect.top() + row as f32 * (METER_BAR + 2.0);
+        let bar = Rect::from_min_size(egui::pos2(rect.left(), top), egui::vec2(width, METER_BAR));
+        ui.painter().rect_filled(bar, CornerRadius::same(2), color);
+    }
+}
+
+/// A level bar's width in points for an RMS level (0..1).
+pub(crate) fn meter_width(rms: f32) -> f32 {
+    let percent = if rms.is_finite() {
+        (rms * 300.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    (percent / 100.0 * METER_WIDTH).max(2.0)
+}
+
+/// Meetings, People and the Settings gear. Meetings is "active" only on
+/// Meetings (not on Search or a transcript), and it clears the search box,
+/// cancelling a pending debounce, so the box matches the unfiltered list.
+fn nav_group(ui: &mut egui::Ui, cx: &mut UiCtx) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = NAV_GAP;
+        for item in draw_order(ui, 3) {
+            match item {
+                0 => {
+                    if widgets::nav_btn(ui, "Meetings", matches!(cx.view, View::Meetings)).clicked()
+                    {
+                        cx.go_meetings_clear_search();
+                    }
+                }
+                1 => {
+                    if widgets::nav_btn(ui, "People", matches!(cx.view, View::People)).clicked() {
+                        cx.nav.go(View::People);
+                    }
+                }
+                _ => {
+                    let selected = matches!(cx.view, View::Settings);
+                    if widgets::nav_icon_btn(ui, ph::GEAR_SIX, selected, "Settings").clicked() {
+                        cx.nav.go(View::Settings);
+                    }
+                }
+            }
+        }
+    })
+    .response
+}
+
+/// Minimize, maximize (always the square glyph) and close-to-tray. Hidden
+/// in tray-flyout mode. Minimize and close are performed by `app.rs`, which
+/// runs `will_hide()` first.
+fn window_controls(ui: &mut egui::Ui, cx: &mut UiCtx, out: &mut TopBarOutput) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = CONTROLS_GAP;
+        for item in draw_order(ui, 3) {
+            match item {
+                0 => {
+                    if widgets::win_btn(ui, ph::MINUS, 14.0, "Minimize", false).clicked() {
+                        out.minimize = true;
+                    }
+                }
+                1 => {
+                    if widgets::win_btn(ui, ph::SQUARE, 12.0, "Maximize", false).clicked() {
+                        cx.window.toggle_maximize();
+                    }
+                }
+                _ => {
+                    if widgets::win_btn(ui, ph::X, 14.0, "Close to tray", true).clicked() {
+                        out.close = true;
+                    }
+                }
+            }
+        }
+    })
+    .response
 }
 
 /// The top bar's panel frame: raised fill, 10/14 padding. `app.rs` paints
@@ -102,11 +612,443 @@ pub fn paint_bottom_border(ui: &egui::Ui, rect: egui::Rect) {
     );
 }
 
-/// Invisible 6 px edge / 12 px corner resize zones. TODO(U7)
-pub fn resize_edges(_ui: &mut egui::Ui, _cx: &mut UiCtx) {}
+// ---------------------------------------------------------------------------
+// Resize edges (shared with the captions overlay)
 
-/// The capture-health warning under the bar while recording. TODO(U7)
-pub fn health_banner(_ui: &mut egui::Ui, _cx: &mut UiCtx) {}
+/// The eight resize zones of a window whose content fills `rect`: 12 pt
+/// corner squares and 6 pt edge strips between them (no overlap).
+pub(crate) fn resize_zones(rect: Rect) -> [(Rect, ResizeDirection); 8] {
+    let (e, c) = (RESIZE_EDGE, RESIZE_CORNER);
+    let (l, r, t, b) = (rect.left(), rect.right(), rect.top(), rect.bottom());
+    let zone = |x0: f32, y0: f32, x1: f32, y1: f32| {
+        Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1.max(x0), y1.max(y0)))
+    };
+    [
+        (zone(l, t, l + c, t + c), ResizeDirection::NorthWest),
+        (zone(r - c, t, r, t + c), ResizeDirection::NorthEast),
+        (zone(l, b - c, l + c, b), ResizeDirection::SouthWest),
+        (zone(r - c, b - c, r, b), ResizeDirection::SouthEast),
+        (zone(l + c, t, r - c, t + e), ResizeDirection::North),
+        (zone(l + c, b - e, r - c, b), ResizeDirection::South),
+        (zone(l, t + c, l + e, b - c), ResizeDirection::West),
+        (zone(r - e, t + c, r, b - c), ResizeDirection::East),
+    ]
+}
 
-/// The first-run "Transcription models not installed." banner. TODO(U7)
-pub fn model_banner(_ui: &mut egui::Ui, _cx: &mut UiCtx) {}
+fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
+    match dir {
+        ResizeDirection::North | ResizeDirection::South => CursorIcon::ResizeVertical,
+        ResizeDirection::East | ResizeDirection::West => CursorIcon::ResizeHorizontal,
+        ResizeDirection::NorthWest | ResizeDirection::SouthEast => CursorIcon::ResizeNwSe,
+        ResizeDirection::NorthEast | ResizeDirection::SouthWest => CursorIcon::ResizeNeSw,
+    }
+}
+
+/// Invisible resize zones for the current viewport of an undecorated
+/// window (the OS draws no resize border). Each zone is a tiny
+/// `Order::Foreground` area, so it wins the hit test over whatever lies
+/// beneath (title bar, player bar) without blocking anything else. Returns
+/// the direction to hand to the OS sizing loop when the primary button
+/// went down on a zone this pass.
+pub(crate) fn edge_resize(ctx: &egui::Context, id_salt: &str) -> Option<ResizeDirection> {
+    let rect = ctx.content_rect();
+    let pressed = ctx.input(|i| i.pointer.primary_pressed());
+    let mut hit = None;
+    for (index, (zone, dir)) in resize_zones(rect).into_iter().enumerate() {
+        if zone.width() <= 0.0 || zone.height() <= 0.0 {
+            continue;
+        }
+        let area = egui::Area::new(egui::Id::new((id_salt, "resize-zone", index)))
+            .order(Order::Foreground)
+            .fixed_pos(zone.min)
+            .movable(false)
+            .constrain(false)
+            .fade_in(false)
+            .show(ctx, |ui| {
+                ui.allocate_exact_size(zone.size(), Sense::drag()).1
+            });
+        let response = area.inner.on_hover_cursor(resize_cursor(dir));
+        if pressed && response.contains_pointer() {
+            hit = Some(dir);
+        }
+    }
+    hit
+}
+
+/// Invisible 6 pt edge / 12 pt corner resize zones on all four sides of
+/// the main window; a press hands off to the OS sizing loop (Aero Snap
+/// works). Not while maximized. A resize pins the tray flyout.
+pub fn resize_edges(ui: &mut egui::Ui, cx: &mut UiCtx) {
+    let ctx = ui.ctx().clone();
+    if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+        return;
+    }
+    if let Some(dir) = edge_resize(&ctx, "main") {
+        cx.flyout.pin();
+        cx.window.begin_resize(dir);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Banners
+
+/// The capture-health warning under the bar while recording (role=alert,
+/// selectable, 8/14 margin).
+pub fn health_banner(ui: &mut egui::Ui, cx: &mut UiCtx) {
+    if !cx.shell.recording() {
+        return;
+    }
+    let Some(warning) = cx.shell.health.as_ref().and_then(capture_warning) else {
+        return;
+    };
+    egui::Panel::top("health-banner")
+        .frame(Frame::new().fill(BG).inner_margin(Margin::symmetric(14, 8)))
+        .resizable(false)
+        .show_separator_line(false)
+        .show(ui, |ui| {
+            widgets::inline_warning(ui, &warning);
+            widgets::announce(
+                ui.ctx(),
+                egui::Id::new("witness-health-alert"),
+                &warning,
+                Politeness::Assertive,
+            );
+        });
+}
+
+/// `file <i> of <n> — <pct>%`, or `… — downloading…` without a total.
+pub(crate) fn download_text(p: &ModelDownloadProgress) -> String {
+    let amount = match p.total_bytes.filter(|t| *t > 0) {
+        Some(total) => format!(
+            "{}%",
+            ((p.downloaded_bytes as f64 / total as f64) * 100.0).round()
+        ),
+        None => "downloading…".to_owned(),
+    };
+    format!("file {} of {} — {amount}", p.file_index, p.file_count)
+}
+
+/// `.model-banner span:first-child { flex: 1; min-width: 200px }`, gap 12.
+const BANNER_TEXT_MIN: f32 = 200.0;
+const BANNER_GAP: f32 = 12.0;
+
+/// The first-run "Transcription models not installed." banner: Download
+/// now (or the download progress) and Later, which persists the dismissal.
+pub fn model_banner(ui: &mut egui::Ui, cx: &mut UiCtx) {
+    if !cx.shell.models_missing {
+        return;
+    }
+    let progress = cx
+        .shell
+        .download
+        .as_ref()
+        .filter(|d| d.error.is_none())
+        .map(download_text);
+    widgets::centered_column(ui, 900.0, |ui| {
+        Frame::new()
+            .fill(BANNER_BG)
+            .stroke(Stroke::new(1.0, BANNER_BORDER))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(14, 10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                banner_contents(ui, cx, progress.as_deref());
+            });
+    });
+    ui.add_space(14.0);
+}
+
+fn banner_text(width: f32) -> egui::text::LayoutJob {
+    let format = |font_id: FontId| egui::TextFormat {
+        font_id,
+        color: TEXT,
+        ..Default::default()
+    };
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        "Transcription models not installed.",
+        0.0,
+        format(theme::semibold(13.0)),
+    );
+    job.append(
+        " Recording works, but nothing gets transcribed. One-time download, ~3.5 GB \
+         (Parakeet + speaker models).",
+        0.0,
+        format(theme::regular(13.0)),
+    );
+    job.wrap.max_width = width;
+    job
+}
+
+fn banner_contents(ui: &mut egui::Ui, cx: &mut UiCtx, progress: Option<&str>) {
+    let small = theme::regular(13.0);
+    // Measure the fixed items to break lines the way CSS flex-wrap does.
+    let text_width = |ui: &egui::Ui, text: &str, font: FontId| {
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), font, TEXT)
+            .size()
+            .x
+    };
+    let button_pad = if narrow(ui) { 20.0 } else { 28.0 };
+    let middle = match progress {
+        Some(text) => text_width(ui, text, small.clone()),
+        None => text_width(ui, "Download now", theme::regular(theme::BASE_SIZE)) + button_pad,
+    };
+    let later = text_width(ui, "Later", theme::regular(theme::BASE_SIZE)) + button_pad;
+    let available = ui.available_width();
+    let lines = wrap_lines(&[BANNER_TEXT_MIN, middle, later], available, BANNER_GAP);
+
+    ui.spacing_mut().item_spacing = egui::vec2(BANNER_GAP, 8.0);
+    for line in lines {
+        // flex: 1 — the text takes whatever its line's other items leave.
+        let others: f32 = line
+            .clone()
+            .filter(|&i| i != 0)
+            .map(|i| if i == 1 { middle } else { later } + BANNER_GAP)
+            .sum();
+        ui.horizontal(|ui| {
+            for item in line {
+                match item {
+                    0 => {
+                        let width = (available - others).max(BANNER_TEXT_MIN.min(available));
+                        ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
+                            ui.set_width(width);
+                            ui.add(egui::Label::new(banner_text(width)).wrap());
+                        });
+                    }
+                    1 => match progress {
+                        Some(text) => {
+                            ui.label(RichText::new(text).font(small.clone()).color(TEXT_MUTED));
+                            widgets::announce(
+                                ui.ctx(),
+                                egui::Id::new("witness-model-download-live"),
+                                text,
+                                Politeness::Polite,
+                            );
+                        }
+                        None => {
+                            if widgets::btn(ui, "Download now").clicked() {
+                                cx.tasks.spawn_op("model-download", |c| OpDone::Notice {
+                                    notice: c.download_models(Engine::Parakeet).err().map(
+                                        |error| {
+                                            Notice::error("Could not start model download", error)
+                                        },
+                                    ),
+                                    refresh: false,
+                                });
+                            }
+                        }
+                    },
+                    _ => {
+                        if widgets::btn_ghost(ui, "Later").clicked() {
+                            cx.prefs.model_banner_dismissed = true;
+                            cx.shell.models_missing = false;
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use witness_core::events::{RecordingLevel, TranscriptionProgress, WatcherStatus};
+    use witness_core::recorder::RecordingHealth;
+    use witness_core::service::AppStatus;
+
+    fn status(recording: bool) -> AppStatus {
+        AppStatus {
+            recording,
+            meeting_id: recording.then_some(7),
+            recording_since: None,
+            live_captions: false,
+            transcribing_meeting_id: None,
+            queue_len: 0,
+            processing_stage: None,
+            processing_pct: None,
+            watcher: WatcherStatus {
+                enabled: true,
+                teams_key_found: true,
+                mic_in_use: false,
+                suppressed: false,
+            },
+        }
+    }
+
+    #[test]
+    fn wrap_lines_behaves_like_flex_wrap() {
+        assert_eq!(wrap_lines(&[10.0, 10.0, 10.0], 100.0, 8.0), vec![0..3]);
+        assert_eq!(
+            wrap_lines(&[40.0, 40.0, 40.0], 100.0, 8.0),
+            vec![0..2, 2..3]
+        );
+        // An item wider than the row still gets its own line.
+        assert_eq!(wrap_lines(&[150.0, 10.0], 100.0, 8.0), vec![0..1, 1..2]);
+        assert_eq!(wrap_lines(&[], 100.0, 8.0), Vec::<Range<usize>>::new());
+        // Exactly full fits.
+        assert_eq!(wrap_lines(&[46.0, 46.0], 100.0, 8.0), vec![0..2]);
+    }
+
+    #[test]
+    fn the_bar_wraps_at_460_while_recording_but_not_when_idle() {
+        // A 460 pt window minus the 2 × 14 padding.
+        let available = 432.0;
+        // record, "Idle" pill, nav, window controls (+ 4 margin)
+        let idle = [37.0, 47.0, 190.0, 100.0 + CONTROLS_MARGIN];
+        assert_eq!(wrap_lines(&idle, available, 8.0).len(), 1);
+        // + bookmark, CC and a recording pill
+        let recording = [37.0, 36.0, 36.0, 70.0, 190.0, 100.0 + CONTROLS_MARGIN];
+        assert_eq!(wrap_lines(&recording, available, 8.0).len(), 2);
+    }
+
+    #[test]
+    fn pill_follows_its_priority_order() {
+        let mut shell = ShellModel::new();
+        assert_eq!(PillState::of(&shell), PillState::Idle);
+
+        let mut s = status(false);
+        s.queue_len = 2;
+        shell.set_status(s.clone());
+        assert_eq!(
+            PillState::of(&shell),
+            PillState::Busy("Transcribing… · 2 queued".into())
+        );
+
+        s.transcribing_meeting_id = Some(3);
+        shell.set_status(s.clone());
+        assert_eq!(
+            PillState::of(&shell),
+            PillState::Busy("Transcribing… · 2 queued".into())
+        );
+        s.processing_stage = Some("asr".into());
+        shell.set_status(s.clone());
+        assert_eq!(
+            PillState::of(&shell),
+            PillState::Busy("Transcribing (asr) · 2 queued".into())
+        );
+        s.processing_pct = Some(44.6);
+        shell.set_status(s.clone());
+        assert_eq!(
+            PillState::of(&shell),
+            PillState::Busy("Transcribing (asr) 45% · 2 queued".into())
+        );
+
+        shell.progress = Some(TranscriptionProgress {
+            meeting_id: 3,
+            stage: "diarize",
+            pct: 12.2,
+        });
+        assert_eq!(
+            PillState::of(&shell),
+            PillState::Busy("Transcribing (diarize) 12% · 2 queued".into())
+        );
+        s.queue_len = 0;
+        shell.set_status(s);
+        assert_eq!(
+            PillState::of(&shell),
+            PillState::Busy("Transcribing (diarize) 12%".into())
+        );
+
+        shell.set_status(status(true));
+        shell.level = Some(RecordingLevel {
+            mic_rms: 0.1,
+            loopback_rms: 0.0,
+            elapsed_ms: 75_000,
+        });
+        assert_eq!(
+            PillState::of(&shell),
+            PillState::Recording {
+                elapsed: "1:15".into(),
+                warning: None
+            }
+        );
+        let mut health = RecordingHealth::default();
+        health.mic.device_loss_count = 1;
+        shell.health = Some(health);
+        let recording = PillState::of(&shell);
+        assert_eq!(
+            recording,
+            PillState::Recording {
+                elapsed: "1:15".into(),
+                warning: Some("Microphone device was lost during recording".into())
+            }
+        );
+        assert_eq!(
+            recording.announcement(),
+            "Recording. Microphone device was lost during recording"
+        );
+        shell.recording_action = true;
+        assert_eq!(PillState::of(&shell), PillState::Stopping);
+        assert_eq!(PillState::Stopping.announcement(), "Stopping…");
+    }
+
+    #[test]
+    fn meter_width_is_clamped() {
+        assert_eq!(meter_width(0.0), 2.0);
+        assert_eq!(meter_width(1.0), METER_WIDTH);
+        assert!((meter_width(0.1) - 14.4).abs() < 1e-3);
+        assert_eq!(meter_width(f32::NAN), 2.0);
+    }
+
+    #[test]
+    fn resize_zones_cover_edges_and_corners_without_overlap() {
+        let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(460.0, 620.0));
+        let zones = resize_zones(rect);
+        let at = |x: f32, y: f32| -> Vec<ResizeDirection> {
+            zones
+                .iter()
+                .filter(|(z, _)| z.contains(egui::pos2(x, y)))
+                .map(|(_, d)| *d)
+                .collect()
+        };
+        assert_eq!(at(2.0, 2.0), vec![ResizeDirection::NorthWest]);
+        assert_eq!(at(450.0, 2.0), vec![ResizeDirection::NorthEast]);
+        assert_eq!(at(2.0, 615.0), vec![ResizeDirection::SouthWest]);
+        assert_eq!(at(458.0, 619.0), vec![ResizeDirection::SouthEast]);
+        assert_eq!(at(200.0, 3.0), vec![ResizeDirection::North]);
+        assert_eq!(at(200.0, 617.0), vec![ResizeDirection::South]);
+        assert_eq!(at(3.0, 300.0), vec![ResizeDirection::West]);
+        assert_eq!(at(457.0, 300.0), vec![ResizeDirection::East]);
+        assert!(at(200.0, 300.0).is_empty());
+        assert!(at(200.0, 7.0).is_empty(), "below the 6 pt top strip");
+    }
+
+    #[test]
+    fn bookmark_tooltip_shows_the_bound_combo() {
+        assert_eq!(
+            bookmark_tooltip(Some("ctrl+alt+b")),
+            "Bookmark this moment (CTRL+ALT+B)"
+        );
+        assert_eq!(bookmark_tooltip(None), "Bookmark this moment");
+    }
+
+    #[test]
+    fn download_progress_text() {
+        let mut p = ModelDownloadProgress {
+            model_id: "parakeet".into(),
+            file: "encoder.onnx".into(),
+            downloaded_bytes: 50,
+            total_bytes: Some(200),
+            file_index: 2,
+            file_count: 5,
+            done: false,
+            error: None,
+        };
+        assert_eq!(download_text(&p), "file 2 of 5 — 25%");
+        p.total_bytes = None;
+        assert_eq!(download_text(&p), "file 2 of 5 — downloading…");
+        p.total_bytes = Some(0);
+        assert_eq!(download_text(&p), "file 2 of 5 — downloading…");
+    }
+
+    #[test]
+    fn edge_resize_registers_zones_without_panicking() {
+        let ctx = theme::test_context();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            assert_eq!(edge_resize(ui.ctx(), "test"), None);
+        });
+        output.textures_delta.clear();
+    }
+}
