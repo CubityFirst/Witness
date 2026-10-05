@@ -192,6 +192,9 @@ struct Editing {
     text: String,
     /// Take focus on the next draw — once, not every frame.
     focus_pending: bool,
+    /// Escape was pressed: the coming focus loss cancels instead of
+    /// committing (egui may report the loss a frame after the key).
+    escaped: bool,
 }
 
 /// A list (re)load in flight. A newer request replaces (and so discards) it.
@@ -415,6 +418,10 @@ impl MeetingsView {
             if now >= at {
                 self.pending_open = None;
                 open_transcript(cx, id, View::Meetings);
+                // Navigation applies after this pass; nothing else (no
+                // input) would draw the next one.
+                // TODO(I1): app.rs could request this after any navigation.
+                ui.ctx().request_repaint();
             } else {
                 ui.ctx().request_repaint_after(at - now);
             }
@@ -490,6 +497,7 @@ impl MeetingsView {
                     original: title.clone(),
                     text: title,
                     focus_pending: true,
+                    escaped: false,
                 });
             }
             RowAction::CommitEdit => self.commit_edit(cx),
@@ -660,6 +668,7 @@ impl MeetingsView {
             return;
         }
         let slot = icon_slot(ui);
+        ui.spacing_mut().item_spacing.y = 0.0;
         for deleted in &self.binned {
             ui.add_space(ROW_GAP);
             bin_row(ui, slot, deleted, actions);
@@ -948,6 +957,9 @@ fn rename_editor(
         .stroke(Stroke::new(1.0, ACCENT))
         .corner_radius(CornerRadius::same(4))
         .inner_margin(EDIT_MARGIN);
+    if row.input(|i| i.key_pressed(Key::Escape)) {
+        editing.escaped = true;
+    }
     let response = edit_ui.add(
         egui::TextEdit::singleline(&mut editing.text)
             .id(egui::Id::new(("meeting-rename", m.id)))
@@ -973,7 +985,7 @@ fn rename_editor(
         let on_pencil = row.rect_contains_pointer(pencil_rect)
             && row.input(|i| i.pointer.any_down() || i.pointer.any_released());
         if !on_pencil {
-            actions.push(if row.input(|i| i.key_pressed(Key::Escape)) {
+            actions.push(if editing.escaped {
                 RowAction::CancelEdit
             } else {
                 RowAction::CommitEdit
@@ -1258,6 +1270,7 @@ mod tests {
                 original: m.title.clone(),
                 text: "New".into(),
                 focus_pending: true,
+                escaped: false,
             };
             meeting_row(ui, rect, metrics, &m, Some(&mut editing), &mut actions);
             assert!(!editing.focus_pending, "focus is requested once");

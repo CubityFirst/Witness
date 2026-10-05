@@ -81,7 +81,11 @@ pub fn search_box(ui: &mut egui::Ui, cx: &mut UiCtx, current: &View) {
     let mut changed = response.changed();
     // Like `<input type=search>`, Escape clears the box (egui has already
     // taken the focus away; give it back so typing can continue).
-    if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Escape)) && has_text {
+    // `focused` is from before the field ran, so this catches Escape both
+    // when egui drops the focus up front and when the field surrenders it.
+    let escape = (focused || response.has_focus() || response.lost_focus())
+        && ui.input(|i| i.key_pressed(Key::Escape));
+    if escape && has_text {
         search.text.clear();
         changed = true;
         response.request_focus();
@@ -99,6 +103,8 @@ pub fn search_box(ui: &mut egui::Ui, cx: &mut UiCtx, current: &View) {
     if let Some(at) = search.debounce_at {
         if now >= at {
             search.debounce_at = None;
+            // The navigation applies after this pass: draw the next one.
+            ui.ctx().request_repaint();
             let query = search.text.clone();
             if !query.trim().is_empty() {
                 cx.nav.go(View::Search { query });
@@ -602,10 +608,10 @@ impl SearchView {
             return;
         }
 
+        ui.spacing_mut().item_spacing.y = 0.0;
         for group in group_hits(&self.hits) {
             let first = &self.hits[group[0]];
             group_title(ui, first);
-            ui.spacing_mut().item_spacing.y = 0.0;
             for &index in &group {
                 let hit = &self.hits[index];
                 if hit_row(ui, hit) {
@@ -710,7 +716,7 @@ fn date_field(ui: &mut egui::Ui, label: &str, id: &str, text: &mut String) {
                         .corner_radius(CornerRadius::same(6))
                         .inner_margin(margin),
                 )
-                .desired_width(104.0),
+                .desired_width(118.0),
         );
         widgets::text_edit_menu(&response);
         let name = if invalid {

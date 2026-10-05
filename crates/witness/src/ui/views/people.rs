@@ -587,7 +587,9 @@ fn person_card(
             egui::Margin::symmetric(14, 10),
             header_radius,
             |ui| {
-                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                // `horizontal`, not `with_layout`: the latter takes the
+                // whole available height.
+                ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     let color = theme::chip_color(if p.is_me { "me" } else { "S1" });
                     widgets::chip(ui, &p.name, color, 16.0).on_hover_text(&p.name);
