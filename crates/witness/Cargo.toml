@@ -1,0 +1,60 @@
+[package]
+name = "witness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Witness: local-only meeting recorder & transcriber (native UI + Windows shell)"
+publish = false
+build = "build.rs"
+
+# The package name is load-bearing: it keeps the exe `witness.exe`, which the
+# installer, the autostart value, shortcuts and CheckIfAppIsRunning all name.
+[[bin]]
+name = "witness"
+path = "src/main.rs"
+
+[dependencies]
+witness-core = { path = "../witness-core" }
+# egui/eframe move in lockstep and break their API every minor release:
+# bump the pins together, deliberately (CLAUDE.md "do not upgrade casually").
+# `glow` is the primary renderer; wgpu is only a runtime fallback (below).
+eframe = { version = "=0.36.2", default-features = false, features = ["glow", "accesskit", "default_fonts"] }
+egui-phosphor = { version = "=0.14.0" }
+# Same winit as eframe, so WindowExtWindows and the dpi types resolve to its copy.
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+# Only here to choose wgpu's backends (DX12 only) for the fallback renderer.
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"], optional = true }
+raw-window-handle = "0.6.2"
+# Re-exports muda 0.21 as tray_icon::menu.
+tray-icon = "0.26.0"
+global-hotkey = "0.8.0"
+rfd = "0.17.2"
+winreg = "0.55"
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Threading",
+  "Win32_System_LibraryLoader",
+  "Win32_System_DataExchange",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Shell",
+  "Win32_UI_Accessibility",
+  "Win32_Graphics_Gdi",
+  "Win32_Graphics_Dwm",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
+] }
+crossbeam-channel = "0.5"
+log = "0.4"
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+anyhow = "1"
+
+[features]
+default = ["wgpu-fallback"]
+# NOT "eframe/wgpu": that enables wgpu/default, i.e. every backend.
+wgpu-fallback = ["eframe/wgpu_no_default_features", "dep:wgpu"]
+
+[build-dependencies]
+winresource = "0.1.31"
