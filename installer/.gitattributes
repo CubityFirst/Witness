@@ -1,0 +1,9 @@
+# `xtask check` and its tests parse these scripts; pin LF so an
+# autocrlf=true checkout (GitHub's Windows runners) gives the same bytes as
+# everywhere else. makensis reads LF fine.
+*.nsi text eol=lf
+*.nsh text eol=lf
+
+# The verbatim Tauri 0.2.1 output stays byte for byte (CRLF + BOM as
+# generated); later lines win, so this overrides the rules above.
+reference/** -text

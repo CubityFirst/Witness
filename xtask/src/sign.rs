@@ -94,6 +94,18 @@ pub fn secret_key_id(sk: &minisign::SecretKey) -> String {
     key_id_hex(sk.keynum())
 }
 
+/// Refuse any key but the release key: installed copies trust only that one.
+pub fn ensure_release_key(sk: &minisign::SecretKey) -> Result<()> {
+    let id = secret_key_id(sk);
+    ensure!(
+        id == legacy::UPDATER_KEY_ID,
+        "the signing key has ID {id}, but installed copies trust only {} \
+         (~/.tauri/witness-updater.key); never rotate it",
+        legacy::UPDATER_KEY_ID
+    );
+    Ok(())
+}
+
 /// `timestamp:{t}\tfile:{name}[\tversion:{v}]`. tauri-cli 2.11.4 wrote no
 /// `version:`; `None` reproduces that for the compatibility tests only.
 pub fn trusted_comment(timestamp: u64, file_name: &str, version: Option<&str>) -> Result<String> {
@@ -212,6 +224,27 @@ pub fn installer_url(version: &str, file_name: &str) -> String {
     )
 }
 
+/// A `--url` must be the installer asset itself: an https URL whose last
+/// path segment is the file name (or GitHub's space-to-dot form of it). The
+/// release *page* URL (`.../releases/tag/vX`) would serve HTML, every client
+/// would fail signature verification, and the release would silently do
+/// nothing.
+pub fn validate_installer_url(url: &str, file_name: &str) -> Result<()> {
+    let hint = "omit --url to use the default release asset URL";
+    ensure!(
+        url.starts_with("https://"),
+        "--url {url} is not an https URL; {hint}"
+    );
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let last = path.rsplit('/').next().unwrap_or("");
+    ensure!(
+        last == file_name || last == file_name.replace(' ', "."),
+        "--url {url} does not point at {file_name} (it must be the release asset's download \
+         URL, not the release page); {hint}"
+    );
+    Ok(())
+}
+
 /// Inputs for [`sign_installer`].
 pub struct SignRequest {
     pub file: PathBuf,
@@ -224,6 +257,8 @@ pub struct SignRequest {
     /// Self-check against this public key instead of the release key
     /// (throwaway-key rehearsals only).
     pub pubkey: Option<String>,
+    /// Sign even though the file's VERSIONINFO does not say `version`.
+    pub force_version: bool,
 }
 
 /// `cargo run -p xtask -- sign`.
@@ -247,6 +282,27 @@ pub fn sign_installer(sk: &minisign::SecretKey, req: &SignRequest) -> Result<Pat
         .to_string();
     let data = std::fs::read(&req.file).with_context(|| format!("read {}", req.file.display()))?;
     ensure!(!data.is_empty(), "{} is empty", req.file.display());
+    // A signature for the wrong file is self-consistent (signed version ==
+    // feed version), so clients would install it, still report the old
+    // version, and be offered the same update forever. NSIS installers (ours
+    // and Tauri's) carry VIAddVersionKey ProductVersion = the app version.
+    if !crate::dist::has_product_version(&data, &version) {
+        ensure!(
+            req.force_version,
+            "{} does not carry VERSIONINFO ProductVersion {version}; is it the right (and a \
+             freshly rebuilt) installer? Pass --force-version only if you are sure",
+            req.file.display()
+        );
+        eprintln!(
+            "warning: {} has no ProductVersion {version}; signing anyway (--force-version)",
+            req.file.display()
+        );
+    }
+    match (&req.url, &req.feed) {
+        (Some(url), Some(_)) => validate_installer_url(url, &file_name)?,
+        (Some(_), None) => bail!("--url only goes into latest.json; it needs --feed"),
+        _ => {}
+    }
 
     let pubkey = match &req.pubkey {
         Some(pk) => {
@@ -258,13 +314,7 @@ pub fn sign_installer(sk: &minisign::SecretKey, req: &SignRequest) -> Result<Pat
             pk.as_str()
         }
         None => {
-            let id = secret_key_id(sk);
-            ensure!(
-                id == legacy::UPDATER_KEY_ID,
-                "the signing key has ID {id}, but installed copies trust only {} \
-                 (~/.tauri/witness-updater.key); never rotate it",
-                legacy::UPDATER_KEY_ID
-            );
+            ensure_release_key(sk)?;
             legacy::UPDATER_PUBKEY
         }
     };
@@ -272,9 +322,7 @@ pub fn sign_installer(sk: &minisign::SecretKey, req: &SignRequest) -> Result<Pat
     let sig = sign_bytes(sk, &data, &file_name, Some(&version), unix_now())?;
     self_check(&data, &sig, pubkey, &version).context("self-check of the new signature failed")?;
 
-    let mut sig_path = req.file.clone().into_os_string();
-    sig_path.push(".sig");
-    let sig_path = PathBuf::from(sig_path);
+    let sig_path = crate::dist::sig_path(&req.file);
     std::fs::write(&sig_path, &sig).with_context(|| format!("write {}", sig_path.display()))?;
     println!(
         "signed {} (version {version}) -> {}",
@@ -460,30 +508,41 @@ mod tests {
         assert!(decode_secret_key("not base64!", "").is_err());
     }
 
+    /// Fake installer bytes around the real VERSIONINFO resource of the
+    /// shipped 0.2.1 installer (ProductVersion 0.2.1).
+    fn fake_021_installer() -> Vec<u8> {
+        let mut data = b"MZ installer bytes".to_vec();
+        data.extend_from_slice(include_bytes!("../fixtures/versioninfo-setup-0.2.1.bin"));
+        data
+    }
+
     #[test]
     fn sign_installer_refuses_a_foreign_key_and_writes_sig_and_feed() {
         let dir = std::env::temp_dir().join(format!("xtask-sign-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("Witness_0.3.0_x64-setup.exe");
-        std::fs::write(&file, b"MZ installer bytes").unwrap();
+        let file = dir.join("Witness_0.2.1_x64-setup.exe");
+        let data = fake_021_installer();
+        std::fs::write(&file, &data).unwrap();
         let (sk_b64, pk_b64) = generate_test_key().unwrap();
         let sk = decode_secret_key(&sk_b64, "").unwrap();
 
         // Without --pubkey only the release key is acceptable.
         let req = |pubkey: Option<String>| SignRequest {
             file: file.clone(),
-            version: "0.3.0".into(),
+            version: "0.2.1".into(),
             feed: Some(dir.join("latest.json")),
             notes: Some("notes".into()),
             url: None,
             pubkey,
+            force_version: false,
         };
         let err = sign_installer(&sk, &req(None)).unwrap_err().to_string();
         assert!(err.contains(legacy::UPDATER_KEY_ID), "{err}");
+        assert!(ensure_release_key(&sk).is_err());
 
         let sig_path = sign_installer(&sk, &req(Some(pk_b64.clone()))).unwrap();
         let sig = std::fs::read_to_string(&sig_path).unwrap();
-        self_check(b"MZ installer bytes", &sig, &pk_b64, "0.3.0").unwrap();
+        self_check(&data, &sig, &pk_b64, "0.2.1").unwrap();
         let feed: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("latest.json")).unwrap()).unwrap();
         assert_eq!(
@@ -491,6 +550,92 @@ mod tests {
             sig.as_str()
         );
         assert_eq!(feed["notes"], "notes");
+        assert_eq!(
+            feed["platforms"]["windows-x86_64"]["url"],
+            installer_url("0.2.1", "Witness_0.2.1_x64-setup.exe")
+        );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sign_installer_refuses_a_version_the_file_does_not_carry() {
+        let dir = std::env::temp_dir().join(format!("xtask-signv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Witness_0.2.1_x64-setup.exe");
+        std::fs::write(&file, fake_021_installer()).unwrap();
+        let (sk_b64, pk_b64) = generate_test_key().unwrap();
+        let sk = decode_secret_key(&sk_b64, "").unwrap();
+        let req = |version: &str, force_version: bool| SignRequest {
+            file: file.clone(),
+            version: version.into(),
+            feed: None,
+            notes: None,
+            url: None,
+            pubkey: Some(pk_b64.clone()),
+            force_version,
+        };
+        // The rollback mistake: an old installer signed as a newer version.
+        let err = sign_installer(&sk, &req("0.3.1", false))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ProductVersion 0.3.1"), "{err}");
+        assert!(!dir.join("Witness_0.2.1_x64-setup.exe.sig").exists());
+        // ... unless explicitly forced.
+        sign_installer(&sk, &req("0.3.1", true)).unwrap();
+        assert!(dir.join("Witness_0.2.1_x64-setup.exe.sig").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sign_installer_validates_the_url() {
+        let dir = std::env::temp_dir().join(format!("xtask-signu-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Witness_0.2.1_x64-setup.exe");
+        std::fs::write(&file, fake_021_installer()).unwrap();
+        let (sk_b64, pk_b64) = generate_test_key().unwrap();
+        let sk = decode_secret_key(&sk_b64, "").unwrap();
+        let req = |url: &str, feed: bool| SignRequest {
+            file: file.clone(),
+            version: "0.2.1".into(),
+            feed: feed.then(|| dir.join("latest.json")),
+            notes: None,
+            url: Some(url.into()),
+            pubkey: Some(pk_b64.clone()),
+            force_version: false,
+        };
+        let page = "https://github.com/CubityFirst/Witness/releases/tag/v0.2.1";
+        let err = sign_installer(&sk, &req(page, true))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("omit --url"), "{err}");
+        assert!(!dir.join("latest.json").exists());
+        let asset = installer_url("0.2.1", "Witness_0.2.1_x64-setup.exe");
+        assert!(
+            sign_installer(&sk, &req(&asset, false)).is_err(),
+            "--url needs --feed"
+        );
+        sign_installer(&sk, &req(&asset, true)).unwrap();
+        assert!(dir.join("latest.json").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn installer_urls() {
+        let name = "Witness_0.3.1_x64-setup.exe";
+        validate_installer_url(&installer_url("0.3.1", name), name).unwrap();
+        validate_installer_url(
+            "https://example.com/a/Witness.Setup.exe",
+            "Witness Setup.exe",
+        )
+        .unwrap();
+        validate_installer_url(&format!("https://example.com/{name}?x=1"), name).unwrap();
+        for bad in [
+            "https://github.com/CubityFirst/Witness/releases/tag/v0.3.1",
+            "https://github.com/CubityFirst/Witness/releases/download/v0.3.1/",
+            "http://github.com/CubityFirst/Witness/releases/download/v0.3.1/Witness_0.3.1_x64-setup.exe",
+            "https://example.com/Witness_0.3.0_x64-setup.exe",
+        ] {
+            assert!(validate_installer_url(bad, name).is_err(), "{bad}");
+        }
     }
 }

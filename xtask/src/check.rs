@@ -64,9 +64,14 @@ pub fn run(tag: Option<&str>) -> Result<()> {
     }
 }
 
+/// Read a repo file with LF line endings: the checks look for multi-line
+/// text, and an autocrlf=true checkout (GitHub's Windows runners) may hand
+/// us CRLF.
 fn read(root: &Path, rel: &str) -> Result<String> {
     let path = root.join(rel);
-    std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    Ok(text.replace("\r\n", "\n"))
 }
 
 /// Workspace members share the workspace version, the lockfile mirrors it,
@@ -398,8 +403,10 @@ pub fn check_pubkey(pubkey_b64: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Through `read`, so fixture strings match however the checkout
+    /// converted line endings.
     fn repo_file(rel: &str) -> String {
-        std::fs::read_to_string(workspace::repo_root().join(rel)).unwrap()
+        read(&workspace::repo_root(), rel).unwrap()
     }
 
     #[test]

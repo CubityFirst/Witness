@@ -12,22 +12,30 @@
    3. Seed state: the autostart Run value (unquoted, as the 0.2.x plugin wrote
       it), fake user data in $inst, and an orphaned EBWebView profile.
    4. Run the new installer with /S /UPDATE, then again with
-      /P /UPDATE /R /ARGS --minimized (what 0.2.x's updater runs), and stop the
-      relaunched witness.exe after 5 s.
+      /P /UPDATE /R /ARGS --minimized (what 0.2.x's updater runs). The
+      relaunch is watched for while that installer runs and up to
+      -RelaunchSeconds after it exits; it must be seen, with --minimized on
+      its command line, or the test fails (-AllowMissingRelaunch downgrades
+      that to a note). It is then stopped.
    5. Assert: DisplayVersion is the new version; InstallLocation,
       MainBinaryName and the install-dir key are unchanged; Run\Witness is
       untouched; the Start-menu shortcut still targets $inst\witness.exe with
       AUMID com.github.cubityfirst.witness; the seeded data survives; the
       EBWebView profile is gone.
    6. Uninstall with /S: the data still survives and Run\Witness is gone.
+   7. Fresh-install the new installer with /S into the same dir (over the
+      leftover data, design §8.6): the shortcuts it creates itself target
+      $inst\witness.exe with the AUMID (update mode keeps 0.2.1's, so step 5
+      cannot show this) and the data survives. Then uninstall again.
 
   Local rehearsal: the test writes to the current user's HKCU and shortcuts,
   and the installers kill any witness.exe of this user. It therefore refuses
   to start unless this profile has no Witness install, no Run\Witness value,
   no Witness shortcuts, no com.github.cubityfirst.witness profile and no
-  running witness.exe, and it removes everything it created afterwards. Pass
-  -InstallDir to keep the first install away from %LOCALAPPDATA%\Witness
-  (which may hold leftover real data from an earlier uninstall).
+  running witness.exe, and it removes everything it created afterwards,
+  including the install dir (-InstallDir, or %LOCALAPPDATA%\Witness, which
+  must not exist beforehand). Pass -InstallDir to keep the test away from
+  %LOCALAPPDATA%\Witness altogether.
 
 .EXAMPLE
   .\installer\tests\upgrade-smoke.ps1 -NewInstaller target\release\bundle\nsis\Witness_0.3.0_x64-setup.exe
@@ -47,8 +55,10 @@ param(
   [string] $OldInstaller,
   # Install the old version here (/D=) instead of %LOCALAPPDATA%\Witness.
   [string] $InstallDir,
-  # Seconds to let the relaunched app run before stopping it.
-  [int] $RelaunchSeconds = 5
+  # Seconds after the /R installer exits to wait for the relaunch.
+  [int] $RelaunchSeconds = 10,
+  # Only note (not fail) when the /R relaunch is not observed.
+  [switch] $AllowMissingRelaunch
 )
 
 Set-StrictMode -Version 2.0
@@ -115,6 +125,52 @@ function Invoke-Installer([string] $Path, [string[]] $Arguments) {
     throw "$Path $Arguments did not finish within $InstallerTimeout s"
   }
   if ($p.ExitCode -ne 0) { throw "$Path $Arguments exited with code $($p.ExitCode)" }
+}
+
+# Run an installer that should relaunch $ExePath (/R), watching for that
+# process every 100 ms from the moment the installer starts: the relaunch
+# happens in .onInstSuccess, before the installer exits, and a short-lived
+# app could otherwise come and go unseen. Returns the first sighting
+# (Id, CommandLine) or $null.
+function Invoke-InstallerWatchingRelaunch([string] $Path, [string[]] $Arguments, [string] $ExePath) {
+  Write-Host "  > $(Split-Path $Path -Leaf) $($Arguments -join ' ')"
+  $p = Start-Process -FilePath $Path -ArgumentList $Arguments -PassThru
+  $null = $p.Handle
+  $started = Get-Date
+  $graceEnd = $null
+  $seen = $null
+  while ($true) {
+    if ($null -eq $seen) {
+      $hit = @(Get-Process -Name witness -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $ExePath })
+      if ($hit.Count -gt 0) {
+        $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $($hit[0].Id)" -ErrorAction SilentlyContinue
+        $cmd = $null
+        if ($null -ne $cim) { $cmd = $cim.CommandLine }
+        $seen = [pscustomobject]@{ Id = $hit[0].Id; CommandLine = $cmd }
+      }
+    }
+    if ($p.HasExited) {
+      if ($null -eq $graceEnd) { $graceEnd = (Get-Date).AddSeconds($RelaunchSeconds) }
+      if ($null -ne $seen -or (Get-Date) -gt $graceEnd) { break }
+    } elseif (((Get-Date) - $started).TotalSeconds -gt $InstallerTimeout) {
+      try { $p.Kill() } catch { }
+      throw "$Path $Arguments did not finish within $InstallerTimeout s"
+    }
+    Start-Sleep -Milliseconds 100
+  }
+  if ($p.ExitCode -ne 0) { throw "$Path $Arguments exited with code $($p.ExitCode)" }
+  return $seen
+}
+
+# uninstall.exe re-launches itself from %TEMP% and returns at once, so poll
+# for the result instead of waiting on the process.
+function Invoke-Uninstaller([string] $Dir) {
+  Invoke-Installer (Join-Path $Dir 'uninstall.exe') @('/S')
+  $deadline = (Get-Date).AddSeconds($InstallerTimeout)
+  while ((Test-RegKey $UninstKey) -or (Test-Path -LiteralPath (Join-Path $Dir 'uninstall.exe'))) {
+    if ((Get-Date) -gt $deadline) { throw "the uninstaller did not finish within $InstallerTimeout s" }
+    Start-Sleep -Milliseconds 500
+  }
 }
 
 function Get-Sha256([string] $Path) { (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant() }
@@ -235,18 +291,21 @@ try {
   Check (-not (Test-Path -LiteralPath $ProfileDir)) "empty $BundleId profile dir removed"
 
   Step "Update again with /P /UPDATE /R /ARGS --minimized (the 0.2.x updater's command line)"
-  Invoke-Installer $NewInstaller @('/P', '/UPDATE', '/R', '/ARGS', '--minimized')
-  Start-Sleep -Seconds $RelaunchSeconds
   $exePath = Join-Path $inst 'witness.exe'
-  $relaunched = @(Get-WitnessProcesses | Where-Object { $_.ExecutablePath -eq $exePath })
-  if ($relaunched.Count -gt 0) {
-    $cmd = $relaunched[0].CommandLine
-    Check ($cmd -like '*--minimized*') "relaunched $exePath with /ARGS ($cmd)"
+  $relaunch = Invoke-InstallerWatchingRelaunch $NewInstaller @('/P', '/UPDATE', '/R', '/ARGS', '--minimized') $exePath
+  if ($null -ne $relaunch) {
+    $cmd = $relaunch.CommandLine
+    Check ($null -ne $cmd -and $cmd -like '*--minimized*') "relaunched $exePath with /ARGS (pid $($relaunch.Id): $cmd)"
+  } elseif ($AllowMissingRelaunch) {
+    Write-Host "  note no witness.exe from $inst seen within $RelaunchSeconds s of the installer exiting (-AllowMissingRelaunch)" -ForegroundColor Yellow
   } else {
-    # Not fatal: the app may legitimately exit early on a headless runner.
-    Write-Host "  note no witness.exe from $inst running after $RelaunchSeconds s (relaunch not observed)" -ForegroundColor Yellow
+    Fail "no witness.exe from $inst seen within $RelaunchSeconds s of the installer exiting: /R /ARGS relaunch missing"
   }
-  foreach ($p in $relaunched) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+  # Whether it is still running does not matter (the app may exit early on a
+  # headless runner); stop whatever is left before the assertions.
+  foreach ($p in @(Get-WitnessProcesses | Where-Object { $_.ExecutablePath -eq $exePath })) {
+    Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+  }
   Start-Sleep -Seconds 1
 
   # --- 5. The contract -----------------------------------------------------------
@@ -275,14 +334,7 @@ try {
 
   # --- 6. Uninstall --------------------------------------------------------------
   Step 'Uninstall with /S'
-  # uninstall.exe re-launches itself from %TEMP% and returns at once, so poll
-  # for the result instead of waiting on the process.
-  Invoke-Installer (Join-Path $inst 'uninstall.exe') @('/S')
-  $deadline = (Get-Date).AddSeconds($InstallerTimeout)
-  while ((Test-RegKey $UninstKey) -or (Test-Path -LiteralPath (Join-Path $inst 'uninstall.exe'))) {
-    if ((Get-Date) -gt $deadline) { throw "the uninstaller did not finish within $InstallerTimeout s" }
-    Start-Sleep -Milliseconds 500
-  }
+  Invoke-Uninstaller $inst
   Check (-not (Test-RegKey $UninstKey)) 'Uninstall\Witness removed'
   Check ($null -eq (Get-RegValue $RunKey 'Witness')) 'Run\Witness removed'
   foreach ($f in @('witness.exe', 'onnxruntime_providers_cuda.dll', 'onnxruntime_providers_shared.dll')) {
@@ -293,6 +345,34 @@ try {
     $path = Join-Path $inst $rel
     Check ((Test-Path -LiteralPath $path) -and (Get-Sha256 $path) -eq $hashes[$rel]) "$rel still survives"
   }
+
+  # --- 7. Fresh install over the leftover data -------------------------------------
+  # Update mode leaves 0.2.1's shortcuts alone, so only a fresh install shows
+  # that witness.nsi's own CreateShortcut + SetLnkAppUserModelId produce the
+  # AUMID toasts depend on. /S creates both shortcuts and does not launch
+  # the app (no /R).
+  Step "Fresh install of $ExpectedVersion with /S over the leftover data"
+  Invoke-Installer $NewInstaller @('/S', "/D=$inst")
+  Check ((Get-RegValue $UninstKey 'DisplayVersion').Value -eq $ExpectedVersion) "DisplayVersion = $ExpectedVersion"
+  Check ((Get-RegValue $ProductKey '').Value -eq $inst) "HKCU\$ProductKey (Default) = $inst"
+  foreach ($lnk in @($StartLnk, $DesktopLnk)) {
+    if (Test-Path -LiteralPath $lnk) {
+      Check ((Get-ShortcutTarget $lnk) -eq $exePath) "$lnk targets $exePath"
+      Check ((Get-ShortcutAumid $lnk) -eq $BundleId) "$lnk AUMID = $BundleId"
+    } else {
+      Fail "$lnk not created"
+    }
+  }
+  foreach ($rel in $seeded.Keys) {
+    $path = Join-Path $inst $rel
+    Check ((Test-Path -LiteralPath $path) -and (Get-Sha256 $path) -eq $hashes[$rel]) "$rel survives the fresh install"
+  }
+  Check (@(Get-WitnessProcesses | Where-Object { $_.ExecutablePath -eq $exePath }).Count -eq 0) 'no app launched without /R'
+
+  Step 'Uninstall the fresh install with /S'
+  Invoke-Uninstaller $inst
+  Check (-not (Test-RegKey $UninstKey)) 'Uninstall\Witness removed'
+  Check (-not (Test-Path -LiteralPath $StartLnk) -and -not (Test-Path -LiteralPath $DesktopLnk)) 'shortcuts removed'
 } catch {
   Fail "aborted: $($_.Exception.Message)"
 } finally {
@@ -324,8 +404,15 @@ try {
   # A relaunched Tauri-era stand-in (local rehearsals) recreates the WebView2
   # profile; Remove-IfPresent retries while its webview children exit.
   Remove-IfPresent $ProfileDir
-  if ($InstallDir) { Remove-IfPresent $InstallDir }
-  Pass 'removed the test install, registry values, shortcuts and profile'
+  # The seeded fake data and settings (data_dir = smoke-data) must not stay
+  # behind for a later real install to pick up. The preconditions proved the
+  # dir did not exist before, so all of it is ours.
+  if ($InstallDir) {
+    Remove-IfPresent $InstallDir
+  } elseif ($inst -and $inst -eq $defaultDir) {
+    Remove-IfPresent $inst
+  }
+  Pass 'removed the test install dir, registry values, shortcuts and profile'
 }
 
 if ($script:Failures.Count -gt 0) {

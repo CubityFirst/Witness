@@ -198,6 +198,12 @@ pub fn makensis(toolchain: &Toolchain, script: &Path, inputs: &Inputs) -> Result
         std::fs::create_dir_all(dir)?;
     }
     let status = Command::new(&toolchain.makensis)
+        // As tauri-bundler does: another NSIS's NSISDIR / NSISCONFDIR /
+        // NSISPLUGINS would swap in its Include, Stubs and plugins for the
+        // hash-pinned 3.11 tree.
+        .env_remove("NSISDIR")
+        .env_remove("NSISCONFDIR")
+        .env_remove("NSISPLUGINS")
         .arg("/V3")
         .args(["-INPUTCHARSET", "UTF8"])
         .args(define_args(inputs, &toolchain.plugins_dir))

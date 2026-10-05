@@ -43,9 +43,12 @@ pub fn dist(sign_it: bool, notes: Option<String>) -> Result<()> {
     let release = metadata.target_directory.join("release");
     println!("target dir: {}", metadata.target_directory.display());
 
-    // Load the key before the long build, so a missing secret fails fast.
+    // Load and vet the key before the long build, so a missing or wrong
+    // secret fails fast.
     let secret_key = if sign_it {
-        Some(sign::load_secret_key()?)
+        let sk = sign::load_secret_key()?;
+        sign::ensure_release_key(&sk)?;
+        Some(sk)
     } else {
         None
     };
@@ -74,7 +77,12 @@ pub fn dist(sign_it: bool, notes: Option<String>) -> Result<()> {
     let toolchain = nsis::ensure_toolchain()?;
     let out_dir = release.join("bundle").join("nsis");
     let outfile = out_dir.join(installer_name(&version));
-    remove_if_present(&outfile)?;
+    // Also drop a .sig / latest.json of an earlier signed run, so they can
+    // never sit next to (and be mistaken for) this build's installer.
+    let feed = out_dir.join("latest.json");
+    for stale in [outfile.clone(), sig_path(&outfile), feed.clone()] {
+        remove_if_present(&stale)?;
+    }
     let files = payload(&release);
     nsis::makensis(
         &toolchain,
@@ -91,7 +99,6 @@ pub fn dist(sign_it: bool, notes: Option<String>) -> Result<()> {
 
     let mut outputs = vec![outfile.clone()];
     if let Some(sk) = secret_key {
-        let feed = out_dir.join("latest.json");
         let sig = sign::sign_installer(
             &sk,
             &sign::SignRequest {
@@ -101,6 +108,7 @@ pub fn dist(sign_it: bool, notes: Option<String>) -> Result<()> {
                 notes,
                 url: None,
                 pubkey: None,
+                force_version: false,
             },
         )?;
         outputs.push(sig);
@@ -169,6 +177,13 @@ fn cargo(root: &Path, args: &[&str]) -> Result<()> {
         bail!("cargo {} failed ({status})", args.join(" "));
     }
     Ok(())
+}
+
+/// `<file>.sig`, where `sign` writes the signature.
+pub(crate) fn sig_path(file: &Path) -> PathBuf {
+    let mut p = file.as_os_str().to_owned();
+    p.push(".sig");
+    PathBuf::from(p)
 }
 
 fn remove_if_present(path: &Path) -> Result<()> {
@@ -270,15 +285,29 @@ mod tests {
     }
 
     #[test]
-    fn real_tauri_exe_versioninfo_if_present() {
-        // The shipped 0.2.1 exe (tauri-build VERSIONINFO) when a reference
-        // build is around; skipped elsewhere.
-        let Some(path) = std::env::var_os("WITNESS_REFERENCE_EXE") else {
-            return;
-        };
-        let bytes = std::fs::read(path).unwrap();
-        assert!(has_product_version(&bytes, "0.2.1"));
-        assert!(!has_product_version(&bytes, "0.2.2"));
+    fn real_versioninfo_resources() {
+        // VS_VERSIONINFO resources cut verbatim from real 0.2.1 binaries (see
+        // installer/reference/PROVENANCE.md): the tauri-build/winres exe dist
+        // guards, and the NSIS installer (VIAddVersionKey) sign guards.
+        for blob in [
+            &include_bytes!("../fixtures/versioninfo-witness-0.2.1.bin")[..],
+            &include_bytes!("../fixtures/versioninfo-setup-0.2.1.bin")[..],
+        ] {
+            let mut pe = b"MZ\x90\x00 header bytes".to_vec();
+            pe.extend_from_slice(blob);
+            pe.extend_from_slice(b"\x00\x00 trailing sections");
+            assert!(has_product_version(&pe, "0.2.1"));
+            assert!(!has_product_version(&pe, "0.2.2"));
+            assert!(!has_product_version(&pe, "0.2"));
+        }
+    }
+
+    #[test]
+    fn sig_path_appends() {
+        assert_eq!(
+            sig_path(Path::new(r"C:\o\Witness_0.3.0_x64-setup.exe")),
+            PathBuf::from(r"C:\o\Witness_0.3.0_x64-setup.exe.sig")
+        );
     }
 
     #[test]

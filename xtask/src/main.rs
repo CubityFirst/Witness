@@ -65,10 +65,14 @@ commands:
       <target>/release/bundle/nsis/. --sign also writes the .sig and
       latest.json (needs TAURI_SIGNING_PRIVATE_KEY[_PASSWORD]).
   sign <file> --version X.Y.Z [--feed PATH] [--notes TEXT] [--url URL] [--pubkey B64]
+       [--force-version]
       Write <file>.sig (and, with --feed, latest.json for that file). Works on
-      any installer, including a Tauri-built rollback. --url overrides the
-      installer download URL; --pubkey self-checks against a non-release key
-      (throwaway-key rehearsals only).
+      any installer, including a Tauri-built rollback, but refuses one whose
+      VERSIONINFO ProductVersion is not X.Y.Z (--force-version overrides).
+      --url overrides the installer download URL in the feed (it must be the
+      https asset URL ending in the file name, never the release page);
+      --pubkey self-checks against a non-release key (throwaway-key
+      rehearsals only).
   package --srcdir DIR [--version X.Y.Z] [--out FILE]
       Development only: wrap prebuilt binaries in DIR with installer/witness.nsi
       (no cargo build, no freshness checks, never signed). Used to iterate on
@@ -115,6 +119,7 @@ fn run(command: &str, mut args: Vec<String>) -> Result<()> {
             let notes = take_value(&mut args, "--notes")?;
             let url = take_value(&mut args, "--url")?;
             let pubkey = take_value(&mut args, "--pubkey")?;
+            let force_version = take_flag(&mut args, "--force-version");
             let file = take_positional(&mut args, "<file>")?;
             no_more(&args)?;
             sign::sign_command(sign::SignRequest {
@@ -124,6 +129,7 @@ fn run(command: &str, mut args: Vec<String>) -> Result<()> {
                 notes,
                 url,
                 pubkey,
+                force_version,
             })
         }
         "package" => {
