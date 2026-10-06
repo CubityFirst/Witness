@@ -1218,7 +1218,7 @@ impl Db {
             return None;
         }
         // Try raw passthrough for power users (phrase quotes, AND/OR/NEAR).
-        // Must actually step the query (LIMIT 1, not 0 â€” LIMIT 0 returns
+        // Must actually step the query (LIMIT 1, not 0 — LIMIT 0 returns
         // before the FTS5 vtab ever parses the MATCH expression).
         let is_valid = conn
             .prepare("SELECT 1 FROM segments_fts WHERE segments_fts MATCH ?1 LIMIT 1")
@@ -1239,7 +1239,7 @@ impl Db {
             .split_whitespace()
             .map(|t| t.replace('"', ""))
             // A quoted phrase with zero tokenizable chars ("(" etc.) is an
-            // FTS5 syntax error â€” drop punctuation-only tokens.
+            // FTS5 syntax error — drop punctuation-only tokens.
             .filter(|t| t.chars().any(|c| c.is_alphanumeric()))
             .collect();
         if tokens.is_empty() {
@@ -1279,7 +1279,7 @@ impl Db {
         };
         let mut sql = String::from(
             "SELECT m.id, m.title, m.started_at, s.id, s.start_ms, sp.display_name,
-                    snippet(segments_fts, 0, ?1, ?2, ' â€¦ ', 12)
+                    snippet(segments_fts, 0, ?1, ?2, ' … ', 12)
              FROM segments_fts
              JOIN segments s ON s.id = segments_fts.rowid
              JOIN meetings m ON m.id = s.meeting_id
@@ -1691,6 +1691,44 @@ mod tests {
         assert_eq!(ids("2026-01-01"), vec![newer, boundary, old]);
         assert!(ids("2026-08-01").is_empty());
 
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn truncated_search_snippets_use_a_real_ellipsis() {
+        let dir =
+            std::env::temp_dir().join(format!("witness-db-ellipsis-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("t.db")).unwrap();
+        let id = db
+            .create_meeting("Long", "2026-07-18T10:00:00+01:00", "manual")
+            .unwrap();
+        let speakers = vec![NewSpeaker {
+            label: "me".into(),
+            display_name: "Me".into(),
+            embedding: None,
+            emb_seconds: 0.0,
+            person_id: None,
+            auto_labeled: false,
+        }];
+        let segments = vec![NewSegment {
+            speaker_label: Some("me".into()),
+            track: "mic".into(),
+            start_ms: 0,
+            end_ms: 9000,
+            text: "one two three four five six seven eight nine ten eleven twelve \
+                   thirteen fourteen budget sixteen seventeen eighteen nineteen twenty \
+                   twentyone twentytwo twentythree twentyfour"
+                .into(),
+        }];
+        db.replace_transcript(id, &speakers, &segments, "parakeet")
+            .unwrap();
+        let hits = db.search("budget", 0, 10, None, None, None, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        let snippet = &hits[0].snippet;
+        assert!(snippet.contains(" \u{2026} "), "{snippet:?}");
+        assert!(!snippet.contains('\u{e2}'), "mojibake: {snippet:?}");
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
     }
