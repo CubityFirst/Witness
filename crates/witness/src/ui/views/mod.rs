@@ -5,6 +5,7 @@
 
 pub mod meetings;
 pub mod people;
+#[allow(dead_code)] // TODO(I1): the F0 stub; TranscriptView (U5) consumes it.
 pub mod player_bar;
 pub mod search;
 pub mod settings;

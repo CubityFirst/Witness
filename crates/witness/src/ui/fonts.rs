@@ -228,8 +228,14 @@ impl FontLoader {
 
     /// Add every font loaded since the last call, as the lowest-priority
     /// fallback of both Proportional and semibold text. Called in `logic()`.
+    ///
+    /// `add_font` only queues the font; egui applies it at the start of the
+    /// next pass, so every viewport (the captions overlay too) is asked for
+    /// one more pass rather than relying on egui's implicit second repaint.
     pub fn install_pending(&self, ctx: &egui::Context) {
+        let mut installed = false;
         while let Ok(loaded) = self.rx.try_recv() {
+            installed = true;
             let mut data = FontData::from_owned(loaded.bytes);
             data.index = loaded.index;
             log::debug!("installing fallback font for {:?}", loaded.script);
@@ -247,6 +253,14 @@ impl FontLoader {
                     },
                 ],
             ));
+        }
+        if installed {
+            let viewports: Vec<egui::ViewportId> =
+                ctx.input(|i| i.raw.viewports.keys().copied().collect());
+            for id in viewports {
+                ctx.request_repaint_of(id);
+            }
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
         }
     }
 }

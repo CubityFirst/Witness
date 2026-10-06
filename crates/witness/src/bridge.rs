@@ -24,7 +24,7 @@ use eframe::egui;
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use witness_core::models::ModelInfo;
 use witness_core::service::{AppStatus, PreparedUpdate, UpdateInfo};
@@ -369,23 +369,38 @@ impl Tasks {
     /// Wait for a reply channel on a worker and turn it into an `OpDone`.
     /// The submit itself stays on the caller's thread, so commands keep the
     /// order in which the user issued them (rec_control is a FIFO).
+    ///
+    /// Like `spawn_op_or`, a reply is always delivered: if the waiter thread
+    /// cannot start, `map(None)` is sent at once, so a caller waiting on it
+    /// (the top bar's record spinner) is never stuck.
     pub fn forward_reply<T: Send + 'static>(
         &self,
         name: &'static str,
         rx: Receiver<T>,
         map: impl FnOnce(Option<T>) -> OpDone + Send + 'static,
     ) {
+        // Shared so the spawn-failure path below can still reach `map`.
+        let map = Arc::new(Mutex::new(Some(map)));
+        let worker_map = map.clone();
         let ctx = self.ctx.clone();
         let tx = self.tx.clone();
         let spawned = std::thread::Builder::new()
             .name(name.into())
             .spawn(move || {
-                let done = map(rx.recv().ok());
-                let _ = tx.send(UiMsg::Op(done));
-                wake_root(&ctx);
+                let reply = rx.recv().ok();
+                let map = worker_map.lock().unwrap_or_else(|p| p.into_inner()).take();
+                if let Some(map) = map {
+                    let _ = tx.send(UiMsg::Op(map(reply)));
+                    wake_root(&ctx);
+                }
             });
         if let Err(error) = spawned {
             log::error!("could not start {name}: {error}");
+            let map = map.lock().unwrap_or_else(|p| p.into_inner()).take();
+            if let Some(map) = map {
+                let _ = self.tx.send(UiMsg::Op(map(None)));
+                wake_root(&self.ctx);
+            }
         }
     }
 }
