@@ -99,18 +99,23 @@ impl Confirm {
                     .wrap(),
                 );
                 ui.add_space(8.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if widgets::btn_danger(ui, pending.ok_label.as_str()).clicked() {
-                        decision = Some(true);
-                    }
-                    let cancel = widgets::btn_ghost(ui, "Cancel");
-                    if pending.focus_cancel {
-                        cancel.request_focus();
-                        pending.focus_cancel = false;
-                    }
-                    if cancel.clicked() {
-                        decision = Some(false);
-                    }
+                // `horizontal` bounds the row's height; a bare right-to-left
+                // layout here would claim all the remaining (screen) height,
+                // stretching the modal and pushing the message off the top.
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if widgets::btn_danger(ui, pending.ok_label.as_str()).clicked() {
+                            decision = Some(true);
+                        }
+                        let cancel = widgets::btn_ghost(ui, "Cancel");
+                        if pending.focus_cancel {
+                            cancel.request_focus();
+                            pending.focus_cancel = false;
+                        }
+                        if cancel.clicked() {
+                            decision = Some(false);
+                        }
+                    });
                 });
                 ui.add_space(6.0);
                 ui.label(
@@ -167,8 +172,24 @@ mod tests {
             "Delete?\nThis cannot be undone.",
             "Delete",
         );
-        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| confirm.show(ui.ctx()));
-        output.textures_delta.clear(); // no renderer to upload the font atlas
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(460.0, 620.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| confirm.show(ui.ctx()));
+            output.textures_delta.clear(); // no renderer to upload the font atlas
+        }
         assert!(confirm.is_open());
+        // A compact card, not a screen-tall panel (the message stays on
+        // screen above the buttons).
+        let card = ctx
+            .memory(|m| m.area_rect(egui::Id::new("witness-confirm")))
+            .expect("modal area");
+        assert!(card.height() < 260.0, "{card:?}");
+        assert!(card.top() > 0.0, "{card:?}");
     }
 }
