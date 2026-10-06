@@ -136,6 +136,9 @@ pub(crate) fn style(s: &mut egui::Style) {
         bar_width: 6.0,
         ..egui::style::ScrollStyle::solid()
     };
+    // No edge fade: CSS scrollers have none, and it dimmed the rows at the
+    // edges (the last meeting row, the segment above the player bar).
+    s.spacing.scroll.fade.strength = 0.0;
 
     let v = &mut s.visuals;
     v.dark_mode = true;
@@ -233,6 +236,8 @@ mod tests {
         // Buttons keep the raised fill.
         assert_eq!(w.inactive.weak_bg_fill, BG_HOVER);
         assert_eq!(w.hovered.weak_bg_fill, BG_HOVER);
+        // No edge fade (CSS scrollers have none).
+        assert_eq!(s.spacing.scroll.fade.strength, 0.0);
     }
 
     #[test]

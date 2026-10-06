@@ -672,20 +672,22 @@ impl SearchView {
                         .map_or_else(|| unknown_person.into(), |p| p.name.clone()),
                 }
             };
-            let combo = egui::ComboBox::from_id_salt("search-who")
-                .selected_text(egui::RichText::new(who_label(filters.who)).size(12.0))
-                .width(110.0)
-                .show_ui(ui, |ui| {
-                    let mut option = |ui: &mut egui::Ui, value: Who| {
-                        ui.selectable_value(&mut filters.who, value, who_label(value));
-                    };
-                    option(ui, Who::Anyone);
-                    option(ui, Who::Me);
-                    option(ui, Who::Them);
-                    for person in people {
-                        option(ui, Who::Person(person.id));
-                    }
-                });
+            let combo = widgets::select(ui, widgets::SelectKind::Compact, |ui| {
+                egui::ComboBox::from_id_salt("search-who")
+                    .selected_text(egui::RichText::new(who_label(filters.who)).size(12.0))
+                    .width(110.0)
+                    .show_ui(ui, |ui| {
+                        let mut option = |ui: &mut egui::Ui, value: Who| {
+                            ui.selectable_value(&mut filters.who, value, who_label(value));
+                        };
+                        option(ui, Who::Anyone);
+                        option(ui, Who::Me);
+                        option(ui, Who::Them);
+                        for person in people {
+                            option(ui, Who::Person(person.id));
+                        }
+                    })
+            });
             let combo = combo.response.on_hover_text("Who said it");
             ui.ctx().accesskit_node_builder(combo.id, |node| {
                 node.set_label("Filter by speaker");

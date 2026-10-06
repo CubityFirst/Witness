@@ -518,7 +518,7 @@ struct BookmarkEdit {
 /// `.rename-input`: BG fill, 1 px accent border, radius 4, 3/6 padding.
 /// Takes focus once when opened; reports Enter / focus loss as Commit and
 /// Escape as Cancel. A focus loss into the field's own right-click menu is
-/// neither.
+/// neither. `label` is the field's accessible name (the 0.2.x aria-label).
 fn inline_editor(
     ui: &mut egui::Ui,
     id: Id,
@@ -526,6 +526,7 @@ fn inline_editor(
     font: FontId,
     width: f32,
     hint: &str,
+    label: &str,
 ) -> (Response, EditOutcome) {
     let response = Frame::new()
         .fill(BG)
@@ -545,6 +546,7 @@ fn inline_editor(
             ui.add(field)
         })
         .inner;
+    set_accessible_label(ui.ctx(), response.id, label);
     let menu_open = Popup::is_id_open(ui.ctx(), Popup::default_response_id(&response));
     let outcome = if response.lost_focus() && !menu_open {
         if ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -561,6 +563,12 @@ fn inline_editor(
         edit.focus_pending = false;
     }
     (response, outcome)
+}
+
+/// Name a widget for screen readers (egui's TextEdit only exposes its hint
+/// as a placeholder).
+fn set_accessible_label(ctx: &egui::Context, id: Id, label: &str) {
+    ctx.accesskit_node_builder(id, |node| node.set_label(label));
 }
 
 // ---------------------------------------------------------------------------
@@ -654,6 +662,9 @@ struct RowCtx<'a> {
     speaker_edit: &'a mut Option<SpeakerEdit>,
     bookmark_edit: &'a mut Option<BookmarkEdit>,
     people: &'a [PersonInfo],
+    /// A deep link's segment whose seek button takes keyboard focus when
+    /// its row is laid out (cleared once taken).
+    focus_seg: &'a mut Option<i64>,
 }
 
 /// A scroll the list should perform: to a segment's row, "nearest"
@@ -961,7 +972,7 @@ fn ts_button(ui: &mut egui::Ui, ms: i64, label: &str) -> Response {
         let y = rect.bottom() - galley.size().y - 1.0;
         ui.painter()
             .galley(egui::pos2(rect.left(), y), galley, TEXT_MUTED);
-        if response.has_focus() {
+        if response.has_focus() && widgets::focus_visible(ui.ctx()) {
             focus_ring(ui, rect, 4);
         }
     }
@@ -1026,7 +1037,7 @@ fn segment_row(ui: &mut egui::Ui, rc: &mut RowCtx, idx: usize, actions: &mut Vec
                     click.widget_info(|| {
                         egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &chip_text)
                     });
-                    if click.has_focus() {
+                    if click.has_focus() && widgets::focus_visible(ui.ctx()) {
                         focus_ring(ui, chip.rect, 255);
                     }
                     let click = click
@@ -1045,7 +1056,14 @@ fn segment_row(ui: &mut egui::Ui, rc: &mut RowCtx, idx: usize, actions: &mut Vec
                 }
             }
             let label = format!("Play at {}", fmt_ts(seg.start_ms));
-            if ts_button(ui, seg.start_ms, &label).clicked() {
+            let ts = ts_button(ui, seg.start_ms, &label);
+            if *rc.focus_seg == Some(seg.id) {
+                // 0.2.x focused the hit's seek button: Tab continues from
+                // the hit and Space/Enter plays from it.
+                ts.request_focus();
+                *rc.focus_seg = None;
+            }
+            if ts.clicked() {
                 actions.push(RowAction::SeekPlay(idx));
             }
             // Selectable text; a click that is not a drag selection seeks.
@@ -1095,6 +1113,16 @@ fn speaker_editor(ui: &mut egui::Ui, rc: &mut RowCtx, actions: &mut Vec<RowActio
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
         let id = Id::new(("speaker-rename", seg_id));
+        // `Rename ${display_name ?? label}`, as the chip shows it.
+        let name = speaker_of(rc.detail, rc.speakers, Some(state.speaker_id))
+            .map(|s| {
+                if s.display_name.is_empty() {
+                    s.label.as_str()
+                } else {
+                    s.display_name.as_str()
+                }
+            })
+            .unwrap_or("speaker");
         let (field, outcome) = inline_editor(
             ui,
             id,
@@ -1102,6 +1130,7 @@ fn speaker_editor(ui: &mut egui::Ui, rc: &mut RowCtx, actions: &mut Vec<RowActio
             theme::regular(TEXT_SIZE),
             180.0,
             "",
+            &format!("Rename {name}"),
         );
         let shown = state.edit.text.trim();
         let hint = format!(
@@ -1198,6 +1227,7 @@ fn bookmark_row(ui: &mut egui::Ui, rc: &mut RowCtx, idx: usize, actions: &mut Ve
                                 theme::regular(TEXT_SIZE),
                                 (note_width - 14.0).max(60.0),
                                 "what happened here?",
+                                "Bookmark note",
                             );
                             if outcome != EditOutcome::Open {
                                 actions.push(RowAction::BookmarkDone {
@@ -1260,7 +1290,7 @@ fn bookmark_seek(ui: &mut egui::Ui, ts: &str) -> Response {
         painter.galley(chip.center() - glyph.size() / 2.0, glyph, BOOKMARK_GLYPH);
         let y = rect.bottom() - time.size().y - 1.0;
         painter.galley(egui::pos2(chip.right() + 8.0, y), time, TEXT_MUTED);
-        if response.has_focus() {
+        if response.has_focus() && widgets::focus_visible(ui.ctx()) {
             focus_ring(ui, rect, 4);
         }
     }
@@ -1326,11 +1356,22 @@ fn menu_item(ui: &mut egui::Ui, text: &str) -> Response {
         ui.allocate_exact_size(egui::vec2(width, galley.size().y + 18.0), Sense::click());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, text));
     if ui.is_rect_visible(rect) {
-        if response.hovered() || response.has_focus() {
+        // `.menu button:hover` only: the first item's programmatic focus on
+        // open must not leave a second highlighted row after a mouse open.
+        if response.hovered() {
             ui.painter().rect_filled(rect, CornerRadius::ZERO, BG_HOVER);
         }
         let pos = egui::pos2(rect.left() + 14.0, rect.center().y - galley.size().y / 2.0);
         ui.painter().galley(pos, galley, TEXT);
+        if response.has_focus() && widgets::focus_visible(ui.ctx()) {
+            // The global `:focus-visible` outline, kept inside the popup.
+            ui.painter().rect_stroke(
+                rect.shrink(2.0),
+                CornerRadius::same(4),
+                Stroke::new(2.0, FOCUS),
+                egui::StrokeKind::Inside,
+            );
+        }
     }
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -1610,6 +1651,9 @@ struct TranscriptState {
     /// The (generation, position) the active row was last computed for.
     last_position: Option<(u64, u64)>,
     focused_once: bool,
+    /// The deep-linked segment whose seek button gets keyboard focus once
+    /// the centring scroll has settled.
+    focus_pending: Option<i64>,
     scroll_req: Option<ScrollReq>,
     /// The scroll area's content viewport last frame (Jump pill anchor).
     scroll_inner: Option<Rect>,
@@ -1663,6 +1707,7 @@ impl TranscriptState {
             follow: true,
             last_position: None,
             focused_once: false,
+            focus_pending: None,
             scroll_req: None,
             scroll_inner: None,
             scroll_outer: None,
@@ -1828,6 +1873,7 @@ impl TranscriptState {
         if *segment_id != self.focus_segment_id {
             self.focus_segment_id = *segment_id;
             self.focused_once = false;
+            self.focus_pending = None;
             self.pending_seek_ms = None;
             self.active = None;
             self.follow = true;
@@ -1973,6 +2019,7 @@ impl TranscriptState {
         self.active = Some(idx);
         self.pending_seek_ms = Some(u64::try_from(detail.segments[idx].start_ms).unwrap_or(0));
         self.scroll_req = Some(ScrollReq::new(idx, true, false));
+        self.focus_pending = Some(target);
     }
 
     /// Resolve the archive path when `audio_path` appears (or on Try
@@ -2217,6 +2264,13 @@ impl TranscriptState {
             return ListOutput::default();
         }
 
+        // The deep link's focus lands once its centred scroll has settled
+        // (the row is laid out on screen then); one attempt only.
+        let mut focus_seg = if self.scroll_req.is_none() {
+            self.focus_pending.take()
+        } else {
+            None
+        };
         let mut rc = RowCtx {
             detail,
             speakers: &self.speakers,
@@ -2225,6 +2279,7 @@ impl TranscriptState {
             speaker_edit: &mut self.speaker_edit,
             bookmark_edit: &mut self.bookmark_edit,
             people: &self.people,
+            focus_seg: &mut focus_seg,
         };
         self.list.show(ui, &mut rc, self.scroll_req)
     }
@@ -2297,6 +2352,7 @@ impl TranscriptState {
                                 theme::semibold(17.0),
                                 width,
                                 "",
+                                "Meeting title",
                             );
                             if outcome != EditOutcome::Open {
                                 title_done = Some(outcome);
@@ -2448,6 +2504,7 @@ impl TranscriptState {
                     .margin(Margin::symmetric(10, 8))
                     .background_color(BG_RAISED),
             );
+            set_accessible_label(ui.ctx(), response.id, "Meeting notes");
             widgets::text_edit_menu(&response);
             if response.changed() {
                 self.notes.edited();
@@ -3386,6 +3443,7 @@ mod tests {
                             speaker_edit: &mut *speaker_edit,
                             bookmark_edit: &mut bookmark_edit,
                             people: &[],
+                            focus_seg: &mut None,
                         };
                         last = list.show(ui, &mut rc, req);
                     });
@@ -3647,5 +3705,121 @@ mod tests {
         // Back within 40 px: the next caption scrolls again.
         feed.scrolled(false, 30.0);
         assert!(feed.stick(Some(("mic", 3_000))));
+    }
+
+    /// One pass with AccessKit on; returns the tree update.
+    fn accesskit_pass(
+        ctx: &egui::Context,
+        f: impl FnMut(&mut egui::Ui),
+    ) -> egui::accesskit::TreeUpdate {
+        ctx.enable_accesskit();
+        let mut output = ctx.run_ui(egui::RawInput::default(), f);
+        output.textures_delta.clear();
+        output
+            .platform_output
+            .accesskit_update
+            .expect("accesskit update")
+    }
+
+    fn node_label(update: &egui::accesskit::TreeUpdate, id: Id) -> Option<String> {
+        let wanted = id.accesskit_id();
+        update
+            .nodes
+            .iter()
+            .find(|(node_id, _)| *node_id == wanted)
+            .and_then(|(_, node)| node.label().map(str::to_owned))
+    }
+
+    #[test]
+    fn inline_editors_have_accessible_names() {
+        let ctx = theme::test_context();
+        let mut edit = LineEdit::new("");
+        let id = Id::new("title-under-test");
+        let update = accesskit_pass(&ctx, |ui| {
+            inline_editor(
+                ui,
+                id,
+                &mut edit,
+                theme::regular(14.0),
+                200.0,
+                "",
+                "Meeting title",
+            );
+        });
+        assert_eq!(node_label(&update, id).as_deref(), Some("Meeting title"));
+    }
+
+    #[test]
+    fn deep_link_focuses_the_hits_seek_button() {
+        let ctx = theme::test_context();
+        let detail = synthetic_detail(1, 6);
+        let speakers: HashMap<i64, usize> = detail
+            .speakers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.id, i))
+            .collect();
+        let mut list = RowList::default();
+        list.rebuild(&detail);
+        let target = detail.segments[3].id;
+        let mut focus_seg = Some(target);
+        let mut update = None;
+        for _ in 0..2 {
+            update = Some(accesskit_pass(&ctx, |ui| {
+                let (mut speaker_edit, mut bookmark_edit) = (None, None);
+                let mut rc = RowCtx {
+                    detail: &detail,
+                    speakers: &speakers,
+                    tokens: &[],
+                    active: Some(3),
+                    speaker_edit: &mut speaker_edit,
+                    bookmark_edit: &mut bookmark_edit,
+                    people: &[],
+                    focus_seg: &mut focus_seg,
+                };
+                egui::ScrollArea::vertical().show_viewport(ui, |ui, _| {
+                    list.show(ui, &mut rc, None);
+                });
+            }));
+        }
+        assert_eq!(focus_seg, None, "the focus request was not taken");
+        let update = update.unwrap();
+        let focused = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == update.focus)
+            .and_then(|(_, node)| node.label().map(str::to_owned));
+        let expected = format!("Play at {}", fmt_ts(detail.segments[3].start_ms));
+        assert_eq!(focused.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn menu_item_focus_without_keyboard_is_not_highlighted() {
+        let ctx = theme::test_context();
+        let id = Id::new("menu-under-test");
+        let mut fills = 0;
+        for pass in 0..2 {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.push_id(id, |ui| {
+                    let item = menu_item(ui, "Markdown…");
+                    if pass == 0 {
+                        item.request_focus();
+                    }
+                });
+            });
+            output.textures_delta.clear();
+            if pass == 1 {
+                fills = output
+                    .shapes
+                    .iter()
+                    .filter(|clipped| match &clipped.shape {
+                        egui::Shape::Rect(rect) => rect.fill == BG_HOVER,
+                        _ => false,
+                    })
+                    .count();
+            }
+        }
+        assert!(ctx.memory(|m| m.focused().is_some()), "item not focused");
+        assert_eq!(fills, 0, "a focused, unhovered item was highlighted");
     }
 }

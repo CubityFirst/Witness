@@ -31,6 +31,13 @@
 //! the reader resyncs at the next indexed page and fills the lost span with
 //! silence, so the timeline (and every later position) stays exact. A
 //! packet the Opus decoder rejects is concealed (PLC) the same way.
+//!
+//! A page header that lost its capture pattern is a *sync hole*: the ogg
+//! reader skips it without an error, so the index scan searches forward for
+//! the next page of the same stream, recovers the packet count from that
+//! page's granule and records the hole; the reader realigns its timeline
+//! when it crosses one, and every hole counts as damage from the moment the
+//! archive is opened (retranscription must not drop the rest of a meeting).
 
 use crate::encoder::{has_mix_tag, FRAME};
 use anyhow::{bail, Context, Result};
@@ -74,16 +81,55 @@ pub(crate) struct AudioPage {
 #[derive(Debug, Default)]
 pub(crate) struct PageIndex {
     pub pages: Vec<AudioPage>,
+    /// Decoded index (pre-skip included) where each sync hole begins: a page
+    /// header without its capture pattern, skipped by searching forward for
+    /// the next page of the stream. Non-empty = the archive is damaged.
+    pub holes: Vec<u64>,
+    /// Granule of the last audio-stream page that has one, indexed or not (a
+    /// page right after a sync hole may be unindexable yet end the stream).
+    last_granule: Option<u64>,
 }
 
 impl PageIndex {
     /// Granule of the last page that has one (the end-of-stream granule).
     fn final_granule(&self) -> Option<u64> {
-        self.pages
-            .iter()
-            .rev()
-            .map(|p| p.granule)
-            .find(|&g| g != u64::MAX)
+        self.last_granule
+    }
+}
+
+/// Header bytes needed to recognise a resync candidate: capture pattern,
+/// version, header type, granule and stream serial.
+const SYNC_PROBE: usize = 18;
+
+/// Search forward from `from` for the next page header of stream `serial`
+/// ("OggS", version 0, same serial number). Returns its byte offset, or None
+/// at end of file. Streams the file in 64 KiB blocks (heap buffer).
+fn find_sync<R: Read + Seek>(r: &mut R, from: u64, serial: [u8; 4]) -> Result<Option<u64>> {
+    r.seek(SeekFrom::Start(from))?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut base = from; // file offset of buf[0]
+    let mut len = 0usize;
+    loop {
+        let n = match r.read(&mut buf[len..]) {
+            Ok(n) => n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e).context("searching for Ogg sync"),
+        };
+        len += n;
+        let candidates = len.saturating_sub(SYNC_PROBE - 1);
+        let found = (0..candidates).find(|&i| {
+            &buf[i..i + 4] == b"OggS" && buf[i + 4] == 0 && buf[i + 14..i + 18] == serial
+        });
+        if let Some(i) = found {
+            return Ok(Some(base + i as u64));
+        }
+        if n == 0 {
+            return Ok(None);
+        }
+        // Keep the tail that could still begin a header.
+        buf.copy_within(candidates..len, 0);
+        base += candidates as u64;
+        len -= candidates;
     }
 }
 
@@ -92,11 +138,18 @@ impl PageIndex {
 /// (the first packet starting at or after it is an audio packet). ~3,600
 /// pages per hour of audio; only the headers are read.
 ///
-/// A truncated trailing page simply ends the scan.
+/// A truncated trailing page simply ends the scan. A page header that lost
+/// its capture pattern is recorded in [`PageIndex::holes`] and skipped by
+/// searching for the next page of the stream; the packet count resumes at
+/// the first later page whose granule pins it down (pages before that stay
+/// out of the index, so nothing can seek into a span of unknown position).
 pub(crate) fn scan_pages<R: Read + Seek>(r: &mut R) -> Result<PageIndex> {
     let mut index = PageIndex::default();
     let mut offset = r.stream_position()?;
-    let mut completed: u64 = 0; // packets completed so far, headers included
+    // Packets completed so far, headers included. None after a sync hole,
+    // until a granule re-establishes it.
+    let mut completed: Option<u64> = Some(0);
+    let mut serial: Option<[u8; 4]> = None;
     let mut header = [0u8; 27];
     let mut lacing = vec![0u8; 255];
     loop {
@@ -105,13 +158,24 @@ pub(crate) fn scan_pages<R: Read + Seek>(r: &mut R) -> Result<PageIndex> {
             Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e).context("reading Ogg page header"),
         }
-        if &header[..4] != b"OggS" {
-            if completed == 0 {
+        let page_serial: [u8; 4] = header[14..18].try_into().unwrap();
+        if &header[..4] != b"OggS" || serial.is_some_and(|s| s != page_serial) {
+            let Some(stream) = serial else {
                 bail!("not an Ogg file");
-            }
-            log::warn!("archive: lost Ogg sync at byte {offset}; ignoring the rest");
-            break;
+            };
+            let at = completed.map_or(0, |c| c.saturating_sub(HEADER_PACKETS));
+            index.holes.push(FRAME as u64 * at);
+            let Some(next) = find_sync(r, offset + 1, stream)? else {
+                log::warn!("archive: lost Ogg sync at byte {offset}; ignoring the rest");
+                break;
+            };
+            log::warn!("archive: lost Ogg sync at byte {offset}; resuming at byte {next}");
+            r.seek(SeekFrom::Start(next))?;
+            offset = next;
+            completed = None;
+            continue;
         }
+        serial = Some(page_serial);
         let header_type = header[5];
         let granule = u64::from_le_bytes(header[6..14].try_into().unwrap());
         let segments = header[26] as usize;
@@ -121,25 +185,39 @@ pub(crate) fn scan_pages<R: Read + Seek>(r: &mut R) -> Result<PageIndex> {
         let body: u64 = lacing[..segments].iter().map(|&l| l as u64).sum();
         // A packet ends at every lacing value < 255.
         let ends = lacing[..segments].iter().filter(|&&l| l < 255).count() as u64;
-
-        let continued = header_type & 0x01 != 0;
-        // Packet `completed` is the first to end on this page; when it began
-        // on an earlier page, a reader seeked here drops that fragment and
-        // yields the next one.
-        let first_packet = completed + continued as u64;
-        let after = completed + ends;
-        if first_packet >= HEADER_PACKETS {
-            index.pages.push(AudioPage {
-                offset,
-                first_decoded: FRAME as u64 * (first_packet - HEADER_PACKETS),
-                granule,
-                end_decoded: FRAME as u64 * after.saturating_sub(HEADER_PACKETS),
-                continued,
-            });
+        if granule != u64::MAX {
+            index.last_granule = Some(granule);
         }
-        completed = after;
-
         let next = offset + 27 + segments as u64 + body;
+
+        // After a sync hole, a non-final granule is the decoded count at the
+        // end of its page (packets × FRAME, pre-skip included), which pins
+        // the packet count; the final granule (`pre_skip + total`) cannot.
+        let eos = header_type & 0x04 != 0;
+        let known = completed.or_else(|| {
+            (granule != u64::MAX && !eos && granule % FRAME as u64 == 0)
+                .then(|| (granule / FRAME as u64 + HEADER_PACKETS).checked_sub(ends))
+                .flatten()
+        });
+        if let Some(completed_before) = known {
+            let continued = header_type & 0x01 != 0;
+            // Packet `completed_before` is the first to end on this page;
+            // when it began on an earlier page, a reader seeked here drops
+            // that fragment and yields the next one.
+            let first_packet = completed_before + continued as u64;
+            let after = completed_before + ends;
+            if first_packet >= HEADER_PACKETS {
+                index.pages.push(AudioPage {
+                    offset,
+                    first_decoded: FRAME as u64 * (first_packet - HEADER_PACKETS),
+                    granule,
+                    end_decoded: FRAME as u64 * after.saturating_sub(HEADER_PACKETS),
+                    continued,
+                });
+            }
+            completed = Some(after);
+        }
+
         if r.seek(SeekFrom::Start(next)).is_err() {
             break;
         }
@@ -184,6 +262,11 @@ pub struct OpusArchiveReader {
     /// Damaged pages skipped plus packets concealed so far. Playback rides
     /// over them; the pipeline refuses to transcribe a damaged archive.
     damage: u64,
+    /// Sync holes found by the index scan (decoded index where each begins).
+    holes: Vec<u64>,
+    /// A packet read past a sync hole, held back until the silence for the
+    /// hole has been handed out.
+    pending: Option<Vec<u8>>,
     /// Decode scratch, interleaved stereo (heap, not stack — see CLAUDE.md).
     pcm: Vec<f32>,
 }
@@ -214,6 +297,8 @@ impl OpusArchiveReader {
             target: pre_skip,
             eof: false,
             damage: 0,
+            holes: index.holes,
+            pending: None,
             pcm: vec![0.0; MAX_FRAME * 2],
         })
     }
@@ -234,9 +319,37 @@ impl OpusArchiveReader {
     }
 
     /// How many damaged spans (bad Ogg pages resynced over, Opus packets
-    /// concealed) the reads so far have hidden. 0 = a clean decode.
+    /// concealed) the reads so far have hidden, plus every sync hole the
+    /// index scan found (known at open, wherever the reads are). 0 = a clean
+    /// decode.
     pub fn damage(&self) -> u64 {
-        self.damage
+        self.damage + self.holes.len() as u64
+    }
+
+    /// Playback position (samples per channel) of the first sync hole: a
+    /// page header that lost its capture pattern. None = no hole.
+    pub fn first_sync_hole(&self) -> Option<u64> {
+        self.holes.first().map(|&d| d.saturating_sub(self.pre_skip))
+    }
+
+    /// When `granule` belongs to an indexed page that should start after
+    /// what has been decoded, the ogg reader silently skipped a sync hole:
+    /// returns that page's first decoded index (a leading continued
+    /// fragment is dropped after a hole, as after a seek).
+    fn skipped_hole(&self, granule: u64) -> Option<u64> {
+        if self.holes.is_empty() || granule == u64::MAX {
+            return None;
+        }
+        // Non-final granules equal `end_decoded`; the final one does not.
+        let i = self.pages.partition_point(|p| p.end_decoded < granule);
+        let page = self
+            .pages
+            .get(i)
+            .filter(|p| p.granule == granule)
+            .or_else(|| self.pages.last().filter(|p| p.granule == granule))?;
+        // Start of the first packet that ends on this page.
+        let first_ending = page.first_decoded - if page.continued { FRAME as u64 } else { 0 };
+        (self.decoded < first_ending).then_some(page.first_decoded)
     }
 
     /// Playback sample index (per channel) of the next sample `read_stereo`
@@ -264,18 +377,36 @@ impl OpusArchiveReader {
                 self.target = to;
                 return Ok(n);
             }
-            let packet = match self.reader.read_packet() {
-                Ok(Some(packet)) => packet,
-                Ok(None) => {
-                    self.eof = true;
-                    return Ok(0);
-                }
-                Err(e) => {
-                    self.resync(&e)?;
-                    continue;
+            let data = match self.pending.take() {
+                Some(data) => data,
+                None => {
+                    let packet = match self.reader.read_packet() {
+                        Ok(Some(packet)) => packet,
+                        Ok(None) => {
+                            self.eof = true;
+                            return Ok(0);
+                        }
+                        Err(e) => {
+                            self.resync(&e)?;
+                            continue;
+                        }
+                    };
+                    if let Some(first) = self.skipped_hole(packet.absgp_page()) {
+                        log::warn!(
+                            "archive: crossed a sync hole near sample {}; resuming at sample {}",
+                            self.decoded.saturating_sub(self.pre_skip),
+                            first.saturating_sub(self.pre_skip)
+                        );
+                        // Silence for the hole first, then this packet.
+                        self.decoded = first;
+                        self.decoder = new_decoder()?;
+                        self.pending = Some(packet.data);
+                        continue;
+                    }
+                    packet.data
                 }
             };
-            let n = self.decode_packet(&packet.data);
+            let n = self.decode_packet(&data);
             let start = self.decoded;
             self.decoded += n as u64;
             // Hand out decoded indices in [target, min(decoded, end)): drops
@@ -360,6 +491,7 @@ impl OpusArchiveReader {
         let d = self.pre_skip + sample;
         self.eof = false;
         self.target = d;
+        self.pending = None;
         if self.pages.is_empty() {
             self.eof = true;
             return Ok(());
@@ -682,6 +814,80 @@ pub(crate) mod tests {
         while r.read_stereo(&mut got).unwrap() > 0 {}
         assert_eq!(got.len() / 2, clean.len() / 2 - (lost.start - 100));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lost_capture_pattern_is_damage_and_keeps_the_timeline() {
+        let dir = scratch("lost-sync");
+        let samples = 8 * 48_000;
+        let path = make_archive(&dir, "lost-sync", samples);
+        let clean = decode_all(&mut OpusArchiveReader::open(&path).unwrap());
+        let (pages, pre_skip) = {
+            let r = OpusArchiveReader::open(&path).unwrap();
+            (r.pages().to_vec(), r.pre_skip())
+        };
+        assert!(pages.len() > 6, "fixture too short: {} pages", pages.len());
+        assert!(!pages[3].continued && !pages[4].continued);
+        // "OggS" → "OggX" on page 3: the ogg reader skips that page without
+        // an error, and a naive index would end right there.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[pages[3].offset as usize + 3] = b'X';
+        let bad = dir.join("bad.opus");
+        std::fs::write(&bad, &bytes).unwrap();
+
+        let mut reader = OpusArchiveReader::open(&bad).unwrap();
+        assert!(reader.damage() > 0, "the hole was not counted at open");
+        assert_eq!(
+            reader.first_sync_hole(),
+            Some(pages[3].first_decoded - pre_skip)
+        );
+        assert_eq!(reader.total_samples(), samples as u64);
+        // The pages after the hole are indexed again, at their true positions.
+        let indexed: Vec<_> = reader.pages().iter().map(|p| p.offset).collect();
+        assert!(!indexed.contains(&pages[3].offset));
+        assert!(pages[4..].iter().all(|p| reader.pages().contains(p)));
+
+        let damaged = decode_all(&mut reader);
+        assert_eq!(damaged.len(), clean.len(), "timeline length changed");
+        let lost = (pages[3].first_decoded - pre_skip) as usize
+            ..(pages[4].first_decoded - pre_skip) as usize;
+        assert!(damaged[lost.start * 2..lost.end * 2]
+            .iter()
+            .all(|&v| v == 0.0));
+        let from = (pages[5].first_decoded - pre_skip) as usize * 2;
+        let snr = snr_db(&clean[from..], &damaged[from..]);
+        assert!(snr > 40.0, "after the hole: SNR {snr:.1} dB");
+
+        // Seeking past the hole lands on the clean timeline too.
+        let mut r = OpusArchiveReader::open(&bad).unwrap();
+        let at = pages[5].first_decoded - pre_skip + 480;
+        r.seek(at).unwrap();
+        let mut got = Vec::new();
+        while r.read_stereo(&mut got).unwrap() > 0 {}
+        assert_eq!(got.len(), clean.len() - at as usize * 2);
+
+        // Retranscription refuses it instead of dropping everything after
+        // the hole; the clean archive still decodes.
+        assert!(crate::encoder::decode_opus(&path).is_ok());
+        let error = crate::encoder::decode_opus(&bad).unwrap_err().to_string();
+        assert!(error.contains("is damaged near"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_sync_matches_only_the_same_stream() {
+        let serial = [1, 2, 3, 4];
+        let mut data = vec![0u8; 70_000];
+        // A capture pattern of another stream, then ours across the 64 KiB
+        // block boundary.
+        data[100..104].copy_from_slice(b"OggS");
+        data[114..118].copy_from_slice(&[9, 9, 9, 9]);
+        let at = 64 * 1024 - 6;
+        data[at..at + 4].copy_from_slice(b"OggS");
+        data[at + 14..at + 18].copy_from_slice(&serial);
+        let mut cur = std::io::Cursor::new(data);
+        assert_eq!(find_sync(&mut cur, 0, serial).unwrap(), Some(at as u64));
+        assert_eq!(find_sync(&mut cur, at as u64 + 1, serial).unwrap(), None);
     }
 
     /// A legacy (pre-comfort-mix) archive: hard-panned L = mic, R = loopback

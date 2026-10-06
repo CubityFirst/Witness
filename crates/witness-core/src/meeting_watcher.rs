@@ -37,6 +37,9 @@ pub enum WatcherCommand {
 pub struct WatcherControl {
     /// Auto-record enabled (mirrors settings; updated by update_settings).
     pub enabled: AtomicBool,
+    /// An exit path suspended auto-record for the rest of this process.
+    /// Sticky: unlike `enabled`, no settings write can clear it.
+    pub exiting: AtomicBool,
     /// Set when the user manually stopped during a call: suppresses
     /// auto-restart until the mic goes idle again.
     pub suppressed: AtomicBool,
@@ -52,10 +55,22 @@ impl WatcherControl {
     pub fn new(enabled: bool, patterns: &[String]) -> Arc<Self> {
         Arc::new(WatcherControl {
             enabled: AtomicBool::new(enabled),
+            exiting: AtomicBool::new(false),
             suppressed: AtomicBool::new(false),
             patterns: Mutex::new(patterns.iter().map(|p| p.to_lowercase()).collect()),
             idle_teams_windows: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Auto-record may start a recording: enabled in settings and not
+    /// suspended by an exit path.
+    pub fn auto_record(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed) && !self.exiting()
+    }
+
+    /// An exit path has suspended auto-record for good.
+    pub fn exiting(&self) -> bool {
+        self.exiting.load(Ordering::SeqCst)
     }
 
     pub fn set_patterns(&self, patterns: &[String]) {
@@ -126,7 +141,7 @@ pub fn spawn(
             loop {
                 let patterns = control.patterns.lock().unwrap().clone();
                 let (mic_active, key_found) = scan(&patterns);
-                let enabled = control.enabled.load(Ordering::Relaxed);
+                let enabled = control.auto_record();
 
                 if mic_active {
                     active_ticks += 1;

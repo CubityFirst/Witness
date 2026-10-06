@@ -50,6 +50,8 @@ const ROW_GAP: f32 = 8.0;
 const NAV_GAP: f32 = 4.0;
 const CONTROLS_GAP: f32 = 2.0;
 const CONTROLS_MARGIN: f32 = 4.0;
+/// The record/stop glyph (`size={17}`).
+const RECORD_ICON: f32 = 17.0;
 /// Level meter: 48 pt wide, two 4 pt bars 2 pt apart, each ≥ 2 pt.
 const METER_WIDTH: f32 = 48.0;
 const METER_BAR: f32 = 4.0;
@@ -71,33 +73,44 @@ enum Unit {
 }
 
 impl Unit {
-    /// First-frame width guesses (pt); replaced by measurements after one pass.
-    fn estimate(self) -> f32 {
-        match self {
+    /// First-frame size guesses (pt); replaced by measurements after one pass.
+    fn estimate(self) -> egui::Vec2 {
+        let width = match self {
             Unit::Record | Unit::Bookmark | Unit::Captions => 40.0,
             Unit::Pill => 60.0,
             Unit::Nav => 190.0,
             Unit::Controls => 100.0,
-        }
+        };
+        egui::vec2(width, 32.0)
     }
 }
 
-/// Unit widths measured in the previous pass (egui temp data).
+/// Unit sizes measured in the previous pass (egui temp data).
 #[derive(Debug, Clone, Default)]
-struct MeasuredWidths(Vec<(Unit, f32)>);
+struct MeasuredWidths(Vec<(Unit, egui::Vec2)>);
 
 impl MeasuredWidths {
-    fn get(&self, unit: Unit) -> f32 {
+    fn size(&self, unit: Unit) -> egui::Vec2 {
         self.0
             .iter()
             .find(|(u, _)| *u == unit)
-            .map_or_else(|| unit.estimate(), |(_, w)| *w)
+            .map_or_else(|| unit.estimate(), |(_, size)| *size)
     }
 
-    fn set(&mut self, unit: Unit, width: f32) {
+    fn get(&self, unit: Unit) -> f32 {
+        self.size(unit).x
+    }
+
+    /// The height of a line holding `units`: its tallest unit (CSS
+    /// `align-items: center` centres every item on that line box).
+    fn line_height(&self, units: &[Unit]) -> f32 {
+        units.iter().map(|&u| self.size(u).y).fold(0.0, f32::max)
+    }
+
+    fn set(&mut self, unit: Unit, size: egui::Vec2) {
         match self.0.iter_mut().find(|(u, _)| *u == unit) {
-            Some(slot) => slot.1 = width,
-            None => self.0.push((unit, width)),
+            Some(slot) => slot.1 = size,
+            None => self.0.push((unit, size)),
         }
     }
 }
@@ -350,42 +363,62 @@ fn draw_bar(ui: &mut egui::Ui, model: &BarModel) -> DrawnBar {
                 ui.set_min_width(ui.available_width());
                 let available = ui.available_width();
                 let lines = wrap_lines(&widths_of(&measured), available, column_gap);
+                let heights_of = |m: &MeasuredWidths| -> Vec<f32> {
+                    lines
+                        .iter()
+                        .map(|line| m.line_height(&units[line.clone()]))
+                        .collect()
+                };
+                let heights = heights_of(&measured);
                 ui.spacing_mut().item_spacing.y = ROW_GAP;
-                for line in &lines {
+                for (line, &line_height) in lines.iter().zip(&heights) {
                     let line_units = &units[line.clone()];
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = column_gap;
-                        let nav_at = line_units.iter().position(|u| *u == Unit::Nav);
-                        for &unit in &line_units[..nav_at.unwrap_or(line_units.len())] {
-                            if unit == Unit::Controls {
-                                // Wrapped without the nav, the controls start
-                                // their line, after their 4 px margin.
-                                ui.add_space(CONTROLS_MARGIN);
-                            }
-                            let rect = draw_unit(ui, unit, model, &mut actions);
-                            measured.set(unit, rect.width());
-                            #[cfg(test)]
-                            rects.push((unit, rect));
-                        }
-                        if let Some(at) = nav_at {
-                            // `margin-left: auto`: the rest of the line hugs
-                            // the right edge (drawn right to left).
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.spacing_mut().item_spacing.x = column_gap + CONTROLS_MARGIN;
-                                for &unit in line_units[at..].iter().rev() {
-                                    let rect = draw_unit(ui, unit, model, &mut actions);
-                                    measured.set(unit, rect.width());
-                                    #[cfg(test)]
-                                    rects.push((unit, rect));
+                    // A line exactly as tall as its tallest unit, every unit
+                    // centred on it (a `ui.horizontal` starts 30 pt tall and
+                    // grows downward, leaving taller units off-centre).
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), line_height),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.x = column_gap;
+                            let nav_at = line_units.iter().position(|u| *u == Unit::Nav);
+                            for &unit in &line_units[..nav_at.unwrap_or(line_units.len())] {
+                                if unit == Unit::Controls {
+                                    // Wrapped without the nav, the controls start
+                                    // their line, after their 4 px margin.
+                                    ui.add_space(CONTROLS_MARGIN);
                                 }
-                            });
-                        }
-                    });
+                                let rect = draw_unit(ui, unit, model, &mut actions);
+                                measured.set(unit, rect.size());
+                                #[cfg(test)]
+                                rects.push((unit, rect));
+                            }
+                            if let Some(at) = nav_at {
+                                // `margin-left: auto`: the rest of the line hugs
+                                // the right edge (drawn right to left).
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.spacing_mut().item_spacing.x = column_gap + CONTROLS_MARGIN;
+                                    for &unit in line_units[at..].iter().rev() {
+                                        let rect = draw_unit(ui, unit, model, &mut actions);
+                                        measured.set(unit, rect.size());
+                                        #[cfg(test)]
+                                        rects.push((unit, rect));
+                                    }
+                                });
+                            }
+                        },
+                    );
                 }
-                // A new measurement moved a unit to another line: redo the
-                // pass so the stale layout is never shown.
-                if wrap_lines(&widths_of(&measured), available, column_gap) != lines {
-                    ui.ctx().request_discard("top bar wrap changed");
+                // A new measurement moved a unit to another line or changed
+                // a line's height: redo the pass so the stale layout is
+                // never shown.
+                let rewrapped = wrap_lines(&widths_of(&measured), available, column_gap) != lines;
+                let resized = heights_of(&measured)
+                    .iter()
+                    .zip(&heights)
+                    .any(|(a, b)| (a - b).abs() > 0.25);
+                if rewrapped || resized {
+                    ui.ctx().request_discard("top bar layout changed");
                 }
             });
         },
@@ -461,16 +494,16 @@ fn record_button(ui: &mut egui::Ui, model: &BarModel) -> egui::Response {
     let spinning = recording && model.busy;
     let content = if spinning {
         // Keeps the button's size; the spinner is painted over it.
-        icons::icon(ph::CIRCLE_NOTCH, 17.0).color(Color32::TRANSPARENT)
+        icons::icon(ph::CIRCLE_NOTCH, RECORD_ICON).color(Color32::TRANSPARENT)
     } else if recording {
-        icons::icon(ph::STOP, 17.0)
+        icons::icon(ph::STOP, RECORD_ICON)
     } else {
-        icons::icon(ph::RECORD, 17.0)
+        icons::icon(ph::RECORD, RECORD_ICON)
     };
     ui.add_enabled_ui(!model.busy, |ui| {
-        let response = widgets::btn_record(ui, recording, content, label);
+        let response = widgets::btn_record(ui, recording, content, RECORD_ICON, label);
         if spinning {
-            icons::paint_spinner(ui, response.rect, 17.0, WHITE);
+            icons::paint_spinner(ui, response.rect, RECORD_ICON, WHITE);
         }
         response
     })
@@ -479,7 +512,8 @@ fn record_button(ui: &mut egui::Ui, model: &BarModel) -> egui::Response {
 
 /// "Bookmark this moment (CTRL+ALT+B)".
 fn bookmark_button(ui: &mut egui::Ui, tooltip: &str) -> egui::Response {
-    let response = widgets::btn(ui, icons::icon(ph::BOOKMARK_SIMPLE, 16.0)).on_hover_text(tooltip);
+    let response = widgets::btn_icon_only(ui, icons::icon(ph::BOOKMARK_SIMPLE, 16.0), 16.0)
+        .on_hover_text(tooltip);
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Bookmark this moment")
     });
@@ -496,7 +530,8 @@ fn bookmark_tooltip(hotkey: Option<&str>) -> String {
 /// Re-open (or focus) the captions overlay.
 fn captions_button(ui: &mut egui::Ui) -> egui::Response {
     let label = "Show the caption overlay";
-    let response = widgets::btn(ui, icons::icon(ph::CLOSED_CAPTIONING, 16.0)).on_hover_text(label);
+    let response = widgets::btn_icon_only(ui, icons::icon(ph::CLOSED_CAPTIONING, 16.0), 16.0)
+        .on_hover_text(label);
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
     response
 }
@@ -609,37 +644,63 @@ fn recording_pill(
 ) -> egui::Response {
     let wide = !narrow(ui);
     let font = theme::regular(13.0);
-    let inner = widgets::pill_frame(ui, PillKind::Recording).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), Sense::hover());
-            let alpha = icons::pulse_alpha(ui.ctx());
+    // Laid out by hand and allocated at its exact size (see
+    // `widgets::pill_shell`): dot, texts and meter 8 pt apart, centred.
+    let mut texts = Vec::new();
+    if wide {
+        texts.push("Recording");
+    }
+    texts.push(elapsed);
+    if warning.is_some() {
+        texts.push("⚠");
+    }
+    let galleys: Vec<_> = texts
+        .iter()
+        .map(|t| {
             ui.painter()
-                .circle_filled(dot.center(), 4.0, REC.gamma_multiply(alpha));
-            let text = |ui: &mut egui::Ui, s: &str| {
-                ui.label(RichText::new(s).font(font.clone()).color(REC_LIGHT));
-            };
-            if wide {
-                text(ui, "Recording");
-            }
-            text(ui, elapsed);
-            if warning.is_some() {
-                text(ui, "⚠");
-            }
-            wide.then(|| level_meter(ui, model))
+                .layout_no_wrap((*t).to_owned(), font.clone(), REC_LIGHT)
         })
-        .inner
+        .collect();
+    let meter_size = egui::vec2(METER_WIDTH, METER_BAR * 2.0 + 2.0);
+    let mut widths = vec![8.0];
+    widths.extend(galleys.iter().map(|g| g.size().x));
+    if wide {
+        widths.push(meter_size.x);
+    }
+    let gap = 8.0;
+    let content = egui::vec2(
+        widths.iter().sum::<f32>() + gap * (widths.len() - 1) as f32,
+        galleys
+            .iter()
+            .map(|g| g.size().y)
+            .fold(meter_size.y, f32::max),
+    );
+    let rect = widgets::pill_shell(ui, PillKind::Recording, content);
+    let mid = rect.center().y;
+    let mut x = rect.left() + widgets::pill_padding(ui).x;
+    let alpha = icons::pulse_alpha(ui.ctx());
+    ui.painter()
+        .circle_filled(egui::pos2(x + 4.0, mid), 4.0, REC.gamma_multiply(alpha));
+    x += 8.0 + gap;
+    for galley in galleys {
+        let size = galley.size();
+        ui.painter()
+            .galley(egui::pos2(x, mid - size.y / 2.0), galley, REC_LIGHT);
+        x += size.x + gap;
+    }
+    let meter = wide.then(|| {
+        let meter = Rect::from_min_size(egui::pos2(x, mid - meter_size.y / 2.0), meter_size);
+        level_meter(ui, meter, model);
+        meter
     });
-    let rect = inner.response.rect;
     let response = ui
         .interact(rect, ui.id().with("recording-pill"), Sense::click())
         .on_hover_cursor(CursorIcon::PointingHand);
     // The pill's click response sits above the hover-only meter, so the
     // meter's own tooltip would never show: pick the text by where the
     // pointer is (the web meter's `title` won over the pill's inside it).
-    let over_meter = inner
-        .inner
-        .is_some_and(|meter| response.hover_pos().is_some_and(|p| meter.contains(p)));
+    let over_meter =
+        meter.is_some_and(|meter| response.hover_pos().is_some_and(|p| meter.contains(p)));
     let tooltip = if over_meter {
         METER_LABEL
     } else {
@@ -662,14 +723,10 @@ fn recording_pill(
     response
 }
 
-/// Two stacked bars: microphone (accent) and system audio (ok), each
-/// `min(100, rms·300)` % of 48 pt, at least 2 pt, easing over 0.15 s.
-/// Returns the meter's rect.
-fn level_meter(ui: &mut egui::Ui, model: &BarModel) -> Rect {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(METER_WIDTH, METER_BAR * 2.0 + 2.0),
-        Sense::hover(),
-    );
+/// Two stacked bars in `rect`: microphone (accent) and system audio (ok),
+/// each `min(100, rms·300)` % of 48 pt, at least 2 pt, easing over 0.15 s.
+fn level_meter(ui: &mut egui::Ui, rect: Rect, model: &BarModel) {
+    let response = ui.interact(rect, ui.id().with("level-meter"), Sense::hover());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, METER_LABEL));
     let (mic, loopback) = model.levels;
     for (row, (rms, color)) in [(mic, ACCENT), (loopback, OK)].into_iter().enumerate() {
@@ -687,7 +744,6 @@ fn level_meter(ui: &mut egui::Ui, model: &BarModel) -> Rect {
         let bar = Rect::from_min_size(egui::pos2(rect.left(), top), egui::vec2(width, METER_BAR));
         ui.painter().rect_filled(bar, CornerRadius::same(2), color);
     }
-    rect
 }
 
 /// A level bar's width in points for an RMS level (0..1).
@@ -702,8 +758,7 @@ pub(crate) fn meter_width(rms: f32) -> f32 {
 
 /// Meetings, People and the Settings gear; returns the group's rect.
 fn nav_group(ui: &mut egui::Ui, active: Option<NavItem>, actions: &mut Vec<BarAction>) -> Rect {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = NAV_GAP;
+    group(ui, NAV_GAP, |ui, rect| {
         for item in draw_order(ui, 3) {
             let (item, response) = match item {
                 0 => (
@@ -724,20 +779,33 @@ fn nav_group(ui: &mut egui::Ui, active: Option<NavItem>, actions: &mut Vec<BarAc
                     ),
                 ),
             };
+            *rect = rect.union(response.rect);
             if response.clicked() {
                 actions.push(BarAction::Nav(item));
             }
         }
     })
-    .response
-    .rect
+}
+
+/// A group of buttons `gap` apart in the line's own layout and full height,
+/// so each centres on the line (a nested `ui.horizontal` starts 30 pt tall
+/// and grows downward). Returns the union of what `add` reports: the
+/// buttons themselves, never the line-tall frame around them (that would
+/// feed back into the line height).
+fn group(ui: &mut egui::Ui, gap: f32, add: impl FnOnce(&mut egui::Ui, &mut Rect)) -> Rect {
+    let mut rect = Rect::NOTHING;
+    let layout = *ui.layout();
+    ui.allocate_ui_with_layout(ui.available_size(), layout, |ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        add(ui, &mut rect);
+    });
+    rect
 }
 
 /// Minimize, maximize (always the square glyph) and close-to-tray; returns
 /// the group's rect. Hidden in tray-flyout mode.
 fn window_controls(ui: &mut egui::Ui, actions: &mut Vec<BarAction>) -> Rect {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = CONTROLS_GAP;
+    group(ui, CONTROLS_GAP, |ui, rect| {
         for item in draw_order(ui, 3) {
             let (action, response) = match item {
                 0 => (
@@ -753,13 +821,12 @@ fn window_controls(ui: &mut egui::Ui, actions: &mut Vec<BarAction>) -> Rect {
                     widgets::win_btn(ui, ph::X, 14.0, "Close to tray", true),
                 ),
             };
+            *rect = rect.union(response.rect);
             if response.clicked() {
                 actions.push(action);
             }
         }
     })
-    .response
-    .rect
 }
 
 /// `.topbar { padding: 10px 14px }`, applied inside the bar's drag scope.
@@ -1160,6 +1227,36 @@ mod tests {
         let (_, wide) = lay_out_bar(900.0, &bar_model(true));
         let (row, controls) = (rect_of(&wide, Unit::Record), rect_of(&wide, Unit::Controls));
         assert!(controls.top() < row.bottom(), "{wide:?}");
+    }
+
+    #[test]
+    fn bar_units_centre_on_one_line_and_pills_hug_their_text() {
+        for (width, recording) in [(460.0, false), (460.0, true), (900.0, true)] {
+            let (bar, rects) = lay_out_bar(width, &bar_model(recording));
+            let line = rect_of(&rects, Unit::Record);
+            for (unit, rect) in &rects {
+                if rect.top() >= line.bottom() {
+                    continue; // wrapped to the second line
+                }
+                assert!(
+                    (rect.center().y - line.center().y).abs() < 0.6,
+                    "{unit:?} off the line's centre at {width}: {rects:?}"
+                );
+            }
+            // `.pill`: 13 px text + 5 px padding (~27), not the row height.
+            let pill = rect_of(&rects, Unit::Pill);
+            assert!((26.0..=28.5).contains(&pill.height()), "pill {pill:?}");
+            // `.btn-with-icon`: 17 px SVG + 12 padding + 2 border = 31.
+            assert!((line.height() - 31.0).abs() < 0.6, "record {line:?}");
+            if recording {
+                let bookmark = rect_of(&rects, Unit::Bookmark);
+                assert!((bookmark.height() - 30.0).abs() < 0.6, "{bookmark:?}");
+            }
+            // One line: 10 + the 33 pt nav buttons + 10 (0.2.x: ~54 px).
+            if width > 800.0 || !recording {
+                assert!(bar.height() < 55.0, "bar {bar:?} at {width}");
+            }
+        }
     }
 
     #[test]

@@ -9,14 +9,15 @@
 //!   for 2 s instead of falling through into a second full instance.
 //! - Once the window exists, a request that times out (the first instance
 //!   is still starting up and not pumping messages yet) is re-sent for up
-//!   to 30 s. A timed-out WM_COPYDATA is dropped, so giving up after one
+//!   to 45 s. A timed-out WM_COPYDATA is dropped, so giving up after one
 //!   attempt would lose the request; the plugin's blocking `SendMessageW`
 //!   waited indefinitely instead.
 //! - If the mutex owner lets go meanwhile (a restart: the old process
 //!   releases it at its point of no return), the new launch takes it over
 //!   and becomes the primary instance.
 //! - An exiting instance refuses requests (`begin_exit`), so a launch that
-//!   races the exit keeps waiting and takes over instead of being told
+//!   races the exit (from the moment Tray Quit starts) keeps waiting and
+//!   takes over instead of being told
 //!   "shown" by a process that is about to disappear. A panicking main
 //!   thread refuses too (the panic hook's message box pumps messages while
 //!   it still holds the mutex, so the launch waits for the exit), and a
@@ -55,8 +56,9 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a second launch keeps re-sending once the window exists: the
 /// first instance may still be starting up (settings, db, recovery, GPU
 /// context) before its message pump runs, or be exiting (a panic's
-/// emergency stop takes up to 10 s before the mutex is released).
-const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
+/// emergency stop takes up to 10 s, a Tray Quit's stop up to 30 s plus the
+/// exit flushes, before the mutex is released).
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(45);
 const ACQUIRE_POLL: Duration = Duration::from_millis(100);
 /// How long one WM_COPYDATA send may block on the first instance.
 const SEND_TIMEOUT_MS: u32 = 2000;

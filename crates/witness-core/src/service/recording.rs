@@ -477,9 +477,10 @@ impl AppCore {
     }
 
     /// Exit paths: the meeting watcher stops auto-starting recordings for
-    /// the rest of this process (lock-free; settings are not touched). [ui-ok]
+    /// the rest of this process (lock-free; settings are not touched, and a
+    /// later settings write cannot re-enable it). [ui-ok]
     pub fn suspend_auto_record(&self) {
-        self.state.watcher.enabled.store(false, Ordering::SeqCst);
+        self.state.watcher.exiting.store(true, Ordering::SeqCst);
     }
 
     /// Panic hook only: stop the recording on a fresh helper thread and wait
@@ -624,5 +625,20 @@ mod tests {
             capture_warning(&lost).unwrap().1,
             "Microphone device lost — recording silence until it returns"
         );
+    }
+
+    #[test]
+    fn exit_suspension_of_auto_record_survives_settings_writes() {
+        let (core, _sink, _dir) = scratch_core("suspend");
+        let watcher = &core.state.watcher;
+        watcher.enabled.store(true, Ordering::Relaxed);
+        assert!(watcher.auto_record());
+        core.suspend_auto_record();
+        assert!(!watcher.auto_record());
+        // What update_settings does on every write (e.g. flush_for_exit
+        // after a Quit's shutdown): it must not undo the suspension.
+        watcher.enabled.store(true, Ordering::Relaxed);
+        assert!(!watcher.auto_record());
+        assert!(watcher.exiting());
     }
 }

@@ -206,6 +206,15 @@ fn decode_opus_chunks(
 ) -> Result<()> {
     let mut reader = OpusArchiveReader::open(path)?;
     let mixed = reader.mixed();
+    // A lost page header is known from the index alone: fail before any
+    // decoding rather than at the hole.
+    if let Some(at) = reader.first_sync_hole() {
+        bail!(
+            "the archived audio {} is damaged near {:.1} s; not transcribing it",
+            path.display(),
+            at as f64 / 48_000.0
+        );
+    }
 
     // Inverse of [main cross; cross main] (determinant 0.5).
     let det = MIX_MAIN * MIX_MAIN - MIX_CROSS * MIX_CROSS;

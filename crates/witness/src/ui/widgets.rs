@@ -32,6 +32,10 @@ struct ButtonStyle {
     font: Font,
     /// Fixed outer size (window buttons); otherwise content + padding.
     fixed_size: Option<egui::Vec2>,
+    /// Content height for icon-only buttons: the SVG's size (+ the CSS
+    /// border), not the glyph galley's text row height (Segoe's 1.33x),
+    /// and no interact-size minimum. None = the galley's height.
+    content_height: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -70,6 +74,7 @@ fn btn_style(ui: &egui::Ui) -> ButtonStyle {
         radius: 6,
         font: Font::Regular(theme::BASE_SIZE),
         fixed_size: None,
+        content_height: None,
     }
 }
 
@@ -102,7 +107,10 @@ fn styled_button(
     );
     let size = style.fixed_size.unwrap_or_else(|| {
         let s = galley.size() + style.padding * 2.0;
-        egui::vec2(s.x, s.y.max(ui.spacing().interact_size.y))
+        match style.content_height {
+            Some(h) => egui::vec2(s.x, h + style.padding.y * 2.0),
+            None => egui::vec2(s.x, s.y.max(ui.spacing().interact_size.y)),
+        }
     });
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let name = label
@@ -161,6 +169,16 @@ pub fn btn(ui: &mut egui::Ui, text: impl Into<WidgetText>) -> Response {
     styled_button(ui, style, text.into(), None)
 }
 
+/// `.btn.btn-with-icon` holding only an `icon` pt glyph: as tall as the
+/// SVG + padding + the 1 px border (30 pt for a 16 pt icon), like CSS.
+pub fn btn_icon_only(ui: &mut egui::Ui, glyph: impl Into<WidgetText>, icon: f32) -> Response {
+    let style = ButtonStyle {
+        content_height: Some(icon + 2.0),
+        ..btn_style(ui)
+    };
+    styled_button(ui, style, glyph.into(), None)
+}
+
 /// `.btn.btn-ghost`: transparent fill, border kept.
 pub fn btn_ghost(ui: &mut egui::Ui, text: impl Into<WidgetText>) -> Response {
     let style = ButtonStyle {
@@ -179,15 +197,16 @@ pub fn btn_danger(ui: &mut egui::Ui, text: impl Into<WidgetText>) -> Response {
 
 /// The top bar's record button: `.btn-record` (light-red semibold glyph on
 /// the normal fill) while idle, `.btn-stop` (danger look) while recording.
-/// `content` is the glyph; `label` its accessible name ("Start recording" /
-/// "Stop recording").
+/// `content` is the glyph (`icon` pt, sized like [`btn_icon_only`]);
+/// `label` its accessible name ("Start recording" / "Stop recording").
 pub fn btn_record(
     ui: &mut egui::Ui,
     recording: bool,
     content: impl Into<WidgetText>,
+    icon: f32,
     label: &str,
 ) -> Response {
-    let style = if recording {
+    let base = if recording {
         danger_style(ui)
     } else {
         ButtonStyle {
@@ -196,6 +215,10 @@ pub fn btn_record(
             font: Font::Semibold(theme::BASE_SIZE),
             ..btn_style(ui)
         }
+    };
+    let style = ButtonStyle {
+        content_height: Some(icon + 2.0),
+        ..base
     };
     styled_button(ui, style, content.into(), Some(label)).on_hover_text(label)
 }
@@ -212,6 +235,7 @@ fn icon_style(size: f32, hover_text: Color32) -> ButtonStyle {
         radius: 6,
         font: Font::Regular(size),
         fixed_size: None,
+        content_height: None,
     }
 }
 
@@ -259,6 +283,7 @@ fn nav_style(selected: bool, padding: egui::Vec2, font: Font) -> ButtonStyle {
         radius: 6,
         font,
         fixed_size: None,
+        content_height: None,
     }
 }
 
@@ -278,9 +303,13 @@ pub fn nav_btn(ui: &mut egui::Ui, text: impl Into<WidgetText>, selected: bool) -
     response
 }
 
-/// `.nav-btn.nav-btn-icon` (7/9 padding) for the Settings gear.
+/// `.nav-btn.nav-btn-icon` (7/9 padding) for the Settings gear: the 18 pt
+/// SVG + padding = 32 pt tall (no border).
 pub fn nav_icon_btn(ui: &mut egui::Ui, glyph: &str, selected: bool, label: &str) -> Response {
-    let style = nav_style(selected, egui::vec2(9.0, 7.0), Font::Regular(18.0));
+    let style = ButtonStyle {
+        content_height: Some(18.0),
+        ..nav_style(selected, egui::vec2(9.0, 7.0), Font::Regular(18.0))
+    };
     styled_button(ui, style, glyph.into(), Some(label)).on_hover_text(label)
 }
 
@@ -298,6 +327,7 @@ pub fn win_btn(ui: &mut egui::Ui, glyph: &str, size: f32, label: &str, close: bo
         radius: 6,
         font: Font::Regular(size),
         fixed_size: Some(egui::vec2(32.0, 30.0)),
+        content_height: None,
     };
     styled_button(ui, style, glyph.into(), Some(label)).on_hover_text(label)
 }
@@ -325,15 +355,24 @@ impl PillKind {
     }
 }
 
-/// The `.pill` frame (fully rounded, 5/9 padding narrow, 5/12 wide), for
-/// pills with custom content such as the recording pill.
-pub fn pill_frame(ui: &egui::Ui, kind: PillKind) -> Frame {
+/// The `.pill` padding: 5/9 narrow, 5/12 wide.
+pub fn pill_padding(ui: &egui::Ui) -> egui::Vec2 {
+    egui::vec2(if narrow(ui) { 9.0 } else { 12.0 }, 5.0)
+}
+
+/// Allocate a pill around `content` (padding added) and paint its fully
+/// rounded fill. Sized exactly and never stretched to the row's height (a
+/// `Frame` in a centred row would be), so it hugs its 13 pt text like the
+/// CSS inline-flex pill. Returns the pill's rect.
+pub fn pill_shell(ui: &mut egui::Ui, kind: PillKind, content: egui::Vec2) -> egui::Rect {
     let (fill, _) = kind.colors();
-    let h = if narrow(ui) { 9 } else { 12 };
-    Frame::new()
-        .fill(fill)
-        .corner_radius(CornerRadius::same(255))
-        .inner_margin(Margin::symmetric(h, 5))
+    let size = content + pill_padding(ui) * 2.0;
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(255), fill);
+    }
+    rect
 }
 
 /// A text pill (13 pt). Recording pills sense clicks; the others only hover.
@@ -346,33 +385,41 @@ pub fn pill(ui: &mut egui::Ui, kind: PillKind, text: impl Into<WidgetText>) -> R
         f32::INFINITY,
         theme::regular(13.0),
     );
-    let frame = pill_frame(ui, kind);
-    let response = frame
-        .show(ui, |ui| {
-            let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
-            ui.painter().galley(rect.min, galley.clone(), color);
-        })
-        .response;
+    let rect = pill_shell(ui, kind, galley.size());
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley.clone(), color);
     let sense = if kind == PillKind::Recording {
         Sense::click()
     } else {
         Sense::hover()
     };
-    let response = ui.interact(response.rect, response.id.with("pill"), sense);
+    let response = ui.interact(rect, ui.id().with(("pill", kind as u8)), sense);
     let name = galley.text().to_owned();
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &name));
     response
 }
 
-/// A speaker chip: fully rounded `color` fill, white semibold 11 pt text,
-/// truncated with an ellipsis at `max_width_em` em (CSS `max-width: 16em`).
-pub fn chip(ui: &mut egui::Ui, text: &str, color: Color32, max_width_em: f32) -> Response {
+/// A chip's padding (8/2 per side).
+const CHIP_PADDING: egui::Vec2 = egui::vec2(16.0, 4.0);
+
+fn chip_galley(ui: &egui::Ui, text: &str, max_width_em: f32) -> std::sync::Arc<egui::Galley> {
     let font = theme::semibold(11.0);
     let max_text = (max_width_em * 11.0 - 16.0).max(11.0);
     let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, WHITE);
     job.wrap = egui::text::TextWrapping::truncate_at_width(max_text);
-    let galley = ui.painter().layout_job(job);
-    let size = galley.size() + egui::vec2(16.0, 4.0);
+    ui.painter().layout_job(job)
+}
+
+/// The size [`chip`] will allocate, for laying out around it first.
+pub fn chip_size(ui: &egui::Ui, text: &str, max_width_em: f32) -> egui::Vec2 {
+    chip_galley(ui, text, max_width_em).size() + CHIP_PADDING
+}
+
+/// A speaker chip: fully rounded `color` fill, white semibold 11 pt text,
+/// truncated with an ellipsis at `max_width_em` em (CSS `max-width: 16em`).
+pub fn chip(ui: &mut egui::Ui, text: &str, color: Color32, max_width_em: f32) -> Response {
+    let galley = chip_galley(ui, text, max_width_em);
+    let size = galley.size() + CHIP_PADDING;
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
     if ui.is_rect_visible(rect) {
         ui.painter()
@@ -532,11 +579,34 @@ pub struct KeyScroll {
     pub space: bool,
 }
 
+fn view_viewport_id() -> egui::Id {
+    egui::Id::new("witness-view-viewport-right")
+}
+
+/// How far the current view's scroll bar pulled its content in from
+/// `right` (the content panel's right edge), as of the last view drawn: 0
+/// without a scroll bar, or when no view noted its viewport. In 0.2.x the
+/// model banner and search box lived in the view's scroller, so they share
+/// this right edge with the view's cards and rows.
+pub fn view_scroll_gutter(ctx: &egui::Context, right: f32) -> f32 {
+    ctx.data(|d| d.get_temp::<f32>(view_viewport_id()))
+        .map_or(0.0, |viewport| (right - viewport).clamp(0.0, 20.0))
+}
+
+/// Forget the noted viewport (before a view draws; it notes it again).
+pub fn clear_view_viewport(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.remove::<f32>(view_viewport_id()));
+}
+
 /// Keyboard scrolling for a view's main `ScrollArea` when nothing has focus
 /// (WebView2 scrolled the focused `<main>`): ↑/↓ 40 pt, PageUp/PageDown 90 %
 /// of the viewport, Home/End, optionally Space/Shift+Space. Call once,
-/// inside the `ScrollArea`.
+/// inside the `ScrollArea`. Also notes the viewport's right edge for
+/// [`view_scroll_gutter`].
 pub fn keyboard_scroll(ui: &mut egui::Ui, opts: KeyScroll) {
+    let viewport = ui.max_rect().right();
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(view_viewport_id(), viewport));
     if ui.ctx().memory(|m| m.focused().is_some()) {
         return;
     }
@@ -670,9 +740,9 @@ pub fn radio_value<T: PartialEq>(
     .inner
 }
 
-/// Range-input visuals: a visible `--border` rail, an accent fill up to the
-/// value, and an accent handle (a ring at rest, since egui paints the
-/// resting handle in the rail colour; filled on hover / drag).
+/// Range-input visuals: a visible `--border` rail and an accent fill up to
+/// the value ([`slider`] paints the solid accent thumb itself, since egui
+/// paints the resting handle in the rail colour).
 fn slider_visuals(style: &mut egui::Style) {
     style.visuals.slider_trailing_fill = true;
     style.visuals.selection.bg_fill = theme::ACCENT;
@@ -685,11 +755,104 @@ fn slider_visuals(style: &mut egui::Style) {
     }
 }
 
-/// `<input type=range>` (`accent-color: var(--accent)`).
-pub fn slider(ui: &mut egui::Ui, slider: egui::Slider<'_>) -> Response {
+/// `<input type=range>` (`accent-color: var(--accent)`): a 4 pt rail
+/// (`--border`, accent up to the value) and a round, solid accent thumb
+/// ~15 pt across, like Chromium's; `width` overrides the default length.
+pub fn slider(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    step: f64,
+    width: Option<f32>,
+) -> Response {
+    let (lo, hi) = (*range.start(), *range.end());
     ui.scope(|ui| {
         slider_visuals(ui.style_mut());
-        ui.add(slider)
+        let spacing = &mut ui.style_mut().spacing;
+        spacing.slider_rail_height = SLIDER_RAIL;
+        // The slider is then as tall as a line of body text, and egui's
+        // handle radius (height / 2.5) about 7.5 pt.
+        spacing.interact_size.y = 0.0;
+        if let Some(width) = width {
+            spacing.slider_width = width;
+        }
+        let response = ui.add(
+            egui::Slider::new(value, range)
+                .step_by(step)
+                .show_value(false)
+                .handle_shape(egui::style::HandleShape::Circle),
+        );
+        if ui.is_rect_visible(response.rect) {
+            let (center, radius) = slider_thumb(response.rect, *value, lo, hi);
+            let painter = ui.painter();
+            painter.circle_filled(center, radius, theme::ACCENT);
+            if response.hovered() || response.dragged() {
+                painter.circle_stroke(center, radius, Stroke::new(2.0, theme::FOCUS));
+            }
+        }
+        response
+    })
+    .inner
+}
+
+/// The range input's rail thickness.
+const SLIDER_RAIL: f32 = 4.0;
+
+/// Where egui draws a horizontal slider's handle in `rect` for `value` in
+/// `lo..=hi`: (centre, radius).
+fn slider_thumb(rect: egui::Rect, value: f32, lo: f32, hi: f32) -> (egui::Pos2, f32) {
+    let radius = rect.height() / 2.5;
+    let t = if hi > lo {
+        ((value - lo) / (hi - lo)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let (left, right) = (rect.left() + radius, rect.right() - radius);
+    (
+        egui::pos2(left + (right - left) * t, rect.center().y),
+        radius,
+    )
+}
+
+/// Which CSS `<select>` a [`select`] imitates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectKind {
+    /// `select.text-input`: `--bg` fill, 1 px border, 6/10 padding.
+    TextInput,
+    /// `select.player-speed`: the same look at 4/6 padding for 12 px text
+    /// (about 24 pt tall).
+    Compact,
+}
+
+/// The button of a select: `--bg` fill and a 1 px `--border` border that
+/// turns accent while focused or open (not on hover) — an input, not a
+/// raised `.btn`. Only the button: popups draw with the context's style.
+pub fn select_style(style: &mut egui::Style, kind: SelectKind) {
+    let w = &mut style.visuals.widgets;
+    for (state, border) in [
+        (&mut w.inactive, BORDER),
+        (&mut w.hovered, BORDER),
+        (&mut w.active, theme::ACCENT),
+        (&mut w.open, theme::ACCENT),
+    ] {
+        state.weak_bg_fill = theme::BG;
+        state.bg_stroke = Stroke::new(1.0, border);
+        state.corner_radius = CornerRadius::same(6);
+    }
+    match kind {
+        SelectKind::TextInput => style.spacing.button_padding = egui::vec2(10.0, 6.0),
+        SelectKind::Compact => {
+            style.spacing.button_padding = egui::vec2(6.0, 4.0);
+            style.spacing.interact_size.y = 0.0;
+        }
+    }
+}
+
+/// Run `add` (an `egui::ComboBox`) with [`select_style`] applied.
+pub fn select<R>(ui: &mut egui::Ui, kind: SelectKind, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.scope(|ui| {
+        select_style(ui.style_mut(), kind);
+        add(ui)
     })
     .inner
 }
@@ -798,8 +961,8 @@ mod tests {
             btn(ui, "Save");
             btn_ghost(ui, "Later");
             btn_danger(ui, "Delete");
-            btn_record(ui, false, "●", "Start recording");
-            btn_record(ui, true, "■", "Stop recording");
+            btn_record(ui, false, "●", 17.0, "Start recording");
+            btn_record(ui, true, "■", 17.0, "Stop recording");
             icon_btn(ui, "x", 16.0, "Rename");
             icon_btn_danger(ui, "x", 16.0, "Delete");
             nav_btn(ui, "Meetings", true);
@@ -904,10 +1067,8 @@ mod tests {
             radio_value(ui, &mut pick, 1, "One");
             radio_value(ui, &mut pick, 2, "Two");
             let mut value = 0.6_f32;
-            slider(
-                ui,
-                egui::Slider::new(&mut value, 0.3..=0.9).show_value(false),
-            );
+            let response = slider(ui, &mut value, 0.3..=0.9, 0.05, Some(80.0));
+            assert_eq!(response.rect.width(), 80.0);
             let mut text = String::from("teams");
             let id = egui::Id::new("text-input");
             let edit = text_input(ui, id, egui::TextEdit::singleline(&mut text));
@@ -915,5 +1076,116 @@ mod tests {
             let card = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(100.0, 40.0));
             paint_left_edge(ui, card, 3.0, 8, theme::ACCENT);
         });
+    }
+
+    /// Shapes painted by one pass of `f` (fonts uploaded and discarded).
+    fn shapes(f: impl FnMut(&mut egui::Ui)) -> Vec<egui::Shape> {
+        let ctx = theme::test_context();
+        let mut f = f;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| f(ui));
+        });
+        output.textures_delta.clear();
+        output.shapes.into_iter().map(|c| c.shape).collect()
+    }
+
+    #[test]
+    fn slider_thumb_is_a_round_accent_disc_on_a_thin_rail() {
+        let mut thumb = None;
+        let shapes = shapes(|ui| {
+            let mut value = 0.5_f32;
+            let response = slider(ui, &mut value, 0.0..=1.0, 0.05, Some(80.0));
+            thumb = Some(slider_thumb(response.rect, value, 0.0, 1.0));
+        });
+        let (center, radius) = thumb.unwrap();
+        assert!((6.5..=8.5).contains(&radius), "radius {radius}");
+        let disc = shapes.iter().any(|shape| {
+            matches!(shape, egui::Shape::Circle(c)
+                if c.fill == theme::ACCENT && c.center == center && c.radius == radius)
+        });
+        assert!(disc, "no solid accent thumb: {shapes:?}");
+        // The rail: 4 pt tall, no 18x24 rectangular handle anywhere.
+        let rects: Vec<_> = shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                // Not the panel's own background.
+                egui::Shape::Rect(r) if r.rect.width() < 1000.0 => Some(r.rect),
+                _ => None,
+            })
+            .collect();
+        assert!(rects
+            .iter()
+            .any(|r| (r.height() - SLIDER_RAIL).abs() < 0.01));
+        assert!(rects.iter().all(|r| r.height() < 10.0), "{rects:?}");
+    }
+
+    #[test]
+    fn selects_look_like_inputs() {
+        let mut heights = Vec::new();
+        let shapes = shapes(|ui| {
+            for kind in [SelectKind::TextInput, SelectKind::Compact] {
+                let response = select(ui, kind, |ui| {
+                    egui::ComboBox::from_id_salt(("select", kind as u8))
+                        .selected_text(egui::RichText::new("1x").size(12.0))
+                        .show_ui(ui, |_| {})
+                        .response
+                });
+                heights.push(response.rect.height());
+            }
+        });
+        let buttons: Vec<_> = shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Rect(r) if r.stroke.color == BORDER => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(buttons.len(), 2, "{shapes:?}");
+        assert!(buttons.iter().all(|r| r.fill == theme::BG));
+        // `.player-speed` (12 px, 4/6 padding) is shorter than a text input.
+        assert!(heights[1] <= 26.0 && heights[1] < heights[0], "{heights:?}");
+    }
+
+    #[test]
+    fn view_scroll_gutter_is_the_scroll_bars_width_only_while_it_shows() {
+        let ctx = theme::test_context();
+        for (rows, expect_bar) in [(200, true), (2, false)] {
+            let mut right = 0.0;
+            for _ in 0..3 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(460.0, 400.0),
+                    )),
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(input, |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        right = ui.max_rect().right();
+                        clear_view_viewport(ui.ctx());
+                        egui::ScrollArea::vertical()
+                            .id_salt(("gutter", rows))
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                keyboard_scroll(ui, KeyScroll::default());
+                                for i in 0..rows {
+                                    ui.label(format!("row {i}"));
+                                }
+                            });
+                    });
+                });
+                output.textures_delta.clear();
+            }
+            let gutter = view_scroll_gutter(&ctx, right);
+            if expect_bar {
+                let s = ctx.global_style().spacing.scroll;
+                assert!(gutter >= s.bar_width, "gutter {gutter}");
+                assert!(gutter <= s.allocated_width() + 0.5, "gutter {gutter}");
+            } else {
+                assert_eq!(gutter, 0.0);
+            }
+        }
+        clear_view_viewport(&ctx);
+        assert_eq!(view_scroll_gutter(&ctx, 400.0), 0.0);
     }
 }

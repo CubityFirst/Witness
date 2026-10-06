@@ -755,9 +755,10 @@ impl SettingsState {
             let enabled = ui.is_enabled();
             let response = widgets::slider(
                 ui,
-                egui::Slider::new(&mut value, THRESHOLD_MIN..=THRESHOLD_MAX)
-                    .step_by(THRESHOLD_STEP as f64)
-                    .show_value(false),
+                &mut value,
+                THRESHOLD_MIN..=THRESHOLD_MAX,
+                THRESHOLD_STEP as f64,
+                None,
             );
             let shown = value;
             response.widget_info(|| {
@@ -1525,6 +1526,7 @@ fn device_picker(
     let mut picked = None;
     // A fixed-width child keeps the truncation inside `width`.
     ui.allocate_ui(egui::vec2(width, ui.spacing().interact_size.y), |ui| {
+        widgets::select_style(ui.style_mut(), widgets::SelectKind::TextInput);
         egui::ComboBox::from_id_salt(id)
             .width(width)
             .selected_text(label)

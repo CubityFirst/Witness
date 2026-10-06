@@ -610,6 +610,13 @@ impl WitnessApp {
         self.quitting = true;
         self.shell.quitting = true;
         log::info!("quit requested");
+        // Quit is irreversible (a failed shutdown still exits), so refuse
+        // second launches from now on: a launch during the stop below (up to
+        // SHUTDOWN_WAIT) keeps waiting for the mutex and takes over, instead
+        // of being answered "shown" by a process about to disappear.
+        if let Some(shell) = &self.shell_objects {
+            shell.instance_guard.begin_exit();
+        }
         // A failed shutdown (logged by `spawn_op_or`) still exits: the user
         // asked to quit, and startup recovery finishes an interrupted stop.
         self.tasks.spawn_op_or(
@@ -1011,15 +1018,27 @@ impl eframe::App for WitnessApp {
                 .fill(theme::BG)
                 .inner_margin(Margin::symmetric(20, 16));
             egui::CentralPanel::default().frame(content).show(ui, |ui| {
-                topbar::model_banner(ui, cx);
-                if cx.view.has_search_box() {
-                    let current = cx.view.clone();
-                    widgets::centered_column(ui, 900.0, |ui| {
-                        views::search::search_box(ui, cx, &current);
-                    });
-                    ui.add_space(12.0);
-                }
+                // The banner and search box end where the view's cards do:
+                // its scroll bar (when shown) takes that width from both,
+                // as it did from the one 0.2.x scroller.
+                let right = ui.max_rect().right();
+                let gutter = widgets::view_scroll_gutter(ui.ctx(), right);
+                widgets::clear_view_viewport(ui.ctx());
+                ui.scope(|ui| {
+                    ui.set_max_width((ui.available_width() - gutter).max(0.0));
+                    topbar::model_banner(ui, cx);
+                    if cx.view.has_search_box() {
+                        let current = cx.view.clone();
+                        widgets::centered_column(ui, 900.0, |ui| {
+                            views::search::search_box(ui, cx, &current);
+                        });
+                        ui.add_space(12.0);
+                    }
+                });
                 view.show(ui, cx);
+                if (widgets::view_scroll_gutter(ui.ctx(), right) - gutter).abs() > 0.5 {
+                    ui.ctx().request_discard("view scroll bar changed");
+                }
             });
         });
 

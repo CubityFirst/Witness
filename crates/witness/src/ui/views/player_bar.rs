@@ -486,12 +486,9 @@ fn right_cluster(ui: &mut egui::Ui, cx: &mut UiCtx, detail: &MeetingDetail) -> f
         // Volume: muted speaker glyph + an 80 px slider, step 0.05.
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            ui.spacing_mut().slider_width = 80.0;
             let mut volume = cx.prefs.volume.clamp(0.0, 1.0);
-            let slider = egui::Slider::new(&mut volume, 0.0..=1.0)
-                .step_by(0.05)
-                .show_value(false);
-            let response = widgets::slider(ui, slider).on_hover_text("Volume");
+            let response = widgets::slider(ui, &mut volume, 0.0..=1.0, 0.05, Some(80.0))
+                .on_hover_text("Volume");
             response.widget_info(|| {
                 egui::WidgetInfo::slider(true, f64::from(volume) * 100.0, "Volume")
             });
@@ -510,20 +507,22 @@ fn right_cluster(ui: &mut egui::Ui, cx: &mut UiCtx, detail: &MeetingDetail) -> f
         // Speed (`.player-speed` select).
         let before = snap_speed(cx.prefs.speed);
         let mut speed = before;
-        egui::ComboBox::from_id_salt("player-speed")
-            .selected_text(egui::RichText::new(speed_label(speed)).size(12.0))
-            .width(56.0)
-            .show_ui(ui, |ui| {
-                for option in SPEEDS {
-                    ui.selectable_value(
-                        &mut speed,
-                        option,
-                        egui::RichText::new(speed_label(option)).size(12.0),
-                    );
-                }
-            })
-            .response
-            .on_hover_text("Playback speed");
+        widgets::select(ui, widgets::SelectKind::Compact, |ui| {
+            egui::ComboBox::from_id_salt("player-speed")
+                .selected_text(egui::RichText::new(speed_label(speed)).size(12.0))
+                .width(56.0)
+                .show_ui(ui, |ui| {
+                    for option in SPEEDS {
+                        ui.selectable_value(
+                            &mut speed,
+                            option,
+                            egui::RichText::new(speed_label(option)).size(12.0),
+                        );
+                    }
+                })
+                .response
+                .on_hover_text("Playback speed")
+        });
         if (speed - before).abs() > f32::EPSILON {
             cx.prefs.speed = speed;
             cx.player.set_speed(speed);

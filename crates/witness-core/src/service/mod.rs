@@ -347,6 +347,11 @@ impl AppCore {
     /// Watcher thread → recording control (formerly main.rs:410-447).
     fn on_watcher_command(&self, cmd: WatcherCommand) {
         match cmd {
+            // Sent just before an exit path suspended auto-record: a
+            // recording started now would be cut off unfinalized.
+            WatcherCommand::StartMeeting if self.state.watcher.exiting() => {
+                log::info!("meeting detected while exiting: not auto-recording");
+            }
             WatcherCommand::StartMeeting => match self.start_recording(Trigger::Auto) {
                 Ok(_) => self.toast("Witness is recording this meeting."),
                 Err(e) => {
@@ -501,22 +506,18 @@ mod tests {
             .watcher
             .enabled
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(core.state.watcher.auto_record());
         assert!(!core.emergency_stop(Duration::from_secs(5)));
-        assert!(!core
-            .state
-            .watcher
-            .enabled
-            .load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!core.state.watcher.auto_record());
+        // A settings write (update_settings stores `enabled`) cannot undo
+        // the exit's suspension.
         core.state
             .watcher
             .enabled
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!core.state.watcher.auto_record());
         core.shutdown();
-        assert!(!core
-            .state
-            .watcher
-            .enabled
-            .load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!core.state.watcher.auto_record());
         drop(
             core.exit_guard(ExitPurpose::Restart)
                 .expect("idle core may exit"),

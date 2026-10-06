@@ -559,6 +559,49 @@ fn hover_area(
     response.on_hover_cursor(CursorIcon::PointingHand)
 }
 
+/// `.person-head` (`align-items: center`): chip, wrapping stats and the
+/// chevron share one centre line. The stats are laid out first so the row
+/// gets its final height before anything is placed; a zero-height cell in
+/// a centred row would start the stats half a row down.
+fn person_head(ui: &mut egui::Ui, p: &PersonAgg, stats: &str, open: bool) -> egui::Rect {
+    const GAP: f32 = 10.0;
+    const CHEVRON_WIDTH: f32 = 12.0;
+    let chip = widgets::chip_size(ui, &p.name, 16.0);
+    let available = ui.available_width();
+    let stats_width = (available - chip.x - CHEVRON_WIDTH - 2.0 * GAP).max(40.0);
+    let stats = ui.painter().layout(
+        stats.to_owned(),
+        theme::regular(13.0),
+        TEXT_MUTED,
+        stats_width,
+    );
+    let chevron = ui.painter().layout_no_wrap(
+        if open { "▾" } else { "▸" }.to_owned(),
+        theme::regular(theme::BASE_SIZE),
+        TEXT_MUTED,
+    );
+    let height = stats.size().y.max(chip.y).max(chevron.size().y);
+    ui.allocate_ui_with_layout(
+        egui::vec2(available, height),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = GAP;
+            let color = theme::chip_color(if p.is_me { "me" } else { "S1" });
+            let chip = widgets::chip(ui, &p.name, color, 16.0).on_hover_text(&p.name);
+            let (cell, _) =
+                ui.allocate_exact_size(egui::vec2(stats_width, stats.size().y), Sense::hover());
+            ui.painter().galley(cell.min, stats, TEXT_MUTED);
+            let (mark, _) = ui.allocate_exact_size(
+                egui::vec2(CHEVRON_WIDTH.max(chevron.size().x), chevron.size().y),
+                Sense::hover(),
+            );
+            ui.painter().galley(mark.min, chevron, TEXT_MUTED);
+            chip.rect.union(cell).union(mark)
+        },
+    )
+    .inner
+}
+
 /// One person card: the header (chip, stats, chevron) toggles the
 /// accordion; the open card lists their meetings and "Forget voice…".
 fn person_card(
@@ -588,30 +631,7 @@ fn person_card(
             egui::Margin::symmetric(14, 10),
             header_radius,
             |ui| {
-                // `horizontal`, not `with_layout`: the latter takes the
-                // whole available height.
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    let color = theme::chip_color(if p.is_me { "me" } else { "S1" });
-                    widgets::chip(ui, &p.name, color, 16.0).on_hover_text(&p.name);
-                    let chevron = if open { "▾" } else { "▸" };
-                    let chevron_width = 12.0;
-                    let stats_width = (ui.available_width() - chevron_width - 10.0).max(40.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(stats_width, 0.0),
-                        Layout::top_down(Align::Min),
-                        |ui| {
-                            ui.set_width(stats_width);
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(&stats).size(13.0).color(TEXT_MUTED),
-                                )
-                                .wrap(),
-                            );
-                        },
-                    );
-                    ui.label(egui::RichText::new(chevron).color(TEXT_MUTED));
-                });
+                person_head(ui, p, &stats, open);
             },
         );
         let name = format!("{}: {stats}", p.name);
@@ -856,5 +876,49 @@ mod tests {
             assert!(actions.is_empty());
         });
         output.textures_delta.clear();
+    }
+    #[test]
+    fn person_head_centres_chip_stats_and_chevron() {
+        let ctx = theme::test_context();
+        let person = PersonAgg {
+            key: "me".into(),
+            person_id: None,
+            name: "Me".into(),
+            is_me: true,
+            meetings: Vec::new(),
+            meeting_count: 12,
+            together_ms: 3_600_000,
+            talk_ms: 1_200_000,
+            words: 4_321,
+        };
+        let stats = stats_text(&person, Some(42.0));
+        for width in [900.0, 300.0] {
+            let mut rects = Vec::new();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 400.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let row = person_head(ui, &person, &stats, false);
+                    rects.push(row);
+                },
+            );
+            output.textures_delta.clear();
+            let row = rects[0];
+            // Every shape (chip fill, stats, chevron) centres on the row.
+            for clipped in output.shapes {
+                let rect = clipped.shape.visual_bounding_rect();
+                if rect.is_positive() && row.intersects(rect) {
+                    assert!(
+                        (rect.center().y - row.center().y).abs() < 3.0,
+                        "{rect:?} off {row:?} at {width}"
+                    );
+                }
+            }
+        }
     }
 }
