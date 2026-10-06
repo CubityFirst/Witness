@@ -94,6 +94,25 @@ fn meta_line(m: &Meeting) -> String {
     )
 }
 
+/// The meta line of `meetings` that is widest unwrapped. The lines share
+/// one format, so wrapped it is also the one that needs the most lines.
+fn widest_meta(ui: &egui::Ui, meetings: &[Meeting]) -> String {
+    let font = theme::regular(12.0);
+    let mut widest = (0.0, String::new());
+    for m in meetings {
+        let text = meta_line(m);
+        let width = ui
+            .painter()
+            .layout_no_wrap(text.clone(), font.clone(), TEXT_MUTED)
+            .size()
+            .x;
+        if width > widest.0 {
+            widest = (width, text);
+        }
+    }
+    widest.1
+}
+
 /// The recycle-bin row's meta line.
 fn bin_meta_line(d: &DeletedMeeting) -> String {
     format!(
@@ -190,6 +209,7 @@ struct RowMetrics {
     /// Height of the title line (the title, or the taller rename input).
     line: f32,
     title: f32,
+    /// Height of the meta block: one line, or the tallest wrapped meta.
     meta: f32,
     /// Outer row height, border included.
     height: f32,
@@ -198,6 +218,7 @@ struct RowMetrics {
 }
 
 impl RowMetrics {
+    /// Metrics with a one-line meta block.
     fn measure(ui: &egui::Ui) -> RowMetrics {
         let (title, body, meta) = ui.ctx().fonts_mut(|f| {
             (
@@ -208,16 +229,78 @@ impl RowMetrics {
         });
         let slot = icon_slot(ui);
         let edit = body + f32::from(EDIT_MARGIN.top + EDIT_MARGIN.bottom) + 2.0;
-        let line = title.max(edit);
-        let content = (line + TITLE_META_GAP + meta).max(slot);
         RowMetrics {
-            line,
+            line: title.max(edit),
             title,
             meta,
-            height: content + 2.0 * ROW_PAD.y,
+            height: 0.0,
             slot,
         }
+        .with_meta(meta)
     }
+
+    /// The same metrics with a meta block `meta` tall (at least one line).
+    fn with_meta(self, meta: f32) -> RowMetrics {
+        let meta = meta.max(self.meta);
+        let content = (self.line + TITLE_META_GAP + meta).max(self.slot);
+        RowMetrics {
+            meta,
+            height: content + 2.0 * ROW_PAD.y,
+            ..self
+        }
+    }
+
+    /// Width of the title + meta block in a row `width` wide: what is left
+    /// after the padding and the status, rename and delete columns.
+    fn main_width(&self, width: f32) -> f32 {
+        (width - 2.0 * ROW_PAD.x - 3.0 * (self.slot + COL_GAP)).max(1.0)
+    }
+}
+
+/// Where a row's parts go: the main block on the left, then the status,
+/// rename and delete slots from the right.
+struct RowRects {
+    main: Rect,
+    status: Rect,
+    pencil: Rect,
+    delete: Rect,
+}
+
+impl RowRects {
+    fn new(rect: Rect, metrics: RowMetrics) -> RowRects {
+        let inner = rect.shrink2(ROW_PAD);
+        let slot = metrics.slot;
+        let slot_rect = |n: f32| {
+            let right = inner.right() - n * (slot + COL_GAP);
+            Rect::from_center_size(
+                egui::pos2(right - slot / 2.0, inner.center().y),
+                egui::vec2(slot, slot),
+            )
+        };
+        let block_height = metrics.line + TITLE_META_GAP + metrics.meta;
+        let main = Rect::from_min_size(
+            egui::pos2(inner.left(), inner.center().y - block_height / 2.0),
+            egui::vec2(metrics.main_width(rect.width()), block_height),
+        );
+        RowRects {
+            main,
+            status: slot_rect(2.0),
+            pencil: slot_rect(1.0),
+            delete: slot_rect(0.0),
+        }
+    }
+}
+
+/// The 12 pt muted meta text wrapped at `width` (`.meeting-meta` wraps;
+/// only the title is cut with an ellipsis).
+fn meta_galley(ui: &egui::Ui, text: &str, width: f32) -> Arc<egui::Galley> {
+    let job = LayoutJob::simple(
+        text.to_owned(),
+        theme::regular(12.0),
+        TEXT_MUTED,
+        width.max(1.0),
+    );
+    ui.painter().layout_job(job)
 }
 
 /// The inline rename editor (one at a time).
@@ -248,6 +331,7 @@ enum ConfirmFor {
 }
 
 /// Something the user asked for during the pass; applied after drawing.
+#[derive(Debug, PartialEq)]
 enum RowAction {
     /// Keyboard (Enter/Space) or accessibility activation: open now.
     OpenNow(i64),
@@ -257,8 +341,10 @@ enum RowAction {
         id: i64,
         title: String,
     },
-    CommitEdit,
-    CancelEdit,
+    /// Commit / cancel the editor of this meeting — ignored once another
+    /// row's editor has replaced it.
+    CommitEdit(i64),
+    CancelEdit(i64),
     Retranscribe(i64),
     Delete {
         id: i64,
@@ -296,6 +382,9 @@ pub struct MeetingsView {
     /// The row holding keyboard focus last pass: it is drawn even when
     /// scrolled out of view, since egui drops the focus of an undrawn widget.
     focused_row: Option<i64>,
+    /// The meta line with the widest unwrapped text, which sets the uniform
+    /// row height when meta lines wrap. None after the rows change.
+    widest_meta: Option<String>,
     /// The `shell.refresh_tick` the data was requested for; None until the
     /// first pass, so mounting loads.
     seen_tick: Option<u64>,
@@ -321,6 +410,7 @@ impl MeetingsView {
             pending_open: None,
             confirm_for: None,
             focused_row: None,
+            widest_meta: None,
             seen_tick: None,
         }
     }
@@ -348,8 +438,13 @@ impl MeetingsView {
         }
     }
 
-    /// Nothing to persist.
-    pub fn flush(&mut self, _cx: &mut UiCtx) {}
+    /// Commit an open rename: egui keeps the editor's focus when the window
+    /// hides or the app quits, where the web input would blur and commit.
+    pub fn flush(&mut self, cx: &mut UiCtx) {
+        if let Some((id, title)) = self.take_edit() {
+            rename(cx, id, title);
+        }
+    }
 
     /// Leaving the list drops a pending single-click open (the TSX timer
     /// is cleared on unmount) and a pending search-box debounce, which
@@ -417,6 +512,7 @@ impl MeetingsView {
                     } else {
                         self.meetings = rows;
                     }
+                    self.widest_meta = None;
                     self.load_error = None;
                     // The editor goes away with its row.
                     let editing_gone = self
@@ -500,30 +596,50 @@ impl MeetingsView {
         cx.confirm.ask(egui::Id::new(CONFIRM_ID), message, ok_label);
     }
 
-    /// Commit the open editor: trim and close; save only a non-empty,
-    /// changed title (an empty one silently reverts). No optimistic update:
-    /// the list reloads when the rename returns.
-    fn commit_edit(&mut self, cx: &mut UiCtx) {
-        let Some(editing) = self.editing.take() else {
-            return;
-        };
+    /// Close the open editor; returns the trimmed title to save when it is
+    /// non-empty and changed (an empty one silently reverts). No optimistic
+    /// update: the list reloads when the rename returns.
+    fn take_edit(&mut self) -> Option<(i64, String)> {
+        let editing = self.editing.take()?;
         let title = editing.text.trim().to_owned();
-        if title.is_empty() || title == editing.original {
-            return;
-        }
-        let id = editing.id;
-        cx.tasks.spawn_op("rename-meeting", move |c| {
-            match c.rename_meeting(id, &title) {
-                Ok(()) => OpDone::Notice {
-                    notice: None,
-                    refresh: true,
-                },
-                Err(error) => OpDone::Notice {
-                    notice: Some(Notice::error("Could not rename the meeting", error)),
-                    refresh: false,
-                },
+        (!title.is_empty() && title != editing.original).then_some((editing.id, title))
+    }
+
+    fn editing_id(&self) -> Option<i64> {
+        self.editing.as_ref().map(|e| e.id)
+    }
+
+    /// The rename-editor half of [`apply`](Self::apply), free of `UiCtx`
+    /// (so it is testable): updates `editing`, returning a title to save.
+    fn edit(&mut self, action: RowAction) -> Option<(i64, String)> {
+        match action {
+            RowAction::StartEdit { id, title } => {
+                self.pending_open = None;
+                if self.editing_id() == Some(id) {
+                    return None;
+                }
+                // Opening another editor blurs (and so commits) this one.
+                let save = self.take_edit();
+                self.editing = Some(Editing {
+                    id,
+                    original: title.clone(),
+                    text: title,
+                    focus_pending: true,
+                    escaped: false,
+                });
+                save
             }
-        });
+            // A press on the pencil of a row *above* the editor queues that
+            // row's StartEdit before the old editor reports its focus loss
+            // (rows push in draw order), so a commit or cancel only applies
+            // to the editor it came from.
+            RowAction::CommitEdit(id) if self.editing_id() == Some(id) => self.take_edit(),
+            RowAction::CancelEdit(id) if self.editing_id() == Some(id) => {
+                self.editing = None;
+                None
+            }
+            _ => None,
+        }
     }
 
     fn apply(&mut self, action: RowAction, ui: &egui::Ui, cx: &mut UiCtx) {
@@ -536,23 +652,13 @@ impl MeetingsView {
                 self.pending_open = Some((id, Instant::now() + OPEN_DELAY));
                 ui.ctx().request_repaint_after(OPEN_DELAY);
             }
-            RowAction::StartEdit { id, title } => {
-                self.pending_open = None;
-                if self.editing.as_ref().is_some_and(|e| e.id == id) {
-                    return;
+            action @ (RowAction::StartEdit { .. }
+            | RowAction::CommitEdit(_)
+            | RowAction::CancelEdit(_)) => {
+                if let Some((id, title)) = self.edit(action) {
+                    rename(cx, id, title);
                 }
-                // Opening another editor blurs (and so commits) this one.
-                self.commit_edit(cx);
-                self.editing = Some(Editing {
-                    id,
-                    original: title.clone(),
-                    text: title,
-                    focus_pending: true,
-                    escaped: false,
-                });
             }
-            RowAction::CommitEdit => self.commit_edit(cx),
-            RowAction::CancelEdit => self.editing = None,
             RowAction::Retranscribe(id) => retranscribe(cx, id),
             RowAction::Delete { id, title, skip } => {
                 if skip {
@@ -657,14 +763,20 @@ impl MeetingsView {
     /// they are within a row of the clip rect, hold the keyboard focus or
     /// are being renamed. The extra row either side gives Tab / Shift+Tab a
     /// next row to move to, which [`follow_focus`] then scrolls into view.
+    ///
+    /// Every row is as tall as the widest meta line needs when wrapped at
+    /// the current width (the web rows wrap theirs one by one), so nothing
+    /// is cut off in the narrow tray flyout.
     fn draw_list(&mut self, ui: &mut egui::Ui, actions: &mut Vec<RowAction>) {
-        let metrics = RowMetrics::measure(ui);
+        let width = ui.available_width();
+        let metrics = self.list_metrics(ui, width);
         let pitch = metrics.height + ROW_GAP;
         let count = self.meetings.len();
         let total = count as f32 * pitch - ROW_GAP;
-        let (_, list_rect) = ui.allocate_space(egui::vec2(ui.available_width(), total));
+        let (_, list_rect) = ui.allocate_space(egui::vec2(width, total));
         let band = ui.clip_rect().expand2(egui::vec2(0.0, pitch));
         let keep = self.focused_row.take();
+        let mut drawn = 0;
         for (index, meeting) in self.meetings.iter().enumerate() {
             let rect = Rect::from_min_size(
                 egui::pos2(list_rect.left(), list_rect.top() + index as f32 * pitch),
@@ -676,9 +788,29 @@ impl MeetingsView {
             if editing.is_none() && keep != Some(meeting.id) && !band.intersects(rect) {
                 continue;
             }
+            drawn += 1;
             if meeting_row(ui, rect, metrics, meeting, editing, actions) {
                 self.focused_row = Some(meeting.id);
             }
+        }
+        // Each drawn row took one auto id from `ui`; take the skipped rows'
+        // too, so the ids of Load more and the bin (and so their keyboard
+        // focus) don't depend on how far the list is scrolled.
+        ui.skip_ahead_auto_ids(count - drawn);
+    }
+
+    /// Row metrics for a list `width` wide, the meta block sized for the
+    /// widest meta line wrapped at that width.
+    fn list_metrics(&mut self, ui: &egui::Ui, width: f32) -> RowMetrics {
+        let metrics = RowMetrics::measure(ui);
+        let widest = self
+            .widest_meta
+            .get_or_insert_with(|| widest_meta(ui, &self.meetings));
+        let wrapped = meta_galley(ui, widest, metrics.main_width(width));
+        if wrapped.rows.len() > 1 {
+            metrics.with_meta(wrapped.size().y)
+        } else {
+            metrics
         }
     }
 
@@ -736,6 +868,21 @@ impl MeetingsView {
 
 // ----------------------------------------------------------------------
 // Actions (spawn_op: the toast and the refresh survive navigation)
+
+fn rename(cx: &mut UiCtx, id: i64, title: String) {
+    cx.tasks.spawn_op("rename-meeting", move |c| {
+        match c.rename_meeting(id, &title) {
+            Ok(()) => OpDone::Notice {
+                notice: None,
+                refresh: true,
+            },
+            Err(error) => OpDone::Notice {
+                notice: Some(Notice::error("Could not rename the meeting", error)),
+                refresh: false,
+            },
+        }
+    });
+}
 
 fn retranscribe(cx: &mut UiCtx, id: i64) {
     cx.tasks
@@ -830,10 +977,13 @@ fn meeting_row(
     editing: Option<&mut Editing>,
     actions: &mut Vec<RowAction>,
 ) -> bool {
+    // An id that doesn't depend on how many rows were drawn before this one:
+    // an auto id would change on scrolling, and egui would drop the focus
+    // of the row's buttons.
     let mut row = ui.new_child(
         UiBuilder::new()
             .max_rect(rect)
-            .id_salt(("meeting-row", m.id))
+            .id(ui.id().with(("meeting-row", m.id)))
             .layout(Layout::left_to_right(Align::Center)),
     );
     // `.meeting-row:hover` also applies while a child button is hovered.
@@ -848,26 +998,12 @@ fn meeting_row(
 
     // Columns from the right: delete, rename, status; the main block
     // takes the rest. Widgets are still added left to right (tab order).
-    let inner = rect.shrink2(ROW_PAD);
-    let slot = metrics.slot;
-    let slot_rect = |n: f32| {
-        let right = inner.right() - n * (slot + COL_GAP);
-        Rect::from_center_size(
-            egui::pos2(right - slot / 2.0, inner.center().y),
-            egui::vec2(slot, slot),
-        )
-    };
-    let delete_rect = slot_rect(0.0);
-    let pencil_rect = slot_rect(1.0);
-    let status_rect = slot_rect(2.0);
-    let block_height = metrics.line + TITLE_META_GAP + metrics.meta;
-    let main_rect = Rect::from_min_size(
-        egui::pos2(inner.left(), inner.center().y - block_height / 2.0),
-        egui::vec2(
-            (status_rect.left() - COL_GAP - inner.left()).max(1.0),
-            block_height,
-        ),
-    );
+    let RowRects {
+        main: main_rect,
+        status: status_rect,
+        pencil: pencil_rect,
+        delete: delete_rect,
+    } = RowRects::new(rect, metrics);
     let is_editing = editing.is_some();
 
     // 1. Main block: the open / double-click-rename button, or the editor.
@@ -920,7 +1056,7 @@ fn meeting_row(
     focused |= pencil.has_focus();
     if pencil.clicked() {
         actions.push(if is_editing {
-            RowAction::CommitEdit
+            RowAction::CommitEdit(m.id)
         } else {
             RowAction::StartEdit {
                 id: m.id,
@@ -1056,24 +1192,19 @@ fn rename_editor(
             && row.input(|i| i.pointer.any_down() || i.pointer.any_released());
         if !on_pencil {
             actions.push(if editing.escaped {
-                RowAction::CancelEdit
+                RowAction::CancelEdit(m.id)
             } else {
-                RowAction::CommitEdit
+                RowAction::CommitEdit(m.id)
             });
         }
     }
     response.has_focus()
 }
 
-/// The 12 pt muted meta line under the title line, kept to one line.
+/// The 12 pt muted meta text under the title line, wrapped (every row has
+/// room for the tallest meta block in the list).
 fn paint_meta(ui: &egui::Ui, main_rect: Rect, metrics: RowMetrics, text: &str) {
-    let galley = truncated(
-        ui,
-        text,
-        theme::regular(12.0),
-        TEXT_MUTED,
-        main_rect.width(),
-    );
+    let galley = meta_galley(ui, text, main_rect.width());
     let top = main_rect.top() + metrics.line + TITLE_META_GAP;
     ui.painter()
         .galley(egui::pos2(main_rect.left(), top), galley, TEXT_MUTED);
@@ -1411,14 +1542,17 @@ mod tests {
             let metrics = RowMetrics::measure(ui);
             let mut actions = Vec::new();
             let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(420.0, metrics.height));
-            for status in [
+            for (id, status) in [
                 "recording",
                 "recorded",
                 "processing",
                 "transcribed",
                 "failed",
-            ] {
-                let m = meeting(3, status, "auto", Some(1000));
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let m = meeting(10 + id as i64, status, "auto", Some(1000));
                 meeting_row(ui, rect, metrics, &m, None, &mut actions);
             }
             let m = meeting(4, "transcribed", "manual", None);
@@ -1438,6 +1572,266 @@ mod tests {
             bin_row(ui, metrics.slot, &binned, &mut actions);
             bin_head(ui, 300.0, 3, true);
             assert!(actions.is_empty(), "no input, no actions");
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // The list driven pass by pass, as `show` draws it.
+
+    fn list_view(n: i64) -> MeetingsView {
+        let mut view = MeetingsView::new();
+        view.meetings = (1..=n)
+            .map(|id| meeting(id, "transcribed", "manual", Some(60_000)))
+            .collect();
+        view
+    }
+
+    /// Where the list starts and how its rows are measured, as last drawn.
+    #[derive(Clone, Copy)]
+    struct ListGeometry {
+        origin: egui::Pos2,
+        width: f32,
+        metrics: RowMetrics,
+    }
+
+    impl ListGeometry {
+        fn row(&self, index: usize) -> RowRects {
+            let pitch = self.metrics.height + ROW_GAP;
+            let rect = Rect::from_min_size(
+                self.origin + egui::vec2(0.0, index as f32 * pitch),
+                egui::vec2(self.width, self.metrics.height),
+            );
+            RowRects::new(rect, self.metrics)
+        }
+    }
+
+    /// One pass of `view` in a 300 pt tall scroll area (scrolled to
+    /// `offset` when given), fed `events`; returns its actions.
+    fn pass(
+        ctx: &egui::Context,
+        view: &mut MeetingsView,
+        events: Vec<egui::Event>,
+        offset: Option<f32>,
+    ) -> (Vec<RowAction>, ListGeometry) {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 400.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut actions = Vec::new();
+        let mut geometry = None;
+        let mut output = ctx.run_ui(input, |ui| {
+            let mut area = egui::ScrollArea::vertical()
+                .id_salt("meetings-scroll")
+                .max_height(300.0)
+                .auto_shrink([false, false]);
+            if let Some(offset) = offset {
+                area = area.vertical_scroll_offset(offset);
+            }
+            area.show(ui, |ui| {
+                let width = ui.available_width();
+                geometry = Some(ListGeometry {
+                    origin: ui.cursor().min,
+                    width,
+                    metrics: view.list_metrics(ui, width),
+                });
+                view.draw(ui, &mut actions);
+            });
+        });
+        output.textures_delta.clear();
+        (actions, geometry.expect("drawn"))
+    }
+
+    fn click_events(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    fn tab() -> Vec<egui::Event> {
+        vec![egui::Event::Key {
+            key: Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]
+    }
+
+    fn focused(ctx: &egui::Context) -> Option<egui::Id> {
+        ctx.memory(|m| m.focused())
+    }
+
+    /// Press and release the pencil of row `target` while row `editing`
+    /// holds an edited editor; returns the view and the saves it asked for.
+    fn pencil_while_editing(editing: usize, target: usize) -> (MeetingsView, Vec<(i64, String)>) {
+        let ctx = theme::test_context();
+        let mut view = list_view(4);
+        let edited = view.meetings[editing].id;
+        let mut saves = Vec::new();
+        let start = RowAction::StartEdit {
+            id: edited,
+            title: view.meetings[editing].title.clone(),
+        };
+        assert_eq!(view.edit(start), None);
+        view.editing.as_mut().unwrap().text = "Renamed".into();
+        let mut geometry = None;
+        for _ in 0..2 {
+            let (actions, g) = pass(&ctx, &mut view, Vec::new(), None);
+            assert!(actions.is_empty(), "{actions:?}");
+            geometry = Some(g);
+        }
+        let rename_id = egui::Id::new(("meeting-rename", edited));
+        assert_eq!(focused(&ctx), Some(rename_id), "the editor took focus");
+
+        let pencil = geometry.unwrap().row(target).pencil.center();
+        for events in [
+            click_events(pencil, true),
+            click_events(pencil, false),
+            Vec::new(),
+            Vec::new(),
+        ] {
+            let (actions, _) = pass(&ctx, &mut view, events, None);
+            saves.extend(actions.into_iter().filter_map(|a| view.edit(a)));
+        }
+        (view, saves)
+    }
+
+    #[test]
+    fn the_pencil_of_another_row_saves_this_one_and_opens_that_one() {
+        // Map §1.4: starting to edit another row commits the open editor
+        // and opens the new one — above the editor (its StartEdit arrives
+        // before the old editor's focus-loss commit) and below it.
+        for (editing, target) in [(1, 0), (1, 3)] {
+            let (view, saves) = pencil_while_editing(editing, target);
+            let edited = view.meetings[editing].id;
+            let clicked = view.meetings[target].id;
+            assert_eq!(saves, vec![(edited, "Renamed".to_owned())]);
+            assert_eq!(view.editing_id(), Some(clicked), "{editing} -> {target}");
+        }
+        // The own pencil ("Done") saves and closes.
+        let (view, saves) = pencil_while_editing(2, 2);
+        assert_eq!(saves, vec![(view.meetings[2].id, "Renamed".to_owned())]);
+        assert_eq!(view.editing_id(), None);
+    }
+
+    #[test]
+    fn stale_editor_actions_are_ignored() {
+        let mut view = list_view(3);
+        let start = |id: i64| RowAction::StartEdit {
+            id,
+            title: format!("Meeting {id}"),
+        };
+        view.edit(start(1));
+        view.editing.as_mut().unwrap().text = "  New  ".into();
+        // Another row's editor opens: this one is saved (trimmed).
+        assert_eq!(view.edit(start(2)), Some((1, "New".to_owned())));
+        assert_eq!(view.edit(RowAction::CommitEdit(1)), None);
+        assert_eq!(view.edit(RowAction::CancelEdit(1)), None);
+        assert_eq!(view.editing_id(), Some(2));
+        // Unchanged and empty titles close without saving.
+        assert_eq!(view.edit(RowAction::CommitEdit(2)), None);
+        assert_eq!(view.editing_id(), None);
+        view.edit(start(3));
+        view.editing.as_mut().unwrap().text = "   ".into();
+        assert_eq!(view.take_edit(), None);
+        view.edit(start(3));
+        assert_eq!(view.edit(RowAction::CancelEdit(3)), None);
+        assert_eq!(view.editing_id(), None);
+    }
+
+    #[test]
+    fn tab_walks_the_whole_list_while_it_scrolls() {
+        let ctx = theme::test_context();
+        let mut view = list_view(12);
+        view.has_more = true;
+        view.binned = vec![DeletedMeeting {
+            meeting: meeting(99, "transcribed", "manual", None),
+            deleted_at: "2026-10-06T10:00:00+01:00".into(),
+        }];
+        pass(&ctx, &mut view, Vec::new(), None);
+        // Main, rename and delete per row, then Load more and the bin head;
+        // follow_focus scrolls each one into view as it is reached.
+        let stops = 12 * 3 + 2;
+        let mut seen = Vec::new();
+        for n in 0..stops {
+            pass(&ctx, &mut view, tab(), None);
+            pass(&ctx, &mut view, Vec::new(), None);
+            let id = focused(&ctx).unwrap_or_else(|| panic!("focus lost at Tab {}", n + 1));
+            assert!(!seen.contains(&id), "Tab {} revisited a widget", n + 1);
+            seen.push(id);
+        }
+    }
+
+    #[test]
+    fn focus_survives_scrolling_the_list() {
+        let ctx = theme::test_context();
+        let mut view = list_view(40);
+        view.has_more = true;
+        pass(&ctx, &mut view, Vec::new(), None);
+        let (_, geometry) = pass(&ctx, &mut view, Vec::new(), None);
+        let pitch = geometry.metrics.height + ROW_GAP;
+
+        // Rename, then Delete, of row 2 (auto ids), and row 2's main block.
+        for tabs in [8, 9, 7] {
+            let ctx = theme::test_context();
+            pass(&ctx, &mut view, Vec::new(), Some(0.0));
+            for _ in 0..tabs {
+                pass(&ctx, &mut view, tab(), None);
+                pass(&ctx, &mut view, Vec::new(), None);
+            }
+            let before = focused(&ctx);
+            assert!(before.is_some());
+            for rows in [1.0, 3.0, 10.0, 0.0] {
+                pass(&ctx, &mut view, Vec::new(), Some(rows * pitch));
+                pass(&ctx, &mut view, Vec::new(), None);
+                assert_eq!(focused(&ctx), before, "{tabs} tabs, scrolled {rows} rows");
+            }
+        }
+
+        // Load more, after the last row: scrolling back to the top draws
+        // more rows before it.
+        let ctx = theme::test_context();
+        let mut view = list_view(8);
+        view.has_more = true;
+        pass(&ctx, &mut view, Vec::new(), None);
+        for _ in 0..8 * 3 + 1 {
+            pass(&ctx, &mut view, tab(), None);
+            pass(&ctx, &mut view, Vec::new(), None);
+        }
+        let before = focused(&ctx);
+        assert!(before.is_some());
+        pass(&ctx, &mut view, Vec::new(), Some(0.0));
+        pass(&ctx, &mut view, Vec::new(), None);
+        assert_eq!(focused(&ctx), before, "Load more kept the focus");
+    }
+
+    #[test]
+    fn narrow_rows_grow_to_fit_wrapped_meta_lines() {
+        run(|ui| {
+            let mut view = list_view(3);
+            view.meetings[1].trigger = "auto".into();
+            let one_line = RowMetrics::measure(ui);
+            let wide = view.list_metrics(ui, 900.0);
+            assert_eq!(wide.height, one_line.height);
+            let narrow = view.list_metrics(ui, 200.0);
+            assert!(narrow.meta > one_line.meta, "{narrow:?}");
+            assert!(narrow.height > one_line.height);
+            // The widest line is the auto one, and fits its block wrapped.
+            let widest = view.widest_meta.clone().unwrap();
+            assert!(widest.ends_with(" · auto"), "{widest}");
+            let galley = meta_galley(ui, &widest, narrow.main_width(200.0));
+            assert!(galley.size().y <= narrow.meta);
+            assert!(galley.size().x <= narrow.main_width(200.0) + 0.5);
         });
     }
 }
