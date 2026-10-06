@@ -28,7 +28,7 @@ use crate::ui::icons::ph;
 use crate::ui::theme::{self, BG, OK, TEXT, TEXT_MUTED};
 use crate::ui::toasts::Notice;
 use crate::ui::widgets::{self, BadgeKind, KeyScroll, Politeness};
-use crate::ui::{format, UiCmd, UiCtx};
+use crate::ui::{UiCmd, UiCtx};
 use eframe::egui::{self, Align, CornerRadius, Layout, Margin, RichText};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -56,11 +56,43 @@ const BACKUP_DIALOG_TITLE: &str = "Choose where to create the Witness backup";
 /// The GPU-library download's progress id.
 const GPU_LIBS_ID: &str = "gpu-libs";
 
-/// A background backup: its completion flag plus the slot its worker fills
-/// with the summary (read back here; dropped harmlessly if the view is gone).
-struct BackupRun {
+/// A `spawn_op` action whose toast is reported globally but whose result
+/// the view also wants (the backup summary, the new autostart state): the
+/// op's completion flag plus the slot its worker fills on success (read
+/// back here; dropped harmlessly if the view is gone).
+struct OpRun<T> {
     handle: OpHandle,
-    summary: Arc<Mutex<Option<BackupSummary>>>,
+    result: Arc<Mutex<Option<T>>>,
+}
+
+impl<T> OpRun<T> {
+    /// Run `f` as an op; it gets the slot to fill and returns the `OpDone`.
+    fn spawn(
+        cx: &UiCtx,
+        name: &'static str,
+        f: impl FnOnce(&AppCore, &Mutex<Option<T>>) -> OpDone + Send + 'static,
+    ) -> Self
+    where
+        T: Send + 'static,
+    {
+        let result = Arc::new(Mutex::new(None));
+        let slot = result.clone();
+        let handle = cx.tasks.spawn_op(name, move |c| f(c, &slot));
+        OpRun { handle, result }
+    }
+
+    /// Once the op finished: `Some(result)` (`None` inside when it failed).
+    fn finished(slot: &mut Option<Self>) -> Option<Option<T>> {
+        let run = slot.take_if(|run| run.handle.is_done())?;
+        Some(run.result.lock().ok().and_then(|mut r| r.take()))
+    }
+}
+
+/// Fill an `OpRun` slot from its worker.
+fn fill<T>(slot: &Mutex<Option<T>>, value: T) {
+    if let Ok(mut slot) = slot.lock() {
+        *slot = Some(value);
+    }
 }
 
 /// The parallel mount-time loads (settings.tsx `useEffect`). A `None` slot
@@ -74,7 +106,6 @@ struct Loads {
     people: Option<Task<CoreResult<Vec<PersonInfo>>>>,
     devices: Option<Task<CoreResult<AudioDevices>>>,
     autostart: Option<Task<Result<bool, String>>>,
-    autostart_set: Option<Task<(bool, Result<(), String>)>>,
     diagnostics: Option<Task<Diagnostics>>,
     pick_dir: Option<Task<Option<PathBuf>>>,
 }
@@ -95,14 +126,17 @@ impl SettingsView {
         self.state.show(ui, cx);
     }
 
-    /// Commit a text-field draft that has not been blurred yet (the view is
-    /// being left, or the window hidden). Other edits already went through
-    /// `SettingsStore`, whose queue outlives the view.
+    /// Commit a text-field draft that has not been blurred yet, or a slider
+    /// drag that has not been released (the view is being left, or the
+    /// window hidden). Other edits already went through `SettingsStore`,
+    /// whose queue outlives the view.
     pub fn flush(&mut self, cx: &mut UiCtx) {
         self.state.commit_drafts(cx);
     }
 
     pub fn on_leave(&mut self, cx: &mut UiCtx) {
+        // An answer given in the pass that also navigated away still acts.
+        self.state.answer_confirms(cx);
         self.flush(cx);
     }
 }
@@ -148,7 +182,10 @@ struct SettingsState {
 
     /// A data_dir change was saved while this view was open.
     needs_restart: bool,
-    backup: Option<BackupRun>,
+    /// The registry write after toggling autostart (the checkbox is
+    /// disabled meanwhile); an op, so a failure toasts after leaving too.
+    autostart_write: Option<OpRun<bool>>,
+    backup: Option<OpRun<BackupSummary>>,
     last_backup: Option<BackupSummary>,
     deleting_cache: Option<OpHandle>,
     forgetting: Vec<OpHandle>,
@@ -157,7 +194,9 @@ struct SettingsState {
     /// This view asked the "Delete models" / "Stop & restart" confirms.
     /// The modal is app-level and outlives the view (Ctrl+F navigates while
     /// it shows), so an answer given after leaving must not fire on a later
-    /// visit: answers are drained every pass and acted on only when asked.
+    /// visit: answers are drained every pass (and on leave) and acted on
+    /// only when asked. A modal still open after leaving answers into the
+    /// void — closing it on leave needs a `Confirm` API (integration).
     asked_cache: bool,
     asked_restart: bool,
 }
@@ -189,6 +228,7 @@ impl SettingsState {
             junk_dirty: false,
             local_threshold: None,
             needs_restart: false,
+            autostart_write: None,
             backup: None,
             last_backup: None,
             deleting_cache: None,
@@ -230,8 +270,13 @@ impl SettingsState {
     }
 
     /// Save the watch patterns / noise phrases if they were typed into
-    /// since their last commit.
+    /// since their last commit, and a slider value still being dragged.
     fn commit_drafts(&mut self, cx: &mut UiCtx) {
+        if let Some(threshold) = self.local_threshold.take() {
+            if threshold != cx.settings.current().speaker_match_threshold {
+                save(cx, |s| s.speaker_match_threshold = threshold);
+            }
+        }
         if self.patterns_dirty {
             self.commit_patterns(cx, parse_patterns(&self.patterns_text));
         }
@@ -359,13 +404,9 @@ impl SettingsState {
                 Err(error) => cx.toasts.error("Could not read autostart status", error),
             }
         }
-        if let Some(result) = take(&mut self.loads.autostart_set) {
-            match result {
-                Ok((enabled, Ok(()))) => self.autostart = Some(enabled),
-                Ok((_, Err(error))) | Err(error) => {
-                    cx.toasts.error("Could not update autostart", error)
-                }
-            }
+        // A failed write was toasted by the op; the checkbox stays as it was.
+        if let Some(Some(enabled)) = OpRun::finished(&mut self.autostart_write) {
+            self.autostart = Some(enabled);
         }
         if let Some(result) = take(&mut self.loads.diagnostics) {
             match result {
@@ -388,10 +429,8 @@ impl SettingsState {
             }
         }
 
-        if let Some(run) = self.backup.take_if(|run| run.handle.is_done()) {
-            if let Some(summary) = run.summary.lock().ok().and_then(|mut s| s.take()) {
-                self.last_backup = Some(summary);
-            }
+        if let Some(Some(summary)) = OpRun::finished(&mut self.backup) {
+            self.last_backup = Some(summary);
         }
         if self
             .deleting_cache
@@ -493,7 +532,7 @@ impl SettingsState {
 
     fn startup(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
         let mut enabled = self.autostart.unwrap_or(false);
-        let loaded = self.autostart.is_some() && self.loads.autostart_set.is_none();
+        let loaded = self.autostart.is_some() && self.autostart_write.is_none();
         let response = ui.add_enabled(
             loaded,
             egui::Checkbox::new(
@@ -502,10 +541,22 @@ impl SettingsState {
             ),
         );
         if response.changed() {
-            // The checkbox shows the new value once the registry write succeeds.
-            self.loads.autostart_set = Some(cx.tasks.spawn("autostart-write", move |_| {
-                (enabled, autostart::set_enabled(enabled))
-            }));
+            // The checkbox shows the new value once the registry write
+            // succeeds; a failure toasts even if Settings was left.
+            self.autostart_write =
+                Some(OpRun::spawn(
+                    cx,
+                    "autostart-write",
+                    move |_, slot| match autostart::set_enabled(enabled) {
+                        Ok(()) => {
+                            fill(slot, enabled);
+                            quiet()
+                        }
+                        Err(error) => {
+                            notice_done(Notice::error("Could not update autostart", error))
+                        }
+                    },
+                ));
         }
     }
 
@@ -543,12 +594,20 @@ impl SettingsState {
         });
         if let Some(backup) = &self.last_backup {
             // "Backup saved to <path> (N files, X MB). Models can be …"
+            let details = backup_details(backup);
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 muted(ui, "Backup saved to");
                 path_code(ui, &backup.path);
-                muted(ui, &backup_details(backup));
+                muted(ui, &details);
             });
+            // `<p role="status">`: screen readers announce the finished backup.
+            widgets::announce(
+                ui.ctx(),
+                egui::Id::new("settings-backup-status"),
+                &format!("Backup saved to {} {details}", backup.path),
+                Politeness::Polite,
+            );
         }
 
         let restart_pending = self.needs_restart
@@ -702,7 +761,16 @@ impl SettingsState {
                     format!("Voice match strictness: {}", threshold_value_text(shown)),
                 )
             });
-            if let Some(edit) = threshold_edit(shown_before, value, response.changed()) {
+            let interacted = response.is_pointer_button_down_on()
+                || response.dragged()
+                || response.drag_stopped()
+                || response.clicked()
+                || (response.has_focus()
+                    && ui.input(|i| {
+                        i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::ArrowRight)
+                    }));
+            if let Some(edit) = threshold_edit(shown_before, value, response.changed(), interacted)
+            {
                 self.local_threshold = Some(edit);
             }
             // Commit once the pointer lets go (a keyboard change commits at
@@ -895,10 +963,11 @@ impl SettingsState {
             } else {
                 "Delete model cache"
             };
+            // The tooltip shows while disabled too, like the button's title.
+            let tip = "Deletes every downloaded model, including old versions — Shift-click to skip confirmation";
             let response = ghost_enabled(ui, enabled, label)
-                .on_hover_text(
-                    "Deletes every downloaded model, including old versions — Shift-click to skip confirmation",
-                );
+                .on_hover_text(tip)
+                .on_disabled_hover_text(tip);
             if response.clicked() {
                 if ui.input(|i| i.modifiers.shift) {
                     self.delete_cache(cx);
@@ -993,7 +1062,7 @@ impl SettingsState {
             }
             muted(
                 ui,
-                &format!("generated {}", format::fmt_date(&d.generated_at)),
+                &format!("generated {}", fmt_generated_at(&d.generated_at)),
             );
         });
     }
@@ -1046,10 +1115,8 @@ impl SettingsState {
     // Actions
 
     fn start_backup(&mut self, cx: &mut UiCtx) {
-        let summary = Arc::new(Mutex::new(None));
-        let slot = summary.clone();
         let owner = cx.dialog_owner();
-        let handle = cx.tasks.spawn_op("create-backup", move |c| {
+        self.backup = Some(OpRun::spawn(cx, "create-backup", move |c, slot| {
             // Cancel returns quietly, like the command's `None`.
             let Some(parent) = dialogs::pick_folder_blocking(owner, Some(BACKUP_DIALOG_TITLE))
             else {
@@ -1057,16 +1124,13 @@ impl SettingsState {
             };
             let notice = match c.create_backup(&parent) {
                 Ok(backup) => {
-                    if let Ok(mut slot) = slot.lock() {
-                        *slot = Some(backup);
-                    }
+                    fill(slot, backup);
                     Notice::success("Backup created")
                 }
                 Err(error) => Notice::error("Could not create backup", error),
             };
             notice_done(notice)
-        });
-        self.backup = Some(BackupRun { handle, summary });
+        }));
     }
 
     fn delete_cache(&mut self, cx: &mut UiCtx) {
@@ -1533,6 +1597,19 @@ fn watcher_text(watcher: Option<&WatcherStatus>) -> String {
     }
 }
 
+/// The diagnostics snapshot time, local, with seconds (`toLocaleString()`
+/// in en-GB: two refreshes within a minute must still look different).
+/// Unparseable input is returned unchanged.
+fn fmt_generated_at(rfc3339: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(rfc3339) {
+        Ok(at) => at
+            .with_timezone(&chrono::Local)
+            .format("%d/%m/%Y, %H:%M:%S")
+            .to_string(),
+        Err(_) => rfc3339.to_string(),
+    }
+}
+
 fn yes_no(value: bool) -> &'static str {
     if value {
         "yes"
@@ -1552,11 +1629,14 @@ fn snap_threshold(value: f32) -> f32 {
 /// The user's slider edit, if any. egui's `Slider` (clamping `Always` plus
 /// `step_by`) rounds an off-grid value such as a hand-edited 0.62 to the
 /// step as it draws and reports that as a change; the range input never
-/// rewrote the value untouched. The slider already *shows* the snapped
-/// value, so a real edit always lands on a different grid position.
-fn threshold_edit(shown: f32, value: f32, changed: bool) -> Option<f32> {
+/// rewrote the value untouched. So a change counts as an edit when the
+/// pointer or keyboard was on the slider this pass (`interacted` — even a
+/// click on the 0.60 the handle already shows over a stored 0.62), or,
+/// without such input (e.g. a screen reader's increment), when it moved to
+/// a different grid position than the one shown.
+fn threshold_edit(shown: f32, value: f32, changed: bool, interacted: bool) -> Option<f32> {
     let snapped = snap_threshold(value);
-    (changed && snapped != snap_threshold(shown)).then_some(snapped)
+    (changed && (interacted || snapped != snap_threshold(shown))).then_some(snapped)
 }
 
 fn threshold_readout(t: f32) -> String {
@@ -1954,13 +2034,32 @@ mod tests {
     fn slider_rounding_an_off_grid_value_is_not_an_edit() {
         // egui snapped a hand-edited 0.62 to 0.60 while drawing and
         // reported a change: not the user's doing, so nothing is saved.
-        assert_eq!(threshold_edit(0.62, 0.6, true), None);
-        assert_eq!(threshold_edit(0.6, 0.6, true), None);
-        assert_eq!(threshold_edit(0.62, 0.65, false), None);
+        assert_eq!(threshold_edit(0.62, 0.6, true, false), None);
+        assert_eq!(threshold_edit(0.6, 0.6, true, false), None);
+        assert_eq!(threshold_edit(0.62, 0.65, false, false), None);
+        assert_eq!(threshold_edit(0.62, 0.65, false, true), None);
         // Real edits, also away from an off-grid start.
-        assert_eq!(threshold_edit(0.62, 0.650_000_1, true), Some(0.65));
-        assert_eq!(threshold_edit(0.62, 0.55, true), Some(0.55));
-        assert_eq!(threshold_edit(0.6, 0.8, true), Some(0.8));
+        assert_eq!(threshold_edit(0.62, 0.650_000_1, true, true), Some(0.65));
+        assert_eq!(threshold_edit(0.62, 0.55, true, true), Some(0.55));
+        assert_eq!(threshold_edit(0.6, 0.8, true, true), Some(0.8));
+        // A non-pointer change (screen-reader increment) to a new position.
+        assert_eq!(threshold_edit(0.6, 0.65, true, false), Some(0.65));
+    }
+
+    #[test]
+    fn diagnostics_time_keeps_seconds() {
+        let text = fmt_generated_at("2026-10-06T10:05:33+00:00");
+        // Local time zone varies; the shape and the seconds do not.
+        assert_eq!(text.len(), "06/10/2026, 10:05:33".len(), "{text}");
+        assert!(text.ends_with(":33") && text.contains("/2026, "), "{text}");
+        assert_eq!(fmt_generated_at("not a date"), "not a date");
+    }
+
+    #[test]
+    fn clicking_the_shown_grid_value_over_an_off_grid_one_saves_it() {
+        // The handle shows 0.60 over a stored 0.62; clicking it there is the
+        // user picking 0.60.
+        assert_eq!(threshold_edit(0.62, 0.6, true, true), Some(0.6));
     }
 
     /// The real egui slider, untouched, over an off-grid stored value: it
@@ -1981,7 +2080,11 @@ mod tests {
                 );
                 assert!(response.changed(), "egui reports its own rounding");
                 assert!((value - 0.6).abs() < 1e-6, "rounded to {value}");
-                edit = threshold_edit(shown, value, response.changed());
+                let interacted = response.is_pointer_button_down_on()
+                    || response.dragged()
+                    || response.clicked();
+                assert!(!interacted);
+                edit = threshold_edit(shown, value, response.changed(), interacted);
             });
         });
         output.textures_delta.clear(); // no renderer to upload the font atlas
