@@ -15,6 +15,7 @@ mod model;
 mod panic;
 mod platform;
 mod settings_store;
+mod snapshot;
 mod ui;
 mod ui_state;
 
@@ -87,6 +88,7 @@ fn main() {
         rx,
         instance_guard,
         minimized,
+        snapshot: snapshot::config(),
     }));
     let creator_ran = AtomicBool::new(false);
 
@@ -194,10 +196,16 @@ fn run(
 }
 
 fn native_options(renderer: RendererChoice) -> eframe::NativeOptions {
+    let snapshot = snapshot::config();
+    let size = snapshot.as_ref().map_or([460.0, 620.0], |s| s.size);
+    let min_size = match &snapshot {
+        Some(s) => [s.size[0].min(380.0), s.size[1].min(360.0)],
+        None => [380.0, 360.0],
+    };
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Witness")
-        .with_inner_size([460.0, 620.0])
-        .with_min_inner_size([460.0, 360.0])
+        .with_inner_size(size)
+        .with_min_inner_size(min_size)
         .with_decorations(false)
         .with_resizable(true)
         // Nothing drops files on Witness, and winit's OleInitialize for

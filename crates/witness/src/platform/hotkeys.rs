@@ -61,6 +61,15 @@ impl Hotkeys {
         }
     }
 
+    /// Nothing bound (debug snapshot runs leave the combos to real instances).
+    pub fn none() -> Hotkeys {
+        Hotkeys {
+            manager: None,
+            record: None,
+            bookmark: None,
+        }
+    }
+
     /// The record combo that bound (e.g. "ctrl+alt+r"), None if all taken.
     pub fn record_combo(&self) -> Option<String> {
         self.record.as_ref().map(|(combo, _)| combo.clone())

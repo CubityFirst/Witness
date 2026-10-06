@@ -5,17 +5,31 @@
 
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Margin, Shadow, Stroke};
 
-pub const BG: Color32 = Color32::from_rgb(0x14, 0x16, 0x1a);
-pub const BG_RAISED: Color32 = Color32::from_rgb(0x1c, 0x1f, 0x25);
-pub const BG_HOVER: Color32 = Color32::from_rgb(0x23, 0x27, 0x2f);
-pub const BORDER: Color32 = Color32::from_rgb(0x2c, 0x31, 0x3a);
-pub const TEXT: Color32 = Color32::from_rgb(0xd8, 0xdd, 0xe5);
-pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x8a, 0x93, 0xa1);
-pub const ACCENT: Color32 = Color32::from_rgb(0x4d, 0x9f, 0xec);
-pub const REC: Color32 = Color32::from_rgb(0xe5, 0x48, 0x4d);
-pub const OK: Color32 = Color32::from_rgb(0x46, 0xa7, 0x58);
-pub const WARN: Color32 = Color32::from_rgb(0xd5, 0xa0, 0x21);
-pub const FOCUS: Color32 = Color32::from_rgb(0x9a, 0xcb, 0xff);
+pub const BG: Color32 = Color32::from_rgb(0x0f, 0x10, 0x13);
+pub const BG_RAISED: Color32 = Color32::from_rgb(0x17, 0x18, 0x1c);
+pub const BG_HOVER: Color32 = Color32::from_rgb(0x1f, 0x21, 0x26);
+/// Pressed / selected rows.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub const BG_ACTIVE: Color32 = Color32::from_rgb(0x26, 0x29, 0x30);
+pub const BORDER: Color32 = Color32::from_rgb(0x26, 0x29, 0x2f);
+/// Input and secondary-button borders.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub const BORDER_STRONG: Color32 = Color32::from_rgb(0x34, 0x38, 0x41);
+pub const TEXT: Color32 = Color32::from_rgb(0xe8, 0xea, 0xee);
+pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x96, 0x9b, 0xa5);
+/// Tertiary text: timestamps, placeholders, hints.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x6b, 0x70, 0x7a);
+pub const ACCENT: Color32 = Color32::from_rgb(0x6e, 0x8e, 0xff);
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0x8a, 0xa3, 0xff);
+/// Accent @ 16 %: selected nav, active segment, search hits.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub const ACCENT_SOFT: Color32 = Color32::from_rgba_unmultiplied_const(0x6e, 0x8e, 0xff, 41);
+pub const REC: Color32 = Color32::from_rgb(0xf0, 0x52, 0x52);
+pub const OK: Color32 = Color32::from_rgb(0x3f, 0xb9, 0x50);
+pub const WARN: Color32 = Color32::from_rgb(0xe0, 0xa5, 0x26);
+pub const FOCUS: Color32 = Color32::from_rgb(0xa8, 0xb9, 0xff);
 /// Light red text: record button, recording pill, failed badges, live header.
 pub const REC_LIGHT: Color32 = Color32::from_rgb(0xff, 0x85, 0x89);
 /// Hover background of stop / danger buttons.
@@ -27,7 +41,7 @@ pub const THEM_CHIP: Color32 = Color32::from_rgb(0x2f, 0x7c, 0x3d);
 /// Glyph colour on the (warn-coloured) bookmark chip.
 pub const BOOKMARK_GLYPH: Color32 = Color32::from_rgb(0x1a, 0x1c, 0x20);
 /// Search-hit `<mark>` text.
-pub const MARK_TEXT: Color32 = Color32::from_rgb(0xff, 0xe9, 0xb3);
+pub const MARK_TEXT: Color32 = Color32::from_rgb(0xdd, 0xe4, 0xff);
 pub const CAPTION_TEXT: Color32 = Color32::from_rgb(0xee, 0xf1, 0xf5);
 pub const CAPTION_ERR: Color32 = Color32::from_rgb(0xff, 0xb4, 0xb7);
 pub const CAPTION_BG: Color32 = Color32::from_rgb(0x0c, 0x0d, 0x10);
@@ -44,10 +58,10 @@ pub const BANNER_BORDER: Color32 = Color32::from_rgb(0x61, 0x4d, 0x1d);
 pub const WARN_BG: Color32 = Color32::from_rgb(0x23, 0x21, 0x1b);
 pub const WARN_BORDER: Color32 = Color32::from_rgb(0x58, 0x46, 0x1c);
 /// `<mark>` background: warn @ 0.35.
-pub const MARK_BG: Color32 = Color32::from_rgba_unmultiplied_const(0xd5, 0xa0, 0x21, 89);
+pub const MARK_BG: Color32 = Color32::from_rgba_unmultiplied_const(0x6e, 0x8e, 0xff, 66);
 /// Active transcript segment: accent @ 0.12 fill, @ 0.35 outline.
-pub const ACTIVE_SEG_BG: Color32 = Color32::from_rgba_unmultiplied_const(0x4d, 0x9f, 0xec, 31);
-pub const ACTIVE_SEG_STROKE: Color32 = Color32::from_rgba_unmultiplied_const(0x4d, 0x9f, 0xec, 89);
+pub const ACTIVE_SEG_BG: Color32 = Color32::from_rgba_unmultiplied_const(0x6e, 0x8e, 0xff, 28);
+pub const ACTIVE_SEG_STROKE: Color32 = Color32::from_rgba_unmultiplied_const(0x6e, 0x8e, 0xff, 0);
 /// Bookmark row: warn @ 0.06.
 pub const BOOKMARK_ROW_BG: Color32 = Color32::from_rgba_unmultiplied_const(0xd5, 0xa0, 0x21, 15);
 /// `.view-error`: red @ 0.08 fill, @ 0.5 border.
@@ -99,6 +113,55 @@ pub fn narrow(ui: &egui::Ui) -> bool {
     ui.ctx().content_rect().width() <= 620.0
 }
 
+/// Spacing scale (pt).
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub const S1: f32 = 4.0;
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub const S2: f32 = 8.0;
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub const S3: f32 = 12.0;
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub const S4: f32 = 16.0;
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub const S5: f32 = 24.0;
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub const S6: f32 = 32.0;
+
+/// Corner radii: small chips, controls/rows, surfaces/modals.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub const R_SM: u8 = 6;
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub const R_MD: u8 = 8;
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub const R_LG: u8 = 12;
+
+/// The content column's maximum width.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub const CONTENT_MAX: f32 = 760.0;
+/// Below this width layouts switch to stacked / icon-only variants.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub const COMPACT_BELOW: f32 = 460.0;
+
+/// A speaker's colour as readable text / avatar fill on the dark
+/// background: the stable chip colour, lifted towards white.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub fn speaker_text(label: &str) -> Color32 {
+    lighten(chip_color(label), 0.35)
+}
+
+/// Mix `c` towards white by `t` (0..1).
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub fn lighten(c: Color32, t: f32) -> Color32 {
+    let mix = |v: u8| (v as f32 + (255.0 - v as f32) * t).round() as u8;
+    Color32::from_rgb(mix(c.r()), mix(c.g()), mix(c.b()))
+}
+
+/// `c` at `alpha` (0..1) as an unmultiplied colour.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub fn alpha(c: Color32, alpha: f32) -> Color32 {
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (alpha * 255.0).round() as u8)
+}
+
 /// Install the theme: eager fonts, visuals, spacing and the app-wide
 /// options (no keyboard zoom — `app.rs` zooms the root viewport only — and
 /// no Ctrl+Q quit shortcut, which the web app never had).
@@ -119,7 +182,7 @@ pub(crate) fn style(s: &mut egui::Style) {
         (TextStyle::Small, FontId::proportional(12.0)),
         (TextStyle::Body, FontId::proportional(BASE_SIZE)),
         (TextStyle::Button, FontId::proportional(BASE_SIZE)),
-        (TextStyle::Heading, semibold(17.0)),
+        (TextStyle::Heading, semibold(20.0)),
         (TextStyle::Monospace, FontId::monospace(13.0)),
     ]
     .into();
@@ -130,7 +193,7 @@ pub(crate) fn style(s: &mut egui::Style) {
 
     s.spacing.item_spacing = egui::vec2(8.0, 8.0);
     s.spacing.button_padding = egui::vec2(10.0, 6.0);
-    s.spacing.interact_size.y = 30.0;
+    s.spacing.interact_size.y = 32.0;
     s.spacing.menu_margin = Margin::same(6);
     s.spacing.scroll = egui::style::ScrollStyle {
         bar_width: 6.0,
@@ -147,7 +210,7 @@ pub(crate) fn style(s: &mut egui::Style) {
     v.panel_fill = BG;
     v.window_fill = BG_RAISED;
     v.window_stroke = Stroke::new(1.0, BORDER);
-    v.window_corner_radius = CornerRadius::same(10);
+    v.window_corner_radius = CornerRadius::same(R_LG);
     v.menu_corner_radius = CornerRadius::same(8);
     v.window_shadow = Shadow {
         offset: [0, 12],
@@ -161,19 +224,19 @@ pub(crate) fn style(s: &mut egui::Style) {
         spread: 0,
         color: Color32::from_black_alpha(115),
     };
-    v.extreme_bg_color = BG; // text-edit background
-    v.text_edit_bg_color = Some(BG);
+    v.extreme_bg_color = BG_RAISED; // text-edit background
+    v.text_edit_bg_color = Some(BG_RAISED);
     v.faint_bg_color = BG_RAISED;
     v.code_bg_color = BG_RAISED;
     v.hyperlink_color = ACCENT;
     v.warn_fg_color = WARN;
     v.error_fg_color = REC;
-    v.selection.bg_fill = Color32::from_rgba_unmultiplied(0x4d, 0x9f, 0xec, 89);
+    v.selection.bg_fill = Color32::from_rgba_unmultiplied(0x6e, 0x8e, 0xff, 89);
     v.selection.stroke = Stroke::new(1.0, FOCUS);
     v.text_cursor.stroke = Stroke::new(2.0, TEXT);
     v.disabled_alpha = 0.55;
 
-    let radius = CornerRadius::same(6);
+    let radius = CornerRadius::same(R_MD);
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = BG;
     w.noninteractive.weak_bg_fill = BG;
@@ -192,9 +255,11 @@ pub(crate) fn style(s: &mut egui::Style) {
         state.corner_radius = radius;
         state.expansion = 0.0;
     }
-    w.inactive.bg_fill = BORDER;
-    // `.btn:hover` / input focus: the border turns accent.
-    w.hovered.bg_stroke = Stroke::new(1.0, ACCENT);
+    w.inactive.bg_fill = BORDER_STRONG;
+    w.inactive.bg_stroke = Stroke::new(1.0, BORDER_STRONG);
+    w.hovered.bg_stroke = Stroke::new(1.0, BORDER_STRONG);
+    w.hovered.weak_bg_fill = BG_ACTIVE;
+    // Pressed / focused controls: the border turns accent.
     w.active.bg_stroke = Stroke::new(1.0, ACCENT);
 }
 
@@ -230,20 +295,22 @@ mod tests {
         style(&mut s);
         let w = &s.visuals.widgets;
         assert!(!s.spacing.scroll.foreground_color);
-        assert_eq!(w.inactive.bg_fill, BORDER);
+        assert_eq!(w.inactive.bg_fill, BORDER_STRONG);
         assert_eq!(w.hovered.bg_fill, TEXT_MUTED);
         assert_eq!(w.active.bg_fill, TEXT_MUTED);
-        // Buttons keep the raised fill.
+        // Secondary controls: hover fill, a step lighter on hover.
         assert_eq!(w.inactive.weak_bg_fill, BG_HOVER);
-        assert_eq!(w.hovered.weak_bg_fill, BG_HOVER);
+        assert_eq!(w.hovered.weak_bg_fill, BG_ACTIVE);
         // No edge fade (CSS scrollers have none).
         assert_eq!(s.spacing.scroll.fade.strength, 0.0);
     }
 
     #[test]
     fn tints_have_the_css_alpha() {
-        assert_eq!(MARK_BG.a(), (0.35f32 * 255.0).round() as u8);
+        // Search hits and the active segment are accent tints.
+        assert_eq!(MARK_BG.a(), 66);
         assert_eq!(BACKDROP.a(), (0.55f32 * 255.0).round() as u8);
-        assert_eq!(ACTIVE_SEG_BG.a(), (0.12f32 * 255.0).round() as u8);
+        assert_eq!(ACTIVE_SEG_BG.a(), 28);
+        assert_eq!(ACCENT_SOFT.a(), 41);
     }
 }

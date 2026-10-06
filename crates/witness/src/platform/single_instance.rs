@@ -83,6 +83,22 @@ pub enum Acquire {
 /// main thread before the event loop (whose message pump then serves the
 /// hidden window). Logging is not up yet at this point: see [`early_log`].
 pub fn acquire(args: &[OsString]) -> Acquire {
+    // Debug snapshot runs (`crate::snapshot`) take per-process names, so
+    // they run beside a real instance and beside each other.
+    if crate::snapshot::config().is_some() {
+        let leak = |kind: &str| -> &'static str {
+            let pid = std::process::id();
+            Box::leak(
+                format!("com.github.cubityfirst.witness-snapshot-{pid}-{kind}").into_boxed_str(),
+            )
+        };
+        let names = Names {
+            mutex: leak("sim"),
+            class: leak("sic"),
+            title: leak("siw"),
+        };
+        return imp::acquire(&names, args);
+    }
     imp::acquire(&NAMES, args)
 }
 

@@ -288,6 +288,12 @@ impl MainWindow {
     }
 
     /// DWM-cloak (composed but invisible) or uncloak the window.
+    /// Debug snapshot runs: never on screen and never activated.
+    pub fn hide_for_snapshot(&self) {
+        self.set_cloaked(true);
+        imp::set_no_activate(self.hwnd, true);
+    }
+
     pub fn set_cloaked(&self, cloaked: bool) {
         imp::set_cloaked(self.hwnd, cloaked);
     }

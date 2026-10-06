@@ -70,6 +70,8 @@ pub struct StartParts {
     pub instance_guard: InstanceGuard,
     /// Started with `--minimized` (autostart): never show a window.
     pub minimized: bool,
+    /// Debug builds: an off-screen snapshot run (`crate::snapshot`).
+    pub snapshot: Option<crate::snapshot::Config>,
 }
 
 /// The OS-shell objects released at the point of no return of an exit path.
@@ -142,6 +144,8 @@ pub struct WitnessApp {
     text_scale: f32,
     /// Debug builds: Ctrl+Alt+Shift+F12 panics (WITNESS_DEBUG_PANIC_HOTKEY=1).
     debug_panic_hotkey: bool,
+    /// Debug builds: an off-screen snapshot run (`crate::snapshot`).
+    snapshot: Option<crate::snapshot::Snapshot>,
 }
 
 impl WitnessApp {
@@ -154,6 +158,7 @@ impl WitnessApp {
             rx,
             instance_guard,
             minimized,
+            snapshot,
         } = parts;
         let ctx = cc.egui_ctx.clone();
 
@@ -166,17 +171,26 @@ impl WitnessApp {
         sink.set_context(ctx.clone());
 
         let window = MainWindow::from_creation_context(cc)?;
-        let tray = match Tray::build(sink.clone()) {
-            Ok(tray) => {
+        if snapshot.is_some() {
+            window.hide_for_snapshot();
+        }
+        // Snapshot runs leave the tray and the hotkeys to real instances.
+        let tray = match snapshot.is_none().then(|| Tray::build(sink.clone())) {
+            None => None,
+            Some(Ok(tray)) => {
                 crate::panic::register_tray(tray.notify_ids());
                 Some(tray)
             }
-            Err(error) => {
+            Some(Err(error)) => {
                 log::error!("could not create the tray icon: {error:#}");
                 None
             }
         };
-        let hotkeys = Hotkeys::register(sink.clone());
+        let hotkeys = if snapshot.is_some() {
+            Hotkeys::none()
+        } else {
+            Hotkeys::register(sink.clone())
+        };
         core.set_bound_hotkeys(hotkeys.record_combo(), hotkeys.bookmark_combo());
         instance_guard.attach(sink.clone());
         let startup = StartupVisibility::new(minimized, &window);
@@ -239,6 +253,7 @@ impl WitnessApp {
             text_scale: system::text_scale_factor(),
             debug_panic_hotkey: cfg!(debug_assertions)
                 && std::env::var_os("WITNESS_DEBUG_PANIC_HOTKEY").is_some_and(|v| v == "1"),
+            snapshot: snapshot.map(crate::snapshot::Snapshot::new),
         };
         app.apply_zoom(&ctx);
         app.debug_surfaces();
@@ -1004,6 +1019,9 @@ impl eframe::App for WitnessApp {
         }
         self.handle_zoom(&ctx);
         self.handle_search_shortcuts(&ctx);
+        if let Some(snapshot) = &mut self.snapshot {
+            snapshot.tick(&ctx);
+        }
 
         let mut topbar_out = topbar::TopBarOutput::default();
         // F0 → U7/U4 contract: besides the documented `show`, `resize_edges`
@@ -1023,41 +1041,33 @@ impl eframe::App for WitnessApp {
             topbar_out = bar.inner;
             topbar::health_banner(ui, cx);
 
-            let content = egui::Frame::new()
-                .fill(theme::BG)
-                .inner_margin(Margin::symmetric(20, 16));
+            // Views own their full-width scroller (bar at the window edge)
+            // and centre their content in `widgets::scroll_column`; the shell
+            // only pads the banner and the search box the same way.
+            let content = egui::Frame::new().fill(theme::BG).inner_margin(Margin {
+                left: 0,
+                right: 0,
+                top: 12,
+                bottom: 0,
+            });
             egui::CentralPanel::default().frame(content).show(ui, |ui| {
-                // The banner and search box end where the view's cards do:
-                // its scroll bar (when shown) takes that width from both,
-                // as it did from the one 0.2.x scroller.
-                let right = ui.max_rect().right();
-                let gutter = widgets::view_scroll_gutter(ui.ctx(), right);
                 widgets::clear_view_viewport(ui.ctx());
-                // CSS margins are whole gaps: `.model-banner` 14 below,
-                // `.list-toolbar` 12 below. An empty scope would still
-                // advance by the item spacing, so it only opens with content.
                 let banner = topbar::has_model_banner(cx);
                 let search = cx.view.has_search_box();
                 if banner || search {
-                    ui.scope(|ui| {
-                        ui.set_max_width((ui.available_width() - gutter).max(0.0));
+                    widgets::padded_column(ui, |ui| {
                         topbar::model_banner(ui, cx);
                         if search {
                             if banner {
-                                widgets::gap(ui, 14.0);
+                                widgets::gap(ui, theme::S3);
                             }
                             let current = cx.view.clone();
-                            widgets::centered_column(ui, 900.0, |ui| {
-                                views::search::search_box(ui, cx, &current);
-                            });
+                            views::search::search_box(ui, cx, &current);
                         }
                     });
-                    widgets::gap(ui, if search { 12.0 } else { 14.0 });
+                    widgets::gap(ui, theme::S2);
                 }
                 view.show(ui, cx);
-                if (widgets::view_scroll_gutter(ui.ctx(), right) - gutter).abs() > 0.5 {
-                    ui.ctx().request_discard("view scroll bar changed");
-                }
             });
         });
 

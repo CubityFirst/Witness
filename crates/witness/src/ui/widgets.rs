@@ -6,9 +6,9 @@
 //! (map-ui-shell §9) — and do not fork them.
 
 use super::theme::{
-    self, narrow, BADGE_OK_BG, BADGE_REC_BG, BADGE_WARN_BG, BG_HOVER, BG_RAISED, BORDER, OK_LIGHT,
-    PILL_BUSY_BG, PILL_REC_BG, REC, REC_HOVER, REC_LIGHT, TEXT, TEXT_MUTED, VIEW_ERROR_BG,
-    VIEW_ERROR_BORDER, WARN, WARN_BG, WARN_BORDER, WHITE,
+    self, narrow, BADGE_OK_BG, BADGE_REC_BG, BADGE_WARN_BG, BG_ACTIVE, BG_HOVER, BG_RAISED, BORDER,
+    BORDER_STRONG, OK_LIGHT, PILL_BUSY_BG, PILL_REC_BG, REC, REC_HOVER, REC_LIGHT, TEXT,
+    TEXT_FAINT, TEXT_MUTED, VIEW_ERROR_BG, VIEW_ERROR_BORDER, WARN, WARN_BG, WARN_BORDER, WHITE,
 };
 use eframe::egui::{
     self, Color32, CornerRadius, FontId, Frame, Margin, Response, Sense, Stroke, TextWrapMode,
@@ -65,13 +65,13 @@ fn btn_padding(ui: &egui::Ui) -> egui::Vec2 {
 fn btn_style(ui: &egui::Ui) -> ButtonStyle {
     ButtonStyle {
         fill: BG_HOVER,
-        hover_fill: BG_HOVER,
-        stroke: BORDER,
-        hover_stroke: theme::ACCENT,
+        hover_fill: BG_ACTIVE,
+        stroke: BORDER_STRONG,
+        hover_stroke: BORDER_STRONG,
         text: TEXT,
         hover_text: TEXT,
         padding: btn_padding(ui),
-        radius: 6,
+        radius: theme::R_MD,
         font: Font::Regular(theme::BASE_SIZE),
         fixed_size: None,
         content_height: None,
@@ -179,11 +179,13 @@ pub fn btn_icon_only(ui: &mut egui::Ui, glyph: impl Into<WidgetText>, icon: f32)
     styled_button(ui, style, glyph.into(), None)
 }
 
-/// `.btn.btn-ghost`: transparent fill, border kept.
+/// Ghost button: text only, a hover fill, no border.
 pub fn btn_ghost(ui: &mut egui::Ui, text: impl Into<WidgetText>) -> Response {
     let style = ButtonStyle {
         fill: Color32::TRANSPARENT,
-        hover_fill: Color32::TRANSPARENT,
+        hover_fill: BG_HOVER,
+        stroke: Color32::TRANSPARENT,
+        hover_stroke: Color32::TRANSPARENT,
         ..btn_style(ui)
     };
     styled_button(ui, style, text.into(), None)
@@ -194,7 +196,9 @@ pub fn btn_ghost(ui: &mut egui::Ui, text: impl Into<WidgetText>) -> Response {
 pub fn btn_ghost_icon(ui: &mut egui::Ui, glyph: impl Into<WidgetText>, icon: f32) -> Response {
     let style = ButtonStyle {
         fill: Color32::TRANSPARENT,
-        hover_fill: Color32::TRANSPARENT,
+        hover_fill: BG_HOVER,
+        stroke: Color32::TRANSPARENT,
+        hover_stroke: Color32::TRANSPARENT,
         content_height: Some(icon + 2.0),
         ..btn_style(ui)
     };
@@ -253,7 +257,7 @@ fn icon_style(size: f32, hover_text: Color32) -> ButtonStyle {
         text: TEXT_MUTED,
         hover_text,
         padding: egui::vec2(4.0, 4.0),
-        radius: 6,
+        radius: theme::R_MD,
         font: Font::Regular(size),
         fixed_size: None,
         content_height: None,
@@ -265,7 +269,7 @@ fn icon_size(ui: &egui::Ui, glyph: &str, size: f32) -> egui::Vec2 {
     let galley = ui
         .painter()
         .layout_no_wrap(glyph.to_owned(), theme::regular(size), TEXT);
-    let side = galley.size().x.max(size) + 8.0;
+    let side = (galley.size().x.max(size) + 12.0).max(28.0);
     egui::vec2(side, side)
 }
 
@@ -291,17 +295,17 @@ pub fn icon_btn_danger(ui: &mut egui::Ui, glyph: &str, size: f32, label: &str) -
 fn nav_style(selected: bool, padding: egui::Vec2, font: Font) -> ButtonStyle {
     ButtonStyle {
         fill: if selected {
-            BG_HOVER
+            BG_ACTIVE
         } else {
             Color32::TRANSPARENT
         },
-        hover_fill: BG_HOVER,
+        hover_fill: if selected { BG_ACTIVE } else { BG_HOVER },
         stroke: Color32::TRANSPARENT,
         hover_stroke: Color32::TRANSPARENT,
         text: if selected { TEXT } else { TEXT_MUTED },
-        hover_text: if selected { TEXT } else { TEXT_MUTED },
+        hover_text: TEXT,
         padding,
-        radius: 6,
+        radius: theme::R_MD,
         font,
         fixed_size: None,
         content_height: None,
@@ -503,8 +507,8 @@ pub fn inline_warning(ui: &mut egui::Ui, text: &str) -> Response {
     Frame::new()
         .fill(WARN_BG)
         .stroke(Stroke::new(1.0, WARN_BORDER))
-        .corner_radius(CornerRadius::same(6))
-        .inner_margin(Margin::symmetric(10, 8))
+        .corner_radius(CornerRadius::same(theme::R_MD))
+        .inner_margin(Margin::symmetric(12, 10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.add(
@@ -516,14 +520,15 @@ pub fn inline_warning(ui: &mut egui::Ui, text: &str) -> Response {
         .response
 }
 
-/// Cards and rows (`.meeting-row`, `.person-card`, settings sections…):
-/// raised fill, 1 px border, radius 8.
+/// A raised surface (grouped controls, the player, detail panels): one
+/// elevation step, hairline border, radius 12. Not for list items — those
+/// are flat [`list_row`]s.
 pub fn card_frame() -> Frame {
     Frame::new()
         .fill(BG_RAISED)
         .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(14, 12))
+        .corner_radius(CornerRadius::same(theme::R_LG))
+        .inner_margin(Margin::symmetric(16, 14))
 }
 
 /// `.view-error`: a red-tinted box (max 720, centred) with `message` and a
@@ -556,18 +561,27 @@ pub fn view_error(ui: &mut egui::Ui, message: &str, buttons: &[&str]) -> Option<
     clicked
 }
 
-/// `.empty`: centred, 60 pt vertical padding; an optional muted second line.
+/// Empty state: centred, generous vertical padding, a 15 pt semibold title
+/// and an optional muted explanation.
 pub fn empty_state(ui: &mut egui::Ui, title: &str, muted: Option<&str>) {
-    ui.add_space(60.0);
+    ui.add_space(56.0);
     ui.vertical_centered(|ui| {
+        ui.spacing_mut().item_spacing.y = 6.0;
         if !title.is_empty() {
-            ui.add(egui::Label::new(egui::RichText::new(title).color(TEXT)).wrap());
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(title)
+                        .font(theme::semibold(15.0))
+                        .color(TEXT),
+                )
+                .wrap(),
+            );
         }
         if let Some(muted) = muted {
             ui.add(egui::Label::new(egui::RichText::new(muted).color(TEXT_MUTED)).wrap());
         }
     });
-    ui.add_space(60.0);
+    ui.add_space(56.0);
 }
 
 /// A column of at most `max_width` centred in the available width (the
@@ -609,6 +623,7 @@ fn view_viewport_id() -> egui::Id {
 /// without a scroll bar, or when no view noted its viewport. In 0.2.x the
 /// model banner and search box lived in the view's scroller, so they share
 /// this right edge with the view's cards and rows.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub fn view_scroll_gutter(ctx: &egui::Context, right: f32) -> f32 {
     ctx.data(|d| d.get_temp::<f32>(view_viewport_id()))
         .map_or(0.0, |viewport| (right - viewport).clamp(0.0, 20.0))
@@ -895,14 +910,14 @@ pub enum SelectKind {
 pub fn select_style(style: &mut egui::Style, kind: SelectKind) {
     let w = &mut style.visuals.widgets;
     for (state, border) in [
-        (&mut w.inactive, BORDER),
-        (&mut w.hovered, BORDER),
+        (&mut w.inactive, BORDER_STRONG),
+        (&mut w.hovered, BORDER_STRONG),
         (&mut w.active, theme::ACCENT),
         (&mut w.open, theme::ACCENT),
     ] {
-        state.weak_bg_fill = theme::BG;
+        state.weak_bg_fill = BG_RAISED;
         state.bg_stroke = Stroke::new(1.0, border);
-        state.corner_radius = CornerRadius::same(6);
+        state.corner_radius = CornerRadius::same(theme::R_MD);
     }
     match kind {
         SelectKind::TextInput => style.spacing.button_padding = egui::vec2(10.0, 6.0),
@@ -928,7 +943,7 @@ pub const TEXT_INPUT_MARGIN: Margin = Margin::symmetric(10, 6);
 /// `.text-input`: `--bg` fill, 1 px `--border` that turns accent on focus,
 /// radius 6, 6/10 padding. Gives `edit` its `id` (needed to know focus).
 pub fn text_input<'t>(ui: &egui::Ui, id: egui::Id, edit: egui::TextEdit<'t>) -> egui::TextEdit<'t> {
-    framed_text_edit(ui, id, edit, theme::BG, 6, TEXT_INPUT_MARGIN)
+    framed_text_edit(ui, id, edit, BG_RAISED, theme::R_MD, TEXT_INPUT_MARGIN)
 }
 
 /// A text field with its own frame: `fill`, a 1 px `--border` that turns
@@ -943,7 +958,11 @@ pub fn framed_text_edit<'t>(
     margin: Margin,
 ) -> egui::TextEdit<'t> {
     let focused = ui.memory(|m| m.has_focus(id));
-    let border = if focused { theme::ACCENT } else { BORDER };
+    let border = if focused {
+        theme::ACCENT
+    } else {
+        BORDER_STRONG
+    };
     edit.id(id).margin(margin).frame(
         Frame::new()
             .fill(fill)
@@ -1020,8 +1039,404 @@ pub fn announce(ctx: &egui::Context, id: egui::Id, text: &str, politeness: Polit
     });
 }
 
+// ---------------------------------------------------------------------------
+// Rework kit (design/ui-rework.md): flat rows, switches, setting rows,
+// groups, eliding labels. Views build on these rather than on cards.
+
+/// Below [`theme::COMPACT_BELOW`] of available width: stacked / icon-only
+/// variants.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub fn is_compact(ui: &egui::Ui) -> bool {
+    ui.available_width() < theme::COMPACT_BELOW
+}
+
+/// Primary button: accent fill, white semibold text.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub fn btn_primary(ui: &mut egui::Ui, text: impl Into<WidgetText>) -> Response {
+    let style = ButtonStyle {
+        fill: theme::ACCENT,
+        hover_fill: theme::ACCENT_HOVER,
+        stroke: Color32::TRANSPARENT,
+        hover_stroke: Color32::TRANSPARENT,
+        text: WHITE,
+        hover_text: WHITE,
+        font: Font::Semibold(theme::BASE_SIZE),
+        ..btn_style(ui)
+    };
+    styled_button(ui, style, text.into(), None)
+}
+
+/// The switch track size.
+const SWITCH: egui::Vec2 = egui::vec2(36.0, 20.0);
+
+/// A Windows-11-style toggle switch (no label): accent track when on, a
+/// hairline track when off; the knob slides. Disabled when `enabled` is
+/// false (the value is kept). `label` is the accessible name.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub fn switch(ui: &mut egui::Ui, enabled: bool, on: &mut bool, label: &str) -> Response {
+    let (rect, mut response) = ui.allocate_exact_size(SWITCH, Sense::click());
+    if enabled && response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    let value = *on;
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, enabled, value, label)
+    });
+    if ui.is_rect_visible(rect) {
+        let t = ui.ctx().animate_bool_responsive(response.id, value);
+        let hovered = enabled && response.hovered();
+        let painter = ui.painter();
+        let radius = CornerRadius::same(255);
+        let track = if value {
+            if hovered {
+                theme::ACCENT_HOVER
+            } else {
+                theme::ACCENT
+            }
+        } else if hovered {
+            BG_ACTIVE
+        } else {
+            BG_HOVER
+        };
+        let stroke = if value {
+            Stroke::NONE
+        } else {
+            Stroke::new(1.0, if hovered { TEXT_MUTED } else { BORDER_STRONG })
+        };
+        painter.rect(rect, radius, track, stroke, egui::StrokeKind::Inside);
+        let knob_r = if value { 7.0 } else { 6.0 };
+        let x = egui::lerp((rect.left() + 10.0)..=(rect.right() - 10.0), t);
+        let knob = if value { WHITE } else { TEXT_MUTED };
+        painter.circle_filled(egui::pos2(x, rect.center().y), knob_r, knob);
+        if !enabled {
+            painter.rect_filled(rect, radius, theme::alpha(theme::BG, 0.45));
+        }
+        if response.has_focus() && focus_visible(ui.ctx()) {
+            painter.rect_stroke(
+                rect.expand(2.0),
+                radius,
+                Stroke::new(2.0, theme::FOCUS),
+                egui::StrokeKind::Outside,
+            );
+        }
+    }
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
+/// A switch with its label on the left, filling the row (clicking the text
+/// toggles too). For simple boolean rows outside a [`setting_row`].
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub fn switch_row(ui: &mut egui::Ui, enabled: bool, on: &mut bool, label: &str) -> Response {
+    let mut out = None;
+    ui.horizontal(|ui| {
+        let text_w = (ui.available_width() - SWITCH.x - theme::S3).max(40.0);
+        let color = if enabled { TEXT } else { TEXT_MUTED };
+        let text = ui.add_sized(
+            [text_w, SWITCH.y],
+            egui::Label::new(egui::RichText::new(label).color(color))
+                .wrap()
+                .sense(Sense::click()),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let mut r = switch(ui, enabled, on, label);
+            if enabled && text.clicked() {
+                *on = !*on;
+                r.mark_changed();
+            }
+            out = Some(r);
+        });
+    });
+    out.expect("switch drawn")
+}
+
+/// A settings row: `title` (+ a muted `description`) on the left, the
+/// control on the right. Narrower than 440 pt the control stacks under the
+/// text, left-aligned, so nothing is squeezed or clipped.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub fn setting_row<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    description: Option<&str>,
+    control: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let text = |ui: &mut egui::Ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        ui.add(egui::Label::new(egui::RichText::new(title).color(TEXT)).wrap());
+        if let Some(d) = description.filter(|d| !d.is_empty()) {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(d)
+                        .font(theme::regular(12.5))
+                        .color(TEXT_MUTED),
+                )
+                .wrap(),
+            );
+        }
+    };
+    if ui.available_width() < 440.0 {
+        ui.vertical(|ui| {
+            text(ui);
+            ui.add_space(theme::S2 - ui.spacing().item_spacing.y);
+            control(ui)
+        })
+        .inner
+    } else {
+        let full = ui.available_width();
+        ui.horizontal(|ui| {
+            // The text takes ~58 %; the control is laid out right to left
+            // in what is left, vertically centred on the row.
+            let text_w = (full * 0.58).max(160.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(text_w, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                text,
+            );
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), 0.0),
+                egui::Layout::right_to_left(egui::Align::Center),
+                control,
+            )
+            .inner
+        })
+        .inner
+    }
+}
+
+/// A grouped surface whose rows are separated by [`group_divider`]: one
+/// raised, rounded block (Settings sections, detail panels).
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub fn group<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    Frame::new()
+        .fill(BG_RAISED)
+        .stroke(Stroke::new(1.0, BORDER))
+        .corner_radius(CornerRadius::same(theme::R_LG))
+        .inner_margin(Margin::symmetric(16, 12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = theme::S3;
+            add(ui)
+        })
+        .inner
+}
+
+/// A hairline between two rows of a [`group`], spanning its content width.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub fn group_divider(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), Sense::hover());
+    ui.painter()
+        .hline(rect.x_range(), rect.center().y, Stroke::new(1.0, BORDER));
+}
+
+/// A section header above a group or list: 12.5 pt semibold muted.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub fn section_header(ui: &mut egui::Ui, text: &str) -> Response {
+    ui.add_space(theme::S3);
+    let r = ui.add(
+        egui::Label::new(
+            egui::RichText::new(text)
+                .font(theme::semibold(12.5))
+                .color(TEXT_MUTED),
+        )
+        .truncate(),
+    );
+    ui.add_space(theme::S1 - ui.spacing().item_spacing.y + 2.0);
+    r
+}
+
+/// A list group header ("Today", "Yesterday", "Thu 23 Jul"): 12 pt
+/// semibold faint, with breathing room above.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub fn day_header(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(theme::S2);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(text)
+                .font(theme::semibold(12.0))
+                .color(TEXT_FAINT),
+        )
+        .truncate(),
+    );
+}
+
+/// A single-line label that elides with `…` at the available width and
+/// shows the whole text as a tooltip when it had to. Use for every title,
+/// name or path that can be long.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub fn elide(ui: &mut egui::Ui, text: &str, font: FontId, color: Color32) -> Response {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(ui.available_width().max(10.0));
+    let galley = ui.painter().layout_job(job);
+    let elided = galley.elided;
+    let response = ui.add(egui::Label::new(galley).selectable(false));
+    if elided {
+        response.on_hover_text(text)
+    } else {
+        response
+    }
+}
+
+/// A full-width clickable list row: radius 8, hover fill, `selected` fill,
+/// keyboard focus ring, 8/12 padding. `add` lays out the row content and
+/// gets whether the row is hovered (for hover-revealed actions). Returns
+/// the row's own response (click = open) and `add`'s result.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub fn list_row<R>(
+    ui: &mut egui::Ui,
+    id_salt: impl egui::AsIdSalt,
+    selected: bool,
+    add: impl FnOnce(&mut egui::Ui, bool) -> R,
+) -> (Response, R) {
+    let id = ui.id().with(id_salt);
+    // The previous frame's hover decides this frame's fill and revealed
+    // actions (immediate mode lays out before it knows).
+    let was_hovered: bool = ui.data(|d| d.get_temp(id).unwrap_or(false));
+    let bg_idx = ui.painter().add(egui::Shape::Noop);
+    let inner = Frame::new()
+        .inner_margin(Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui, was_hovered)
+        });
+    let rect = inner.response.rect;
+    let response = ui.interact(rect, id, Sense::click());
+    let hovered = response.contains_pointer();
+    ui.data_mut(|d| d.insert_temp(id, hovered));
+    if hovered != was_hovered {
+        ui.ctx().request_repaint();
+    }
+    let fill = if selected {
+        BG_ACTIVE
+    } else if hovered {
+        BG_HOVER
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().set(
+        bg_idx,
+        egui::epaint::RectShape::filled(rect, CornerRadius::same(theme::R_MD), fill),
+    );
+    if response.has_focus() && focus_visible(ui.ctx()) {
+        ui.painter().rect_stroke(
+            rect,
+            CornerRadius::same(theme::R_MD),
+            Stroke::new(2.0, theme::FOCUS),
+            egui::StrokeKind::Inside,
+        );
+    }
+    (
+        response.on_hover_cursor(egui::CursorIcon::PointingHand),
+        inner.inner,
+    )
+}
+
+/// Up to two initials of `name` ("Paul Gordon" → "PG", "me" → "ME").
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub fn initials(name: &str) -> String {
+    let words: Vec<&str> = name
+        .split(|c: char| c.is_whitespace() || c == '-' || c == '_')
+        .filter(|w| !w.is_empty())
+        .collect();
+    let mut out = String::new();
+    match words.as_slice() {
+        [] => {}
+        [one] => out.extend(one.chars().take(2)),
+        [first, .., last] => {
+            out.extend(first.chars().take(1));
+            out.extend(last.chars().take(1));
+        }
+    }
+    out.to_uppercase()
+}
+
+/// A round avatar with `name`'s initials, tinted by `color`.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub fn avatar(ui: &mut egui::Ui, name: &str, color: Color32, size: f32) -> Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        painter.circle_filled(rect.center(), size / 2.0, theme::alpha(color, 0.22));
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            initials(name),
+            theme::semibold((size * 0.38).max(10.0)),
+            theme::lighten(color, 0.45),
+        );
+    }
+    response
+}
+
+/// Horizontal page padding: 16 pt up to 640 pt of width, 24 beyond.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub fn pad_x(width: f32) -> f32 {
+    if width <= 640.0 {
+        theme::S4
+    } else {
+        theme::S5
+    }
+}
+
+/// [`content_column`] with the responsive side padding: what the shell
+/// uses for the banner / search box and views use inside their scroller.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub fn padded_column<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let pad = pad_x(ui.available_width());
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.add_space(pad);
+        let inner_w = (ui.available_width() - pad).max(0.0);
+        ui.vertical(|ui| {
+            ui.set_width(inner_w);
+            content_column(ui, add)
+        })
+        .inner
+    })
+    .inner
+}
+
+/// A view's main scroller: full window width (its bar at the window edge),
+/// the content in a [`padded_column`], keyboard scrolling when nothing has
+/// focus. `id_salt` keeps each view's scroll offset separate.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub fn scroll_column<R>(
+    ui: &mut egui::Ui,
+    id_salt: impl egui::AsIdSalt,
+    keys: KeyScroll,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::scroll_area::ScrollAreaOutput<R> {
+    egui::ScrollArea::vertical()
+        .id_salt(id_salt)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            keyboard_scroll(ui, keys);
+            let out = padded_column(ui, add);
+            ui.add_space(theme::S5);
+            out
+        })
+}
+
+/// The content column every view lives in: at most
+/// [`theme::CONTENT_MAX`] wide, centred.
+#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
+pub fn content_column<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    centered_column(ui, theme::CONTENT_MAX, add)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn initials_of_names() {
+        assert_eq!(super::initials("Paul Gordon"), "PG");
+        assert_eq!(super::initials("me"), "ME");
+        assert_eq!(super::initials("Kate Maguire-Rawlinson"), "KR");
+        assert_eq!(super::initials(""), "");
+    }
+
     use super::*;
 
     fn run(f: impl FnMut(&mut egui::Ui)) {
@@ -1215,12 +1630,12 @@ mod tests {
         let buttons: Vec<_> = shapes
             .iter()
             .filter_map(|shape| match shape {
-                egui::Shape::Rect(r) if r.stroke.color == BORDER => Some(r),
+                egui::Shape::Rect(r) if r.stroke.color == BORDER_STRONG => Some(r),
                 _ => None,
             })
             .collect();
         assert_eq!(buttons.len(), 2, "{shapes:?}");
-        assert!(buttons.iter().all(|r| r.fill == theme::BG));
+        assert!(buttons.iter().all(|r| r.fill == BG_RAISED));
         // `.player-speed` (12 px, 4/6 padding) is shorter than a text input.
         assert!(heights[1] <= 26.0 && heights[1] < heights[0], "{heights:?}");
     }
