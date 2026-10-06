@@ -4,24 +4,15 @@
 //! modal, toasts). Views live in `views/`; the top bar and the captions
 //! overlay have their own modules.
 
-// The kit (F0) is complete but mostly consumed by the views; `captions`
-// is still the F0 stub. TODO(I1): drop these allows after the merge.
-#[allow(dead_code)]
 pub mod captions;
-#[allow(dead_code)]
 pub mod confirm;
 pub mod fonts;
-#[allow(dead_code)]
 pub mod format;
-#[allow(dead_code)]
 pub mod icons;
-#[allow(dead_code)]
 pub mod theme;
-#[allow(dead_code)]
 pub mod toasts;
 pub mod topbar;
 pub mod views;
-#[allow(dead_code)]
 pub mod widgets;
 
 use crate::bridge::{OpDone, RecOrigin, Tasks};
@@ -45,7 +36,6 @@ use witness_core::player::Player;
 use witness_core::{AppCore, RecCmd};
 
 /// The current screen. Initial: `Meetings`.
-#[allow(dead_code)] // TODO(I1): consumers land with the units.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum View {
     #[default]
@@ -118,7 +108,6 @@ impl Nav {
 
 /// App-level commands pushed by views. Handled in `logic()` (never in
 /// `ui()`), so they run whether or not the window is visible.
-#[allow(dead_code)] // TODO(I1): consumers land with the units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiCmd {
     /// CC button, after `check_captions_overlay` succeeded.
@@ -129,12 +118,9 @@ pub enum UiCmd {
     CheckUpdate,
     /// Settings → Updates → Install.
     InstallUpdate,
-    /// Quit the app (same path as tray Quit).
-    Quit,
 }
 
 /// Search "Who" filter.
-#[allow(dead_code)] // TODO(I1): consumers land with the units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Who {
     #[default]
@@ -174,18 +160,21 @@ impl SearchBox {
 }
 
 /// State that outlives a view instance.
-#[allow(dead_code)] // TODO(I1): consumers land with the units.
 #[derive(Debug, Default)]
 pub struct ViewMemory {
     /// How many meetings the list had loaded (a reload fetches at least this many).
     pub meetings_loaded: usize,
     pub search_filters: SearchFilters,
     pub search_box: SearchBox,
+    /// meeting id → (seq, text) of the newest notes draft handed to the
+    /// writer this session, so reopening a meeting cannot adopt a database
+    /// read that raced the previous visit's last write (transcript.rs
+    /// `Notes::load`).
+    pub queued_notes: std::collections::BTreeMap<i64, (u64, String)>,
 }
 
 /// Everything a view may touch during a pass. Built fresh by `app.rs` for
 /// each `ui()` and `flush()` call.
-#[allow(dead_code)] // TODO(I1): consumers land with the units.
 pub struct UiCtx<'a> {
     pub core: &'a Arc<AppCore>,
     pub tasks: &'a Tasks,
@@ -205,7 +194,6 @@ pub struct UiCtx<'a> {
     pub fonts: &'a FontLoader,
 }
 
-#[allow(dead_code)] // TODO(I1): consumers land with the units.
 impl UiCtx<'_> {
     /// The owner for a native dialog. Opening a dialog pins the tray flyout
     /// first, so the dialog's focus change does not dismiss the window.

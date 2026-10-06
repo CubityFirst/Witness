@@ -45,9 +45,8 @@ use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Frame, Id, Key, Layout, Margin, Modifiers,
     Order, Popup, Rect, RectAlign, Response, Sense, Stroke,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use witness_core::db::{Bookmark, Meeting, Segment, Speaker};
 use witness_core::events::LiveTranscript;
@@ -453,23 +452,6 @@ impl Notes {
             NotesStatus::Saved => Some("Saved"),
         }
     }
-}
-
-/// meeting id → (seq, text) of the newest notes draft handed to the writer
-/// this session. It outlives the view, so reopening a meeting cannot adopt
-/// a database read that raced the previous visit's last write (see
-/// [`Notes::load`]). Only the UI thread touches it.
-// TODO(I1): this could live in `ViewMemory`; U5 owns only its own files.
-static QUEUED_NOTES: Mutex<BTreeMap<i64, (u64, String)>> = Mutex::new(BTreeMap::new());
-
-fn remember_queued_notes(meeting_id: i64, seq: u64, text: String) {
-    if let Ok(mut map) = QUEUED_NOTES.lock() {
-        map.insert(meeting_id, (seq, text));
-    }
-}
-
-fn queued_notes(meeting_id: i64) -> Option<(u64, String)> {
-    QUEUED_NOTES.lock().ok()?.get(&meeting_id).cloned()
 }
 
 // ---------------------------------------------------------------------------
@@ -1550,10 +1532,8 @@ impl PlayOrigin {
 }
 
 /// Why the last `play()` failed, taken once.
-// TODO(I1): return `player.take_play_error()` once U3's engine is merged
-// (the F0 stub has no error channel, so nothing is reported until then).
-fn take_play_error(_player: &witness_core::player::Player) -> Option<String> {
-    None
+fn take_play_error(player: &witness_core::player::Player) -> Option<String> {
+    player.take_play_error()
 }
 
 /// The transcript view. The state is boxed: it is far larger than the
@@ -1804,7 +1784,7 @@ impl TranscriptState {
             } else {
                 let seq = cx.core.queue_notes(self.meeting_id, text.clone());
                 self.notes.sent(seq);
-                remember_queued_notes(self.meeting_id, seq, text);
+                cx.memory.queued_notes.insert(self.meeting_id, (seq, text));
             }
         }
         cx.set_notes_deadline(None);
@@ -1934,15 +1914,10 @@ impl TranscriptState {
             }
         }
 
-        // TODO(I1): a write that fails after this view is gone (the draft
-        // queued by `on_leave`) is only reported when the meeting is
-        // reopened (`Notes::load` adopts the draft, this ack then fails it).
-        // The TSX toasted it at once: have the shell toast "Could not save
-        // notes" for every `NotesSaveFailed` in `ShellModel::apply`, and drop
-        // this toast (keep the ack for the indicator).
-        if let Some(error) = self.notes.on_ack(cx.shell.notes_acks.get(&self.meeting_id)) {
-            cx.toasts.error("Could not save notes", error);
-        }
+        // The ack only drives the indicator and the retry: the shell toasts
+        // "Could not save notes" for every failed write (`ShellModel::apply`),
+        // including one queued by `on_leave` after this view was gone.
+        let _ = self.notes.on_ack(cx.shell.notes_acks.get(&self.meeting_id));
 
         self.poll_audio(cx);
     }
@@ -1959,7 +1934,7 @@ impl TranscriptState {
         let queued = if self.synthetic {
             None
         } else {
-            queued_notes(self.meeting_id)
+            cx.memory.queued_notes.get(&self.meeting_id).cloned()
         };
         self.notes.load(&detail.meeting.notes, queued);
         self.load_error = None;

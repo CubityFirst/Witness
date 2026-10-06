@@ -111,8 +111,6 @@ impl InstanceGuard {
     /// Explorer, a thread waiting in a send still dispatches incoming
     /// WM_COPYDATA, and without this a racing launch would be answered
     /// "shown" by a process that is about to exit (leaving no Witness).
-    // TODO(I1): need `teardown_and_exit` to call
-    // `shell.instance_guard.begin_exit()` before dropping the tray/hotkeys.
     pub fn begin_exit(&self) {
         imp::begin_exit(self.hwnd);
     }

@@ -390,10 +390,6 @@ pub enum BadgeKind {
     Busy,
     /// `.badge-failed`: red tint, light-red text.
     Failed,
-    /// `.badge-recording`: same look as Failed.
-    Recording,
-    /// `.badge-recorded`: hover fill, muted text.
-    Neutral,
 }
 
 /// An uppercase 11 pt badge (3/8 padding, 0.4 px letter spacing).
@@ -401,8 +397,7 @@ pub fn badge(ui: &mut egui::Ui, kind: BadgeKind, text: &str) -> Response {
     let (fill, color) = match kind {
         BadgeKind::Ok => (BADGE_OK_BG, OK_LIGHT),
         BadgeKind::Busy => (BADGE_WARN_BG, WARN),
-        BadgeKind::Failed | BadgeKind::Recording => (BADGE_REC_BG, REC_LIGHT),
-        BadgeKind::Neutral => (BG_HOVER, TEXT_MUTED),
+        BadgeKind::Failed => (BADGE_REC_BG, REC_LIGHT),
     };
     let mut job = egui::text::LayoutJob::default();
     job.append(
@@ -524,27 +519,6 @@ pub fn centered_column<R>(
         .inner
     })
     .inner
-}
-
-/// A full-width row with a hover background behind its content. The row's
-/// own response (click/hover) is registered *behind* the children, so
-/// buttons inside keep their clicks; the background is reserved before
-/// layout and filled afterwards.
-pub fn hover_row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> Response {
-    let background = ui.painter().add(egui::Shape::Noop);
-    let response = ui
-        .scope_builder(egui::UiBuilder::new().sense(Sense::click()), |ui| {
-            ui.set_min_width(ui.available_width());
-            add(ui);
-        })
-        .response;
-    if response.contains_pointer() && ui.is_enabled() {
-        ui.painter().set(
-            background,
-            egui::Shape::rect_filled(response.rect, CornerRadius::same(8), BG_HOVER),
-        );
-    }
-    response
 }
 
 /// Options for [`keyboard_scroll`].
@@ -704,9 +678,6 @@ mod tests {
                 Some("Join a meeting or hit record."),
             );
             centered_column(ui, 900.0, |ui| ui.label("column"));
-            hover_row(ui, |ui| {
-                ui.label("row");
-            });
             keyboard_scroll(ui, KeyScroll { space: true });
             let edit = ui.text_edit_singleline(&mut String::new());
             text_edit_menu(&edit);

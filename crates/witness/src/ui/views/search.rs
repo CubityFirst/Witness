@@ -108,8 +108,7 @@ pub fn search_box(ui: &mut egui::Ui, cx: &mut UiCtx, current: &View) {
     if let Some(at) = search.debounce_at.filter(|_| !modal_open) {
         if now >= at {
             search.debounce_at = None;
-            // The navigation applies after this pass: draw the next one.
-            ui.ctx().request_repaint();
+            // `apply_navigation` repaints after the pass.
             let query = search.text.clone();
             if !query.trim().is_empty() {
                 cx.nav.go(View::Search { query });

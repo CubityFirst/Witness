@@ -226,7 +226,8 @@ struct DrawnBar {
     /// included).
     response: egui::Response,
     actions: Vec<BarAction>,
-    /// Where each unit landed.
+    /// Where each unit landed (read by the layout tests).
+    #[cfg(test)]
     rects: Vec<(Unit, Rect)>,
 }
 
@@ -315,6 +316,7 @@ fn draw_bar(ui: &mut egui::Ui, model: &BarModel) -> DrawnBar {
     let column_gap = if narrow(ui) { 8.0 } else { 12.0 };
     let units = &model.units;
     let mut actions = Vec::new();
+    #[cfg(test)]
     let mut rects = Vec::new();
 
     let widths_id = ui.id().with("topbar-unit-widths");
@@ -360,6 +362,7 @@ fn draw_bar(ui: &mut egui::Ui, model: &BarModel) -> DrawnBar {
                             }
                             let rect = draw_unit(ui, unit, model, &mut actions);
                             measured.set(unit, rect.width());
+                            #[cfg(test)]
                             rects.push((unit, rect));
                         }
                         if let Some(at) = nav_at {
@@ -370,6 +373,7 @@ fn draw_bar(ui: &mut egui::Ui, model: &BarModel) -> DrawnBar {
                                 for &unit in line_units[at..].iter().rev() {
                                     let rect = draw_unit(ui, unit, model, &mut actions);
                                     measured.set(unit, rect.width());
+                                    #[cfg(test)]
                                     rects.push((unit, rect));
                                 }
                             });
@@ -388,6 +392,7 @@ fn draw_bar(ui: &mut egui::Ui, model: &BarModel) -> DrawnBar {
     DrawnBar {
         response: bar.response,
         actions,
+        #[cfg(test)]
         rects,
     }
 }

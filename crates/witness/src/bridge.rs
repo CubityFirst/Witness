@@ -22,10 +22,11 @@ use crate::ui::toasts::Notice;
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use eframe::egui;
 use std::any::Any;
+use std::collections::BTreeSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use witness_core::models::ModelInfo;
 use witness_core::service::{AppStatus, PreparedUpdate, UpdateInfo};
 use witness_core::{AppCore, CoreEvent, CoreResult, EventSink, RecCmd, RecOutcome};
@@ -212,11 +213,6 @@ impl<T> Task<T> {
             }
         }
     }
-
-    /// True until `poll` has returned the result.
-    pub fn is_pending(&self) -> bool {
-        !self.done
-    }
 }
 
 impl<U> Task<CoreResult<U>> {
@@ -226,35 +222,63 @@ impl<U> Task<CoreResult<U>> {
     }
 }
 
-impl<T: Send + 'static> Task<T> {
-    /// Wrap a plain reply channel (e.g. `AppCore::submit_recording`): a tiny
-    /// waiter thread forwards the value and wakes the UI.
-    pub fn from_receiver(rx: Receiver<T>, ctx: egui::Context) -> Task<T> {
-        let (tx, task_rx) = crossbeam_channel::bounded(1);
-        let spawned = std::thread::Builder::new()
-            .name("task-reply".into())
-            .spawn(move || {
-                if let Ok(value) = rx.recv() {
-                    let _ = tx.send(Ok(value));
-                }
-                wake_root(&ctx);
-            });
-        if let Err(error) = spawned {
-            log::error!("could not start a reply waiter: {error}");
-        }
-        Task {
-            rx: task_rx,
-            done: false,
-        }
-    }
-}
-
 /// Runs core work off the UI thread.
 #[derive(Clone)]
 pub struct Tasks {
     core: Arc<AppCore>,
     ctx: egui::Context,
     tx: Sender<UiMsg>,
+    ops: Arc<OpTracker>,
+}
+
+/// The `spawn_op`s still running, by ticket, so an exit path can wait for
+/// the ops its own `flush` just started (e.g. a Meetings rename commit).
+#[derive(Default)]
+struct OpTracker {
+    /// (next ticket, tickets in flight)
+    state: Mutex<(u64, BTreeSet<u64>)>,
+    idle: Condvar,
+}
+
+impl OpTracker {
+    fn lock(&self) -> std::sync::MutexGuard<'_, (u64, BTreeSet<u64>)> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn begin(&self) -> u64 {
+        let mut state = self.lock();
+        let ticket = state.0;
+        state.0 += 1;
+        state.1.insert(ticket);
+        ticket
+    }
+
+    fn end(&self, ticket: u64) {
+        self.lock().1.remove(&ticket);
+        self.idle.notify_all();
+    }
+
+    fn mark(&self) -> u64 {
+        self.lock().0
+    }
+
+    /// Wait until no op with a ticket ≥ `mark` runs; false on timeout.
+    fn wait_since(&self, mark: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.lock();
+        while state.1.range(mark..).next().is_some() {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            state = self
+                .idle
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        true
+    }
 }
 
 impl Tasks {
@@ -263,7 +287,19 @@ impl Tasks {
             core,
             ctx,
             tx: sink.sender(),
+            ops: Arc::default(),
         }
+    }
+
+    /// A marker for [`Tasks::wait_ops_since`]: ops spawned from now on.
+    pub fn op_mark(&self) -> u64 {
+        self.ops.mark()
+    }
+
+    /// Exit paths only (blocks the caller): wait up to `timeout` for every
+    /// `spawn_op` started since `mark`. False if some were still running.
+    pub fn wait_ops_since(&self, mark: u64, timeout: Duration) -> bool {
+        self.ops.wait_since(mark, timeout)
     }
 
     pub fn core(&self) -> &Arc<AppCore> {
@@ -330,6 +366,8 @@ impl Tasks {
         let core = self.core.clone();
         let ctx = self.ctx.clone();
         let tx = self.tx.clone();
+        let ops = self.ops.clone();
+        let ticket = ops.begin();
         // The worker gets a copy; the original covers a failed spawn.
         let on_panic = on_failure.clone();
         let spawned = std::thread::Builder::new()
@@ -337,12 +375,14 @@ impl Tasks {
             .spawn(move || {
                 let done = run_guarded(name, &*core, f, on_panic);
                 finished.finish();
+                ops.end(ticket);
                 let _ = tx.send(UiMsg::Op(done));
                 wake_root(&ctx);
             });
         match spawned {
             Ok(_) => handle,
             Err(error) => {
+                self.ops.end(ticket);
                 log::error!("could not start operation {name}: {error}");
                 let done = on_failure(format!("internal error: could not start {name}: {error}"));
                 let _ = self.tx.send(UiMsg::Op(done));
@@ -446,7 +486,6 @@ mod tests {
     fn task_yields_its_value_once() {
         let mut task = task_from(|| 41 + 1);
         assert_eq!(wait(&mut task), Ok(42));
-        assert!(!task.is_pending());
         assert!(task.poll().is_none(), "Some exactly once");
     }
 
@@ -499,12 +538,26 @@ mod tests {
     }
 
     #[test]
-    fn from_receiver_forwards_the_reply() {
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        let mut task = Task::from_receiver(rx, egui::Context::default());
-        assert!(task.poll().is_none());
-        tx.send("done").unwrap();
-        assert_eq!(wait(&mut task), Ok("done"));
+    fn op_tracker_waits_only_for_ops_since_the_mark() {
+        let ops = Arc::new(OpTracker::default());
+        let old = ops.begin();
+        let mark = ops.mark();
+        assert!(
+            ops.wait_since(mark, Duration::ZERO),
+            "an older op is ignored"
+        );
+        let new = ops.begin();
+        assert!(!ops.wait_since(mark, Duration::from_millis(20)));
+        let worker = {
+            let ops = ops.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                ops.end(new);
+            })
+        };
+        assert!(ops.wait_since(mark, Duration::from_secs(5)));
+        worker.join().unwrap();
+        ops.end(old);
     }
 
     #[test]

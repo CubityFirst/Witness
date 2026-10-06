@@ -8,7 +8,7 @@
 //! tray. They flag the pass instead, and `app.rs` schedules the next frame
 //! only while the window is shown and not minimized (design §4.2).
 
-use eframe::egui::{self, Color32, Response, RichText, Sense};
+use eframe::egui::{self, Color32, RichText};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use egui_phosphor::regular as ph;
@@ -46,15 +46,6 @@ pub fn take_animation_request(ctx: &egui::Context) -> bool {
 /// A Phosphor glyph as rich text at `size` points.
 pub fn icon(glyph: &str, size: f32) -> RichText {
     RichText::new(glyph).size(size)
-}
-
-/// The spinning `CircleNotch` (1 turn/s, linear), `size` points square.
-pub fn spinner(ui: &mut egui::Ui, size: f32, color: Color32) -> Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
-    if ui.is_rect_visible(rect) {
-        paint_spinner(ui, rect, size, color);
-    }
-    response
 }
 
 /// Paint the spinner glyph centred in `rect` (for custom widgets, e.g. a

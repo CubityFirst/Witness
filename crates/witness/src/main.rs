@@ -9,19 +9,11 @@
 // Release builds have no console window.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-// F0.2: the bridge, shell model and settings store are complete, but most
-// of their consumers (the views, the shell objects) are still stubs. `ui`
-// and `platform` carry narrower allows on their kit and stub modules (see
-// their mod.rs), so unit-owned code there is still checked for dead code.
-// TODO(I1): remove these `allow(dead_code)`s once every unit is merged.
 mod app;
-#[allow(dead_code)]
 mod bridge;
-#[allow(dead_code)]
 mod model;
 mod panic;
 mod platform;
-#[allow(dead_code)]
 mod settings_store;
 mod ui;
 mod ui_state;

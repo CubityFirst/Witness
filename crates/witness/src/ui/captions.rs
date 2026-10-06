@@ -491,6 +491,7 @@ impl CaptionsOverlay {
     }
 
     /// Open and not closed by the user.
+    #[cfg(test)]
     pub fn is_open(&self) -> bool {
         self.open && !lock(&self.state).close_requested
     }

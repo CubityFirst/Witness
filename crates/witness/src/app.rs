@@ -45,6 +45,9 @@ const UI_PASS_TIMEOUT: Duration = Duration::from_secs(2);
 const ANIMATION_FRAME: Duration = Duration::from_millis(33);
 /// How long exit paths wait for the notes writer.
 const NOTES_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long exit paths wait for the ops their own `flush` started (a
+/// Meetings rename commit).
+const OPS_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long exit paths wait for a pending settings write.
 const SETTINGS_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 /// How soon a minimize the app performed itself must show up in the
@@ -545,7 +548,6 @@ impl WitnessApp {
                 }
                 UiCmd::CheckUpdate => self.shell.update.check(&self.tasks),
                 UiCmd::InstallUpdate => self.shell.update.install(&self.tasks),
-                UiCmd::Quit => self.begin_quit(),
             }
         }
     }
@@ -588,7 +590,11 @@ impl WitnessApp {
 
     /// Reversible: safe to run and then keep running if a later step fails.
     fn prepare_exit(&mut self) {
+        let mark = self.tasks.op_mark();
         self.will_hide();
+        if !self.tasks.wait_ops_since(mark, OPS_FLUSH_TIMEOUT) {
+            log::warn!("exiting with an operation still running");
+        }
         self.core.flush_notes(NOTES_FLUSH_TIMEOUT);
         // A queued settings write only starts from `on_written`, which never
         // runs once the process has exited.
@@ -723,6 +729,10 @@ impl WitnessApp {
     /// Ctrl for `/`): egui's `consume_key` ignores an extra Alt, which would
     /// steal Ctrl+Alt+F / AltGr+F and Alt+/.
     fn handle_search_shortcuts(&mut self, ctx: &egui::Context) {
+        // The confirmation is modal: keys do not reach the page behind it.
+        if self.confirm.is_open() {
+            return;
+        }
         let typing = ctx.egui_wants_keyboard_input();
         let jump = ctx.input_mut(|i| {
             let ctrl_f = consume_key_exact(i, Key::F, |m| m.command && !m.alt);
@@ -747,7 +757,11 @@ impl WitnessApp {
     fn apply_navigation(&mut self, ctx: &egui::Context) {
         let Some(next) = self.nav.take() else { return };
         if next.key() != self.view.key() {
+            // `on_leave` still reads an answer given in this pass; a modal
+            // left open would outlive the view that asked (its answer would
+            // do nothing), so it closes with the view.
             self.with_view(|view, cx| view.on_leave(cx));
+            self.confirm.withdraw();
             if matches!(next, View::Settings) {
                 // settings.tsx re-read get_settings on every mount, so it
                 // shows the stored (normalized) values after a round trip.
@@ -797,6 +811,9 @@ fn consume_key_exact(
 /// can run while an `ExitGuard` borrowed from a cloned `Arc<AppCore>` lives.
 fn teardown_and_exit(shell: Option<ShellObjects>, code: i32) -> ! {
     if let Some(shell) = shell {
+        // Refuse second launches first: NIM_DELETE below waits on Explorer
+        // and would otherwise answer a racing launch "shown".
+        shell.instance_guard.begin_exit();
         drop(shell.tray); // NIM_DELETE
         drop(shell.hotkeys); // UnregisterHotKey
         shell.instance_guard.release(); // ReleaseMutex, CloseHandle, DestroyWindow

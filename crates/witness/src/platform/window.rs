@@ -104,11 +104,6 @@ impl MainWindow {
         })
     }
 
-    /// The raw HWND (0 if unknown).
-    pub fn hwnd(&self) -> isize {
-        self.hwnd
-    }
-
     /// Owner for native dialogs. Callers go through `UiCtx::dialog_owner`,
     /// which pins the flyout first.
     pub fn owner(&self) -> OwnerHwnd {

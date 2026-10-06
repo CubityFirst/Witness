@@ -50,6 +50,12 @@ impl Confirm {
         self.answers.remove(&id)
     }
 
+    /// Close a showing request without recording an answer: the view that
+    /// asked is being replaced, so nobody is left to act on a "yes".
+    pub fn withdraw(&mut self) {
+        self.pending = None;
+    }
+
     /// Whether a request is showing.
     pub fn is_open(&self) -> bool {
         self.pending.is_some()
@@ -140,6 +146,16 @@ mod tests {
         confirm.resolve(true);
         assert_eq!(confirm.answer(b), Some(true));
         assert!(!confirm.is_open());
+    }
+
+    #[test]
+    fn withdraw_closes_without_an_answer() {
+        let mut confirm = Confirm::new();
+        let a = egui::Id::new("a");
+        confirm.ask(a, "Delete?", "Delete");
+        confirm.withdraw();
+        assert!(!confirm.is_open());
+        assert_eq!(confirm.answer(a), None);
     }
 
     #[test]

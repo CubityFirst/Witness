@@ -561,11 +561,8 @@ impl MeetingsView {
             let now = Instant::now();
             if now >= at {
                 self.pending_open = None;
+                // `apply_navigation` repaints after the pass.
                 open_transcript(cx, id, View::Meetings);
-                // Navigation applies after this pass; nothing else (no
-                // input) would draw the next one.
-                // TODO(I1): app.rs could request this after any navigation.
-                ui.ctx().request_repaint();
             } else {
                 ui.ctx().request_repaint_after(at - now);
             }

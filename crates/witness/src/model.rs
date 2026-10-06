@@ -202,12 +202,20 @@ impl ShellModel {
                     self.update.progress = Some(p.clone());
                 }
             }
-            CoreEvent::NotesSaved { meeting_id, seq } => self.ack_notes(*meeting_id, *seq, None),
+            CoreEvent::NotesSaved { meeting_id, seq } => {
+                self.ack_notes(*meeting_id, *seq, None);
+            }
             CoreEvent::NotesSaveFailed {
                 meeting_id,
                 seq,
                 error,
-            } => self.ack_notes(*meeting_id, *seq, Some(error.clone())),
+            } => {
+                // notes.tsx toasted every failed save, whether or not the
+                // transcript was still open.
+                if self.ack_notes(*meeting_id, *seq, Some(error.clone())) {
+                    effects.push(Effect::Notice(Notice::error("Could not save notes", error)));
+                }
+            }
             // Shell side effects: handled by app.rs (tray, captions overlay).
             CoreEvent::TrayRecording(_)
             | CoreEvent::TrayWarning(_)
@@ -217,12 +225,15 @@ impl ShellModel {
         effects
     }
 
-    fn ack_notes(&mut self, meeting_id: i64, seq: u64, error: Option<String>) {
+    /// Record an ack; false if it is older than one already recorded.
+    fn ack_notes(&mut self, meeting_id: i64, seq: u64, error: Option<String>) -> bool {
         let entry = self.notes_acks.entry(meeting_id).or_insert((0, None));
         // Acks arrive in seq order per meeting; never move backwards.
         if seq >= entry.0 {
             *entry = (seq, error);
+            return true;
         }
+        false
     }
 }
 
@@ -545,12 +556,18 @@ mod tests {
             error: "late".into(),
         });
         assert_eq!(m.notes_acks[&1], (4, None));
-        m.apply(&CoreEvent::NotesSaveFailed {
+        let effects = m.apply(&CoreEvent::NotesSaveFailed {
             meeting_id: 1,
             seq: 5,
             error: "disk full".into(),
         });
         assert_eq!(m.notes_acks[&1], (5, Some("disk full".into())));
+        assert_eq!(
+            effects,
+            vec![Effect::Notice(Notice::error_plain(
+                "Could not save notes: disk full"
+            ))]
+        );
     }
 
     fn info(version: &str) -> UpdateInfo {

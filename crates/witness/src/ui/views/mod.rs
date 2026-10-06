@@ -5,24 +5,8 @@
 
 pub mod meetings;
 pub mod people;
-#[allow(dead_code)] // TODO(I1): the F0 stub; TranscriptView (U5) consumes it.
 pub mod player_bar;
 pub mod search;
 pub mod settings;
 pub mod transcript;
 pub mod updates;
-
-use super::theme::TEXT_MUTED;
-use super::widgets;
-use eframe::egui;
-
-/// Placeholder body for a view that has not been ported yet.
-pub(crate) fn not_ported(ui: &mut egui::Ui, name: &str) {
-    widgets::centered_column(ui, 900.0, |ui| {
-        ui.add_space(40.0);
-        ui.vertical_centered(|ui| {
-            ui.heading(name);
-            ui.label(egui::RichText::new(format!("{name} — not ported yet")).color(TEXT_MUTED));
-        });
-    });
-}

@@ -459,7 +459,6 @@ impl Player {
     /// (player bar) / "Could not play the recording" (segment/bookmark
     /// click) with the message. The file stays loaded at its position and
     /// the next `play` tries the device again. Additive to design §6.1.
-    // TODO(I1): U5 must call this (see the U3 report); §6.1 lacks it.
     pub fn take_play_error(&self) -> Option<String> {
         self.shared.meta().play_error.take()
     }

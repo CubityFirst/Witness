@@ -119,32 +119,13 @@ impl Toasts {
         self.push(Notice::error(message, err));
     }
 
-    /// An error shown verbatim.
-    pub fn error_plain(&mut self, message: impl Into<String>) {
-        self.push(Notice::error_plain(message));
-    }
-
+    #[cfg(test)]
     pub fn info(&mut self, message: impl Into<String>) {
         self.push(Notice::info(message));
     }
 
     pub fn success(&mut self, message: impl Into<String>) {
         self.push(Notice::success(message));
-    }
-
-    /// A notice with an action button (never expires).
-    pub fn action(
-        &mut self,
-        kind: NoticeKind,
-        message: impl Into<String>,
-        label: impl Into<String>,
-        action: ToastAction,
-    ) {
-        self.push(Notice {
-            kind,
-            message: message.into(),
-            action: Some((label.into(), action)),
-        });
     }
 
     /// Add (or refresh) a notice.
@@ -184,6 +165,7 @@ impl Toasts {
         });
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }

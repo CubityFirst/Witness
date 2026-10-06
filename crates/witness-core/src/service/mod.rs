@@ -157,10 +157,15 @@ pub fn mark_ui_thread() {
     UI_THREAD.with(|flag| flag.set(true));
 }
 
+/// Whether the calling thread is the one [`mark_ui_thread`] marked.
+pub fn is_ui_thread() -> bool {
+    UI_THREAD.with(Cell::get)
+}
+
 /// Debug-build guard at the top of every blocking (⏳) method.
 pub fn assert_off_ui_thread(name: &str) {
     debug_assert!(
-        !UI_THREAD.with(Cell::get),
+        !is_ui_thread(),
         "AppCore::{name} blocks and must not run on the UI thread"
     );
 }
@@ -170,7 +175,6 @@ pub struct AppCore {
     pub(crate) sink: Arc<dyn EventSink>,
     pub(crate) notifier: Arc<dyn Notifier>,
     /// The release found by the most recent update check (service/updater.rs).
-    #[allow(dead_code)] // TODO(U2): read and written by the updater.
     pub(crate) pending_update: Mutex<Option<updater::Release>>,
     rec_tx: Sender<rec_control::Request>,
     notes: notes::NotesWriter,
@@ -512,7 +516,7 @@ mod tests {
     fn ui_thread_flag_is_per_thread() {
         std::thread::spawn(|| {
             mark_ui_thread();
-            assert!(UI_THREAD.with(Cell::get));
+            assert!(is_ui_thread());
         })
         .join()
         .unwrap();

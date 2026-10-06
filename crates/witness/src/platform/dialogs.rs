@@ -72,13 +72,9 @@ where
     F: FnOnce() -> Option<PathBuf> + Send,
 {
     // Debug builds also catch an unparented dialog opened on the UI thread
-    // (no deadlock, but it freezes the UI). This relies on Rust naming the
-    // process's main thread "main", which is where eframe/winit run.
-    // TODO(I1): use a `witness_core::service::is_ui_thread()` next to
-    // `mark_ui_thread` instead, so there is one definition of the UI thread
-    // (U9 does not own witness-core).
+    // (no deadlock, but it freezes the UI).
     debug_assert!(
-        std::thread::current().name() != Some("main"),
+        !witness_core::service::is_ui_thread(),
         "the {kind} dialog blocks and must not be opened on the UI thread \
          (open it from a Tasks worker)"
     );
