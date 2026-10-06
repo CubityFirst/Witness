@@ -444,6 +444,7 @@ impl WitnessApp {
                 self.toasts.error("Could not restart Witness", error);
             }
             OpDone::ShutdownDone => {
+                log::info!("recording control shut down; exiting");
                 self.prepare_exit();
                 teardown_and_exit(self.shell_objects.take(), 0);
             }
@@ -576,6 +577,7 @@ impl WitnessApp {
             return;
         }
         self.quitting = true;
+        log::info!("quit requested");
         // A failed shutdown (logged by `spawn_op_or`) still exits: the user
         // asked to quit, and startup recovery finishes an interrupted stop.
         self.tasks.spawn_op_or(
@@ -818,6 +820,7 @@ fn teardown_and_exit(shell: Option<ShellObjects>, code: i32) -> ! {
         drop(shell.hotkeys); // UnregisterHotKey
         shell.instance_guard.release(); // ReleaseMutex, CloseHandle, DestroyWindow
     }
+    log::info!("Witness exiting ({code})");
     log::logger().flush();
     std::process::exit(code)
 }
