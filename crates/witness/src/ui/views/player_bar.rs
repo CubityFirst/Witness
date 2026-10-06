@@ -18,6 +18,7 @@ use crate::ui::theme::{
     self, ACCENT, BG, BG_HOVER, BG_RAISED, BORDER, FOCUS, TEXT, TEXT_MUTED, WARN,
 };
 use crate::ui::toasts::Notice;
+use crate::ui::widgets;
 use crate::ui::UiCtx;
 use eframe::egui::{
     self, Align, CornerRadius, Frame, Key, Layout, Margin, Response, Sense, Stroke,
@@ -489,9 +490,8 @@ fn right_cluster(ui: &mut egui::Ui, cx: &mut UiCtx, detail: &MeetingDetail) -> f
             let mut volume = cx.prefs.volume.clamp(0.0, 1.0);
             let slider = egui::Slider::new(&mut volume, 0.0..=1.0)
                 .step_by(0.05)
-                .show_value(false)
-                .trailing_fill(true);
-            let response = ui.add(slider).on_hover_text("Volume");
+                .show_value(false);
+            let response = widgets::slider(ui, slider).on_hover_text("Volume");
             response.widget_info(|| {
                 egui::WidgetInfo::slider(true, f64::from(volume) * 100.0, "Volume")
             });

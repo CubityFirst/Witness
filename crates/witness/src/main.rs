@@ -50,7 +50,8 @@ fn main() {
         // The running instance has been asked to show itself.
         Acquire::Secondary => std::process::exit(0),
     };
-    panic::register_instance(instance_guard.raw_mutex(), instance_guard.raw_hwnd());
+    let instance_hwnd = instance_guard.raw_hwnd();
+    panic::register_instance(instance_guard.raw_mutex(), instance_hwnd);
 
     let settings = match Settings::load_result() {
         Ok(settings) => settings,
@@ -112,13 +113,16 @@ fn main() {
         }
         Err(error) => {
             log::error!("could not start the window: {error}");
-            // Emergency teardown (design §4.6): save any recording and
-            // release the instance (if the app was created, it and the tray
-            // are already gone).
+            // Emergency teardown (design §4.6): save any recording, tell the
+            // user, exit. The instance mutex stays held until the end: the
+            // core's threads run on behind the message box, and a relaunch
+            // must not start a second core on the same database (it waits,
+            // then takes over once this process is gone). If the app was
+            // created, it and the tray are already gone; its leaked guard
+            // is released by the exit itself.
+            bridge::mark_ui_dead();
+            single_instance::begin_exit_raw(instance_hwnd);
             let stopped = core.emergency_stop(Duration::from_secs(10));
-            if let Some(parts) = parts.borrow_mut().take() {
-                parts.instance_guard.release();
-            }
             log::logger().flush();
             let saved = if stopped {
                 " The recording in progress was saved."
@@ -128,6 +132,9 @@ fn main() {
             error_box(&format!(
                 "Witness could not start its window: {error}{saved}"
             ));
+            if let Some(parts) = parts.borrow_mut().take() {
+                parts.instance_guard.release();
+            }
             std::process::exit(1);
         }
     }

@@ -10,12 +10,23 @@
 //!    `catch_unwind`.
 //! 3. A main-thread panic (first time only) stops the recording on a helper
 //!    thread (WAVs finalised, meeting queued for transcription on the next
-//!    launch), removes the tray icon, releases the single-instance mutex,
-//!    flushes the log, tells the user, and exits with code 101.
+//!    launch), removes the tray icon, flushes the log, tells the user, and
+//!    exits with code 101.
 //!
 //! Nothing here takes a lock on the panicking thread: the UI thread holds no
 //! core locks while drawing, and `AppCore::emergency_stop` does its work on
-//! a fresh thread with a timeout.
+//! a fresh thread with a timeout. The panicking thread may still hold the
+//! egui `Context` lock, though (the hook runs before unwinding), so repaint
+//! requests from other threads are switched off first
+//! ([`crate::bridge::mark_ui_dead`]) — the recorder's writer thread emits
+//! through the UI sink while it finalises.
+//!
+//! The single-instance mutex stays held until the process exits: the
+//! pipeline worker, meeting watcher and rec-control threads keep running
+//! behind the message box, so a relaunch must not start a second core on
+//! the same database meanwhile. The hidden instance window refuses requests
+//! from the start ([`crate::platform::single_instance::begin_exit_raw`]),
+//! so a relaunch waits and takes the mutex over once this process is gone.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -90,6 +101,12 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 /// The irreversible main-thread path. Never returns.
 fn main_thread_teardown() -> ! {
+    crate::bridge::mark_ui_dead();
+    // Refuse second launches from here on (the message box below pumps the
+    // hidden window's messages); they wait for the mutex instead.
+    if let Some(&(_, hwnd)) = INSTANCE.get() {
+        crate::platform::single_instance::begin_exit_raw(hwnd);
+    }
     let mut stopped = false;
     let mut log_path = None;
     if let Some(core) = CORE.get() {
@@ -99,17 +116,17 @@ fn main_thread_teardown() -> ! {
     if let Some(&(hwnd, uid)) = TRAY.get() {
         remove_tray_icon(hwnd, uid);
     }
-    if let Some(&(mutex, hwnd)) = INSTANCE.get() {
-        crate::platform::single_instance::begin_exit_raw(hwnd);
-        if mutex != 0 {
-            release_mutex(mutex);
-        }
-    }
     log::logger().flush();
     let details = log_path
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "witness.log".into());
     crate::platform::system::error_box(&teardown_message(stopped, &details));
+    // Only now: the core's threads die with the process a moment later.
+    if let Some(&(mutex, _)) = INSTANCE.get() {
+        if mutex != 0 {
+            release_mutex(mutex);
+        }
+    }
     std::process::exit(101)
 }
 

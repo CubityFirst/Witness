@@ -93,6 +93,22 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      # The upgrade smoke test needs a version above the shipped 0.2.1. Until
+      # the release PR bumps the workspace, `dist` stamps 0.2.1 itself, which
+      # makes the /UPDATE run a same-version reinstall and its DisplayVersion
+      # checks vacuous. Same binaries and installer script, rehearsal version
+      # (above any real release) stamped in.
+      - name: Package a higher-version rehearsal installer
+        run: cargo run --locked -p xtask -- package --srcdir target/release --version 99.0.0 --out target/release/Witness_99.0.0_x64-setup.exe
+
+      - name: Upload the rehearsal installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: witness-installer-rehearsal
+          path: target/release/Witness_99.0.0_x64-setup.exe
+          if-no-files-found: error
+          retention-days: 14
+
   upgrade-smoke:
     # Guards the update contract every installed 0.2.x copy relies on: install
     # the shipped 0.2.1, update over it the way its updater does, and assert
@@ -111,7 +127,9 @@ jobs:
       - name: Download the installer
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: witness-installer
+          # The 99.0.0 rehearsal build of this PR's installer: a real
+          # version increase over 0.2.1 (see the dist job).
+          name: witness-installer-rehearsal
           path: installer-under-test
 
       - name: Install 0.2.1, update over it, uninstall

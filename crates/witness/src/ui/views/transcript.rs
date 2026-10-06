@@ -1069,11 +1069,20 @@ fn segment_row(ui: &mut egui::Ui, rc: &mut RowCtx, idx: usize, actions: &mut Vec
     let rect = row_rect(&prepared);
     if active {
         prepared.frame.fill = ACTIVE_SEG_BG;
-        prepared.frame.stroke = Stroke::new(1.0, ACTIVE_SEG_STROKE);
     } else if ui.rect_contains_pointer(rect) {
         prepared.frame.fill = BG_HOVER;
     }
-    prepared.end(ui);
+    let response = prepared.end(ui);
+    if active {
+        // `outline: 1px`: painted over the row, never part of its layout (a
+        // frame stroke would grow the active row and shift every row below).
+        ui.painter().rect_stroke(
+            response.rect,
+            CornerRadius::same(6),
+            Stroke::new(1.0, ACTIVE_SEG_STROKE),
+            egui::StrokeKind::Inside,
+        );
+    }
 }
 
 /// The rename field under a speaker's row, its hint and the people
@@ -1222,21 +1231,8 @@ fn bookmark_row(ui: &mut egui::Ui, rc: &mut RowCtx, idx: usize, actions: &mut Ve
         BOOKMARK_ROW_BG
     };
     let response = prepared.end(ui);
-    // `border-left: 2px solid var(--warn)`.
-    let edge = Rect::from_min_size(
-        response.rect.left_top(),
-        egui::vec2(2.0, response.rect.height()),
-    );
-    ui.painter().rect_filled(
-        edge,
-        CornerRadius {
-            nw: 6,
-            sw: 6,
-            ne: 0,
-            se: 0,
-        },
-        WARN,
-    );
+    // `border-left: 2px solid var(--warn)`, following the rounded corners.
+    widgets::paint_left_edge(ui, response.rect, 2.0, 6, WARN);
 }
 
 /// `.bookmark-seek`: the warn chip with the bookmark glyph plus `[ts]`.

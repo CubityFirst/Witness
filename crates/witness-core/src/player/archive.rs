@@ -181,6 +181,9 @@ pub struct OpusArchiveReader {
     target: u64,
     /// The physical stream (or `total_samples`) has ended.
     eof: bool,
+    /// Damaged pages skipped plus packets concealed so far. Playback rides
+    /// over them; the pipeline refuses to transcribe a damaged archive.
+    damage: u64,
     /// Decode scratch, interleaved stereo (heap, not stack — see CLAUDE.md).
     pcm: Vec<f32>,
 }
@@ -210,6 +213,7 @@ impl OpusArchiveReader {
             decoded: 0,
             target: pre_skip,
             eof: false,
+            damage: 0,
             pcm: vec![0.0; MAX_FRAME * 2],
         })
     }
@@ -227,6 +231,12 @@ impl OpusArchiveReader {
     /// The OpusTags carry our comfort-mix marker (`WITNESS_MIX=75`).
     pub fn mixed(&self) -> bool {
         self.mixed
+    }
+
+    /// How many damaged spans (bad Ogg pages resynced over, Opus packets
+    /// concealed) the reads so far have hidden. 0 = a clean decode.
+    pub fn damage(&self) -> u64 {
+        self.damage
     }
 
     /// Playback sample index (per channel) of the next sample `read_stereo`
@@ -293,10 +303,13 @@ impl OpusArchiveReader {
                 .decode_float(Some(data), &mut self.pcm[..], false)
             {
                 Ok(n) => return n,
-                Err(e) => log::warn!(
-                    "archive: undecodable Opus packet near sample {}: {e}; concealed",
-                    self.decoded.saturating_sub(self.pre_skip)
-                ),
+                Err(e) => {
+                    self.damage += 1;
+                    log::warn!(
+                        "archive: undecodable Opus packet near sample {}: {e}; concealed",
+                        self.decoded.saturating_sub(self.pre_skip)
+                    )
+                }
             }
         }
         let frame = &mut self.pcm[..FRAME * 2];
@@ -314,6 +327,7 @@ impl OpusArchiveReader {
     /// fills the skipped span with silence. Each resync moves strictly
     /// forward, so a run of bad pages cannot loop. No page left: EOF.
     fn resync(&mut self, err: &OggReadError) -> Result<()> {
+        self.damage += 1;
         let decoded = self.decoded;
         let next = self.pages.partition_point(|p| p.first_decoded <= decoded);
         let Some(&page) = self.pages.get(next) else {
@@ -625,7 +639,9 @@ pub(crate) mod tests {
         let dir = scratch("damaged");
         let samples = 6 * 48_000;
         let path = make_archive(&dir, "damaged", samples);
-        let clean = decode_all(&mut OpusArchiveReader::open(&path).unwrap());
+        let mut reader = OpusArchiveReader::open(&path).unwrap();
+        let clean = decode_all(&mut reader);
+        assert_eq!(reader.damage(), 0);
         let (pages, pre_skip) = {
             let r = OpusArchiveReader::open(&path).unwrap();
             (r.pages().to_vec(), r.pre_skip())
@@ -638,8 +654,15 @@ pub(crate) mod tests {
         let bad = dir.join("bad.opus");
         std::fs::write(&bad, &bytes).unwrap();
 
-        let damaged = decode_all(&mut OpusArchiveReader::open(&bad).unwrap());
+        let mut reader = OpusArchiveReader::open(&bad).unwrap();
+        let damaged = decode_all(&mut reader);
         assert_eq!(damaged.len(), clean.len(), "timeline length changed");
+        assert!(reader.damage() > 0, "the resync was not counted");
+        // Retranscription is strict: the clean archive decodes, the damaged
+        // one fails instead of transcribing concealed silence.
+        assert!(crate::encoder::decode_opus(&path).is_ok());
+        let error = crate::encoder::decode_opus(&bad).unwrap_err().to_string();
+        assert!(error.contains("is damaged near"), "{error}");
         let lost = (pages[2].first_decoded - pre_skip) as usize
             ..(pages[3].first_decoded - pre_skip) as usize;
         assert!(damaged[lost.start * 2..lost.end * 2]

@@ -195,6 +195,11 @@ pub(crate) fn has_mix_tag(data: &[u8]) -> bool {
 /// Stream an archive as unmixed (mic, loopback) 48 kHz mono chunks, one
 /// Opus packet at a time. Decoding (pre-skip, end trim, EOF) is the player's
 /// `OpusArchiveReader`, so playback and retranscription share one timeline.
+///
+/// Strict, unlike playback: the reader conceals damaged pages and packets,
+/// but a transcript built over concealed silence would silently replace a
+/// complete one, so any damage fails the decode (and the retranscription
+/// job, which then keeps the existing transcript — as in 0.2.x).
 fn decode_opus_chunks(
     path: &Path,
     mut on_pcm: impl FnMut(&[f32], &[f32]) -> Result<()>,
@@ -211,7 +216,15 @@ fn decode_opus_chunks(
 
     loop {
         stereo.clear();
-        if reader.read_stereo(&mut stereo)? == 0 {
+        let frames = reader.read_stereo(&mut stereo)?;
+        if reader.damage() > 0 {
+            bail!(
+                "the archived audio {} is damaged near {:.1} s; not transcribing it",
+                path.display(),
+                reader.position() as f64 / 48_000.0
+            );
+        }
+        if frames == 0 {
             break;
         }
         mic.clear();

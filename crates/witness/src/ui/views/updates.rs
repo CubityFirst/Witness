@@ -10,7 +10,7 @@
 use super::settings::{badge, ghost_enabled, muted_paragraph, primary, row, section};
 use crate::model::{UpdateFlow, UpdatePhase};
 use crate::ui::theme::TEXT;
-use crate::ui::widgets::BadgeKind;
+use crate::ui::widgets::{self, BadgeKind};
 use crate::ui::{UiCmd, UiCtx};
 use eframe::egui::{self, RichText};
 
@@ -67,12 +67,13 @@ impl UpdatesSection {
                 muted_paragraph(ui, &notes);
             }
             let mut check = cx.settings.current().check_for_updates;
-            if ui
-                .checkbox(
-                    &mut check,
-                    "Check for updates at startup (no meeting data is sent)",
-                )
-                .changed()
+            if widgets::checkbox(
+                ui,
+                true,
+                &mut check,
+                "Check for updates at startup (no meeting data is sent)",
+            )
+            .changed()
             {
                 let mut next = cx.settings.current().clone();
                 next.check_for_updates = check;

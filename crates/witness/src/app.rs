@@ -192,7 +192,7 @@ impl WitnessApp {
         shell.bookmark_hotkey = hotkeys.bookmark_combo();
         shell.update.init(&core);
         let settings = SettingsStore::new(&core);
-        let view = View::default();
+        let view = crate::ui::debug_start_view();
         let active = ActiveView::for_view(&view);
 
         let mut app = WitnessApp {
@@ -241,6 +241,7 @@ impl WitnessApp {
                 && std::env::var_os("WITNESS_DEBUG_PANIC_HOTKEY").is_some_and(|v| v == "1"),
         };
         app.apply_zoom(&ctx);
+        app.debug_surfaces();
         // Mount-time calls (app.tsx:193-215).
         let mut effects = vec![Effect::RefreshStatus];
         if !app.prefs.model_banner_dismissed {
@@ -503,6 +504,12 @@ impl WitnessApp {
     }
 
     fn handle_shell(&mut self, event: ShellEvent) {
+        if self.quitting && ignored_while_quitting(&event) {
+            // Quit's stop is queued (or running) in rec-control; a toggle
+            // behind it would start a recording that exit then kills.
+            log::debug!("{event:?} ignored: quitting");
+            return;
+        }
         match event {
             ShellEvent::TrayClick { x, y } => self.flyout.open(&self.window, x, y),
             ShellEvent::TrayMenuOpen | ShellEvent::SecondInstance => {
@@ -521,6 +528,30 @@ impl WitnessApp {
             ShellEvent::TrayMenuQuit => self.begin_quit(),
         }
         self.shell.popup_mode = self.flyout.is_popup();
+    }
+
+    /// Debug builds only, for passive visual checks (no input needed):
+    /// `WITNESS_DEBUG_TOASTS=1` shows one toast of each kind and
+    /// `WITNESS_DEBUG_CONFIRM=1` opens a sample confirm (its answer is
+    /// ignored). See also `WITNESS_DEBUG_START_VIEW` (`ui::debug_start_view`).
+    fn debug_surfaces(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            let on = |name: &str| std::env::var_os(name).is_some_and(|v| v == "1");
+            if on("WITNESS_DEBUG_TOASTS") {
+                self.toasts.push(Notice::info("Debug: an info toast"));
+                self.toasts.success("Debug: a success toast");
+                self.toasts
+                    .error("Debug: an error toast", "with its reason after the colon");
+            }
+            if on("WITNESS_DEBUG_CONFIRM") {
+                self.confirm.ask(
+                    egui::Id::new("debug-confirm"),
+                    "Debug: move this meeting to the recycle bin?",
+                    "Delete",
+                );
+            }
+        }
     }
 
     /// App-level commands pushed by views during `ui()`.
@@ -577,6 +608,7 @@ impl WitnessApp {
             return;
         }
         self.quitting = true;
+        self.shell.quitting = true;
         log::info!("quit requested");
         // A failed shutdown (logged by `spawn_op_or`) still exits: the user
         // asked to quit, and startup recovery finishes an interrupted stop.
@@ -680,7 +712,12 @@ impl WitnessApp {
             }
             Err(error) => {
                 drop(guard);
-                self.toasts.error("Installing the update failed", error);
+                // Same wording as 0.2.x: the caller's prefix around the
+                // core's "Installing the update failed: …".
+                self.toasts.error(
+                    "Could not install the update",
+                    format!("Installing the update failed: {error}"),
+                );
                 self.shell.update.install_failed();
             }
         }
@@ -789,6 +826,16 @@ impl WitnessApp {
             }
         }
     }
+}
+
+/// Shell events dropped once Tray Quit has started: the recording toggles
+/// (a toggle queued behind Quit's stop would start a recording the exit then
+/// kills unfinalized) and the bookmark hotkey. Opening the window still works.
+fn ignored_while_quitting(event: &ShellEvent) -> bool {
+    matches!(
+        event,
+        ShellEvent::TrayMenuToggleRecord | ShellEvent::HotkeyRecord | ShellEvent::HotkeyBookmark
+    )
 }
 
 /// Consume presses of `key` whose modifiers satisfy `accept`; true if any.
@@ -931,6 +978,7 @@ impl eframe::App for WitnessApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        widgets::track_focus_visible(&ctx);
         if self.debug_panic_hotkey
             && ctx.input(|i| {
                 i.modifiers.ctrl && i.modifiers.alt && i.modifiers.shift && i.key_pressed(Key::F12)
@@ -1005,5 +1053,39 @@ impl eframe::App for WitnessApp {
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         theme::clear_color()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::starts_recording;
+    use witness_core::Trigger;
+
+    #[test]
+    fn quitting_drops_recording_toggles_but_not_window_events() {
+        for event in [
+            ShellEvent::TrayMenuToggleRecord,
+            ShellEvent::HotkeyRecord,
+            ShellEvent::HotkeyBookmark,
+        ] {
+            assert!(ignored_while_quitting(&event), "{event:?}");
+        }
+        for event in [
+            ShellEvent::TrayClick { x: 1.0, y: 2.0 },
+            ShellEvent::TrayMenuOpen,
+            ShellEvent::SecondInstance,
+            ShellEvent::TrayMenuQuit,
+        ] {
+            assert!(!ignored_while_quitting(&event), "{event:?}");
+        }
+    }
+
+    #[test]
+    fn only_starting_commands_are_refused_while_quitting() {
+        assert!(starts_recording(RecCmd::Start(Trigger::Manual)));
+        assert!(starts_recording(RecCmd::ToggleWithToast));
+        assert!(!starts_recording(RecCmd::Stop { by_user: true }));
+        assert!(!starts_recording(RecCmd::BookmarkNow));
     }
 }

@@ -105,15 +105,37 @@ impl OpHandle {
     }
 }
 
+/// Set once the UI thread has died (main-thread panic, or the event loop
+/// failed). See [`mark_ui_dead`].
+static UI_DEAD: AtomicBool = AtomicBool::new(false);
+
+/// The UI thread is gone: from now on repaint requests are skipped. Called
+/// first by the panic hook. The hook runs before unwinding, so a panic
+/// inside an egui closure (`ctx.input`, `memory_mut`, text layout…) still
+/// holds the `Context` write lock; a repaint request from another thread
+/// would block on it forever — and the emergency stop needs the recorder's
+/// writer thread and `stop_recording`, which both emit through [`UiSink`].
+pub fn mark_ui_dead() {
+    UI_DEAD.store(true, Ordering::SeqCst);
+}
+
+fn ui_dead() -> bool {
+    UI_DEAD.load(Ordering::SeqCst)
+}
+
 /// Wake the root viewport (whose `logic()` drains the channel) from any
-/// thread.
+/// thread. A no-op once [`mark_ui_dead`] ran.
 pub fn wake_root(ctx: &egui::Context) {
-    ctx.request_repaint_of(egui::ViewportId::ROOT);
+    if !ui_dead() {
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
 }
 
 /// [`wake_root`] after at most `delay`.
 pub fn wake_root_after(ctx: &egui::Context, delay: Duration) {
-    ctx.request_repaint_after_for(delay, egui::ViewportId::ROOT);
+    if !ui_dead() {
+        ctx.request_repaint_after_for(delay, egui::ViewportId::ROOT);
+    }
 }
 
 /// The core's `EventSink` and the shell handlers' way into the UI thread.
@@ -585,5 +607,32 @@ mod tests {
             rx.try_recv(),
             Ok(UiMsg::Shell(ShellEvent::SecondInstance))
         ));
+    }
+
+    /// After a main-thread panic inside an egui closure the `Context` write
+    /// lock stays held; emits from other threads (the emergency stop's
+    /// writer thread) must still return instead of blocking on it.
+    #[test]
+    fn emits_never_block_on_a_held_context_lock_once_the_ui_is_dead() {
+        let (sink, rx) = UiSink::new();
+        let ctx = egui::Context::default();
+        sink.set_context(ctx.clone());
+        mark_ui_dead();
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        // `input` holds the Context write lock for the whole closure.
+        ctx.input(|_| {
+            let sink = sink.clone();
+            let done_tx = done_tx.clone();
+            std::thread::spawn(move || {
+                sink.emit(CoreEvent::MeetingsChanged);
+                sink.shell(ShellEvent::TrayMenuOpen);
+                let _ = done_tx.send(());
+            });
+            assert!(
+                done_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+                "an emit blocked on the egui Context lock"
+            );
+        });
+        assert_eq!(rx.try_iter().count(), 2);
     }
 }

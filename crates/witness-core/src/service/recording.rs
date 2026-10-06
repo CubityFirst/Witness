@@ -476,10 +476,19 @@ impl AppCore {
         Ok(())
     }
 
+    /// Exit paths: the meeting watcher stops auto-starting recordings for
+    /// the rest of this process (lock-free; settings are not touched). [ui-ok]
+    pub fn suspend_auto_record(&self) {
+        self.state.watcher.enabled.store(false, Ordering::SeqCst);
+    }
+
     /// Panic hook only: stop the recording on a fresh helper thread and wait
     /// up to `timeout`. True when a recording was stopped and saved. Never
     /// panics and never takes a lock on the calling thread.
     pub fn emergency_stop(&self, timeout: Duration) -> bool {
+        // The process is dying (possibly behind a message box): no new
+        // auto-recordings that the exit would cut off.
+        self.suspend_auto_record();
         let Some(core) = self.this.upgrade() else {
             return false;
         };

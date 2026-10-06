@@ -112,7 +112,10 @@ fn styled_button(
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &name));
 
     if ui.is_rect_visible(rect) {
-        let hovered = enabled && (response.hovered() || response.has_focus());
+        // Keyboard focus looks like hover (`:focus-visible`); focus that came
+        // with a click, or programmatic focus after one, does not.
+        let ring = response.has_focus() && focus_visible(ui.ctx());
+        let hovered = enabled && (response.hovered() || ring);
         let (fill, stroke, text) = if hovered {
             (style.hover_fill, style.hover_stroke, style.hover_text)
         } else {
@@ -135,7 +138,7 @@ fn styled_button(
         );
         let pos = rect.center() - galley.size() / 2.0;
         painter.galley(pos, galley, text);
-        if response.has_focus() {
+        if ring {
             // `:focus-visible`: 2 px focus ring, 2 px outside.
             painter.rect_stroke(
                 rect.expand(2.0),
@@ -611,6 +614,148 @@ pub fn text_edit_menu(response: &Response) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Form controls
+
+/// Checkbox / radio visuals (CSS `accent-color: var(--accent)`): an empty
+/// box with a visible muted outline (accent on hover), or an accent-filled
+/// box with a white mark when checked. The label keeps the text colour.
+fn toggle_visuals(style: &mut egui::Style, checked: bool) {
+    style.visuals.override_text_color = Some(TEXT);
+    let w = &mut style.visuals.widgets;
+    for (state, hover) in [
+        (&mut w.inactive, false),
+        (&mut w.hovered, true),
+        (&mut w.active, true),
+    ] {
+        if checked {
+            state.bg_fill = theme::ACCENT;
+            state.bg_stroke = Stroke::new(1.0, theme::ACCENT);
+            state.fg_stroke = Stroke::new(2.0, WHITE);
+        } else {
+            state.bg_fill = theme::BG;
+            state.bg_stroke = Stroke::new(1.0, if hover { theme::ACCENT } else { TEXT_MUTED });
+        }
+    }
+}
+
+/// `<input type=checkbox>` with the app's accent look; disabled when
+/// `enabled` is false (the value is kept).
+pub fn checkbox(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    checked: &mut bool,
+    text: impl Into<WidgetText>,
+) -> Response {
+    let on = *checked;
+    ui.scope(|ui| {
+        toggle_visuals(ui.style_mut(), on);
+        ui.add_enabled(enabled, egui::Checkbox::new(checked, text))
+    })
+    .inner
+}
+
+/// `<input type=radio>` with the app's accent look: selects `alternative`.
+pub fn radio_value<T: PartialEq>(
+    ui: &mut egui::Ui,
+    current: &mut T,
+    alternative: T,
+    text: impl Into<WidgetText>,
+) -> Response {
+    let on = *current == alternative;
+    ui.scope(|ui| {
+        toggle_visuals(ui.style_mut(), on);
+        ui.radio_value(current, alternative, text)
+    })
+    .inner
+}
+
+/// Range-input visuals: a visible `--border` rail, an accent fill up to the
+/// value, and an accent handle (a ring at rest, since egui paints the
+/// resting handle in the rail colour; filled on hover / drag).
+fn slider_visuals(style: &mut egui::Style) {
+    style.visuals.slider_trailing_fill = true;
+    style.visuals.selection.bg_fill = theme::ACCENT;
+    let w = &mut style.visuals.widgets;
+    w.inactive.bg_fill = BORDER;
+    w.inactive.fg_stroke = Stroke::new(2.0, theme::ACCENT);
+    for state in [&mut w.hovered, &mut w.active] {
+        state.bg_fill = theme::ACCENT;
+        state.fg_stroke = Stroke::new(2.0, theme::FOCUS);
+    }
+}
+
+/// `<input type=range>` (`accent-color: var(--accent)`).
+pub fn slider(ui: &mut egui::Ui, slider: egui::Slider<'_>) -> Response {
+    ui.scope(|ui| {
+        slider_visuals(ui.style_mut());
+        ui.add(slider)
+    })
+    .inner
+}
+
+/// `.text-input` padding (6 px / 10 px).
+pub const TEXT_INPUT_MARGIN: Margin = Margin::symmetric(10, 6);
+
+/// `.text-input`: `--bg` fill, 1 px `--border` that turns accent on focus,
+/// radius 6, 6/10 padding. Gives `edit` its `id` (needed to know focus).
+pub fn text_input<'t>(ui: &egui::Ui, id: egui::Id, edit: egui::TextEdit<'t>) -> egui::TextEdit<'t> {
+    let focused = ui.memory(|m| m.has_focus(id));
+    let border = if focused { theme::ACCENT } else { BORDER };
+    edit.id(id).margin(TEXT_INPUT_MARGIN).frame(
+        Frame::new()
+            .fill(theme::BG)
+            .stroke(Stroke::new(1.0, border))
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(TEXT_INPUT_MARGIN),
+    )
+}
+
+/// CSS `border-left: Npx solid` on a card with rounded corners: the band
+/// follows the card's left corner arcs instead of sticking out past them.
+pub fn paint_left_edge(ui: &egui::Ui, card: egui::Rect, width: f32, radius: u8, color: Color32) {
+    let band = egui::Rect::from_min_max(
+        card.left_top(),
+        egui::pos2(card.left() + width, card.bottom()),
+    );
+    ui.painter()
+        .with_clip_rect(band.intersect(ui.clip_rect()))
+        .rect_filled(card, CornerRadius::same(radius), color);
+}
+
+// ---------------------------------------------------------------------------
+// Focus visibility
+
+fn focus_visible_id() -> egui::Id {
+    egui::Id::new("witness-focus-visible")
+}
+
+/// CSS `:focus-visible` from this pass's input: a key press turns it on, a
+/// pointer press turns it off; `None` = no change.
+fn focus_visible_change(events: &[egui::Event]) -> Option<bool> {
+    events.iter().rev().find_map(|event| match event {
+        egui::Event::Key { pressed: true, .. } => Some(true),
+        egui::Event::PointerButton { pressed: true, .. } => Some(false),
+        _ => None,
+    })
+}
+
+/// Track whether focus should be drawn (Chromium's `:focus-visible`
+/// heuristic): after keyboard input yes, after a click no, and programmatic
+/// focus (the confirm modal's Cancel) follows the last input. Call once per
+/// pass, before any widget.
+pub fn track_focus_visible(ctx: &egui::Context) {
+    if let Some(visible) = ctx.input(|i| focus_visible_change(&i.events)) {
+        ctx.data_mut(|d| d.insert_temp(focus_visible_id(), visible));
+    }
+}
+
+/// Whether a focused widget should show its focus ring now.
+pub fn focus_visible(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(focus_visible_id()))
+        .unwrap_or(false)
+}
+
 /// How urgently a live region is announced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Politeness {
@@ -692,6 +837,83 @@ mod tests {
             let long = chip(ui, &"long ".repeat(40), Color32::RED, 16.0);
             assert!(short.rect.width() < long.rect.width());
             assert!(long.rect.width() <= 16.0 * 11.0 + 0.5);
+        });
+    }
+
+    #[test]
+    fn focus_is_visible_after_keys_and_hidden_after_clicks() {
+        let key = egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let click = egui::Event::PointerButton {
+            pos: egui::Pos2::ZERO,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let release = egui::Event::PointerButton {
+            pos: egui::Pos2::ZERO,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        assert_eq!(focus_visible_change(&[]), None);
+        assert_eq!(focus_visible_change(std::slice::from_ref(&release)), None);
+        assert_eq!(focus_visible_change(std::slice::from_ref(&key)), Some(true));
+        assert_eq!(
+            focus_visible_change(&[key.clone(), click.clone()]),
+            Some(false)
+        );
+        assert_eq!(focus_visible_change(&[click, release, key]), Some(true));
+
+        let ctx = theme::test_context();
+        assert!(!focus_visible(&ctx), "hidden until a key is pressed");
+    }
+
+    #[test]
+    fn form_controls_are_visible_on_raised_cards() {
+        let mut style = egui::Style::default();
+        theme::style(&mut style);
+        toggle_visuals(&mut style, false);
+        let idle = style.visuals.widgets.inactive;
+        assert_eq!(idle.bg_stroke.color, TEXT_MUTED, "unchecked outline");
+        toggle_visuals(&mut style, true);
+        let on = style.visuals.widgets.inactive;
+        assert_eq!((on.bg_fill, on.fg_stroke.color), (theme::ACCENT, WHITE));
+        assert_eq!(style.visuals.override_text_color, Some(TEXT));
+
+        let mut style = egui::Style::default();
+        theme::style(&mut style);
+        slider_visuals(&mut style);
+        assert!(style.visuals.slider_trailing_fill);
+        assert_eq!(style.visuals.selection.bg_fill, theme::ACCENT);
+        assert_eq!(style.visuals.widgets.inactive.bg_fill, BORDER, "rail");
+    }
+
+    #[test]
+    fn form_controls_lay_out() {
+        run(|ui| {
+            let mut on = true;
+            assert!(checkbox(ui, true, &mut on, "Auto-record").rect.height() > 0.0);
+            checkbox(ui, false, &mut on, "Disabled");
+            let mut pick = 1;
+            radio_value(ui, &mut pick, 1, "One");
+            radio_value(ui, &mut pick, 2, "Two");
+            let mut value = 0.6_f32;
+            slider(
+                ui,
+                egui::Slider::new(&mut value, 0.3..=0.9).show_value(false),
+            );
+            let mut text = String::from("teams");
+            let id = egui::Id::new("text-input");
+            let edit = text_input(ui, id, egui::TextEdit::singleline(&mut text));
+            ui.add(edit);
+            let card = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(100.0, 40.0));
+            paint_left_edge(ui, card, 3.0, 8, theme::ACCENT);
         });
     }
 }

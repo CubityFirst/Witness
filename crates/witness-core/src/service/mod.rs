@@ -497,8 +497,26 @@ mod tests {
                 .unwrap(),
             Err("Not recording".into())
         );
+        core.state
+            .watcher
+            .enabled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(!core.emergency_stop(Duration::from_secs(5)));
+        assert!(!core
+            .state
+            .watcher
+            .enabled
+            .load(std::sync::atomic::Ordering::SeqCst));
+        core.state
+            .watcher
+            .enabled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         core.shutdown();
+        assert!(!core
+            .state
+            .watcher
+            .enabled
+            .load(std::sync::atomic::Ordering::SeqCst));
         drop(
             core.exit_guard(ExitPurpose::Restart)
                 .expect("idle core may exit"),

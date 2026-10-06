@@ -59,6 +59,8 @@ pub struct ShellModel {
     pub popup_mode: bool,
     /// Top-bar start/stop in flight (spinner, debounce).
     pub recording_action: bool,
+    /// Tray Quit is stopping the recording and exiting: no new recordings.
+    pub quitting: bool,
     /// First-run banner: Parakeet models not installed.
     pub models_missing: bool,
     pub record_hotkey: Option<String>,

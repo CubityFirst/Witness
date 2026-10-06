@@ -778,9 +778,16 @@ mod tests {
             "cargo run --locked -p xtask -- dist",
             "./installer/tests/upgrade-smoke.ps1",
             "cargo test --locked -p xtask sig_compat",
+            // The smoke test runs on a real version increase over 0.2.1.
+            "cargo run --locked -p xtask -- package --srcdir target/release --version 99.0.0",
         ] {
             assert!(ci.contains(step), "ci.yml must run `{step}`");
         }
+        assert_eq!(
+            ci.matches("name: witness-installer-rehearsal").count(),
+            2,
+            "the smoke job must test the rehearsal (higher-version) installer"
+        );
         let release = repo_file(".github/workflows/release.yml");
         assert!(release.contains("-- check --tag"));
         assert!(release.contains("-- dist --sign --notes"));

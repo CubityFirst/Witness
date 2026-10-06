@@ -303,21 +303,8 @@ fn toast_ui(ui: &mut egui::Ui, toast: &Toast, width: f32) -> (Option<ToastAction
             });
         })
         .response;
-    // The 3 px coloured left border.
-    let edge = egui::Rect::from_min_max(
-        response.rect.left_top(),
-        egui::pos2(response.rect.left() + 3.0, response.rect.bottom()),
-    );
-    ui.painter().rect_filled(
-        edge,
-        CornerRadius {
-            nw: 8,
-            sw: 8,
-            ne: 0,
-            se: 0,
-        },
-        toast.kind.accent(),
-    );
+    // The 3 px coloured left border, following the rounded corners.
+    widgets::paint_left_edge(ui, response.rect, 3.0, 8, toast.kind.accent());
     widgets::announce(
         ui.ctx(),
         egui::Id::new(("witness-toast", toast.id)),

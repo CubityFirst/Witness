@@ -533,12 +533,11 @@ impl SettingsState {
     fn startup(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
         let mut enabled = self.autostart.unwrap_or(false);
         let loaded = self.autostart.is_some() && self.autostart_write.is_none();
-        let response = ui.add_enabled(
+        let response = widgets::checkbox(
+            ui,
             loaded,
-            egui::Checkbox::new(
-                &mut enabled,
-                "Start Witness with Windows (minimized to tray)",
-            ),
+            &mut enabled,
+            "Start Witness with Windows (minimized to tray)",
         );
         if response.changed() {
             // The checkbox shows the new value once the registry write
@@ -627,9 +626,13 @@ impl SettingsState {
 
     fn recording(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
         let mut auto_record = cx.settings.current().auto_record;
-        if ui
-            .checkbox(&mut auto_record, "Auto-record when a meeting is detected")
-            .changed()
+        if widgets::checkbox(
+            ui,
+            true,
+            &mut auto_record,
+            "Auto-record when a meeting is detected",
+        )
+        .changed()
         {
             save(cx, |s| s.auto_record = auto_record);
         }
@@ -638,13 +641,12 @@ impl SettingsState {
             let label = row_label(ui, "Watch patterns");
             let width = input_width(ui, INPUT_WIDTH);
             wrap_for(ui, width);
-            let response = ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.patterns_text)
-                        .id(patterns_id())
-                        .desired_width(width),
-                )
-                .labelled_by(label);
+            let field = widgets::text_input(
+                ui,
+                patterns_id(),
+                egui::TextEdit::singleline(&mut self.patterns_text).desired_width(width),
+            );
+            let response = ui.add(field).labelled_by(label);
             widgets::text_edit_menu(&response);
             self.patterns_dirty |= response.changed();
             // Enter surrenders focus too, so this covers blur and Enter. A
@@ -710,33 +712,36 @@ impl SettingsState {
         let settings = cx.settings.current().clone();
 
         let mut auto_transcribe = settings.auto_transcribe;
-        if ui
-            .checkbox(&mut auto_transcribe, "Auto-transcribe after each recording")
-            .changed()
+        if widgets::checkbox(
+            ui,
+            true,
+            &mut auto_transcribe,
+            "Auto-transcribe after each recording",
+        )
+        .changed()
         {
             save(cx, |s| s.auto_transcribe = auto_transcribe);
         }
         let mut live = settings.live_transcribe;
-        if ui
-            .checkbox(
-                &mut live,
-                "Live captions while recording (Parakeet; provisional — the final pass replaces them)",
-            )
-            .changed()
+        if widgets::checkbox(
+            ui,
+            true,
+            &mut live,
+            "Live captions while recording (Parakeet; provisional — the final pass replaces them)",
+        )
+        .changed()
         {
             save(cx, |s| s.live_transcribe = live);
         }
         // Disabled without live captions, but its value is kept.
         let mut overlay = settings.caption_overlay;
-        if ui
-            .add_enabled(
-                settings.live_transcribe,
-                egui::Checkbox::new(
-                    &mut overlay,
-                    "Floating caption window on top of other apps while recording",
-                ),
-            )
-            .changed()
+        if widgets::checkbox(
+            ui,
+            settings.live_transcribe,
+            &mut overlay,
+            "Floating caption window on top of other apps while recording",
+        )
+        .changed()
         {
             save(cx, |s| s.caption_overlay = overlay);
         }
@@ -748,7 +753,8 @@ impl SettingsState {
                 .unwrap_or(settings.speaker_match_threshold);
             let mut value = shown_before;
             let enabled = ui.is_enabled();
-            let response = ui.add(
+            let response = widgets::slider(
+                ui,
                 egui::Slider::new(&mut value, THRESHOLD_MIN..=THRESHOLD_MAX)
                     .step_by(THRESHOLD_STEP as f64)
                     .show_value(false),
@@ -808,14 +814,14 @@ impl SettingsState {
                 row_width(ui)
             };
             let width = room.min(320.0);
-            let response = ui
-                .add(
-                    egui::TextEdit::multiline(&mut self.junk_text)
-                        .id(junk_id())
-                        .desired_rows(4)
-                        .desired_width(width),
-                )
-                .labelled_by(label);
+            let field = widgets::text_input(
+                ui,
+                junk_id(),
+                egui::TextEdit::multiline(&mut self.junk_text)
+                    .desired_rows(4)
+                    .desired_width(width),
+            );
+            let response = ui.add(field).labelled_by(label);
             widgets::text_edit_menu(&response);
             self.junk_dirty |= response.changed();
             // Blur only (Enter inserts a line); a clean buffer is skipped as
@@ -841,8 +847,13 @@ impl SettingsState {
         row(ui, |ui| {
             row_label(ui, "Engine");
             let mut engine = settings.engine;
-            ui.radio_value(&mut engine, Engine::Parakeet, "Parakeet TDT v3 (fast, GPU)");
-            ui.radio_value(&mut engine, Engine::Whisper, "Whisper large-v3-turbo");
+            widgets::radio_value(
+                ui,
+                &mut engine,
+                Engine::Parakeet,
+                "Parakeet TDT v3 (fast, GPU)",
+            );
+            widgets::radio_value(ui, &mut engine, Engine::Whisper, "Whisper large-v3-turbo");
             if engine != settings.engine {
                 save(cx, |s| s.engine = engine);
             }

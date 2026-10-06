@@ -113,7 +113,7 @@ pub fn install(ctx: &egui::Context) {
     super::icons::set_animations(crate::platform::system::client_area_animations());
 }
 
-fn style(s: &mut egui::Style) {
+pub(crate) fn style(s: &mut egui::Style) {
     use egui::TextStyle;
     s.text_styles = [
         (TextStyle::Small, FontId::proportional(12.0)),
@@ -178,13 +178,18 @@ fn style(s: &mut egui::Style) {
     w.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
     w.noninteractive.corner_radius = radius;
     for state in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
-        state.bg_fill = BG_HOVER;
+        // Buttons and combo boxes fill with `weak_bg_fill`. The strong
+        // `bg_fill` is egui's for scroll handles and slider rails (plus
+        // checkbox / radio boxes and slider handles, which `widgets` styles
+        // itself): the `--border` thumb, `--text-muted` on hover / drag.
+        state.bg_fill = TEXT_MUTED;
         state.weak_bg_fill = BG_HOVER;
         state.bg_stroke = Stroke::new(1.0, BORDER);
         state.fg_stroke = Stroke::new(1.0, TEXT);
         state.corner_radius = radius;
         state.expansion = 0.0;
     }
+    w.inactive.bg_fill = BORDER;
     // `.btn:hover` / input focus: the border turns accent.
     w.hovered.bg_stroke = Stroke::new(1.0, ACCENT);
     w.active.bg_stroke = Stroke::new(1.0, ACCENT);
@@ -214,6 +219,20 @@ mod tests {
         assert_eq!(chip_color("S8"), Color32::from_rgb(0x7b, 0x5a, 0x3a));
         assert_eq!(chip_color("S9"), chip_color("S1"));
         assert_eq!(chip_color(""), chip_color("S1"));
+    }
+
+    #[test]
+    fn scroll_thumbs_follow_the_spec() {
+        let mut s = egui::Style::default();
+        style(&mut s);
+        let w = &s.visuals.widgets;
+        assert!(!s.spacing.scroll.foreground_color);
+        assert_eq!(w.inactive.bg_fill, BORDER);
+        assert_eq!(w.hovered.bg_fill, TEXT_MUTED);
+        assert_eq!(w.active.bg_fill, TEXT_MUTED);
+        // Buttons keep the raised fill.
+        assert_eq!(w.inactive.weak_bg_fill, BG_HOVER);
+        assert_eq!(w.hovered.weak_bg_fill, BG_HOVER);
     }
 
     #[test]

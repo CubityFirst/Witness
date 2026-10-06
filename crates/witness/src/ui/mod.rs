@@ -56,6 +56,45 @@ pub enum View {
     Settings,
 }
 
+/// `WITNESS_DEBUG_START_VIEW` (debug builds only) for passive visual
+/// checks: `meetings`, `people`, `settings`, `search:<query>` or
+/// `transcript:<meeting id>`. Anything else (or unset) is Meetings.
+pub fn debug_start_view() -> View {
+    #[cfg(debug_assertions)]
+    if let Some(spec) = std::env::var_os("WITNESS_DEBUG_START_VIEW") {
+        let spec = spec.to_string_lossy();
+        match parse_start_view(&spec) {
+            Some(view) => return view,
+            None => log::warn!("WITNESS_DEBUG_START_VIEW={spec:?} not understood; ignored"),
+        }
+    }
+    View::default()
+}
+
+/// The `WITNESS_DEBUG_START_VIEW` grammar.
+#[cfg_attr(not(any(debug_assertions, test)), allow(dead_code))]
+fn parse_start_view(spec: &str) -> Option<View> {
+    let (kind, arg) = match spec.split_once(':') {
+        Some((kind, arg)) => (kind, Some(arg)),
+        None => (spec, None),
+    };
+    match (kind.trim(), arg) {
+        ("meetings", None) => Some(View::Meetings),
+        ("people", None) => Some(View::People),
+        ("settings", None) => Some(View::Settings),
+        ("search", Some(query)) => Some(View::Search {
+            query: query.to_owned(),
+        }),
+        ("transcript", Some(id)) => id.trim().parse().ok().map(|meeting_id| View::Transcript {
+            meeting_id,
+            segment_id: None,
+            highlight: None,
+            from: None,
+        }),
+        _ => None,
+    }
+}
+
 impl View {
     /// The remount key: the kind, or `transcript-<id>`. A new view value is
     /// created whenever it changes.
@@ -219,6 +258,10 @@ impl UiCtx<'_> {
     /// Start/Stop are ignored while one is in flight (the spinner shows);
     /// the reply arrives as `OpDone::Recording { origin: TopBar, .. }`.
     pub fn submit_rec(&mut self, cmd: RecCmd) {
+        if self.shell.quitting && starts_recording(cmd) {
+            log::debug!("top-bar {cmd:?} ignored: quitting");
+            return;
+        }
         let start_stop = matches!(cmd, RecCmd::Start(_) | RecCmd::Stop { .. });
         if start_stop {
             if self.shell.recording_action {
@@ -228,6 +271,13 @@ impl UiCtx<'_> {
         }
         submit_recording(self.tasks, cmd, RecOrigin::TopBar);
     }
+}
+
+/// Whether `cmd` can start a recording. While Tray Quit runs, those are
+/// dropped: queued behind Quit's stop, they would start a recording that the
+/// exit then kills without finalizing it.
+pub fn starts_recording(cmd: RecCmd) -> bool {
+    matches!(cmd, RecCmd::Start(_) | RecCmd::ToggleWithToast)
 }
 
 /// Submit `cmd` to the core's rec-control FIFO (never blocks) and forward
@@ -310,6 +360,31 @@ impl ActiveView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_start_view_grammar() {
+        assert_eq!(parse_start_view("people"), Some(View::People));
+        assert_eq!(parse_start_view("settings"), Some(View::Settings));
+        assert_eq!(parse_start_view("meetings"), Some(View::Meetings));
+        assert_eq!(
+            parse_start_view("search:budget review"),
+            Some(View::Search {
+                query: "budget review".into()
+            })
+        );
+        assert_eq!(
+            parse_start_view("transcript:42"),
+            Some(View::Transcript {
+                meeting_id: 42,
+                segment_id: None,
+                highlight: None,
+                from: None,
+            })
+        );
+        assert_eq!(parse_start_view("transcript:x"), None);
+        assert_eq!(parse_start_view("people:1"), None);
+        assert_eq!(parse_start_view(""), None);
+    }
 
     #[test]
     fn view_keys_remount_per_transcript() {

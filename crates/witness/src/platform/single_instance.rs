@@ -18,8 +18,9 @@
 //! - An exiting instance refuses requests (`begin_exit`), so a launch that
 //!   races the exit keeps waiting and takes over instead of being told
 //!   "shown" by a process that is about to disappear. A panicking main
-//!   thread refuses too (the panic hook's message box pumps messages after
-//!   the mutex is released), and a launch tries every window with the
+//!   thread refuses too (the panic hook's message box pumps messages while
+//!   it still holds the mutex, so the launch waits for the exit), and a
+//!   launch tries every window with the
 //!   instance's class and title, so a dying instance's leftover window
 //!   cannot hide the new primary's.
 
@@ -135,8 +136,8 @@ impl InstanceGuard {
     }
 }
 
-/// [`InstanceGuard::begin_exit`] by raw handle, for the panic hook: once it
-/// lets go of the mutex, the dying process's window (still pumping in the
+/// [`InstanceGuard::begin_exit`] by raw handle, for the panic hook and the
+/// window-failure path: the dying process's window (still pumping in the
 /// MessageBox loop) must not answer later launches "shown".
 pub fn begin_exit_raw(hwnd: isize) {
     imp::begin_exit(hwnd);

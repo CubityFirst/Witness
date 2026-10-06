@@ -198,6 +198,9 @@ impl AppCore {
     /// including a watcher start/stop already in flight (up to 30 s). ⏳
     pub fn shutdown(&self) {
         super::assert_off_ui_thread("shutdown");
+        // The process is about to exit: a meeting that starts now must not
+        // auto-record a meeting the exit would then cut off unfinalized.
+        self.suspend_auto_record();
         shutdown(&self.rec_tx, SHUTDOWN_WAIT);
     }
 
