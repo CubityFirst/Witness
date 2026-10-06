@@ -6206,6 +6206,8 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "minisign",
+ "minisign-verify",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

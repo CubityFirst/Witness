@@ -1,11 +1,26 @@
 name: Release
 
-# Push a tag like v0.2.0 (after `npm run version:set -- 0.2.0` is committed).
-# Builds the signed NSIS installer and publishes it with latest.json, which
-# installed copies of Witness poll for in-app updates.
+# Bump with `cargo run -p xtask -- version X.Y.Z`, commit, then push the tag
+# vX.Y.Z (or run this workflow manually on that tag). Builds the signed NSIS
+# installer and publishes it with its .sig and latest.json, which installed
+# copies of Witness poll (releases/latest/download/latest.json) for updates.
+#
+# Prerelease first: a GitHub prerelease is invisible to releases/latest, so
+# installed copies do not see it until it is promoted with
+#   gh release edit vX.Y.Z --prerelease=false --latest
+# Tag pushes publish a prerelease unless the repository variable
+# RELEASE_PRERELEASE is exactly "false"; manual runs use the `prerelease`
+# input. Never publish a draft, and never use a semver prerelease version
+# (the installer's VIProductVersion must be numeric).
 on:
   push:
     tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: Publish as a GitHub prerelease (installed copies ignore it until promoted)
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -24,6 +39,7 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       LIBCLANG_PATH: C:\Program Files\LLVM\bin
+      CARGO_TARGET_DIR: ${{ github.workspace }}\target
 
     steps:
       - name: Check out source
@@ -31,48 +47,57 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Node.js
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version-file: .nvmrc
-          cache: npm
-
       - name: Install LLVM 19
         shell: pwsh
         run: choco install llvm --version=19.1.7 --allow-downgrade --yes --no-progress
 
-      - name: Install locked frontend dependencies
-        run: npm ci
-
-      - name: Validate frontend and release config
-        run: npm run check
-
-      - name: Check tag matches app version
-        shell: pwsh
-        run: |
-          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
-          if ("v$version" -ne $env:GITHUB_REF_NAME) {
-            throw "Tag $env:GITHUB_REF_NAME does not match app version $version (run npm run version:set)"
-          }
+      # Also fails a manual run started from a branch instead of a tag.
+      - name: Check the tag and release configuration
+        env:
+          TAG: ${{ github.ref_name }}
+        run: cargo run --locked -p xtask -- check --tag "$env:TAG"
 
       - name: Test locked Rust targets
-        working-directory: src-tauri
-        run: cargo test --locked
+        run: cargo test --workspace --locked
+
+      - name: Cache the NSIS toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/AppData/Local/witness-build
+          key: nsis-c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1-utils-5ba143b5db4a87d32d6e7802e033330aae56cbceabe0d1e3ba41948385ad4709
 
       - name: Build signed installer and update feed
-        shell: pwsh
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: ./scripts/build-windows-release.ps1 -Sign -Notes "See https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
+          NOTES: See https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+        run: cargo run --locked -p xtask -- dist --sign --notes "$env:NOTES"
 
       - name: Publish GitHub release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
+          PRERELEASE_INPUT: ${{ inputs.prerelease }}
+          PRERELEASE_VAR: ${{ vars.RELEASE_PRERELEASE }}
         run: |
-          $dir = "src-tauri/target/release/bundle/nsis"
-          $installer = Get-ChildItem $dir -Filter "*-setup.exe" | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
-          gh release create $env:GITHUB_REF_NAME `
-            $installer.FullName "$($installer.FullName).sig" "$dir/latest.json" `
-            --repo $env:GITHUB_REPOSITORY --title "Witness $env:GITHUB_REF_NAME" --generate-notes
+          # Decided here, not in an expression: `a && false || b` would fall
+          # through to b when the input is false.
+          if ($env:EVENT -eq 'workflow_dispatch') {
+            $prerelease = $env:PRERELEASE_INPUT -eq 'true'
+          } else {
+            $prerelease = $env:PRERELEASE_VAR -ne 'false'
+          }
+          $dir = "target/release/bundle/nsis"
+          $version = $env:TAG.TrimStart('v')
+          $installer = Join-Path $dir "Witness_${version}_x64-setup.exe"
+          foreach ($f in @($installer, "$installer.sig", "$dir/latest.json")) {
+            if (-not (Test-Path $f)) { throw "missing release asset $f" }
+          }
+          $flags = @()
+          if ($prerelease) { $flags += '--prerelease' }
+          Write-Host "publishing $env:TAG (prerelease: $prerelease)"
+          gh release create $env:TAG $installer "$installer.sig" "$dir/latest.json" `
+            --repo $env:GITHUB_REPOSITORY --title "Witness $env:TAG" --generate-notes @flags
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed ($LASTEXITCODE)" }

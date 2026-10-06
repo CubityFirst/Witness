@@ -33,8 +33,8 @@ ${StrLoc}
 
 !define MANUFACTURER "github"
 !define PRODUCTNAME "Witness"
-!define VERSION "0.1.0"
-!define VERSIONWITHBUILD "0.1.0.0"
+!define VERSION "0.2.1"
+!define VERSIONWITHBUILD "0.2.1.0"
 !define HOMEPAGE ""
 !define INSTALLMODE "currentUser"
 !define LICENSE ""
@@ -44,7 +44,7 @@ ${StrLoc}
 !define UNINSTALLERICON ""
 !define UNINSTALLERHEADERIMAGE ""
 !define MAINBINARYNAME "witness"
-!define MAINBINARYSRCPATH "G:\Scripts\Witness\src-tauri\target\release\witness.exe"
+!define MAINBINARYSRCPATH "C:\witness-port\wt\ref-021\src-tauri\target\release\witness.exe"
 !define BUNDLEID "com.github.cubityfirst.witness"
 !define COPYRIGHT ""
 !define OUTFILE "nsis-output.exe"
@@ -61,7 +61,7 @@ ${StrLoc}
 !define MANUKEY "Software\${MANUFACTURER}"
 !define MANUPRODUCTKEY "${MANUKEY}\${PRODUCTNAME}"
 !define UNINSTALLERSIGNCOMMAND ""
-!define ESTIMATEDSIZE "134121"
+!define ESTIMATEDSIZE "102522"
 !define STARTMENUFOLDER ""
 
 Var PassiveMode
@@ -462,7 +462,7 @@ FunctionEnd
 ;Languages
 !insertmacro MUI_LANGUAGE "English"
 !insertmacro MUI_RESERVEFILE_LANGDLL
-  !include "G:\Scripts\Witness\src-tauri\target\release\nsis\x64\English.nsh"
+  !include "C:\witness-port\wt\ref-021\src-tauri\target\release\nsis\x64\English.nsh"
 
 Function .onInit
   ${GetOptions} $CMDLINE "/P" $PassiveMode
@@ -639,8 +639,8 @@ Section Install
 
   ; Copy resources
     CreateDirectory "$INSTDIR\"
-    File /a "/oname=onnxruntime_providers_cuda.dll" "G:\Scripts\Witness\src-tauri\target\release\onnxruntime_providers_cuda.dll"
-    File /a "/oname=onnxruntime_providers_shared.dll" "G:\Scripts\Witness\src-tauri\target\release\onnxruntime_providers_shared.dll"
+    File /a "/oname=onnxruntime_providers_cuda.dll" "C:\witness-port\wt\ref-021\src-tauri\target\release\onnxruntime_providers_cuda.dll"
+    File /a "/oname=onnxruntime_providers_shared.dll" "C:\witness-port\wt\ref-021\src-tauri\target\release\onnxruntime_providers_shared.dll"
 
   ; Copy external binaries
 
