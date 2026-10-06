@@ -70,6 +70,10 @@ pub struct AppState {
     /// Meeting allowed to publish asynchronous live-caption readiness. Zero
     /// invalidates a worker that finishes initializing after its recording.
     pub live_captions_meeting_id: AtomicI64,
+    /// The meeting whose recording was most recently saved (WAVs finalized
+    /// and its row closed) in this process; zero before the first. Lets a
+    /// stop that waited out another thread's stop tell success from failure.
+    pub last_saved_recording: AtomicI64,
     pub pipeline: Pipeline,
     pub watcher: Arc<WatcherControl>,
     pub last_watcher_status: Mutex<WatcherStatus>,

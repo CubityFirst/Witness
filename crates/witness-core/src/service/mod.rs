@@ -237,6 +237,7 @@ impl AppCore {
             recording_trigger: Mutex::new(Trigger::Manual.as_str()),
             live_captions: AtomicBool::new(false),
             live_captions_meeting_id: AtomicI64::new(0),
+            last_saved_recording: AtomicI64::new(0),
             pipeline,
             watcher: watcher.clone(),
             last_watcher_status: Mutex::new(events::WatcherStatus {

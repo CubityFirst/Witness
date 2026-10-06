@@ -398,6 +398,7 @@ impl AppCore {
                 e
             ));
         }
+        state.last_saved_recording.store(id, Ordering::SeqCst);
         let transcribe = state.settings.lock().unwrap().auto_transcribe;
         // Keep the Idle transition and durable pipeline enqueue atomic with
         // backup start. The global lock order is recorder -> backup_in_progress.
@@ -498,16 +499,26 @@ impl AppCore {
     /// Stop the recording, waiting out a start or stop already running on
     /// another thread (as tray Quit does) until `deadline`. True when a
     /// recording was stopped and saved — by this call or by the stop it
-    /// waited for.
+    /// waited for (judged by `last_saved_recording`: that stop's failure
+    /// paths also end in Idle).
     fn stop_until_settled(&self, deadline: std::time::Instant) -> bool {
-        let mut waited_for_stop = false;
+        // The meeting whose stop is running elsewhere, once seen.
+        let mut waited_for = None;
         loop {
             match self.stop_recording(true) {
                 Ok(()) => return true,
-                Err(e) if e == "Not recording" => return waited_for_stop,
+                Err(e) if e == "Not recording" => {
+                    return waited_for.is_some_and(|id| {
+                        self.state.last_saved_recording.load(Ordering::SeqCst) == id
+                    });
+                }
                 Err(e) if e == STILL_STARTING || e == ALREADY_STOPPING => {
-                    if e == ALREADY_STOPPING {
-                        waited_for_stop = true;
+                    if e == ALREADY_STOPPING && waited_for.is_none() {
+                        if let RecorderState::Stopping { meeting_id, .. } =
+                            &*self.state.recorder.lock().unwrap()
+                        {
+                            waited_for = Some(*meeting_id);
+                        }
                     }
                     if std::time::Instant::now() >= deadline {
                         log::error!("emergency stop: {e} at the deadline");
@@ -689,21 +700,37 @@ mod tests {
         assert!(core.state.db.list_meetings(0, 10).unwrap().is_empty());
     }
 
-    #[test]
-    fn emergency_stop_waits_for_a_stop_running_elsewhere() {
+    /// Another thread's stop of meeting 7 runs; `saved` is whether it
+    /// saved the recording before going Idle (its failure paths go Idle too).
+    fn emergency_stop_behind_a_stop_elsewhere(saved: bool) -> bool {
         let (core, _sink, _dir) = scratch_core("emergency-stopping");
         *core.state.recorder.lock().unwrap() = RecorderState::Stopping {
-            meeting_id: 1,
+            meeting_id: 7,
             started_at: chrono::Local::now(),
         };
         let other = core.clone();
         let finisher = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
+            if saved {
+                other.state.last_saved_recording.store(7, Ordering::SeqCst);
+            }
             *other.state.recorder.lock().unwrap() = RecorderState::Idle;
         });
-        // The other thread's stop saved the recording: report it.
-        assert!(core.emergency_stop(Duration::from_secs(10)));
+        let stopped = core.emergency_stop(Duration::from_secs(10));
         finisher.join().unwrap();
+        stopped
+    }
+
+    #[test]
+    fn emergency_stop_waits_for_a_stop_running_elsewhere() {
+        // The other thread's stop saved the recording: report it.
+        assert!(emergency_stop_behind_a_stop_elsewhere(true));
+    }
+
+    #[test]
+    fn emergency_stop_never_claims_a_failed_stop_elsewhere_saved() {
+        // That stop failed (WAV finalize / DB) and went Idle: no "saved".
+        assert!(!emergency_stop_behind_a_stop_elsewhere(false));
     }
 
     #[test]

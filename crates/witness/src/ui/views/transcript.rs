@@ -370,12 +370,14 @@ struct Notes {
 impl Notes {
     /// The first load: `text` from the database, `queued` the newest draft
     /// an earlier visit handed to the writer (already matched to this
-    /// meeting's `started_at`), `ack` the writer's newest ack for the id.
-    /// That draft wins only while it may not have reached the database: its
-    /// write is still pending (the read may have beaten it) or it failed.
-    /// Only this view writes notes, so it is then the newest text, and its
-    /// ack settles it like any other write. Once its write succeeded the
-    /// database is the truth.
+    /// meeting's `started_at`), `ack` the writer's newest ack for the id AS
+    /// IT WAS WHEN THE READ WAS SPAWNED — not when its result arrives:
+    /// `meeting_detail` is several separately locked reads, so the writer
+    /// can land the draft and ack it after the notes were read but before
+    /// the result is consumed. That draft wins unless it was already saved
+    /// before the read began: its write was then pending (the read may have
+    /// beaten it) or it failed. Only this view writes notes, so it is then
+    /// the newest text, and its ack settles it like any other write.
     fn load(
         &mut self,
         text: &str,
@@ -464,6 +466,15 @@ impl Notes {
             NotesStatus::Saved => Some("Saved"),
         }
     }
+}
+
+/// An earlier visit's queued draft for this id, only if it belongs to the
+/// same meeting (`started_at`): a purged meeting's id can be reused, and its
+/// notes must never surface in the successor.
+fn queued_notes_for(queued: Option<&QueuedNotes>, started_at: &str) -> Option<(u64, String)> {
+    queued
+        .filter(|q| q.started_at == started_at)
+        .map(|q| (q.seq, q.text.clone()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1628,6 +1639,8 @@ struct TranscriptState {
 
     detail: Option<MeetingDetail>,
     load: Option<Task<CoreResult<MeetingDetail>>>,
+    /// `notes_acks[meeting_id]` when `load` was spawned (see `Notes::load`).
+    load_ack: Option<(u64, Option<String>)>,
     load_error: Option<String>,
     /// `refresh_tick` the current load answers.
     seen_refresh: Option<u64>,
@@ -1696,6 +1709,7 @@ impl TranscriptState {
             synthetic: synthetic_enabled(),
             detail: None,
             load: None,
+            load_ack: None,
             load_error: None,
             seen_refresh: None,
             reload_gen: 0,
@@ -1911,6 +1925,9 @@ impl TranscriptState {
             self.load_error = None;
         }
         let id = self.meeting_id;
+        // Before the read starts: an ack seen now is for a write the read
+        // will see.
+        self.load_ack = cx.shell.notes_acks.get(&id).cloned();
         self.load = Some(if self.synthetic {
             cx.tasks
                 .spawn("meeting-detail", move |_| Ok(synthetic_detail(id, 3_000)))
@@ -2000,17 +2017,14 @@ impl TranscriptState {
         let queued = if self.synthetic {
             None
         } else {
-            cx.memory
-                .queued_notes
-                .get(&self.meeting_id)
-                .filter(|q| q.started_at == detail.meeting.started_at)
-                .map(|q| (q.seq, q.text.clone()))
+            queued_notes_for(
+                cx.memory.queued_notes.get(&self.meeting_id),
+                &detail.meeting.started_at,
+            )
         };
-        self.notes.load(
-            &detail.meeting.notes,
-            queued,
-            cx.shell.notes_acks.get(&self.meeting_id),
-        );
+        let load_ack = self.load_ack.take();
+        self.notes
+            .load(&detail.meeting.notes, queued, load_ack.as_ref());
         self.load_error = None;
         self.speakers = detail
             .speakers
@@ -3229,6 +3243,8 @@ fn synthetic_detail(meeting_id: i64, count: usize) -> MeetingDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::ShellModel;
+    use witness_core::CoreEvent;
 
     fn seg(id: i64, start_ms: i64, text: &str) -> Segment {
         Segment {
@@ -3755,17 +3771,57 @@ mod tests {
         notes.load("same", Some((3, "same".into())), None);
         assert_eq!((notes.seq, notes.draft.as_str()), (0, "same"));
 
-        // Its write succeeded: the database is the truth, even when it
-        // differs (a reused id after a purge reads "").
+        // Its write succeeded before the read began: the database is the
+        // truth, even when it differs.
+        let mut notes = Notes::default();
+        notes.load("db", Some((7, "newer".into())), Some(&(7, None)));
+        assert_eq!((notes.seq, notes.draft.as_str()), (0, "db"));
+        assert_eq!(notes.take_flush(7), None);
+    }
+
+    #[test]
+    fn an_ack_landing_after_the_read_never_lets_the_stale_read_win() {
+        // Visit 1 queued seq 7; the reopen spawns its read before the ack.
+        let mut shell = ShellModel::new();
+        let at_spawn = shell.notes_acks.get(&1).cloned();
+        // The read got the old text, then the writer saved seq 7 and its
+        // ack was applied before the view consumed the read.
+        shell.apply(&CoreEvent::NotesSaved {
+            meeting_id: 1,
+            seq: 7,
+        });
+        let mut notes = Notes::default();
+        notes.load("X", Some((7, "X Y".into())), at_spawn.as_ref());
+        assert_eq!(notes.draft, "X Y", "the saved draft, not the stale read");
+        assert_eq!(notes.on_ack(shell.notes_acks.get(&1)), None);
+        assert_eq!(notes.confirmed, "X Y");
+        // Typing on builds on the saved text.
+        notes.draft = "X Y Z".into();
+        notes.edited();
+        assert_eq!(notes.take_flush(7).as_deref(), Some("X Y Z"));
+    }
+
+    #[test]
+    fn a_purged_meetings_queued_notes_stay_out_of_its_id_successor() {
+        let queued = QueuedNotes {
+            started_at: "2026-10-01T09:00:00+01:00".into(),
+            seq: 7,
+            text: "purged meeting's notes".into(),
+        };
+        assert_eq!(
+            queued_notes_for(Some(&queued), "2026-10-01T09:00:00+01:00"),
+            Some((7, "purged meeting's notes".into()))
+        );
+        // The successor's write is still unacked and the draft differs, so
+        // only the started_at match keeps it out.
         let mut notes = Notes::default();
         notes.load(
             "",
-            Some((7, "purged meeting's notes".into())),
-            Some(&(7, None)),
+            queued_notes_for(Some(&queued), "2026-10-06T14:00:00+01:00"),
+            None,
         );
         assert_eq!((notes.seq, notes.draft.as_str()), (0, ""));
         assert!(!notes.open);
-        assert_eq!(notes.take_flush(7), None);
     }
 
     #[test]
