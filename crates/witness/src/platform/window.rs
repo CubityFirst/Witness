@@ -121,14 +121,15 @@ impl MainWindow {
     }
 
     /// Hand the current primary press to the OS move loop (title-bar drag).
-    pub fn start_drag(&self) {
-        if let Err(error) = self.window.drag_window() {
+    pub fn start_drag(&self) -> Result<(), String> {
+        self.window.drag_window().map_err(|error| {
             log::debug!("window drag failed: {error}");
-        }
+            error.to_string()
+        })
     }
 
     /// Hand the current primary press to the OS sizing loop (Aero Snap works).
-    pub fn begin_resize(&self, dir: egui::ResizeDirection) {
+    pub fn begin_resize(&self, dir: egui::ResizeDirection) -> Result<(), String> {
         use winit::window::ResizeDirection as W;
         let dir = match dir {
             egui::ResizeDirection::North => W::North,
@@ -140,9 +141,10 @@ impl MainWindow {
             egui::ResizeDirection::NorthWest => W::NorthWest,
             egui::ResizeDirection::SouthWest => W::SouthWest,
         };
-        if let Err(error) = self.window.drag_resize_window(dir) {
+        self.window.drag_resize_window(dir).map_err(|error| {
             log::debug!("window resize failed: {error}");
-        }
+            error.to_string()
+        })
     }
 
     /// Close to tray (the caller has already run `will_hide()`).

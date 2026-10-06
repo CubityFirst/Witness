@@ -302,7 +302,9 @@ pub fn show(ui: &mut egui::Ui, cx: &mut UiCtx) -> TopBarOutput {
         if press.is_some_and(|p| press_drags_window(p, screen)) {
             // Our own title-bar drag turns the tray flyout into a window.
             cx.flyout.pin();
-            cx.window.start_drag();
+            if let Err(error) = cx.window.start_drag() {
+                cx.toasts.error("Could not move the window", error);
+            }
         }
     }
     if response.double_clicked() {
@@ -852,7 +854,9 @@ pub fn resize_edges(ui: &mut egui::Ui, cx: &mut UiCtx) {
     }
     if let Some(dir) = edge_resize(&ctx, "main") {
         cx.flyout.pin();
-        cx.window.begin_resize(dir);
+        if let Err(error) = cx.window.begin_resize(dir) {
+            cx.toasts.error("Could not resize the window", error);
+        }
     }
 }
 
