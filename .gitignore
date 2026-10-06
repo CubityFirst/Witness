@@ -1,8 +1,7 @@
-node_modules/
-dist/
+# Tauri-era dev data dirs: untracked, but they hold real dev data (databases,
+# audio, models). Never delete them; dev settings point data_dir at them.
 src-tauri/target/
 src-tauri/target-test/
-src-tauri/gen/schemas/
 *.log
 witness-settings.toml
 # Machine-local build tool locations (CMAKE, LIBCLANG_PATH). CONTRIBUTING.md

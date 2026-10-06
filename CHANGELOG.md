@@ -6,6 +6,39 @@ still evolve quickly.
 
 ## Unreleased
 
+### Native UI
+
+- The user interface is rewritten natively in Rust with egui/eframe. Tauri,
+  WebView2 (and its helper processes), Node.js, npm, Vite, Preact and
+  TypeScript are gone; Witness is a single `witness.exe` with a far smaller
+  dependency tree. The backend, database, archive format, settings file and
+  data directory are unchanged, so existing data opens as before.
+- Updates continue through the same feed and signing key: 0.2.x installs
+  update into this release through their built-in updater, into the same
+  per-user install location, keeping shortcuts, the autostart entry and all
+  data. The installer now removes the leftover WebView2 profile
+  (`%LOCALAPPDATA%\com.github.cubityfirst.witness\EBWebView`).
+- The built-in updater is native: it verifies the minisign signature and the
+  signed version against the pinned key, uses the Windows certificate store,
+  and honours the system (WinINet) and environment proxy settings.
+- The player volume, playback speed and the dismissed model banner are now
+  stored in `ui-state.toml` in the data directory; they reset once when
+  upgrading from 0.2.x.
+- New "Copy to clipboard" item in the transcript Export menu.
+- Native save and folder dialogs are now modal over the Witness window.
+- Startup failures (for example an unreadable settings file) and internal
+  errors now show a message instead of exiting silently; an internal error
+  saves the recording in progress before closing.
+- Known regressions, accepted for this release:
+  - high-contrast themes are detected but the app keeps its own dark
+    palette;
+  - right-to-left scripts (Arabic, Hebrew, Persian) display in logical
+    order rather than being reordered;
+  - no spellcheck in meeting notes;
+  - in long transcripts, a drag selection only spans the rows currently on
+    screen — use Export → Copy to clipboard instead;
+  - dates use a fixed day-month-year format.
+
 ### Added
 
 - Durable, revisioned processing jobs with crash recovery and live-work

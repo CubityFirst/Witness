@@ -25,7 +25,7 @@ recording other people.
   default bitrate.
 - Runs Parakeet TDT or Whisper transcription locally. Parakeet supports live
   captions; the final transcript replaces those provisional captions.
-- Diarizes up to four remote speakers and stores explicit speaker enrollments
+- Diarizes up to eight remote speakers and stores explicit speaker enrollments
   as local voice-print embeddings.
 - Searches transcript text and notes with SQLite FTS5.
 - Recovers interrupted recordings and queued processing after a restart.
@@ -160,32 +160,35 @@ Common problems:
 
 ## Build from source
 
+Witness is a pure Rust Cargo workspace: `crates/witness-core` (the backend
+library), `crates/witness` (the native egui app, `witness.exe`) and `xtask`
+(build, signing and release tooling). No Node.js, npm, or WebView2 is needed.
+
 Requirements:
 
-- Rust stable with the MSVC target;
-- Node.js 24.15.x and npm (the supported range is `>=24.15 <25`);
+- Rust with the MSVC target (the toolchain is pinned in
+  `rust-toolchain.toml`; rustup installs it on first use);
 - Visual Studio Build Tools with Desktop C++ and CMake; and
 - LLVM/libclang 19.x for bindgen. Put CMake on `PATH` and set
   `LIBCLANG_PATH` to your LLVM `bin` directory when it is not discoverable.
   Do not rely on machine-specific paths in repository configuration.
 
 ```powershell
-npm ci
-npm run build
-Set-Location src-tauri
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
-Set-Location ..
-npm run tauri dev
+cargo test --workspace --locked
+cargo clippy --workspace --locked --all-targets -- -D warnings
+cargo run -p witness
 ```
 
-Build the NSIS installer with `npm run release:windows`. The command compiles
-first, verifies the generated ONNX Runtime provider DLLs, and only then bundles
-them through the release configuration. The base Tauri configuration keeps
-bundling disabled so a one-phase `tauri build` cannot silently omit those DLLs.
-The default Whisper build uses CPU; `--features whisper-cuda` requires a
-compatible CUDA toolkit. Runtime CUDA support for Parakeet also needs a
-compatible NVIDIA driver and cuDNN 9.
+Build the NSIS installer with `cargo run -p xtask -- dist`. It compiles the
+release `witness.exe`, verifies its version resource and that both ONNX
+Runtime provider DLLs were produced next to it, fetches the pinned NSIS
+toolchain (SHA-256 verified) into `%LOCALAPPDATA%\witness-build`, and writes
+`Witness_<version>_x64-setup.exe` under `<target>\release\bundle\nsis\`.
+`cargo run -p xtask -- help` lists the other release commands.
+
+The default Whisper build uses CPU; `--features witness-core/whisper-cuda`
+requires a compatible CUDA toolkit. Runtime CUDA support for
+Parakeet also needs a compatible NVIDIA driver and cuDNN 9.
 
 See [Contributing](CONTRIBUTING.md) and the
 [release checklist](docs/RELEASE_CHECKLIST.md) before proposing a change or
@@ -196,10 +199,10 @@ shipping an artifact.
 - Windows 11 only; Teams is the only built-in auto-detection target.
 - No echo cancellation. Speakers can bleed remote audio into the microphone
   track; a headset is recommended.
-- Diarization supports at most four remote speakers.
+- Diarization supports at most eight remote speakers.
 - Voice matching is probabilistic. Approximate matches are marked and should be
   confirmed or corrected.
-- Live captions are provisional and are not backfilled after a UI reload.
+- Live captions are provisional; the final transcript replaces them.
 - No application-level encryption or cloud synchronization.
 
 ## Security and license

@@ -1,35 +1,43 @@
 # Contributing
 
-Witness is a Windows-first Rust/Tauri application. Keep changes small enough to
-review, preserve local-data safety, and add regression tests for failure paths.
+Witness is a Windows-first Rust application with a native egui UI. Keep
+changes small enough to review, preserve local-data safety, and add regression
+tests for failure paths.
 
 ## Development setup
 
-Install Rust stable with the MSVC target, Node.js 24.15.x (`>=24.15 <25`), Visual Studio Build Tools
-with Desktop C++ and CMake, and LLVM/libclang 19.x. Put CMake on `PATH`; set
-`LIBCLANG_PATH` to the LLVM `bin` directory if bindgen cannot find it. Developer
-machines must supply their own paths rather than committing machine-specific
-tool locations.
+Install Rust with the MSVC target (`rust-toolchain.toml` pins the version),
+Visual Studio Build Tools with Desktop C++ and CMake, and LLVM/libclang 19.x.
+Put CMake on `PATH`; set `LIBCLANG_PATH` to the LLVM `bin` directory if
+bindgen cannot find it. Developer machines must supply their own paths (for
+example in an untracked `.cargo/config.toml`) rather than committing
+machine-specific tool locations. No Node.js or npm is involved.
+
+The repository root is a Cargo workspace: `crates/witness-core` (backend
+library), `crates/witness` (the `witness.exe` app) and `xtask` (release
+tooling, run as `cargo run -p xtask -- <command>`).
 
 ```powershell
-npm ci
-npm run tauri dev
+cargo run -p witness
 ```
+
+To keep a development build away from your real recordings, point
+`WITNESS_SETTINGS` at a scratch `witness-settings.toml` whose `data_dir` is an
+empty folder.
 
 Model integration tests download gigabytes and real-device tests interact with
 Windows audio. They are ignored by default; run them deliberately and never put
-private meeting audio into fixtures or bug reports.
+private meeting audio into fixtures or bug reports. Their models resolve to
+`<target>\debug\models`, or to `WITNESS_MODELS_DIR` when set.
 
 ## Before opening a pull request
 
 ```powershell
-npm run check
-npm audit --audit-level=high
-Set-Location src-tauri
 cargo fmt --all --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
-cargo audit --deny unsound --ignore RUSTSEC-2026-0221 --ignore RUSTSEC-2024-0429
+cargo clippy --workspace --locked --all-targets -- -D warnings
+cargo test --workspace --locked
+cargo run --locked -p xtask -- check
+cargo audit --deny unsound --ignore RUSTSEC-2024-0429
 ```
 
 Also perform the smallest relevant manual test: capture and playback for audio
@@ -53,3 +61,9 @@ handling changes.
 - Avoid unbounded queues and long uninterruptible inference calls.
 - Preserve the single-process, tray-first design and explicit recorder state
   transitions.
+- Never block the UI thread: blocking `AppCore` calls run through the app's
+  task helpers (`Tasks::spawn` for loads, `Tasks::spawn_op` for actions), and
+  debug builds assert this.
+- Changes to the installer, update feed, signing, or `service/updater.rs` must
+  keep installed 0.2.x and later copies able to update (see the release
+  checklist); `cargo run -p xtask -- check` guards the fixed values.

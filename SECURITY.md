@@ -33,26 +33,23 @@ Security-sensitive changes should preserve these invariants:
 - database migrations are transactional and forward-only;
 - paths originating in the database cannot escape their designated root;
 - incomplete writes are never published as settings, recordings, models, or
-  backups; and
-- Tauri capabilities and content security policy stay least-privilege.
+  backups;
+- there is no IPC surface: the UI is native code in the same process, with no
+  embedded browser, local web server, or custom URL protocol (the only
+  cross-process channel is the single-instance message, which only shows
+  the window and is logged, never interpreted as a command); and
+- the updater installs only an installer whose minisign signature verifies
+  against the pinned public key and whose signed trusted comment carries the
+  same `version:` as the update feed.
 
 ## Temporary advisory acceptance
 
-As of 2026-08-11, `npm audit` reports the moderate
-[PostCSS source-map advisory GHSA-fxqj-rqcc-2cmp](https://github.com/advisories/GHSA-fxqj-rqcc-2cmp)
-through Vite, with no compatible fix available. Witness accepts this finding
-temporarily because PostCSS is a development-only build dependency, packaged
-applications do not include the build tool, and CI processes only
-repository-controlled CSS with an explicit source path. CI continues to fail
-on high or critical npm advisories, Dependabot tracks upstream releases, and
-the waiver must be removed when a compatible patched dependency is available.
-Rust dependencies are checked against RustSec on every pull request.
-
-The RustSec gate denies new unsoundness findings. It explicitly ignores
-`RUSTSEC-2026-0221` (`event-listener`) and `RUSTSEC-2024-0429` (`glib`) because
-neither crate is present in the resolved Windows target dependency tree; they
-remain in the cross-platform lockfile through upstream packages. The audit also
-reports several unmaintained transitive crates, including the current Opus
-binding. These are maintenance warnings rather than known vulnerabilities and
-remain tracked through dependency updates. Recheck both exceptions whenever
-Tauri, audio, or target dependencies change.
+Rust dependencies are checked against RustSec on every pull request. The gate
+denies new unsoundness findings. It explicitly ignores `RUSTSEC-2024-0429`
+(`glib`) because that crate is reached only through the tray library's Linux
+GTK backend and is never compiled for Windows; it remains in the
+cross-platform lockfile through upstream packages. The audit also reports
+several unmaintained transitive crates, including the current Opus binding.
+These are maintenance warnings rather than known vulnerabilities and remain
+tracked through dependency updates. Recheck the exception whenever the UI,
+tray, audio, or target dependencies change.
