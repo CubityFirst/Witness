@@ -1,7 +1,7 @@
 //! In-app updates from GitHub Releases, replacing tauri-plugin-updater 2.12.0
 //! with the same feed, the same minisign key and the same NSIS installer
-//! flags â€” every 0.2.x install updates through its Tauri updater, and every
-//! native build must keep consuming the very same `latest.json` (design Â§8.1).
+//! flags — every 0.2.x install updates through its Tauri updater, and every
+//! native build must keep consuming the very same `latest.json` (design §8.1).
 //!
 //! Flow:
 //! - **Check** (`check_for_update`, also run once 30 s after startup when
@@ -9,7 +9,7 @@
 //!   plugin (`name` alias, leading `v`, RFC 3339 `pub_date`,
 //!   `windows-x86_64-nsis` then `windows-x86_64`), and remember a strictly
 //!   newer release as `pending_update`.
-//! - **Download** (`download_update`, always a click in Settings â†’ Updates):
+//! - **Download** (`download_update`, always a click in Settings → Updates):
 //!   stream the installer into `%TEMP%\Witness-{ver}-updater-XXXXXX\`, then
 //!   check the `MZ` header and the minisign signature against the embedded
 //!   key, *requiring* the signed `version:` to match the feed. Any failure
@@ -23,7 +23,7 @@
 //! (the Windows certificate store, so enterprise roots pushed by GPO and
 //! TLS-inspecting proxies work) and the WinINet system proxy (honouring
 //! `ProxyOverride`), otherwise the `HTTPS_PROXY`/`ALL_PROXY` environment
-//! (honouring `NO_PROXY`). PAC/WPAD and NTLM proxy auth are unsupported â€” as
+//! (honouring `NO_PROXY`). PAC/WPAD and NTLM proxy auth are unsupported — as
 //! they were with the plugin.
 
 use super::{AppCore, CoreEvent, CoreResult, UpdateInfo};
@@ -49,7 +49,7 @@ pub const UPDATER_PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYy
 /// recovery, model preflight, or an auto-started recording.
 pub(crate) const STARTUP_CHECK_DELAY: Duration = Duration::from_secs(30);
 
-/// Feed platform keys, most specific first â€” the plugin's lookup order for
+/// Feed platform keys, most specific first — the plugin's lookup order for
 /// a binary stamped as an NSIS bundle.
 const PLATFORM_KEYS: [&str; 2] = ["windows-x86_64-nsis", "windows-x86_64"];
 
@@ -239,7 +239,7 @@ fn http_error(what: &str, error: ureq::Error) -> anyhow::Error {
 /// `expected_version` (port of the plugin's `verify_signature`).
 ///
 /// A signed version that differs is always rejected; a missing one only
-/// when `require_signed_version` â€” the native updater requires it, because
+/// when `require_signed_version` — the native updater requires it, because
 /// every release from 0.3.0 on is signed by the xtask with `version:`.
 pub(crate) fn verify(
     installer: &[u8],
@@ -368,8 +368,8 @@ fn usable_proxy(source: &str, address: &str) -> Option<ureq::Proxy> {
     }
 }
 
-/// The environment proxy for HTTPS requests â€” `HTTPS_PROXY`, then
-/// `ALL_PROXY` (each upper case first, as reqwest read them) â€” unless
+/// The environment proxy for HTTPS requests — `HTTPS_PROXY`, then
+/// `ALL_PROXY` (each upper case first, as reqwest read them) — unless
 /// `NO_PROXY` covers every one of `hosts`. `var` reads a variable (injected
 /// so tests need not touch the process environment).
 fn env_proxy(var: impl Fn(&str) -> Option<String>, hosts: &[&str]) -> Option<String> {
@@ -461,7 +461,7 @@ fn wininet_proxy(server: &str, overrides: &str, hosts: &[&str]) -> SystemProxy {
 }
 
 /// `ProxyServer` is either one `host:port` for every protocol, or the
-/// per-protocol `http=host:port;https=host:port;â€¦` form. We only ever make
+/// per-protocol `http=host:port;https=host:port;…` form. We only ever make
 /// HTTPS requests, so `https=` wins; `http=` is the fallback.
 fn https_proxy_server(server: &str) -> Option<String> {
     let server = server.trim();
@@ -563,8 +563,8 @@ fn download_release(
 
 /// Stream `body` into `temp_root\Witness-{ver}-updater-XXXXXX\Witness-{ver}-installer.exe`
 /// (the plugin's layout), then check the `MZ` header and the signature.
-/// On ANY error once the dir exists â€” a network read, a short body, a bad
-/// header or signature â€” the dir is removed before returning, so no
+/// On ANY error once the dir exists — a network read, a short body, a bad
+/// header or signature — the dir is removed before returning, so no
 /// unverified executable stays on disk. It survives only on success,
 /// because the installer must still exist when ShellExecute runs.
 fn save_and_verify(
@@ -698,9 +698,9 @@ fn random_suffix(salt: u32) -> String {
 
 /// A downloaded, verified installer ready to launch.
 ///
-/// Dropping it without a successful [`launch`](Self::launch) â€” the exit
+/// Dropping it without a successful [`launch`](Self::launch) — the exit
 /// guard refused (a recording started during the download, a backup), the
-/// launch failed, or the app quit first â€” removes its temp dir, so the
+/// launch failed, or the app quit first — removes its temp dir, so the
 /// ~100 MB installer never piles up in %TEMP% across retries (0.2.x checked
 /// those guards before writing any file). After a successful launch the
 /// installer must outlive this process, so it is kept (and `process::exit`
@@ -746,8 +746,8 @@ impl PreparedUpdate {
     /// rewrite, relaunch with this process's arguments (e.g. `--minimized`).
     ///
     /// Err (the bare reason; the caller prefixes "Installing the update
-    /// failed: ") when ShellExecute reports failure (â‰¤ 32) â€” the process
-    /// keeps running in that case (design Â§4.5).
+    /// failed: ") when ShellExecute reports failure (≤ 32) — the process
+    /// keeps running in that case (design §4.5).
     pub fn launch(&self, relaunch_args: &[OsString]) -> CoreResult<()> {
         let parameters = nsis_parameters(relaunch_args);
         log::info!(
@@ -887,12 +887,12 @@ pub(crate) fn spawn_startup_check(core: Arc<AppCore>) {
                         info.version
                     );
                     core.toast(&format!(
-                        "Witness {} is available â€” install it from Settings â†’ Updates.",
+                        "Witness {} is available — install it from Settings → Updates.",
                         info.version
                     ));
                 }
                 Ok(None) => log::info!("update check: up to date"),
-                // Offline, feed not published yet, etc. â€” never worth a toast.
+                // Offline, feed not published yet, etc. — never worth a toast.
                 Err(e) => log::warn!("update check failed: {e}"),
             }
         });
@@ -903,7 +903,7 @@ pub(crate) fn spawn_startup_check(core: Arc<AppCore>) {
 
 impl AppCore {
     /// Fetch the feed and remember a newer release as pending (or clear the
-    /// pending one when up to date). â³
+    /// pending one when up to date). ⏳
     pub fn check_for_update(&self) -> CoreResult<Option<UpdateInfo>> {
         super::assert_off_ui_thread("check_for_update");
         let current = semver::Version::parse(current_version()).map_err(super::err)?;
@@ -926,7 +926,7 @@ impl AppCore {
 
     /// Download and verify the pending installer into %TEMP%, emitting
     /// `UpdateProgress`. Fails fast while the recorder is busy (re-checked
-    /// under the locks by `exit_guard` before launch). â³
+    /// under the locks by `exit_guard` before launch). ⏳
     pub fn download_update(&self) -> CoreResult<PreparedUpdate> {
         super::assert_off_ui_thread("download_update");
         let release = self
@@ -934,7 +934,7 @@ impl AppCore {
             .lock()
             .unwrap()
             .clone()
-            .ok_or("No update is pending â€” check for updates first")?;
+            .ok_or("No update is pending — check for updates first")?;
         // Fail fast before a ~100 MB download.
         if self.state.recorder.lock().unwrap().is_busy() {
             return Err("Stop the recording before installing the update".into());
@@ -1094,7 +1094,7 @@ mod tests {
 
     // --- signatures --------------------------------------------------------
 
-    /// A throwaway key pair, plus its public key as base64 of the key box â€”
+    /// A throwaway key pair, plus its public key as base64 of the key box —
     /// the form the feed config (and `UPDATER_PUBKEY`) carries.
     fn throwaway_key() -> (minisign::KeyPair, String) {
         let pair = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
@@ -1779,7 +1779,7 @@ mod tests {
         assert!(core.pending_update().is_none());
         assert_eq!(
             core.download_update().unwrap_err(),
-            "No update is pending â€” check for updates first"
+            "No update is pending — check for updates first"
         );
         *core.pending_update.lock().unwrap() = parse_feed(FEED, &v("0.0.1")).unwrap();
         let info = core.pending_update().unwrap();
