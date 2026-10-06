@@ -126,28 +126,196 @@ pub(crate) fn wrap_lines(widths: &[f32], available: f32, gap: f32) -> Vec<Range<
     lines
 }
 
-/// Draw the bar inside `Panel::top("topbar")`.
-pub fn show(ui: &mut egui::Ui, cx: &mut UiCtx) -> TopBarOutput {
-    let mut out = TopBarOutput::default();
-    let screen = ui.ctx().content_rect();
-    let column_gap = if narrow(ui) { 8.0 } else { 12.0 };
-
-    let recording = cx.shell.recording();
+/// The units of the bar for this state, in DOM order.
+fn bar_units(recording: bool, live_captions: bool, popup: bool) -> Vec<Unit> {
     let mut units = vec![Unit::Record];
     if recording {
         // Bookmarking works for any recording; the overlay button only
         // makes sense when a live-caption session actually started (the
         // core rejects it otherwise).
         units.push(Unit::Bookmark);
-        if cx.shell.live_captions_active() {
+        if live_captions {
             units.push(Unit::Captions);
         }
     }
     units.push(Unit::Pill);
     units.push(Unit::Nav);
-    if !cx.flyout.is_popup() {
+    if !popup {
         units.push(Unit::Controls);
     }
+    units
+}
+
+/// The highlighted navigation item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NavItem {
+    Meetings,
+    People,
+    Settings,
+}
+
+/// What the bar shows this pass. Plain data, so the bar can be laid out
+/// headless in tests; [`show`] builds it from the [`UiCtx`] and performs
+/// the [`BarAction`]s the pass produced.
+struct BarModel {
+    units: Vec<Unit>,
+    recording: bool,
+    /// A start or stop is in flight (`ShellModel::recording_action`).
+    busy: bool,
+    pill: PillState,
+    bookmark_tooltip: String,
+    /// Microphone and system-audio RMS (0..1).
+    levels: (f32, f32),
+    /// Ease the level meter; never in a hidden window (a hidden root still
+    /// runs full passes).
+    animate_meter: bool,
+    /// Meetings is "active" only on Meetings (not on Search or a
+    /// transcript).
+    active: Option<NavItem>,
+}
+
+impl BarModel {
+    fn of(cx: &UiCtx) -> BarModel {
+        let recording = cx.shell.recording();
+        BarModel {
+            units: bar_units(
+                recording,
+                cx.shell.live_captions_active(),
+                cx.flyout.is_popup(),
+            ),
+            recording,
+            busy: cx.shell.recording_action,
+            pill: PillState::of(cx.shell),
+            bookmark_tooltip: bookmark_tooltip(cx.shell.bookmark_hotkey.as_deref()),
+            levels: cx
+                .shell
+                .level
+                .as_ref()
+                .map_or((0.0, 0.0), |l| (l.mic_rms, l.loopback_rms)),
+            animate_meter: cx.window.is_shown()
+                && !cx.window.is_minimized()
+                && icons::animations_enabled(),
+            active: match cx.view {
+                View::Meetings => Some(NavItem::Meetings),
+                View::People => Some(NavItem::People),
+                View::Settings => Some(NavItem::Settings),
+                View::Transcript { .. } | View::Search { .. } => None,
+            },
+        }
+    }
+}
+
+/// A click in the bar, performed by [`show`] after the pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BarAction {
+    /// Record when idle, Stop while recording.
+    Record,
+    Bookmark,
+    ShowCaptions,
+    /// The recording pill: open the recording's transcript.
+    OpenTranscript,
+    Nav(NavItem),
+    Minimize,
+    Maximize,
+    Close,
+}
+
+/// One pass of the bar.
+struct DrawnBar {
+    /// The background's click-and-drag response (the whole bar, padding
+    /// included).
+    response: egui::Response,
+    actions: Vec<BarAction>,
+    /// Where each unit landed.
+    rects: Vec<(Unit, Rect)>,
+}
+
+/// Whether a press at `press` drags the window: anywhere on the bar except
+/// within 8 pt of the window's top, left or right edge (the resize border).
+/// Tested on where the press began, not where the drag threshold was
+/// crossed (CSS tested the mousedown position).
+fn press_drags_window(press: egui::Pos2, screen: Rect) -> bool {
+    !(press.y - screen.top() < EDGE_GRAB
+        || press.x - screen.left() < EDGE_GRAB
+        || screen.right() - press.x < EDGE_GRAB)
+}
+
+/// Draw the bar inside `Panel::top("topbar")` (framed by [`frame`]).
+pub fn show(ui: &mut egui::Ui, cx: &mut UiCtx) -> TopBarOutput {
+    let model = BarModel::of(cx);
+    let bar = draw_bar(ui, &model);
+
+    let mut out = TopBarOutput::default();
+    for action in bar.actions {
+        match action {
+            BarAction::Record => cx.submit_rec(if model.recording {
+                RecCmd::Stop { by_user: true }
+            } else {
+                RecCmd::Start(Trigger::Manual)
+            }),
+            // `app.rs` toasts "Bookmark added" or the error on the reply.
+            BarAction::Bookmark => cx.submit_rec(RecCmd::BookmarkNow),
+            // The core check is ⏳, so it runs as an op;
+            // `OpDone::CaptionsCheck` shows the overlay or toasts "Could not
+            // show the caption overlay: …".
+            BarAction::ShowCaptions => {
+                cx.tasks.spawn_op_or(
+                    "captions-check",
+                    |c| OpDone::CaptionsCheck(c.check_captions_overlay()),
+                    |error| OpDone::CaptionsCheck(Err(error)),
+                );
+            }
+            BarAction::OpenTranscript => {
+                if let Some(meeting_id) = cx.shell.status.as_ref().and_then(|s| s.meeting_id) {
+                    // Transcripts never nest: from a transcript, Back goes
+                    // to where that transcript came from.
+                    let from = match cx.view {
+                        View::Transcript { from, .. } => from.clone(),
+                        other => Some(Box::new(other.clone())),
+                    };
+                    cx.nav.go(View::Transcript {
+                        meeting_id,
+                        segment_id: None,
+                        highlight: None,
+                        from,
+                    });
+                }
+            }
+            // Clears the search box (cancelling a pending debounce) so the
+            // box matches the unfiltered list.
+            BarAction::Nav(NavItem::Meetings) => cx.go_meetings_clear_search(),
+            BarAction::Nav(NavItem::People) => cx.nav.go(View::People),
+            BarAction::Nav(NavItem::Settings) => cx.nav.go(View::Settings),
+            // Minimize and close are performed by `app.rs`, which runs
+            // `will_hide()` first.
+            BarAction::Minimize => out.minimize = true,
+            BarAction::Maximize => cx.window.toggle_maximize(),
+            BarAction::Close => out.close = true,
+        }
+    }
+
+    let response = bar.response;
+    if response.drag_started_by(egui::PointerButton::Primary) {
+        let screen = ui.ctx().content_rect();
+        let press = ui.input(|i| i.pointer.press_origin());
+        if press.is_some_and(|p| press_drags_window(p, screen)) {
+            // Our own title-bar drag turns the tray flyout into a window.
+            cx.flyout.pin();
+            cx.window.start_drag();
+        }
+    }
+    if response.double_clicked() {
+        cx.window.toggle_maximize();
+    }
+    out
+}
+
+/// Lay out and draw the bar's units (flex-wrap, see the module docs).
+fn draw_bar(ui: &mut egui::Ui, model: &BarModel) -> DrawnBar {
+    let column_gap = if narrow(ui) { 8.0 } else { 12.0 };
+    let units = &model.units;
+    let mut actions = Vec::new();
+    let mut rects = Vec::new();
 
     let widths_id = ui.id().with("topbar-unit-widths");
     let mut measured: MeasuredWidths = ui.data(|d| d.get_temp(widths_id).unwrap_or_default());
@@ -168,73 +336,97 @@ pub fn show(ui: &mut egui::Ui, cx: &mut UiCtx) -> TopBarOutput {
     };
 
     // The bar's own response is registered behind the widgets, so buttons
-    // keep their clicks and only the background drags the window.
+    // keep their clicks and only the background drags the window. The
+    // padding sits inside the sensing scope: like the web header's mouse
+    // handlers, the whole bar drags, padding included.
     let bar = ui.scope_builder(
         egui::UiBuilder::new().sense(Sense::click_and_drag()),
         |ui| {
-            ui.set_min_width(ui.available_width());
-            let available = ui.available_width();
-            let lines = wrap_lines(&widths_of(&measured), available, column_gap);
-            ui.spacing_mut().item_spacing.y = ROW_GAP;
-            for line in &lines {
-                let line_units = &units[line.clone()];
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = column_gap;
-                    let nav_at = line_units.iter().position(|u| *u == Unit::Nav);
-                    for &unit in &line_units[..nav_at.unwrap_or(line_units.len())] {
-                        let width = draw_unit(ui, unit, cx, &mut out);
-                        measured.set(unit, width);
-                    }
-                    if let Some(at) = nav_at {
-                        // `margin-left: auto`: the rest of the line hugs the
-                        // right edge (drawn right to left).
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.spacing_mut().item_spacing.x = column_gap + CONTROLS_MARGIN;
-                            for &unit in line_units[at..].iter().rev() {
-                                let width = draw_unit(ui, unit, cx, &mut out);
-                                measured.set(unit, width);
+            Frame::new().inner_margin(BAR_PADDING).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                let available = ui.available_width();
+                let lines = wrap_lines(&widths_of(&measured), available, column_gap);
+                ui.spacing_mut().item_spacing.y = ROW_GAP;
+                for line in &lines {
+                    let line_units = &units[line.clone()];
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = column_gap;
+                        let nav_at = line_units.iter().position(|u| *u == Unit::Nav);
+                        for &unit in &line_units[..nav_at.unwrap_or(line_units.len())] {
+                            if unit == Unit::Controls {
+                                // Wrapped without the nav, the controls start
+                                // their line, after their 4 px margin.
+                                ui.add_space(CONTROLS_MARGIN);
                             }
-                        });
-                    }
-                });
-            }
-            // A new measurement moved a unit to another line: redo the pass
-            // so the stale layout is never shown.
-            if wrap_lines(&widths_of(&measured), available, column_gap) != lines {
-                ui.ctx().request_discard("top bar wrap changed");
-            }
+                            let rect = draw_unit(ui, unit, model, &mut actions);
+                            measured.set(unit, rect.width());
+                            rects.push((unit, rect));
+                        }
+                        if let Some(at) = nav_at {
+                            // `margin-left: auto`: the rest of the line hugs
+                            // the right edge (drawn right to left).
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.spacing_mut().item_spacing.x = column_gap + CONTROLS_MARGIN;
+                                for &unit in line_units[at..].iter().rev() {
+                                    let rect = draw_unit(ui, unit, model, &mut actions);
+                                    measured.set(unit, rect.width());
+                                    rects.push((unit, rect));
+                                }
+                            });
+                        }
+                    });
+                }
+                // A new measurement moved a unit to another line: redo the
+                // pass so the stale layout is never shown.
+                if wrap_lines(&widths_of(&measured), available, column_gap) != lines {
+                    ui.ctx().request_discard("top bar wrap changed");
+                }
+            });
         },
     );
     ui.data_mut(|d| d.insert_temp(widths_id, measured));
-
-    let response = bar.response;
-    if response.drag_started_by(egui::PointerButton::Primary) {
-        let near_edge = response.interact_pointer_pos().is_some_and(|p| {
-            p.y - screen.top() < EDGE_GRAB
-                || p.x - screen.left() < EDGE_GRAB
-                || screen.right() - p.x < EDGE_GRAB
-        });
-        if !near_edge {
-            // Our own title-bar drag turns the tray flyout into a window.
-            cx.flyout.pin();
-            cx.window.start_drag();
-        }
+    DrawnBar {
+        response: bar.response,
+        actions,
+        rects,
     }
-    if response.double_clicked() {
-        cx.window.toggle_maximize();
-    }
-    out
 }
 
-/// Draw one wrap unit; returns its width.
-fn draw_unit(ui: &mut egui::Ui, unit: Unit, cx: &mut UiCtx, out: &mut TopBarOutput) -> f32 {
+/// Draw one wrap unit; returns its rect.
+fn draw_unit(
+    ui: &mut egui::Ui,
+    unit: Unit,
+    model: &BarModel,
+    actions: &mut Vec<BarAction>,
+) -> Rect {
+    let mut act = |response: &egui::Response, action: BarAction| {
+        if response.clicked() {
+            actions.push(action);
+        }
+    };
     match unit {
-        Unit::Record => record_button(ui, cx).rect.width(),
-        Unit::Bookmark => bookmark_button(ui, cx).rect.width(),
-        Unit::Captions => captions_button(ui, cx).rect.width(),
-        Unit::Pill => status_pill(ui, cx).rect.width(),
-        Unit::Nav => nav_group(ui, cx).rect.width(),
-        Unit::Controls => window_controls(ui, cx, out).rect.width(),
+        Unit::Record => {
+            let response = record_button(ui, model);
+            act(&response, BarAction::Record);
+            response.rect
+        }
+        Unit::Bookmark => {
+            let response = bookmark_button(ui, &model.bookmark_tooltip);
+            act(&response, BarAction::Bookmark);
+            response.rect
+        }
+        Unit::Captions => {
+            let response = captions_button(ui);
+            act(&response, BarAction::ShowCaptions);
+            response.rect
+        }
+        Unit::Pill => {
+            let response = status_pill(ui, model);
+            act(&response, BarAction::OpenTranscript);
+            response.rect
+        }
+        Unit::Nav => nav_group(ui, model.active, actions),
+        Unit::Controls => window_controls(ui, actions),
     }
 }
 
@@ -252,15 +444,14 @@ fn draw_order(ui: &egui::Ui, n: usize) -> Vec<usize> {
 /// while a start or stop is in flight; both go through the ordered
 /// rec-control worker, and a failure becomes an in-app error toast
 /// (`app.rs`, on the reply).
-fn record_button(ui: &mut egui::Ui, cx: &mut UiCtx) -> egui::Response {
-    let recording = cx.shell.recording();
-    let busy = cx.shell.recording_action;
+fn record_button(ui: &mut egui::Ui, model: &BarModel) -> egui::Response {
+    let recording = model.recording;
     let label = if recording {
         "Stop recording"
     } else {
         "Start recording"
     };
-    let spinning = recording && busy;
+    let spinning = recording && model.busy;
     let content = if spinning {
         // Keeps the button's size; the spinner is painted over it.
         icons::icon(ph::CIRCLE_NOTCH, 17.0).color(Color32::TRANSPARENT)
@@ -269,36 +460,22 @@ fn record_button(ui: &mut egui::Ui, cx: &mut UiCtx) -> egui::Response {
     } else {
         icons::icon(ph::RECORD, 17.0)
     };
-    let response = ui
-        .add_enabled_ui(!busy, |ui| {
-            let response = widgets::btn_record(ui, recording, content, label);
-            if spinning {
-                icons::paint_spinner(ui, response.rect, 17.0, WHITE);
-            }
-            response
-        })
-        .inner;
-    if response.clicked() {
-        cx.submit_rec(if recording {
-            RecCmd::Stop { by_user: true }
-        } else {
-            RecCmd::Start(Trigger::Manual)
-        });
-    }
-    response
+    ui.add_enabled_ui(!model.busy, |ui| {
+        let response = widgets::btn_record(ui, recording, content, label);
+        if spinning {
+            icons::paint_spinner(ui, response.rect, 17.0, WHITE);
+        }
+        response
+    })
+    .inner
 }
 
-/// "Bookmark this moment (CTRL+ALT+B)": `app.rs` toasts "Bookmark added"
-/// or the error when the reply arrives.
-fn bookmark_button(ui: &mut egui::Ui, cx: &mut UiCtx) -> egui::Response {
-    let tooltip = bookmark_tooltip(cx.shell.bookmark_hotkey.as_deref());
-    let response = widgets::btn(ui, icons::icon(ph::BOOKMARK_SIMPLE, 16.0)).on_hover_text(&tooltip);
+/// "Bookmark this moment (CTRL+ALT+B)".
+fn bookmark_button(ui: &mut egui::Ui, tooltip: &str) -> egui::Response {
+    let response = widgets::btn(ui, icons::icon(ph::BOOKMARK_SIMPLE, 16.0)).on_hover_text(tooltip);
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Bookmark this moment")
     });
-    if response.clicked() {
-        cx.submit_rec(RecCmd::BookmarkNow);
-    }
     response
 }
 
@@ -309,20 +486,11 @@ fn bookmark_tooltip(hotkey: Option<&str>) -> String {
     }
 }
 
-/// Re-open (or focus) the captions overlay. The core check is ⏳, so it
-/// runs as an op; `OpDone::CaptionsCheck` shows the overlay or toasts
-/// "Could not show the caption overlay: …".
-fn captions_button(ui: &mut egui::Ui, cx: &mut UiCtx) -> egui::Response {
+/// Re-open (or focus) the captions overlay.
+fn captions_button(ui: &mut egui::Ui) -> egui::Response {
     let label = "Show the caption overlay";
     let response = widgets::btn(ui, icons::icon(ph::CLOSED_CAPTIONING, 16.0)).on_hover_text(label);
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
-    if response.clicked() {
-        cx.tasks.spawn_op_or(
-            "captions-check",
-            |c| OpDone::CaptionsCheck(c.check_captions_overlay()),
-            |error| OpDone::CaptionsCheck(Err(error)),
-        );
-    }
     response
 }
 
@@ -402,30 +570,33 @@ impl PillState {
     }
 }
 
-fn status_pill(ui: &mut egui::Ui, cx: &mut UiCtx) -> egui::Response {
-    let state = PillState::of(cx.shell);
+/// The status pill; only the recording pill is clickable.
+fn status_pill(ui: &mut egui::Ui, model: &BarModel) -> egui::Response {
     widgets::announce(
         ui.ctx(),
         egui::Id::new("witness-status-pill-live"),
-        &state.announcement(),
+        &model.pill.announcement(),
         Politeness::Polite,
     );
-    match state {
+    match &model.pill {
         PillState::Stopping => widgets::pill(ui, PillKind::Busy, "Stopping…"),
-        PillState::Busy(text) => widgets::pill(ui, PillKind::Busy, text),
+        PillState::Busy(text) => widgets::pill(ui, PillKind::Busy, text.as_str()),
         PillState::Idle => widgets::pill(ui, PillKind::Idle, "Idle"),
         PillState::Recording { elapsed, warning } => {
-            recording_pill(ui, cx, &elapsed, warning.as_deref())
+            recording_pill(ui, model, elapsed, warning.as_deref())
         }
     }
 }
+
+/// The level meter's tooltip and accessible name.
+const METER_LABEL: &str = "Microphone and system audio levels";
 
 /// The clickable recording pill: pulsing dot, "Recording" (wide only),
 /// elapsed time, ⚠ on a capture warning, and the level meter (wide only).
 /// A click opens the recording's transcript.
 fn recording_pill(
     ui: &mut egui::Ui,
-    cx: &mut UiCtx,
+    model: &BarModel,
     elapsed: &str,
     warning: Option<&str>,
 ) -> egui::Response {
@@ -448,16 +619,26 @@ fn recording_pill(
             if warning.is_some() {
                 text(ui, "⚠");
             }
-            if wide {
-                level_meter(ui, cx);
-            }
-        });
+            wide.then(|| level_meter(ui, model))
+        })
+        .inner
     });
     let rect = inner.response.rect;
     let response = ui
         .interact(rect, ui.id().with("recording-pill"), Sense::click())
-        .on_hover_cursor(CursorIcon::PointingHand)
-        .on_hover_text(warning.unwrap_or("Open live captions"));
+        .on_hover_cursor(CursorIcon::PointingHand);
+    // The pill's click response sits above the hover-only meter, so the
+    // meter's own tooltip would never show: pick the text by where the
+    // pointer is (the web meter's `title` won over the pill's inside it).
+    let over_meter = inner
+        .inner
+        .is_some_and(|meter| response.hover_pos().is_some_and(|p| meter.contains(p)));
+    let tooltip = if over_meter {
+        METER_LABEL
+    } else {
+        warning.unwrap_or("Open live captions")
+    };
+    let response = response.on_hover_text(tooltip);
     let name = format!(
         "{elapsed} recording. {}",
         warning.unwrap_or("Open live transcript")
@@ -471,46 +652,22 @@ fn recording_pill(
             egui::StrokeKind::Outside,
         );
     }
-    if response.clicked() {
-        if let Some(meeting_id) = cx.shell.status.as_ref().and_then(|s| s.meeting_id) {
-            // Transcripts never nest: from a transcript, Back goes to where
-            // that transcript came from.
-            let from = match cx.view {
-                View::Transcript { from, .. } => from.clone(),
-                other => Some(Box::new(other.clone())),
-            };
-            cx.nav.go(View::Transcript {
-                meeting_id,
-                segment_id: None,
-                highlight: None,
-                from,
-            });
-        }
-    }
     response
 }
 
 /// Two stacked bars: microphone (accent) and system audio (ok), each
 /// `min(100, rms·300)` % of 48 pt, at least 2 pt, easing over 0.15 s.
-fn level_meter(ui: &mut egui::Ui, cx: &UiCtx) {
-    let label = "Microphone and system audio levels";
+/// Returns the meter's rect.
+fn level_meter(ui: &mut egui::Ui, model: &BarModel) -> Rect {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(METER_WIDTH, METER_BAR * 2.0 + 2.0),
         Sense::hover(),
     );
-    response
-        .on_hover_text(label)
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label));
-    let (mic, loopback) = cx
-        .shell
-        .level
-        .as_ref()
-        .map_or((0.0, 0.0), |l| (l.mic_rms, l.loopback_rms));
-    // Never animate a hidden window: a hidden root still runs full passes.
-    let animate = cx.window.is_shown() && !cx.window.is_minimized() && icons::animations_enabled();
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, METER_LABEL));
+    let (mic, loopback) = model.levels;
     for (row, (rms, color)) in [(mic, ACCENT), (loopback, OK)].into_iter().enumerate() {
         let target = meter_width(rms);
-        let width = if animate {
+        let width = if model.animate_meter {
             ui.ctx().animate_value_with_time(
                 ui.id().with(("level-bar", row)),
                 target,
@@ -523,6 +680,7 @@ fn level_meter(ui: &mut egui::Ui, cx: &UiCtx) {
         let bar = Rect::from_min_size(egui::pos2(rect.left(), top), egui::vec2(width, METER_BAR));
         ui.painter().rect_filled(bar, CornerRadius::same(2), color);
     }
+    rect
 }
 
 /// A level bar's width in points for an RMS level (0..1).
@@ -535,72 +693,76 @@ pub(crate) fn meter_width(rms: f32) -> f32 {
     (percent / 100.0 * METER_WIDTH).max(2.0)
 }
 
-/// Meetings, People and the Settings gear. Meetings is "active" only on
-/// Meetings (not on Search or a transcript), and it clears the search box,
-/// cancelling a pending debounce, so the box matches the unfiltered list.
-fn nav_group(ui: &mut egui::Ui, cx: &mut UiCtx) -> egui::Response {
+/// Meetings, People and the Settings gear; returns the group's rect.
+fn nav_group(ui: &mut egui::Ui, active: Option<NavItem>, actions: &mut Vec<BarAction>) -> Rect {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = NAV_GAP;
         for item in draw_order(ui, 3) {
-            match item {
-                0 => {
-                    if widgets::nav_btn(ui, "Meetings", matches!(cx.view, View::Meetings)).clicked()
-                    {
-                        cx.go_meetings_clear_search();
-                    }
-                }
-                1 => {
-                    if widgets::nav_btn(ui, "People", matches!(cx.view, View::People)).clicked() {
-                        cx.nav.go(View::People);
-                    }
-                }
-                _ => {
-                    let selected = matches!(cx.view, View::Settings);
-                    if widgets::nav_icon_btn(ui, ph::GEAR_SIX, selected, "Settings").clicked() {
-                        cx.nav.go(View::Settings);
-                    }
-                }
+            let (item, response) = match item {
+                0 => (
+                    NavItem::Meetings,
+                    widgets::nav_btn(ui, "Meetings", active == Some(NavItem::Meetings)),
+                ),
+                1 => (
+                    NavItem::People,
+                    widgets::nav_btn(ui, "People", active == Some(NavItem::People)),
+                ),
+                _ => (
+                    NavItem::Settings,
+                    widgets::nav_icon_btn(
+                        ui,
+                        ph::GEAR_SIX,
+                        active == Some(NavItem::Settings),
+                        "Settings",
+                    ),
+                ),
+            };
+            if response.clicked() {
+                actions.push(BarAction::Nav(item));
             }
         }
     })
     .response
+    .rect
 }
 
-/// Minimize, maximize (always the square glyph) and close-to-tray. Hidden
-/// in tray-flyout mode. Minimize and close are performed by `app.rs`, which
-/// runs `will_hide()` first.
-fn window_controls(ui: &mut egui::Ui, cx: &mut UiCtx, out: &mut TopBarOutput) -> egui::Response {
+/// Minimize, maximize (always the square glyph) and close-to-tray; returns
+/// the group's rect. Hidden in tray-flyout mode.
+fn window_controls(ui: &mut egui::Ui, actions: &mut Vec<BarAction>) -> Rect {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = CONTROLS_GAP;
         for item in draw_order(ui, 3) {
-            match item {
-                0 => {
-                    if widgets::win_btn(ui, ph::MINUS, 14.0, "Minimize", false).clicked() {
-                        out.minimize = true;
-                    }
-                }
-                1 => {
-                    if widgets::win_btn(ui, ph::SQUARE, 12.0, "Maximize", false).clicked() {
-                        cx.window.toggle_maximize();
-                    }
-                }
-                _ => {
-                    if widgets::win_btn(ui, ph::X, 14.0, "Close to tray", true).clicked() {
-                        out.close = true;
-                    }
-                }
+            let (action, response) = match item {
+                0 => (
+                    BarAction::Minimize,
+                    widgets::win_btn(ui, ph::MINUS, 14.0, "Minimize", false),
+                ),
+                1 => (
+                    BarAction::Maximize,
+                    widgets::win_btn(ui, ph::SQUARE, 12.0, "Maximize", false),
+                ),
+                _ => (
+                    BarAction::Close,
+                    widgets::win_btn(ui, ph::X, 14.0, "Close to tray", true),
+                ),
+            };
+            if response.clicked() {
+                actions.push(action);
             }
         }
     })
     .response
+    .rect
 }
 
-/// The top bar's panel frame: raised fill, 10/14 padding. `app.rs` paints
-/// the 1 px bottom border with [`paint_bottom_border`].
+/// `.topbar { padding: 10px 14px }`, applied inside the bar's drag scope.
+const BAR_PADDING: Margin = Margin::symmetric(14, 10);
+
+/// The top bar's panel frame: the raised fill only. The padding is part of
+/// the bar itself ([`BAR_PADDING`]), so the drag area covers it. `app.rs`
+/// paints the 1 px bottom border with [`paint_bottom_border`].
 pub fn frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(BG_RAISED)
-        .inner_margin(Margin::symmetric(14, 10))
+    egui::Frame::new().fill(BG_RAISED)
 }
 
 /// The bar's 1 px bottom border.
@@ -731,6 +893,10 @@ pub(crate) fn download_text(p: &ModelDownloadProgress) -> String {
 /// `.model-banner span:first-child { flex: 1; min-width: 200px }`, gap 12.
 const BANNER_TEXT_MIN: f32 = 200.0;
 const BANNER_GAP: f32 = 12.0;
+/// The model banner's text: a bold lead, then the explanation.
+const BANNER_TITLE: &str = "Transcription models not installed.";
+const BANNER_BODY: &str = " Recording works, but nothing gets transcribed. One-time download, \
+                           ~3.5 GB (Parakeet + speaker models).";
 
 /// The first-run "Transcription models not installed." banner: Download
 /// now (or the download progress) and Later, which persists the dismissal.
@@ -744,6 +910,13 @@ pub fn model_banner(ui: &mut egui::Ui, cx: &mut UiCtx) {
         .as_ref()
         .filter(|d| d.error.is_none())
         .map(download_text);
+    // `.model-banner` was `role="status"`: announced when it appears.
+    widgets::announce(
+        ui.ctx(),
+        egui::Id::new("witness-model-banner"),
+        &format!("{BANNER_TITLE}{BANNER_BODY}"),
+        Politeness::Polite,
+    );
     widgets::centered_column(ui, 900.0, |ui| {
         Frame::new()
             .fill(BANNER_BG)
@@ -765,17 +938,8 @@ fn banner_text(width: f32) -> egui::text::LayoutJob {
         ..Default::default()
     };
     let mut job = egui::text::LayoutJob::default();
-    job.append(
-        "Transcription models not installed.",
-        0.0,
-        format(theme::semibold(13.0)),
-    );
-    job.append(
-        " Recording works, but nothing gets transcribed. One-time download, ~3.5 GB \
-         (Parakeet + speaker models).",
-        0.0,
-        format(theme::regular(13.0)),
-    );
+    job.append(BANNER_TITLE, 0.0, format(theme::semibold(13.0)));
+    job.append(BANNER_BODY, 0.0, format(theme::regular(13.0)));
     job.wrap.max_width = width;
     job
 }
@@ -891,16 +1055,113 @@ mod tests {
         assert_eq!(wrap_lines(&[46.0, 46.0], 100.0, 8.0), vec![0..2]);
     }
 
+    fn bar_model(recording: bool) -> BarModel {
+        BarModel {
+            units: bar_units(recording, recording, false),
+            recording,
+            busy: false,
+            pill: if recording {
+                PillState::Recording {
+                    elapsed: "12:34".into(),
+                    warning: None,
+                }
+            } else {
+                PillState::Idle
+            },
+            bookmark_tooltip: bookmark_tooltip(Some("ctrl+alt+b")),
+            levels: (0.1, 0.05),
+            animate_meter: false,
+            active: Some(NavItem::Meetings),
+        }
+    }
+
+    /// Run the real bar (measure + discard included) in a `width` × 620
+    /// window for a few frames, like `app.rs` does; returns the last pass.
+    fn lay_out_bar(width: f32, model: &BarModel) -> (Rect, Vec<(Unit, Rect)>) {
+        let ctx = theme::test_context();
+        let mut last = (Rect::NOTHING, Vec::new());
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 620.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                egui::Panel::top("topbar")
+                    .frame(frame())
+                    .resizable(false)
+                    .show_separator_line(false)
+                    .show(ui, |ui| {
+                        let bar = draw_bar(ui, model);
+                        last = (bar.response.rect, bar.rects);
+                    });
+            });
+            output.textures_delta.clear();
+        }
+        last
+    }
+
+    fn rect_of(rects: &[(Unit, Rect)], unit: Unit) -> Rect {
+        rects.iter().find(|(u, _)| *u == unit).unwrap().1
+    }
+
     #[test]
     fn the_bar_wraps_at_460_while_recording_but_not_when_idle() {
-        // A 460 pt window minus the 2 × 14 padding.
-        let available = 432.0;
-        // record, "Idle" pill, nav, window controls (+ 4 margin)
-        let idle = [37.0, 47.0, 190.0, 100.0 + CONTROLS_MARGIN];
-        assert_eq!(wrap_lines(&idle, available, 8.0).len(), 1);
-        // + bookmark, CC and a recording pill
-        let recording = [37.0, 36.0, 36.0, 70.0, 190.0, 100.0 + CONTROLS_MARGIN];
-        assert_eq!(wrap_lines(&recording, available, 8.0).len(), 2);
+        let (bar, idle) = lay_out_bar(460.0, &bar_model(false));
+        assert_eq!(idle.len(), 4, "{idle:?}");
+        let row = rect_of(&idle, Unit::Record);
+        for (unit, rect) in &idle {
+            assert!(
+                rect.top() < row.bottom() && rect.bottom() > row.top(),
+                "{unit:?} wrapped: {idle:?}"
+            );
+        }
+        // Window controls hug the right edge, inside the 14 pt padding.
+        assert!((rect_of(&idle, Unit::Controls).right() - (460.0 - 14.0)).abs() < 1.0);
+        // The drag area is the whole bar, padding included.
+        assert_eq!(bar.left(), 0.0);
+        assert_eq!(bar.top(), 0.0);
+        assert_eq!(bar.right(), 460.0);
+        assert!((bar.bottom() - (rect_of(&idle, Unit::Nav).bottom() + 10.0)).abs() < 1.0);
+
+        let (_, rec) = lay_out_bar(460.0, &bar_model(true));
+        assert_eq!(rec.len(), 6, "{rec:?}");
+        let first = rect_of(&rec, Unit::Record).top();
+        for unit in [Unit::Bookmark, Unit::Captions, Unit::Pill, Unit::Nav] {
+            assert!(
+                (rect_of(&rec, unit).top() - first).abs() < 8.0,
+                "{unit:?} should stay on the first line: {rec:?}"
+            );
+        }
+        let controls = rect_of(&rec, Unit::Controls);
+        assert!(
+            controls.top() > rect_of(&rec, Unit::Nav).bottom(),
+            "the window controls wrap to a second line: {rec:?}"
+        );
+        // Only the nav has `margin-left: auto`: alone on their line, the
+        // controls start it, after the 14 pt padding and their 4 pt margin.
+        assert!(
+            (controls.left() - (14.0 + CONTROLS_MARGIN)).abs() < 1.0,
+            "{controls:?}"
+        );
+
+        // Wide enough, the recording bar is one line again.
+        let (_, wide) = lay_out_bar(900.0, &bar_model(true));
+        let (row, controls) = (rect_of(&wide, Unit::Record), rect_of(&wide, Unit::Controls));
+        assert!(controls.top() < row.bottom(), "{wide:?}");
+    }
+
+    #[test]
+    fn presses_near_the_top_left_and_right_edges_do_not_drag() {
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(460.0, 620.0));
+        assert!(press_drags_window(egui::pos2(200.0, 20.0), screen));
+        assert!(press_drags_window(egui::pos2(200.0, 8.0), screen));
+        assert!(press_drags_window(egui::pos2(200.0, 50.0), screen));
+        assert!(!press_drags_window(egui::pos2(200.0, 7.0), screen));
+        assert!(!press_drags_window(egui::pos2(5.0, 30.0), screen));
+        assert!(!press_drags_window(egui::pos2(455.0, 30.0), screen));
     }
 
     #[test]

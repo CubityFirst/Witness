@@ -791,6 +791,13 @@ fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
             CAPTION_ERR,
         );
         top = band.bottom();
+        // The web banner was `role="alert"`.
+        widgets::announce(
+            &ctx,
+            egui::Id::new("witness-captions-error"),
+            error,
+            Politeness::Assertive,
+        );
     }
 
     // Lines, newest at the bottom; older ones are pushed up and clipped.
@@ -1043,6 +1050,107 @@ mod tests {
             saved.clamped_to(system::work_area_at(saved.center())).scale
         );
         assert!(overlay.restore.is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An open overlay with a known outer rect, as if its window existed.
+    fn open_overlay(dir: &Path) -> CaptionsOverlay {
+        let mut overlay = CaptionsOverlay::new(dir);
+        overlay.open(9, OpenReason::Auto);
+        lock(&overlay.state).outer_rect = Some(RectI {
+            x: 10,
+            y: 20,
+            w: 560,
+            h: 150,
+        });
+        overlay
+    }
+
+    /// One overlay pass on a 560 × 150 surface with `events` as input.
+    fn overlay_pass(
+        ctx: &egui::Context,
+        overlay: &CaptionsOverlay,
+        events: Vec<egui::Event>,
+        os_close: bool,
+    ) {
+        let mut input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(560.0, 150.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        if os_close {
+            input
+                .viewports
+                .entry(input.viewport_id)
+                .or_default()
+                .events
+                .push(egui::ViewportEvent::Close);
+        }
+        let mut output = ctx.run_ui(input, |ui| overlay_ui(ui, &overlay.state));
+        output.textures_delta.clear();
+    }
+
+    fn assert_closed_and_saved(overlay: &CaptionsOverlay, dir: &Path) {
+        assert!(!overlay.is_open());
+        let saved = OverlayGeometry::load(dir).expect("geometry saved on close");
+        assert_eq!(
+            (saved.x, saved.y, saved.width, saved.height),
+            (10, 20, 560, 150)
+        );
+    }
+
+    #[test]
+    fn escape_closes_the_overlay() {
+        let dir = temp_dir();
+        let overlay = open_overlay(&dir);
+        let ctx = theme::test_context();
+        overlay_pass(&ctx, &overlay, Vec::new(), false);
+        assert!(overlay.is_open());
+        let escape = egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        overlay_pass(&ctx, &overlay, vec![escape], false);
+        assert_closed_and_saved(&overlay, &dir);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_os_close_request_closes_the_overlay() {
+        // Alt+F4 arrives as a viewport close request.
+        let dir = temp_dir();
+        let overlay = open_overlay(&dir);
+        let ctx = theme::test_context();
+        overlay_pass(&ctx, &overlay, Vec::new(), false);
+        overlay_pass(&ctx, &overlay, Vec::new(), true);
+        assert_closed_and_saved(&overlay, &dir);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_close_button_closes_the_overlay() {
+        let dir = temp_dir();
+        let overlay = open_overlay(&dir);
+        let ctx = theme::test_context();
+        // × sits at the right end of the grip.
+        let at = egui::pos2(540.0, 16.0);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        overlay_pass(&ctx, &overlay, vec![egui::Event::PointerMoved(at)], false);
+        overlay_pass(&ctx, &overlay, vec![button(true)], false);
+        assert!(overlay.is_open(), "a press alone does not close");
+        overlay_pass(&ctx, &overlay, vec![button(false)], false);
+        assert_closed_and_saved(&overlay, &dir);
         let _ = std::fs::remove_dir_all(dir);
     }
 
