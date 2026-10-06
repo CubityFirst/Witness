@@ -26,8 +26,8 @@ use witness_core::AppCore;
 static CORE: OnceLock<Arc<AppCore>> = OnceLock::new();
 /// (owner hwnd, uID) of the notification-area icon.
 static TRAY: OnceLock<(isize, u32)> = OnceLock::new();
-/// The single-instance mutex handle.
-static INSTANCE: OnceLock<isize> = OnceLock::new();
+/// The single-instance (mutex, hidden window) handles.
+static INSTANCE: OnceLock<(isize, isize)> = OnceLock::new();
 static MAIN_THREAD: OnceLock<ThreadId> = OnceLock::new();
 static ONCE: AtomicBool = AtomicBool::new(false);
 
@@ -72,10 +72,11 @@ pub fn register_tray(ids: (isize, u32)) {
     }
 }
 
-/// Register the single-instance mutex so it is released before exiting.
-pub fn register_instance(mutex: isize) {
-    if mutex != 0 {
-        let _ = INSTANCE.set(mutex);
+/// Register the single-instance mutex (released before exiting) and its
+/// hidden window (told to stop answering second launches first).
+pub fn register_instance(mutex: isize, hwnd: isize) {
+    if mutex != 0 || hwnd != 0 {
+        let _ = INSTANCE.set((mutex, hwnd));
     }
 }
 
@@ -98,8 +99,11 @@ fn main_thread_teardown() -> ! {
     if let Some(&(hwnd, uid)) = TRAY.get() {
         remove_tray_icon(hwnd, uid);
     }
-    if let Some(&mutex) = INSTANCE.get() {
-        release_mutex(mutex);
+    if let Some(&(mutex, hwnd)) = INSTANCE.get() {
+        crate::platform::single_instance::begin_exit_raw(hwnd);
+        if mutex != 0 {
+            release_mutex(mutex);
+        }
     }
     log::logger().flush();
     let details = log_path

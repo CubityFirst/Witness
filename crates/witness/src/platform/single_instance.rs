@@ -128,6 +128,18 @@ impl InstanceGuard {
     pub fn raw_mutex(&self) -> isize {
         self.mutex
     }
+
+    /// The raw hidden-window handle (0 = none), for the panic hook.
+    pub fn raw_hwnd(&self) -> isize {
+        self.hwnd
+    }
+}
+
+/// [`InstanceGuard::begin_exit`] by raw handle, for the panic hook: once it
+/// lets go of the mutex, the dying process's window (still pumping in the
+/// MessageBox loop) must not answer later launches "shown".
+pub fn begin_exit_raw(hwnd: isize) {
+    imp::begin_exit(hwnd);
 }
 
 /// Note a line for the log before logging exists; `attach` writes it out.

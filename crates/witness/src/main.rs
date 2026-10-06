@@ -50,7 +50,7 @@ fn main() {
         // The running instance has been asked to show itself.
         Acquire::Secondary => std::process::exit(0),
     };
-    panic::register_instance(instance_guard.raw_mutex());
+    panic::register_instance(instance_guard.raw_mutex(), instance_guard.raw_hwnd());
 
     let settings = match Settings::load_result() {
         Ok(settings) => settings,
