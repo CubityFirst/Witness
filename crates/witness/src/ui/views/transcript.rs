@@ -45,8 +45,9 @@ use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Frame, Id, Key, Layout, Margin, Modifiers,
     Order, Popup, Rect, RectAlign, Response, Sense, Stroke,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use witness_core::db::{Bookmark, Meeting, Segment, Speaker};
 use witness_core::events::LiveTranscript;
@@ -368,7 +369,12 @@ struct Notes {
 }
 
 impl Notes {
-    fn load(&mut self, text: &str) {
+    /// The first load: `text` from the database, `queued` the newest draft
+    /// an earlier visit handed to the writer. That draft wins when it
+    /// differs: the read may have beaten its write to the database (or the
+    /// write failed), and only this view writes notes, so it is the newest
+    /// text. Its ack then settles it like any other write.
+    fn load(&mut self, text: &str, queued: Option<(u64, String)>) {
         if self.loaded {
             return;
         }
@@ -376,7 +382,12 @@ impl Notes {
         self.draft = text.to_string();
         self.queued = text.to_string();
         self.confirmed = text.to_string();
-        self.open = !text.is_empty();
+        if let Some((seq, newer)) = queued.filter(|(_, newer)| newer != text) {
+            self.draft = newer.clone();
+            self.queued = newer;
+            self.seq = seq;
+        }
+        self.open = !self.draft.is_empty();
     }
 
     /// The user typed: "Saving…" unless the text is back to the stored one.
@@ -444,6 +455,23 @@ impl Notes {
     }
 }
 
+/// meeting id → (seq, text) of the newest notes draft handed to the writer
+/// this session. It outlives the view, so reopening a meeting cannot adopt
+/// a database read that raced the previous visit's last write (see
+/// [`Notes::load`]). Only the UI thread touches it.
+// TODO(I1): this could live in `ViewMemory`; U5 owns only its own files.
+static QUEUED_NOTES: Mutex<BTreeMap<i64, (u64, String)>> = Mutex::new(BTreeMap::new());
+
+fn remember_queued_notes(meeting_id: i64, seq: u64, text: String) {
+    if let Ok(mut map) = QUEUED_NOTES.lock() {
+        map.insert(meeting_id, (seq, text));
+    }
+}
+
+fn queued_notes(meeting_id: i64) -> Option<(u64, String)> {
+    QUEUED_NOTES.lock().ok()?.get(&meeting_id).cloned()
+}
+
 // ---------------------------------------------------------------------------
 // Editors
 
@@ -482,6 +510,21 @@ struct SpeakerEdit {
     /// Where the suggestion list was drawn last frame (a click there must
     /// not commit the half-typed text through the focus loss).
     suggest_rect: Option<Rect>,
+    /// The field lost focus toward the list and that commit was held back
+    /// pending a pick.
+    blur_swallowed: bool,
+}
+
+impl SpeakerEdit {
+    fn new(speaker_id: i64, seg_id: i64, name: &str) -> Self {
+        SpeakerEdit {
+            speaker_id,
+            seg_id,
+            edit: LineEdit::new(name),
+            suggest_rect: None,
+            blur_swallowed: false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -542,26 +585,82 @@ fn inline_editor(
 // Rows
 
 /// What a row asked for this frame; applied after the list is drawn.
+///
+/// The editor results name the editor they close (`seg_id` / `id`): a
+/// click on another row's chip or note blurs the open editor in the SAME
+/// pass, and that row may sit above the editor's, so its Open action can be
+/// pushed first. [`editor_results_first`] applies the closing results
+/// before any Open, and each result only touches the editor it names.
 #[derive(Debug, Clone, PartialEq)]
 enum RowAction {
     /// Timestamp or text click: seek, play, follow.
     SeekPlay(usize),
+    /// Chip click; the prefill is read when applied (after any commit).
     OpenSpeaker {
         speaker_id: i64,
         seg_id: i64,
-        text: String,
     },
-    SpeakerDone(EditOutcome),
+    SpeakerDone {
+        seg_id: i64,
+        outcome: EditOutcome,
+    },
     /// A suggestion was picked: rename to it.
-    SpeakerPick(String),
+    SpeakerPick {
+        seg_id: i64,
+        name: String,
+    },
     /// Bookmark time click: seek, play, follow (active row unchanged).
     BookmarkSeek(i64),
-    EditBookmark {
+    /// Note click; the prefill is read when applied (after any commit).
+    EditBookmark(i64),
+    BookmarkDone {
         id: i64,
-        note: String,
+        outcome: EditOutcome,
     },
-    BookmarkDone(EditOutcome),
     DeleteBookmark(i64),
+}
+
+impl RowAction {
+    /// An inline editor's result (commit, cancel, pick).
+    fn closes_editor(&self) -> bool {
+        matches!(
+            self,
+            RowAction::SpeakerDone { .. }
+                | RowAction::SpeakerPick { .. }
+                | RowAction::BookmarkDone { .. }
+        )
+    }
+}
+
+/// Editor results before everything else, otherwise in draw order: the
+/// TSX commits the old editor on the mousedown blur, before the click
+/// that opens the next one.
+fn editor_results_first(actions: Vec<RowAction>) -> Vec<RowAction> {
+    let (mut ordered, rest): (Vec<_>, Vec<_>) =
+        actions.into_iter().partition(RowAction::closes_editor);
+    ordered.extend(rest);
+    ordered
+}
+
+/// What routing an editor action asks of the view.
+#[derive(Debug)]
+enum EditorEffect {
+    /// Rename the closed editor's speaker to this name.
+    CommitSpeaker(SpeakerEdit, String),
+    /// Save the closed editor's bookmark note.
+    CommitBookmark(BookmarkEdit),
+    /// A rename opened: refresh the people suggestions.
+    LoadPeople,
+}
+
+/// Take `slot`'s editor if it is the one `matches` names (a stale result
+/// for an editor that is no longer open does nothing).
+fn take_editor<T>(slot: &mut Option<T>, matches: impl FnOnce(&T) -> bool) -> Option<T> {
+    if slot.as_ref().is_some_and(matches) {
+        slot.take()
+    } else {
+        None
+    }
 }
 
 /// What the rows need to draw, borrowed from the view for one pass.
@@ -626,6 +725,15 @@ struct ListOutput {
     target_error: Option<f32>,
 }
 
+/// One pass's layout inputs for the stand-in space.
+struct ListPass {
+    /// Every row's height (measured, else estimated) at pass start.
+    heights: Vec<f32>,
+    /// Rows to lay out wherever they are ([`RowList::editor_rows`]).
+    editors: Vec<usize>,
+    width: f32,
+}
+
 /// The virtualised segment + bookmark list with its height cache.
 #[derive(Debug, Default)]
 struct RowList {
@@ -678,13 +786,85 @@ impl RowList {
         }
     }
 
+    /// Rows holding an open inline editor, ascending. They are laid out
+    /// even when scrolled far away: egui drops the focus of a widget that
+    /// is not laid out, which would strand the editor (open, unfocused,
+    /// never committing) and hand its keystrokes to the player keys.
+    fn editor_rows(&self, rc: &RowCtx) -> Vec<usize> {
+        let keys = [
+            rc.speaker_edit.as_ref().map(|e| RowKey::Seg(e.seg_id)),
+            rc.bookmark_edit.as_ref().map(|e| RowKey::Bm(e.id)),
+        ];
+        let mut rows: Vec<usize> = keys
+            .into_iter()
+            .flatten()
+            .filter_map(|key| self.keys.iter().position(|k| *k == key))
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
+
+    /// Draw row `r` at the cursor and record its measured height.
+    fn draw_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        rc: &mut RowCtx,
+        r: usize,
+        width: f32,
+        actions: &mut Vec<RowAction>,
+    ) -> f32 {
+        let row_top = ui.cursor().top();
+        let key = self.keys[r];
+        let row = self.rows[r];
+        ui.push_id(key, |ui| match row {
+            Row::Seg(i) => segment_row(ui, rc, i, actions),
+            Row::Bm(i) => bookmark_row(ui, rc, i, actions),
+        });
+        ui.add_space(ROW_GAP);
+        let h = ui.cursor().top() - row_top;
+        self.heights[r] = Some((width, h));
+        h
+    }
+
+    /// Stand-in space for the rows in `range`, except the editor rows among
+    /// them, which are drawn in place.
+    fn space_or_editors(
+        &mut self,
+        ui: &mut egui::Ui,
+        rc: &mut RowCtx,
+        range: std::ops::Range<usize>,
+        pass: &ListPass,
+        out: &mut ListOutput,
+    ) {
+        let mut from = range.start;
+        for &r in pass.editors.iter().filter(|r| range.contains(r)) {
+            let space: f32 = pass.heights[from..r].iter().sum();
+            if space > 0.0 {
+                ui.add_space(space);
+            }
+            self.draw_row(ui, rc, r, pass.width, &mut out.actions);
+            out.rendered += 1;
+            from = r + 1;
+        }
+        let space: f32 = pass.heights[from..range.end].iter().sum();
+        if space > 0.0 {
+            ui.add_space(space);
+        }
+    }
+
     /// Lay out the rows that intersect the viewport (plus overscan) and
     /// stand-in space for the rest; perform `req`'s scroll.
     fn show(&mut self, ui: &mut egui::Ui, rc: &mut RowCtx, req: Option<ScrollReq>) -> ListOutput {
         let mut out = ListOutput::default();
         let n = self.rows.len();
         let width = ui.available_width();
-        let heights: Vec<f32> = (0..n).map(|r| self.height(rc.detail, r, width)).collect();
+        let pass = ListPass {
+            heights: (0..n).map(|r| self.height(rc.detail, r, width)).collect(),
+            editors: self.editor_rows(rc),
+            width,
+        };
+        let heights = &pass.heights;
         let clip = ui.clip_rect();
         let (lo, hi) = (clip.top() - OVERSCAN, clip.bottom() + OVERSCAN);
         let top = ui.cursor().top();
@@ -716,26 +896,17 @@ impl RowList {
                 y += heights[first];
                 first += 1;
             }
-            if y > top {
-                ui.add_space(y - top);
-            }
             let mut target_rect = target.filter(|t| *t < first).map(|t| {
                 let y0 = top + heights[..t].iter().sum::<f32>();
                 Rect::from_min_size(egui::pos2(left, y0), egui::vec2(width, heights[t]))
             });
+            self.space_or_editors(ui, rc, 0..first, &pass, &mut out);
             let mut anchor = None;
             let mut next = first;
             while next < n && ui.cursor().top() < hi {
                 let row_top = ui.cursor().top();
                 let key = self.keys[next];
-                let row = self.rows[next];
-                ui.push_id(key, |ui| match row {
-                    Row::Seg(i) => segment_row(ui, rc, i, &mut out.actions),
-                    Row::Bm(i) => bookmark_row(ui, rc, i, &mut out.actions),
-                });
-                ui.add_space(ROW_GAP);
-                let h = ui.cursor().top() - row_top;
-                self.heights[next] = Some((width, h));
+                let h = self.draw_row(ui, rc, next, width, &mut out.actions);
                 if row_top <= clip.top() && row_top + h > clip.top() {
                     anchor = Some((key, clip.top() - row_top));
                 }
@@ -758,10 +929,7 @@ impl RowList {
                     egui::vec2(width, heights[t]),
                 ));
             }
-            let below: f32 = heights[next..].iter().sum();
-            if below > 0.0 {
-                ui.add_space(below);
-            }
+            self.space_or_editors(ui, rc, next..n, &pass, &mut out);
             // No anchor while the list starts below the viewport top (the
             // header is in view and reflows with the rest).
             self.anchor = anchor;
@@ -886,7 +1054,6 @@ fn segment_row(ui: &mut egui::Ui, rc: &mut RowCtx, idx: usize, actions: &mut Vec
                         actions.push(RowAction::OpenSpeaker {
                             speaker_id,
                             seg_id: seg.id,
-                            text: who.name.to_string(),
                         });
                     }
                 }
@@ -933,9 +1100,10 @@ fn speaker_editor(ui: &mut egui::Ui, rc: &mut RowCtx, actions: &mut Vec<RowActio
     let Some(state) = rc.speaker_edit.as_mut() else {
         return;
     };
+    let seg_id = state.seg_id;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
-        let id = Id::new(("speaker-rename", state.seg_id));
+        let id = Id::new(("speaker-rename", seg_id));
         let (field, outcome) = inline_editor(
             ui,
             id,
@@ -952,38 +1120,60 @@ fn speaker_editor(ui: &mut egui::Ui, rc: &mut RowCtx, actions: &mut Vec<RowActio
         ui.add(egui::Label::new(egui::RichText::new(hint).size(11.0).color(TEXT_MUTED)).wrap());
 
         // A press on the suggestion list blurs the field first; that blur
-        // must not commit the half-typed text.
+        // must not commit the half-typed text. It is remembered instead:
+        // if the press ends without a pick, the edit commits then.
         let into_suggestions = ui.input(|i| {
             i.pointer
                 .interact_pos()
                 .is_some_and(|p| state.suggest_rect.is_some_and(|r| r.contains(p)))
         });
         match outcome {
-            EditOutcome::Commit if into_suggestions => {}
+            EditOutcome::Commit if into_suggestions => state.blur_swallowed = true,
             EditOutcome::Open => {}
-            done => actions.push(RowAction::SpeakerDone(done)),
+            outcome => actions.push(RowAction::SpeakerDone { seg_id, outcome }),
+        }
+        if field.has_focus() {
+            state.blur_swallowed = false;
         }
 
+        // Only while the field is on screen: a focused editor in a row
+        // scrolled away must not float its list over the rest of the view.
         let names = suggestions(rc.people, &state.edit.text);
+        let on_screen = ui.clip_rect().intersects(field.rect);
         state.suggest_rect = None;
-        if names.is_empty() || !(field.has_focus() || into_suggestions) {
-            return;
-        }
-        let area = egui::Area::new(id.with("suggestions"))
-            .order(Order::Foreground)
-            .fixed_pos(field.rect.left_bottom() + egui::vec2(-6.0, 6.0))
-            .show(ui.ctx(), |ui| {
-                menu_frame(ui).show(ui, |ui| {
-                    ui.set_min_width(field.rect.width() + 12.0);
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    for name in names {
-                        if menu_item(ui, name).clicked() {
-                            actions.push(RowAction::SpeakerPick(name.to_string()));
+        let mut picked = false;
+        if !names.is_empty() && on_screen && (field.has_focus() || into_suggestions) {
+            let area = egui::Area::new(id.with("suggestions"))
+                .order(Order::Foreground)
+                .fixed_pos(field.rect.left_bottom() + egui::vec2(-6.0, 6.0))
+                .show(ui.ctx(), |ui| {
+                    menu_frame(ui).show(ui, |ui| {
+                        ui.set_min_width(field.rect.width() + 12.0);
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for name in names {
+                            if menu_item(ui, name).clicked() {
+                                picked = true;
+                                actions.push(RowAction::SpeakerPick {
+                                    seg_id,
+                                    name: name.to_string(),
+                                });
+                            }
                         }
-                    }
+                    });
                 });
+            state.suggest_rect = Some(area.response.rect);
+        }
+
+        // The press on the list was dragged off it and released elsewhere:
+        // no pick will come, and the field cannot lose focus again.
+        let released = !ui.input(|i| i.pointer.any_down());
+        if state.blur_swallowed && !picked && released && !field.has_focus() {
+            state.blur_swallowed = false;
+            actions.push(RowAction::SpeakerDone {
+                seg_id,
+                outcome: EditOutcome::Commit,
             });
-        state.suggest_rect = Some(area.response.rect);
+        }
     });
 }
 
@@ -1019,7 +1209,10 @@ fn bookmark_row(ui: &mut egui::Ui, rc: &mut RowCtx, idx: usize, actions: &mut Ve
                                 "what happened here?",
                             );
                             if outcome != EditOutcome::Open {
-                                actions.push(RowAction::BookmarkDone(outcome));
+                                actions.push(RowAction::BookmarkDone {
+                                    id: bookmark.id,
+                                    outcome,
+                                });
                             }
                         }
                     } else {
@@ -1129,10 +1322,7 @@ fn bookmark_note(ui: &mut egui::Ui, bookmark: &Bookmark, actions: &mut Vec<RowAc
         .on_hover_cursor(egui::CursorIcon::Text)
         .on_hover_text("Click to edit note");
     if click.clicked() {
-        actions.push(RowAction::EditBookmark {
-            id: bookmark.id,
-            note: bookmark.note.clone(),
-        });
+        actions.push(RowAction::EditBookmark(bookmark.id));
     }
 }
 
@@ -1197,6 +1387,7 @@ fn header_menu(
         .frame(menu_frame(ui))
         .show(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
+            let mut ids = Vec::with_capacity(items.len());
             for (index, text) in items.iter().enumerate() {
                 let item = menu_item(ui, text);
                 if index == 0 && !was_open {
@@ -1205,7 +1396,9 @@ fn header_menu(
                 if item.clicked() {
                     chosen = Some(index);
                 }
+                ids.push(item.id);
             }
+            menu_keys(ui, &ids);
         });
     if chosen.is_some() {
         // Space/Enter on a focused item is not a pointer click: close here.
@@ -1217,6 +1410,57 @@ fn header_menu(
         trigger.request_focus();
     }
     chosen
+}
+
+/// Where an in-menu key moves focus from item `at` of `len`
+/// (`handleMenuKey`): ↓/↑ cycle with wrap, Home/End jump to the ends.
+fn menu_key_target(key: Key, at: usize, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    match key {
+        Key::ArrowDown => Some((at + 1) % len),
+        Key::ArrowUp => Some((at + len - 1) % len),
+        Key::Home => Some(0),
+        Key::End => Some(len - 1),
+        _ => None,
+    }
+}
+
+/// The in-menu keys while one of `ids` has focus. The arrows are consumed
+/// and egui's own arrow navigation is cancelled for the pass (it searches
+/// every layer, so it would carry focus out of the open menu).
+fn menu_keys(ui: &mut egui::Ui, ids: &[Id]) {
+    let Some(at) = ids.iter().position(|id| ui.memory(|m| m.has_focus(*id))) else {
+        return;
+    };
+    let pressed = ui.input_mut(|i| {
+        [
+            Key::ArrowDown,
+            Key::ArrowUp,
+            Key::Home,
+            Key::End,
+            Key::ArrowLeft,
+            Key::ArrowRight,
+        ]
+        .into_iter()
+        .filter(|key| i.consume_key(Modifiers::NONE, *key))
+        .collect::<Vec<_>>()
+    });
+    if pressed.is_empty() {
+        return;
+    }
+    let target = pressed
+        .iter()
+        .rev()
+        .find_map(|key| menu_key_target(*key, at, ids.len()));
+    ui.memory_mut(|m| {
+        // ←/→ do nothing in the menu (and must not leave it either).
+        m.move_focus(egui::FocusDirection::None);
+        if let Some(target) = target {
+            m.request_focus(ids[target]);
+        }
+    });
 }
 
 /// The floating "Jump to current" pill (`.jump-pill`).
@@ -1286,6 +1530,32 @@ enum Playback {
     Unavailable,
 }
 
+/// Which control last started playback: the failure toasts differ
+/// (map §13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlayOrigin {
+    /// The player bar's Play button or the Space key (player.tsx).
+    Bar,
+    /// A segment's timestamp/text or a bookmark's time (transcript.tsx).
+    Seek,
+}
+
+impl PlayOrigin {
+    fn failure(self) -> &'static str {
+        match self {
+            PlayOrigin::Bar => "Could not play recording",
+            PlayOrigin::Seek => "Could not play the recording",
+        }
+    }
+}
+
+/// Why the last `play()` failed, taken once.
+// TODO(I1): return `player.take_play_error()` once U3's engine is merged
+// (the F0 stub has no error channel, so nothing is reported until then).
+fn take_play_error(_player: &witness_core::player::Player) -> Option<String> {
+    None
+}
+
 /// The transcript view. The state is boxed: it is far larger than the
 /// other views, and `ActiveView` holds one of them inline.
 pub struct TranscriptView(Box<TranscriptState>);
@@ -1309,9 +1579,10 @@ impl TranscriptView {
         self.0.flush(cx);
     }
 
-    /// `flush()` + release the audio device (the view is being replaced).
+    /// `flush()`, save an open bookmark note, and release the audio device
+    /// (the view is being replaced).
     pub fn on_leave(&mut self, cx: &mut UiCtx) {
-        self.0.flush(cx);
+        self.0.leave(cx);
         cx.player.unload();
     }
 }
@@ -1364,11 +1635,19 @@ struct TranscriptState {
     last_position: Option<(u64, u64)>,
     focused_once: bool,
     scroll_req: Option<ScrollReq>,
-    /// The scroll area's visible rect last frame (wheel / scrollbar
-    /// detection, Jump pill anchor).
+    /// The scroll area's content viewport last frame (Jump pill anchor).
     scroll_inner: Option<Rect>,
+    /// The whole scroll area last frame, scroll bar included (wheel
+    /// detection).
+    scroll_outer: Option<Rect>,
+    /// Where the vertical scroll bar was last frame, while it showed.
+    scroll_bar: Option<Rect>,
     first_frame: bool,
     player_bar: PlayerBarState,
+    /// Picks the toast when the player reports a play failure.
+    play_origin: PlayOrigin,
+    /// The live-caption feed's stick-to-bottom tracking.
+    live_feed: LiveFeedState,
 }
 
 impl TranscriptState {
@@ -1410,8 +1689,12 @@ impl TranscriptState {
             focused_once: false,
             scroll_req: None,
             scroll_inner: None,
+            scroll_outer: None,
+            scroll_bar: None,
             first_frame: true,
             player_bar: PlayerBarState::default(),
+            play_origin: PlayOrigin::Bar,
+            live_feed: LiveFeedState::default(),
         }
     }
 
@@ -1445,7 +1728,7 @@ impl TranscriptState {
 
         // The player bar, pinned under the scrolling content.
         if playable {
-            let mut add_at = None;
+            let mut bar_out = player_bar::PlayerBarOutput::default();
             let detail = self.detail.as_ref().expect("checked above");
             let bar_state = &mut self.player_bar;
             egui::Panel::bottom(Id::new(("transcript-player", self.meeting_id)))
@@ -1454,10 +1737,13 @@ impl TranscriptState {
                 .show_separator_line(false)
                 .show(ui, |ui| {
                     widgets::centered_column(ui, MAX_WIDTH, |ui| {
-                        add_at = player_bar::show(ui, cx, detail, bar_state).add_bookmark_at_ms;
+                        bar_out = player_bar::show(ui, cx, detail, bar_state);
                     });
                 });
-            if let Some(at_ms) = add_at {
+            if bar_out.toggled {
+                self.play_origin = PlayOrigin::Bar;
+            }
+            if let Some(at_ms) = bar_out.add_bookmark_at_ms {
                 self.add_bookmark(cx, at_ms);
             }
         }
@@ -1475,9 +1761,12 @@ impl TranscriptState {
                 list_out = self.content(ui, cx, &playback);
             });
         });
-        self.scroll_inner = Some(output.inner_rect);
+        self.record_scroll_rects(ui, &output);
         self.settle_scroll(&ctx, &list_out);
         self.apply_actions(cx, playable, std::mem::take(&mut list_out.actions));
+        if let Some(error) = take_play_error(cx.player) {
+            cx.toasts.error(self.play_origin.failure(), error);
+        }
 
         if !self.follow && playable && self.active.is_some() {
             let anchor = egui::pos2(
@@ -1509,10 +1798,26 @@ impl TranscriptState {
     fn flush(&mut self, cx: &mut UiCtx) {
         let acked = self.acked(cx);
         if let Some(text) = self.notes.take_flush(acked) {
-            let seq = cx.core.queue_notes(self.meeting_id, text);
-            self.notes.sent(seq);
+            if self.synthetic {
+                // Debug data: never write it over a real meeting's notes.
+                self.notes.confirmed = text;
+            } else {
+                let seq = cx.core.queue_notes(self.meeting_id, text.clone());
+                self.notes.sent(seq);
+                remember_queued_notes(self.meeting_id, seq, text);
+            }
         }
         cx.set_notes_deadline(None);
+    }
+
+    /// The view is going: an open bookmark-note editor saves, as its blur
+    /// would. A half-typed speaker rename is dropped: renaming enrols a
+    /// voice print, so it takes Enter, a pick or a click elsewhere.
+    fn leave(&mut self, cx: &mut UiCtx) {
+        self.flush(cx);
+        if let Some(state) = self.bookmark_edit.take() {
+            self.commit_bookmark(cx, state);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1629,6 +1934,12 @@ impl TranscriptState {
             }
         }
 
+        // TODO(I1): a write that fails after this view is gone (the draft
+        // queued by `on_leave`) is only reported when the meeting is
+        // reopened (`Notes::load` adopts the draft, this ack then fails it).
+        // The TSX toasted it at once: have the shell toast "Could not save
+        // notes" for every `NotesSaveFailed` in `ShellModel::apply`, and drop
+        // this toast (keep the ack for the indicator).
         if let Some(error) = self.notes.on_ack(cx.shell.notes_acks.get(&self.meeting_id)) {
             cx.toasts.error("Could not save notes", error);
         }
@@ -1645,7 +1956,12 @@ impl TranscriptState {
                 .chain(detail.segments.iter().map(|s| s.text.as_str()))
                 .chain(detail.bookmarks.iter().map(|b| b.note.as_str())),
         );
-        self.notes.load(&detail.meeting.notes);
+        let queued = if self.synthetic {
+            None
+        } else {
+            queued_notes(self.meeting_id)
+        };
+        self.notes.load(&detail.meeting.notes, queued);
         self.load_error = None;
         self.speakers = detail
             .speakers
@@ -1784,6 +2100,7 @@ impl TranscriptState {
             )
         });
         if space {
+            self.play_origin = PlayOrigin::Bar;
             cx.player.toggle();
         }
         if left {
@@ -1794,20 +2111,53 @@ impl TranscriptState {
         }
     }
 
-    /// A wheel over the transcript or a press on its scrollbar suspends
-    /// follow-along (programmatic scrolls do not).
+    /// `play()` on behalf of `origin` (which picks the failure toast).
+    fn play(&mut self, cx: &mut UiCtx, origin: PlayOrigin) {
+        self.play_origin = origin;
+        cx.player.play();
+    }
+
+    /// Remember where the scroll area and its bar are, for next frame's
+    /// [`Self::detect_user_scroll`]. `inner_rect` excludes a solid bar,
+    /// which egui places to the right of it; a floating bar overlays the
+    /// content's right edge instead.
+    fn record_scroll_rects<R>(
+        &mut self,
+        ui: &egui::Ui,
+        output: &egui::scroll_area::ScrollAreaOutput<R>,
+    ) {
+        let inner = output.inner_rect;
+        let style = ui.spacing().scroll;
+        let bar_width = style.bar_inner_margin + style.bar_width + style.bar_outer_margin;
+        let (bar_x, outer) = if style.floating {
+            ((inner.right() - bar_width)..=inner.right(), inner)
+        } else {
+            let right = inner.right() + style.allocated_width();
+            (inner.right()..=right, inner.with_max_x(right))
+        };
+        let scrollable = output.content_size.y > inner.height() + 0.5;
+        self.scroll_inner = Some(inner);
+        self.scroll_outer = Some(outer);
+        self.scroll_bar = scrollable.then(|| Rect::from_x_y_ranges(bar_x, inner.y_range()));
+    }
+
+    /// A wheel over the transcript or a press on its scroll bar (a thumb
+    /// drag or a track click) suspends follow-along; programmatic scrolls
+    /// and presses on the content do not.
     fn detect_user_scroll(&mut self, ctx: &egui::Context) {
-        let Some(inner) = self.scroll_inner else {
+        let Some(outer) = self.scroll_outer else {
             return;
         };
-        let bar = Rect::from_x_y_ranges((inner.right() - 14.0)..=inner.right(), inner.y_range());
+        let bar = self.scroll_bar;
         let scrolled = ctx.input(|i| {
             let wheel = i.events.iter().any(|event| {
                 matches!(event, egui::Event::MouseWheel { delta, modifiers, .. }
                     if delta.y != 0.0 && !modifiers.command)
-            }) && i.pointer.hover_pos().is_some_and(|p| inner.contains(p));
+            }) && i.pointer.hover_pos().is_some_and(|p| outer.contains(p));
             let thumb = i.pointer.primary_pressed()
-                && i.pointer.interact_pos().is_some_and(|p| bar.contains(p));
+                && i.pointer
+                    .interact_pos()
+                    .is_some_and(|p| bar.is_some_and(|bar| bar.contains(p)));
             wheel || thumb
         });
         if scrolled {
@@ -1855,7 +2205,14 @@ impl TranscriptState {
                 || ((status == "processing" || status == "recorded") && !lines.is_empty()));
         if show_live {
             let active = cx.shell.live_captions_active();
-            live_feed(ui, self.meeting_id, status == "recording", active, lines);
+            live_feed(
+                ui,
+                &mut self.live_feed,
+                self.meeting_id,
+                status == "recording",
+                active,
+                lines,
+            );
         }
 
         self.notes_panel(ui, cx);
@@ -2144,6 +2501,16 @@ impl TranscriptState {
     }
 
     fn apply_actions(&mut self, cx: &mut UiCtx, playable: bool, actions: Vec<RowAction>) {
+        let actions = editor_results_first(actions);
+        // A note blurred by a click on its own trash button: the row is
+        // going, so saving the note would only race the delete.
+        let deleted: Vec<i64> = actions
+            .iter()
+            .filter_map(|a| match a {
+                RowAction::DeleteBookmark(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
         for action in actions {
             match action {
                 RowAction::SeekPlay(idx) => {
@@ -2157,10 +2524,8 @@ impl TranscriptState {
                     };
                     // Without audio there is nothing to seek (as before).
                     if playable {
-                        // TODO(I1): toast "Could not play the recording" from
-                        // the player's play error once U3's API is merged.
                         cx.player.seek_ms(u64::try_from(start).unwrap_or(0));
-                        cx.player.play();
+                        self.play(cx, PlayOrigin::Seek);
                         self.active = Some(idx);
                         self.follow = true;
                     }
@@ -2168,37 +2533,82 @@ impl TranscriptState {
                 RowAction::BookmarkSeek(at_ms) => {
                     if playable {
                         cx.player.seek_ms(u64::try_from(at_ms).unwrap_or(0));
-                        cx.player.play();
+                        self.play(cx, PlayOrigin::Seek);
                         self.follow = true;
                     }
                 }
-                RowAction::OpenSpeaker {
-                    speaker_id,
-                    seg_id,
-                    text,
-                } => {
-                    self.speaker_edit = Some(SpeakerEdit {
-                        speaker_id,
-                        seg_id,
-                        edit: LineEdit::new(&text),
-                        suggest_rect: None,
-                    });
-                    // Refreshed each time a rename opens.
-                    self.people_task =
-                        Some(cx.tasks.spawn("list-people", |core| core.list_people()));
-                }
-                RowAction::SpeakerDone(EditOutcome::Commit) => self.commit_speaker(cx, None),
-                RowAction::SpeakerDone(_) => self.speaker_edit = None,
-                RowAction::SpeakerPick(name) => self.commit_speaker(cx, Some(name)),
-                RowAction::EditBookmark { id, note } => {
-                    self.bookmark_edit = Some(BookmarkEdit {
-                        id,
-                        edit: LineEdit::new(&note),
-                    });
-                }
-                RowAction::BookmarkDone(EditOutcome::Commit) => self.commit_bookmark(cx),
-                RowAction::BookmarkDone(_) => self.bookmark_edit = None,
                 RowAction::DeleteBookmark(id) => self.delete_bookmark(cx, id),
+                editor => match self.route_editor(editor, &deleted) {
+                    Some(EditorEffect::CommitSpeaker(state, name)) => {
+                        self.commit_speaker(cx, state, name);
+                    }
+                    Some(EditorEffect::CommitBookmark(state)) => self.commit_bookmark(cx, state),
+                    Some(EditorEffect::LoadPeople) => {
+                        // Refreshed each time a rename opens.
+                        self.people_task =
+                            Some(cx.tasks.spawn("list-people", |core| core.list_people()));
+                    }
+                    None => {}
+                },
+            }
+        }
+    }
+
+    /// Open, close or commit the inline editors (no side effects here; the
+    /// returned effect is the caller's to run). A result only touches the
+    /// editor it names, and an Open prefills from the current data, so it
+    /// sees a commit applied just before it. `deleted`: bookmarks removed
+    /// this pass, whose note is not saved.
+    fn route_editor(&mut self, action: RowAction, deleted: &[i64]) -> Option<EditorEffect> {
+        match action {
+            RowAction::OpenSpeaker { speaker_id, seg_id } => {
+                let speaker = self
+                    .detail
+                    .as_ref()?
+                    .speakers
+                    .iter()
+                    .find(|s| s.id == speaker_id)?;
+                let name = if speaker.display_name.is_empty() {
+                    &speaker.label
+                } else {
+                    &speaker.display_name
+                };
+                self.speaker_edit = Some(SpeakerEdit::new(speaker_id, seg_id, name));
+                Some(EditorEffect::LoadPeople)
+            }
+            RowAction::SpeakerDone { seg_id, outcome } => {
+                let state = take_editor(&mut self.speaker_edit, |e| e.seg_id == seg_id)?;
+                (outcome == EditOutcome::Commit).then(|| {
+                    let name = state.edit.text.clone();
+                    EditorEffect::CommitSpeaker(state, name)
+                })
+            }
+            RowAction::SpeakerPick { seg_id, name } => {
+                let state = take_editor(&mut self.speaker_edit, |e| e.seg_id == seg_id)?;
+                Some(EditorEffect::CommitSpeaker(state, name))
+            }
+            RowAction::EditBookmark(id) => {
+                let note = self
+                    .detail
+                    .as_ref()?
+                    .bookmarks
+                    .iter()
+                    .find(|b| b.id == id)?
+                    .note
+                    .clone();
+                self.bookmark_edit = Some(BookmarkEdit {
+                    id,
+                    edit: LineEdit::new(&note),
+                });
+                None
+            }
+            RowAction::BookmarkDone { id, outcome } => {
+                let state = take_editor(&mut self.bookmark_edit, |e| e.id == id)?;
+                (outcome == EditOutcome::Commit && !deleted.contains(&id))
+                    .then_some(EditorEffect::CommitBookmark(state))
+            }
+            RowAction::SeekPlay(_) | RowAction::BookmarkSeek(_) | RowAction::DeleteBookmark(_) => {
+                None
             }
         }
     }
@@ -2215,6 +2625,9 @@ impl TranscriptState {
             return;
         }
         detail.meeting.title = title.clone();
+        if self.synthetic {
+            return;
+        }
         let id = self.meeting_id;
         cx.tasks.spawn_op("rename-meeting", move |core| {
             failure_notice(
@@ -2226,12 +2639,10 @@ impl TranscriptState {
 
     /// Commit rules (map §4.4): empty is a no-op; the same name on a
     /// confirmed speaker is a no-op, but re-entering it on an auto-matched
-    /// (≈) one confirms it.
-    fn commit_speaker(&mut self, cx: &mut UiCtx, picked: Option<String>) {
-        let Some(state) = self.speaker_edit.take() else {
-            return;
-        };
-        let name = picked.unwrap_or(state.edit.text).trim().to_string();
+    /// (≈) one confirms it. `state` is the closed editor, `name` the typed
+    /// text or the picked suggestion.
+    fn commit_speaker(&mut self, cx: &mut UiCtx, state: SpeakerEdit, name: String) {
+        let name = name.trim().to_string();
         if name.is_empty() {
             return;
         }
@@ -2250,6 +2661,9 @@ impl TranscriptState {
             speaker.auto_labeled = false;
         }
         self.stats = speaker_stats(detail, &self.speakers);
+        if self.synthetic {
+            return;
+        }
         let speaker_id = state.speaker_id;
         cx.tasks.spawn_op("rename-speaker", move |core| {
             failure_notice(
@@ -2260,10 +2674,7 @@ impl TranscriptState {
     }
 
     /// Enter / blur saves the trimmed note (even unchanged or empty).
-    fn commit_bookmark(&mut self, cx: &mut UiCtx) {
-        let Some(state) = self.bookmark_edit.take() else {
-            return;
-        };
+    fn commit_bookmark(&mut self, cx: &mut UiCtx, state: BookmarkEdit) {
         let note = state.edit.text.trim().to_string();
         if let Some(bookmark) = self
             .detail
@@ -2271,6 +2682,9 @@ impl TranscriptState {
             .and_then(|d| d.bookmarks.iter_mut().find(|b| b.id == state.id))
         {
             bookmark.note = note.clone();
+        }
+        if self.synthetic {
+            return;
         }
         let id = state.id;
         cx.tasks.spawn_op("bookmark-note", move |core| {
@@ -2290,6 +2704,9 @@ impl TranscriptState {
         if self.bookmark_edit.as_ref().is_some_and(|e| e.id == id) {
             self.bookmark_edit = None;
         }
+        if self.synthetic {
+            return;
+        }
         cx.tasks.spawn_op("delete-bookmark", move |core| {
             failure_notice(core.delete_bookmark(id), "Could not remove the bookmark")
         });
@@ -2298,6 +2715,9 @@ impl TranscriptState {
     /// The player bar's bookmark button. The op reports the new id back so
     /// the row appears with its note editor open.
     fn add_bookmark(&mut self, cx: &mut UiCtx, at_ms: i64) {
+        if self.synthetic {
+            return;
+        }
         let id = self.meeting_id;
         let tx = self.bookmark_tx.clone();
         cx.tasks.spawn_op("add-bookmark", move |core| {
@@ -2318,6 +2738,9 @@ impl TranscriptState {
 
     /// No confirmation (as before); user-set names carry forward by label.
     fn retranscribe(&mut self, cx: &mut UiCtx, engine: Option<Engine>) {
+        if self.synthetic {
+            return;
+        }
         let id = self.meeting_id;
         cx.tasks
             .spawn_op("retranscribe", move |core| OpDone::Notice {
@@ -2440,10 +2863,49 @@ fn title_row(ui: &mut egui::Ui, title: &str) -> bool {
     start
 }
 
-/// The provisional caption feed (map §5): own scroll area that sticks to
-/// the bottom while the user is there.
+/// A new caption scrolls the feed to the bottom only if the reader was
+/// within this distance of it (transcript.tsx, tracked on scroll).
+const LIVE_STICK_PX: f32 = 40.0;
+
+/// The live feed's stick-to-bottom state.
+#[derive(Debug)]
+struct LiveFeedState {
+    /// The reader was within `LIVE_STICK_PX` of the bottom last frame.
+    near_bottom: bool,
+    /// The newest caption seen (track, start), so only a new one scrolls.
+    newest: Option<(&'static str, u64)>,
+}
+
+impl Default for LiveFeedState {
+    fn default() -> Self {
+        LiveFeedState {
+            near_bottom: true,
+            newest: None,
+        }
+    }
+}
+
+impl LiveFeedState {
+    /// Whether this frame brings a new caption to scroll down to.
+    fn stick(&mut self, newest: Option<(&'static str, u64)>) -> bool {
+        let arrived = newest.is_some() && newest != self.newest;
+        self.newest = newest;
+        arrived && self.near_bottom
+    }
+
+    /// After drawing: how far the view sits above the end of the feed.
+    fn scrolled(&mut self, stuck: bool, distance_from_bottom: f32) {
+        // A frame that just scrolled down may still report the old offset;
+        // it is at the bottom by construction.
+        self.near_bottom = stuck || distance_from_bottom < LIVE_STICK_PX;
+    }
+}
+
+/// The provisional caption feed (map §5): own scroll area that follows new
+/// captions while the reader is within 40 px of its bottom.
 fn live_feed(
     ui: &mut egui::Ui,
+    state: &mut LiveFeedState,
     meeting_id: i64,
     recording: bool,
     captions_active: bool,
@@ -2452,6 +2914,7 @@ fn live_feed(
     let mut sorted: Vec<&LiveTranscript> = lines.iter().collect();
     sorted.sort_by_key(|line| line.start_ms);
     let max_height = ui.ctx().content_rect().height() * 0.6;
+    let stick = state.stick(lines.back().map(|line| (line.track, line.start_ms)));
     Frame::new()
         .stroke(Stroke::new(1.0, LIVE_BORDER))
         .corner_radius(CornerRadius::same(8))
@@ -2478,10 +2941,9 @@ fn live_feed(
                 );
             });
             ui.add_space(6.0 - ui.spacing().item_spacing.y);
-            egui::ScrollArea::vertical()
+            let output = egui::ScrollArea::vertical()
                 .id_salt(("live-feed", meeting_id))
                 .max_height((max_height - 40.0).max(80.0))
-                .stick_to_bottom(true)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     if sorted.is_empty() {
@@ -2501,7 +2963,13 @@ fn live_feed(
                     for line in &sorted {
                         ui.push_id((line.track, line.start_ms), |ui| live_line(ui, line));
                     }
+                    if stick {
+                        ui.scroll_to_cursor(Some(Align::Max));
+                    }
                 });
+            let distance =
+                output.content_size.y - output.state.offset.y - output.inner_rect.height();
+            state.scrolled(stick, distance);
         });
     if let Some(newest) = lines.back() {
         widgets::announce(
@@ -2823,10 +3291,10 @@ mod tests {
     #[test]
     fn notes_save_through_the_writer_with_acks() {
         let mut notes = Notes::default();
-        notes.load("old");
+        notes.load("old", None);
         assert!(notes.open);
         assert_eq!(notes.take_flush(0), None, "nothing changed");
-        notes.load("ignored on reload");
+        notes.load("ignored on reload", None);
         assert_eq!(notes.draft, "old");
 
         notes.draft = "new".into();
@@ -2857,7 +3325,7 @@ mod tests {
     #[test]
     fn notes_saved_state_when_typing_back() {
         let mut notes = Notes::default();
-        notes.load("");
+        notes.load("", None);
         assert!(!notes.open);
         notes.draft = "x".into();
         notes.edited();
@@ -2898,9 +3366,22 @@ mod tests {
     fn run_list_sized(
         list: &mut RowList,
         detail: &MeetingDetail,
+        req: Option<ScrollReq>,
+        frames: usize,
+        width: f32,
+    ) -> ListOutput {
+        run_list_editing(list, detail, req, frames, width, &mut None)
+    }
+
+    /// `run_list_sized` with a speaker editor that may be open; the
+    /// output's actions are every pass's.
+    fn run_list_editing(
+        list: &mut RowList,
+        detail: &MeetingDetail,
         mut req: Option<ScrollReq>,
         frames: usize,
         width: f32,
+        speaker_edit: &mut Option<SpeakerEdit>,
     ) -> ListOutput {
         let ctx = CTX.with(|ctx| ctx.clone());
         let speakers: HashMap<i64, usize> = detail
@@ -2911,6 +3392,7 @@ mod tests {
             .collect();
         let mut last = ListOutput::default();
         let mut settled_error = None;
+        let mut actions = Vec::new();
         for _ in 0..frames {
             let input = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(
@@ -2924,14 +3406,13 @@ mod tests {
                     .id_salt("test-list")
                     .auto_shrink(false)
                     .show_viewport(ui, |ui, _| {
-                        let mut speaker_edit = None;
                         let mut bookmark_edit = None;
                         let mut rc = RowCtx {
                             detail,
                             speakers: &speakers,
                             tokens: &[],
                             active: None,
-                            speaker_edit: &mut speaker_edit,
+                            speaker_edit: &mut *speaker_edit,
                             bookmark_edit: &mut bookmark_edit,
                             people: &[],
                         };
@@ -2939,6 +3420,7 @@ mod tests {
                     });
             });
             output.textures_delta.clear();
+            actions.append(&mut last.actions);
             if last.target_error.is_some() {
                 settled_error = last.target_error;
             }
@@ -2946,6 +3428,7 @@ mod tests {
             req = req.and_then(|r| r.next(&last));
         }
         last.target_error = settled_error;
+        last.actions = actions;
         last
     }
 
@@ -3010,5 +3493,188 @@ mod tests {
         let row = list.keys.iter().position(|k| *k == key).unwrap();
         assert_eq!(list.heights[row], Some((700.0, 99.0)));
         assert_eq!(list.seg_row.len(), 50);
+    }
+
+    /// Route a pass's row actions the way `apply_actions` does.
+    fn route_all(state: &mut TranscriptState, actions: Vec<RowAction>) -> Vec<EditorEffect> {
+        let deleted: Vec<i64> = actions
+            .iter()
+            .filter_map(|a| match a {
+                RowAction::DeleteBookmark(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        editor_results_first(actions)
+            .into_iter()
+            .filter_map(|action| state.route_editor(action, &deleted))
+            .collect()
+    }
+
+    #[test]
+    fn a_click_on_a_row_above_commits_the_open_rename_first() {
+        let mut state = TranscriptState::new(1, None, None);
+        // Segment id 6 is Alice's (speaker 2), id 3 Bob's (speaker 3, ≈).
+        state.detail = Some(synthetic_detail(1, 10));
+        let mut open = SpeakerEdit::new(2, 6, "Alice");
+        open.edit.text = "Alicia".into();
+        state.speaker_edit = Some(open);
+        // Bob's chip sits above: its Open was pushed before the blur.
+        let effects = route_all(
+            &mut state,
+            vec![
+                RowAction::OpenSpeaker {
+                    speaker_id: 3,
+                    seg_id: 3,
+                },
+                RowAction::SpeakerDone {
+                    seg_id: 6,
+                    outcome: EditOutcome::Commit,
+                },
+            ],
+        );
+        assert_eq!(effects.len(), 2, "{effects:?}");
+        match &effects[0] {
+            EditorEffect::CommitSpeaker(closed, name) => {
+                assert_eq!((closed.speaker_id, closed.seg_id), (2, 6));
+                assert_eq!(name, "Alicia");
+            }
+            other => panic!("expected Alice's commit, got {other:?}"),
+        }
+        assert!(matches!(effects[1], EditorEffect::LoadPeople));
+        // Bob's editor is open with his name; he was not renamed/confirmed.
+        let bob = state.speaker_edit.as_ref().expect("Bob's editor open");
+        assert_eq!((bob.speaker_id, bob.seg_id), (3, 3));
+        assert_eq!(bob.edit.text, "Bob");
+    }
+
+    #[test]
+    fn an_editor_result_only_closes_its_own_editor() {
+        let mut state = TranscriptState::new(1, None, None);
+        // Bookmarks 1–3 (one every 150 segments).
+        state.detail = Some(synthetic_detail(1, 400));
+        state.speaker_edit = Some(SpeakerEdit::new(3, 3, "Bob"));
+        let stale = route_all(
+            &mut state,
+            vec![RowAction::SpeakerPick {
+                seg_id: 6,
+                name: "Carol".into(),
+            }],
+        );
+        assert!(stale.is_empty());
+        assert_eq!(state.speaker_edit.as_ref().map(|e| e.seg_id), Some(3));
+
+        // A note blurred by its own trash button is not saved.
+        state.bookmark_edit = Some(BookmarkEdit {
+            id: 1,
+            edit: LineEdit::new("typed"),
+        });
+        let effects = route_all(
+            &mut state,
+            vec![
+                RowAction::BookmarkDone {
+                    id: 1,
+                    outcome: EditOutcome::Commit,
+                },
+                RowAction::DeleteBookmark(1),
+            ],
+        );
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(state.bookmark_edit.is_none());
+
+        // Another note's click commits the open one, then opens its own.
+        state.bookmark_edit = Some(BookmarkEdit {
+            id: 1,
+            edit: LineEdit::new("typed"),
+        });
+        let effects = route_all(
+            &mut state,
+            vec![
+                RowAction::EditBookmark(2),
+                RowAction::BookmarkDone {
+                    id: 1,
+                    outcome: EditOutcome::Commit,
+                },
+            ],
+        );
+        assert!(
+            matches!(&effects[..], [EditorEffect::CommitBookmark(b)] if b.id == 1 && b.edit.text == "typed")
+        );
+        assert_eq!(state.bookmark_edit.as_ref().map(|e| e.id), Some(2));
+    }
+
+    #[test]
+    fn an_open_editor_keeps_focus_when_its_row_scrolls_far_away() {
+        let detail = synthetic_detail(1, 3_000);
+        let mut list = RowList::default();
+        list.rebuild(&detail);
+        let mut edit = Some(SpeakerEdit::new(3, 3, "Bob"));
+        let top = Some(ScrollReq::new(0, false, false));
+        run_list_editing(&mut list, &detail, top, 3, 800.0, &mut edit);
+        let field = Id::new(("speaker-rename", 3_i64));
+        let focused = || CTX.with(|ctx| ctx.memory(|m| m.focused()));
+        assert_eq!(focused(), Some(field));
+
+        let far = Some(ScrollReq::new(1_000, true, false));
+        let out = run_list_editing(&mut list, &detail, far, 8, 800.0, &mut edit);
+        assert!(out.target_error.is_some(), "jumped to the far row");
+        assert_eq!(focused(), Some(field), "the editor kept its focus");
+        assert!(
+            out.actions.is_empty(),
+            "nothing committed: {:?}",
+            out.actions
+        );
+        assert!(edit.is_some());
+    }
+
+    #[test]
+    fn menu_keys_wrap_and_jump() {
+        assert_eq!(menu_key_target(Key::ArrowDown, 4, 5), Some(0));
+        assert_eq!(menu_key_target(Key::ArrowUp, 0, 5), Some(4));
+        assert_eq!(menu_key_target(Key::ArrowDown, 1, 5), Some(2));
+        assert_eq!(menu_key_target(Key::Home, 3, 5), Some(0));
+        assert_eq!(menu_key_target(Key::End, 0, 2), Some(1));
+        assert_eq!(menu_key_target(Key::ArrowLeft, 1, 2), None);
+        assert_eq!(menu_key_target(Key::ArrowDown, 0, 0), None);
+    }
+
+    #[test]
+    fn reopening_prefers_the_newest_queued_notes() {
+        // The read raced the last visit's write: the queued draft wins and
+        // its (successful) ack confirms it quietly.
+        let mut notes = Notes::default();
+        notes.load("db", Some((7, "newer".into())));
+        assert_eq!(notes.draft, "newer");
+        assert!(notes.open);
+        assert_eq!(notes.take_flush(0), None, "already queued");
+        assert_eq!(notes.on_ack(Some(&(7, None))), None);
+        assert_eq!(notes.confirmed, "newer");
+        assert_eq!(notes.indicator(), None);
+
+        // That write failed after the view was gone: report it now, and
+        // the next flush retries the draft.
+        let mut notes = Notes::default();
+        notes.load("db", Some((7, "newer".into())));
+        let ack = (7, Some("disk full".to_string()));
+        assert_eq!(notes.on_ack(Some(&ack)).as_deref(), Some("disk full"));
+        assert_eq!(notes.take_flush(7).as_deref(), Some("newer"));
+
+        // The database already has it: a plain load.
+        let mut notes = Notes::default();
+        notes.load("same", Some((3, "same".into())));
+        assert_eq!((notes.seq, notes.draft.as_str()), (0, "same"));
+    }
+
+    #[test]
+    fn live_feed_follows_only_from_near_the_bottom() {
+        let mut feed = LiveFeedState::default();
+        assert!(feed.stick(Some(("mic", 1_000))), "first caption");
+        feed.scrolled(true, 300.0);
+        assert!(!feed.stick(Some(("mic", 1_000))), "nothing new");
+        // The reader scrolled up 100 px: new captions leave them there.
+        feed.scrolled(false, 100.0);
+        assert!(!feed.stick(Some(("loopback", 2_000))));
+        // Back within 40 px: the next caption scrolls again.
+        feed.scrolled(false, 30.0);
+        assert!(feed.stick(Some(("mic", 3_000))));
     }
 }

@@ -58,6 +58,9 @@ pub struct PlayerBarState {
 pub struct PlayerBarOutput {
     /// "Add bookmark" at this position.
     pub add_bookmark_at_ms: Option<i64>,
+    /// Play/Pause was pressed (a play failure toasts "Could not play
+    /// recording").
+    pub toggled: bool,
 }
 
 /// The nearest offered speed (a hand-edited `ui-state.toml` may hold any
@@ -236,7 +239,11 @@ fn scrubber(
             }
         }
         if response.drag_stopped() || response.clicked() {
-            if let Some(ms) = st.scrub_ms {
+            // A press and release in the same pass (a touchpad tap, a fast
+            // click on an idle window) was never `held`: seek to where it
+            // landed. A keyboard "click" has no pointer position.
+            let landed = response.interact_pointer_pos().map(|pos| to_ms(pos.x));
+            if let Some(ms) = st.scrub_ms.or(landed) {
                 cx.player.seek_ms(ms);
             }
         }
@@ -246,7 +253,21 @@ fn scrubber(
         st.last_scrub_seek = None;
     }
 
-    // Keyboard on the focused scrubber: ←/→ ±5 s, Home/End.
+    // Keyboard on the focused scrubber: ←/→ ±5 s, Home/End. Like
+    // egui's Slider, it keeps the arrows: otherwise egui's arrow-key
+    // navigation also moves focus off it, and the next press would land
+    // on a button.
+    if response.has_focus() {
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                response.id,
+                egui::EventFilter {
+                    horizontal_arrows: true,
+                    ..Default::default()
+                },
+            );
+        });
+    }
     if response.has_focus() && duration > 0 {
         let (left, right, home, end) = ui.input_mut(|i| {
             (
@@ -256,6 +277,10 @@ fn scrubber(
                 i.consume_key(egui::Modifiers::NONE, Key::End),
             )
         });
+        if left || right {
+            // The lock filter applies from the pass after focus arrived.
+            ui.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+        }
         if left {
             cx.player.skip_ms(-SKIP_KEY_MS);
         }
@@ -410,6 +435,7 @@ fn left_cluster(
     };
     if player_btn(ui, glyph, 18.0, label, tip, true).clicked() {
         cx.player.toggle();
+        out.toggled = true;
     }
     if player_btn(
         ui,
