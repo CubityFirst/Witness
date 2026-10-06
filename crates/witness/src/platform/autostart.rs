@@ -142,7 +142,9 @@ fn is_enabled_at(keys: Keys<'_>) -> io::Result<bool> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let run = match hkcu.open_subkey_with_flags(keys.run, KEY_READ) {
         Ok(run) => run,
-        // No Run key at all: nothing can be registered.
+        // No Run key at all: nothing can be registered. Deliberate deviation:
+        // auto-launch propagated this as an error ("Could not read autostart
+        // status: ... (os error 2)"); a missing key just means "off".
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
     };

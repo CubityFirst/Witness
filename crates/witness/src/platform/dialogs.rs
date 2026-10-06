@@ -37,7 +37,7 @@ pub struct SaveFileRequest {
 /// Show a modal save dialog; None when cancelled. The first extension is
 /// also the default one, so a typed name without one still gets it.
 pub fn save_file_blocking(owner: OwnerHwnd, request: SaveFileRequest) -> Option<PathBuf> {
-    on_dialog_thread("save", move || {
+    on_dialog_thread("save", owner, move || {
         let mut dialog = with_owner(rfd::FileDialog::new(), owner).set_file_name(request.file_name);
         if !request.extensions.is_empty() {
             dialog = dialog.add_filter(request.filter_name, &request.extensions);
@@ -50,7 +50,7 @@ pub fn save_file_blocking(owner: OwnerHwnd, request: SaveFileRequest) -> Option<
 /// shell's default caption ("Select Folder").
 pub fn pick_folder_blocking(owner: OwnerHwnd, title: Option<&str>) -> Option<PathBuf> {
     let title = title.map(str::to_owned);
-    on_dialog_thread("folder", move || {
+    on_dialog_thread("folder", owner, move || {
         let mut dialog = with_owner(rfd::FileDialog::new(), owner);
         if let Some(title) = title {
             dialog = dialog.set_title(title);
@@ -61,18 +61,34 @@ pub fn pick_folder_blocking(owner: OwnerHwnd, title: Option<&str>) -> Option<Pat
 
 /// Run `show` on a fresh thread (clean COM apartment) and wait for it. A
 /// panic inside the dialog reads as "cancelled" after being logged.
-fn on_dialog_thread<F>(kind: &str, show: F) -> Option<PathBuf>
+///
+/// Refused (logged, read as "cancelled") in every build when the calling
+/// thread owns `owner`: the dialog's Show disables the owner through
+/// EnableWindow, which waits for the owner's thread to handle messages,
+/// while that thread sits in the join below without pumping, so both would
+/// wait forever. That is exactly the UI thread misusing this API.
+fn on_dialog_thread<F>(kind: &str, owner: OwnerHwnd, show: F) -> Option<PathBuf>
 where
     F: FnOnce() -> Option<PathBuf> + Send,
 {
-    // The UI thread is the process's main thread (eframe/winit run there
-    // and `main()` marks it), so this is the core's off-UI-thread guard with
-    // a message that names the dialog rather than an AppCore method.
+    // Debug builds also catch an unparented dialog opened on the UI thread
+    // (no deadlock, but it freezes the UI). This relies on Rust naming the
+    // process's main thread "main", which is where eframe/winit run.
+    // TODO(I1): use a `witness_core::service::is_ui_thread()` next to
+    // `mark_ui_thread` instead, so there is one definition of the UI thread
+    // (U9 does not own witness-core).
     debug_assert!(
         std::thread::current().name() != Some("main"),
         "the {kind} dialog blocks and must not be opened on the UI thread \
          (open it from a Tasks worker)"
     );
+    if owned_by_current_thread(owner) {
+        log::error!(
+            "the {kind} dialog was opened on its owner window's thread (the UI \
+             thread); refused, since waiting for it there would hang Witness"
+        );
+        return None;
+    }
     let picked = std::thread::scope(|scope| {
         let spawned = std::thread::Builder::new()
             .name(format!("dialog-{kind}"))
@@ -144,6 +160,28 @@ fn is_window(_hwnd: isize) -> bool {
     false
 }
 
+/// Whether `owner` is a live window created by the calling thread.
+#[cfg(windows)]
+fn owned_by_current_thread(owner: OwnerHwnd) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    if owner.0 == 0 || !is_window(owner.0) {
+        return false;
+    }
+    // SAFETY: plain queries. GetWindowThreadProcessId returns 0 for a window
+    // that vanished in between, and 0 is never a thread id.
+    unsafe {
+        GetWindowThreadProcessId(HWND(owner.0 as *mut core::ffi::c_void), None)
+            == GetCurrentThreadId()
+    }
+}
+
+#[cfg(not(windows))]
+fn owned_by_current_thread(_owner: OwnerHwnd) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,7 +218,7 @@ mod tests {
                     assert_eq!(here, com::RPC_E_CHANGED_MODE);
                     let worker = std::thread::current().id();
                     // ...but the dialog thread starts clean.
-                    let picked = on_dialog_thread("probe", move || {
+                    let picked = on_dialog_thread("probe", OwnerHwnd(0), move || {
                         assert_ne!(std::thread::current().id(), worker);
                         let hr =
                             com::CoInitializeEx(std::ptr::null(), com::COINIT_APARTMENTTHREADED);
@@ -195,6 +233,65 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    /// A dialog opened on its owner's own thread (the UI thread misusing the
+    /// API) must come back as "cancelled" at once in every build instead of
+    /// deadlocking in EnableWindow. It runs on a helper thread so that a
+    /// regression fails the test rather than hanging it.
+    #[cfg(windows)]
+    #[test]
+    fn dialog_on_the_owner_thread_is_refused_not_deadlocked() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
+        };
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("owner-thread".into())
+            .spawn(move || {
+                // SAFETY: a message-only STATIC window owned by this thread,
+                // destroyed below.
+                let hwnd = unsafe {
+                    CreateWindowExW(
+                        WINDOW_EX_STYLE(0),
+                        w!("STATIC"),
+                        w!("Witness dialog owner (same-thread test)"),
+                        WINDOW_STYLE(0),
+                        0,
+                        0,
+                        0,
+                        0,
+                        Some(HWND_MESSAGE),
+                        None,
+                        None,
+                        None,
+                    )
+                }
+                .unwrap();
+                let owner = OwnerHwnd(hwnd.0 as isize);
+                assert!(owned_by_current_thread(owner));
+                let shown = AtomicBool::new(false);
+                let picked = on_dialog_thread("probe", owner, || {
+                    shown.store(true, Ordering::SeqCst);
+                    Some(PathBuf::from("shown"))
+                });
+                let shown = shown.into_inner();
+                // SAFETY: the window was created on this thread.
+                unsafe { DestroyWindow(hwnd).unwrap() };
+                tx.send((picked, shown)).unwrap();
+            })
+            .unwrap();
+        let (picked, shown) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a dialog on its owner's thread hung");
+        assert_eq!(picked, None);
+        assert!(!shown, "the dialog must not be shown at all");
+        assert!(!owned_by_current_thread(OwnerHwnd(0)));
     }
 
     #[test]
