@@ -166,20 +166,67 @@ fn squash(line: &str) -> String {
     line.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The body of `Section <name>` … `SectionEnd`, as code lines.
-fn section<'a>(nsi: &'a str, name: &str) -> Vec<&'a str> {
+/// The body of the first `<header>` … `<end>` block, as code lines.
+fn block<'a>(nsi: &'a str, header: &str, end: &str) -> Vec<&'a str> {
     let mut inside = false;
     let mut out = Vec::new();
     for line in code_lines(nsi) {
         if !inside {
-            inside = squash(line) == format!("Section {name}");
-        } else if line == "SectionEnd" {
+            inside = squash(line) == header;
+        } else if line == end {
             break;
         } else {
             out.push(line);
         }
     }
     out
+}
+
+/// The body of `Section <name>` … `SectionEnd`, as code lines.
+fn section<'a>(nsi: &'a str, name: &str) -> Vec<&'a str> {
+    block(nsi, &format!("Section {name}"), "SectionEnd")
+}
+
+/// The body of `Function <name>` … `FunctionEnd`, squashed.
+fn function(nsi: &str, name: &str) -> Vec<String> {
+    block(nsi, &format!("Function {name}"), "FunctionEnd")
+        .into_iter()
+        .map(squash)
+        .collect()
+}
+
+/// The lines of the `${If}` block that starts at `lines[start]` (nested
+/// `${If}`s included), or nothing if `start` is not such a line.
+fn if_block(lines: &[String], start: usize) -> &[String] {
+    let mut depth = 0usize;
+    for (i, line) in lines.iter().enumerate().skip(start) {
+        if line.starts_with("${If}") || line.starts_with("${IfNot}") {
+            depth += 1;
+        } else if line == "${EndIf}" {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return &lines[start..=i];
+            }
+        }
+        if depth == 0 {
+            break;
+        }
+    }
+    &[]
+}
+
+/// The target of an `RMDir /r` line with defines expanded, lowercased and
+/// without quotes or a trailing backslash.
+fn recursive_rmdir_target(line: &str, defines: &BTreeMap<String, String>) -> Option<String> {
+    let expanded = expand(line, defines).to_ascii_lowercase();
+    let target = expanded.strip_prefix("rmdir /r ")?;
+    Some(
+        target
+            .trim()
+            .trim_matches('"')
+            .trim_end_matches('\\')
+            .to_string(),
+    )
 }
 
 /// The destination file name of a `File` instruction.
@@ -196,6 +243,9 @@ fn installed_name(line: &str, defines: &BTreeMap<String, String>) -> Option<Stri
     let source = expand(source, defines);
     source.rsplit(['\\', '/']).next().map(str::to_string)
 }
+
+/// A function body and the `(switch, variable)` pairs it must parse.
+type FlagSet<'a> = (&'a str, &'a Vec<String>, &'a [(&'a str, &'a str)]);
 
 /// Installer identity, file list, flags and data safety (design §8.1/§8.2).
 pub fn check_installer(nsi: &str, utils: &str) -> Vec<String> {
@@ -231,12 +281,21 @@ pub fn check_installer(nsi: &str, utils: &str) -> Vec<String> {
             "{NSI_PATH}: must be `RequestExecutionLevel user` (per-user install, never elevated)"
         ));
     }
-    if !has(r#"StrCpy $INSTDIR "$LOCALAPPDATA\${PRODUCTNAME}""#)
-        || !has("Call RestorePreviousInstallLocation")
+    let on_init = function(nsi, ".onInit");
+    let on_install_success = function(nsi, ".onInstSuccess");
+    let install: Vec<String> = section(nsi, "Install").into_iter().map(squash).collect();
+    let uninstall_lines: Vec<String> = section(nsi, "Uninstall").into_iter().map(squash).collect();
+
+    if !on_init
+        .iter()
+        .any(|l| l == r#"StrCpy $INSTDIR "$LOCALAPPDATA\${PRODUCTNAME}""#)
+        || !on_init
+            .iter()
+            .any(|l| l == "Call RestorePreviousInstallLocation")
     {
         problems.push(format!(
-            "{NSI_PATH}: default $INSTDIR must be $LOCALAPPDATA\\${{PRODUCTNAME}}, restored from \
-             {} on reinstall",
+            "{NSI_PATH}: .onInit must default $INSTDIR to $LOCALAPPDATA\\${{PRODUCTNAME}}, \
+             restored from {} on reinstall",
             legacy::MANUPRODUCTKEY
         ));
     }
@@ -285,28 +344,73 @@ pub fn check_installer(nsi: &str, utils: &str) -> Vec<String> {
         }
     }
 
-    // The update flags and the relaunch/kill helpers 0.2.x relies on.
-    for flag in ["/P", "/NS", "/UPDATE", "/R", "/ARGS"] {
-        if !contains(&format!(r#"${{GetOptions}} $CMDLINE "{flag}""#)) {
-            problems.push(format!("{NSI_PATH}: must handle the {flag} switch"));
+    // The update flags 0.2.x passes, each parsed where it takes effect: the
+    // installer's own .onInit (un.onInit has the same lines for the
+    // uninstaller, which must not satisfy this) and .onInstSuccess.
+    let flag_sets: [FlagSet; 2] = [
+        (
+            ".onInit",
+            &on_init,
+            &[
+                ("/P", "$PassiveMode"),
+                ("/NS", "$NoShortcutMode"),
+                ("/UPDATE", "$UpdateMode"),
+            ],
+        ),
+        (
+            ".onInstSuccess",
+            &on_install_success,
+            &[("/R", "$R0"), ("/ARGS", "$R0")],
+        ),
+    ];
+    for (name, body, flags) in flag_sets {
+        for (flag, var) in flags {
+            let parse = format!(r#"${{GetOptions}} $CMDLINE "{flag}" {var}"#);
+            let set = format!("StrCpy {var} 1");
+            let parsed = body.contains(&parse);
+            let stored = *var == "$R0" || body.contains(&set);
+            if !parsed || !stored {
+                problems.push(format!(
+                    "{NSI_PATH}: Function {name} must handle the {flag} switch (into {var})"
+                ));
+            }
         }
     }
-    if !has(r#"nsis_tauri_utils::RunAsUser "$INSTDIR\${MAINBINARYNAME}.exe" "$R0""#) {
+    let args_at = on_install_success
+        .iter()
+        .position(|l| l == r#"${GetOptions} $CMDLINE "/ARGS" $R0"#);
+    let relaunch_at = on_install_success
+        .iter()
+        .position(|l| l == r#"nsis_tauri_utils::RunAsUser "$INSTDIR\${MAINBINARYNAME}.exe" "$R0""#);
+    if !matches!((args_at, relaunch_at), (Some(a), Some(r)) if a < r) {
         problems.push(format!(
-            "{NSI_PATH}: /R must relaunch witness.exe with the /ARGS value via RunAsUser"
+            "{NSI_PATH}: .onInstSuccess must relaunch witness.exe on /R with the /ARGS value \
+             via RunAsUser"
         ));
     }
-    let app_checks = lines
-        .iter()
-        .filter(|l| {
-            l.as_str()
-                == r#"!insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}""#
-        })
-        .count();
-    if app_checks != 2 {
-        problems.push(format!(
-            "{NSI_PATH}: CheckIfAppIsRunning must guard both Install and Uninstall (found {app_checks})"
-        ));
+
+    // The running app is closed before any file is replaced or deleted.
+    let app_check = r#"!insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}""#;
+    for (name, body, first_touch) in [
+        ("Install", &install, "File "),
+        ("Uninstall", &uninstall_lines, "Delete "),
+    ] {
+        let checks: Vec<usize> = body
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.as_str() == app_check)
+            .map(|(i, _)| i)
+            .collect();
+        let touch = body.iter().position(|l| l.starts_with(first_touch));
+        let guarded = checks.len() == 1 && touch.is_some_and(|t| checks[0] < t);
+        if !guarded {
+            problems.push(format!(
+                "{NSI_PATH}: Section {name} must run CheckIfAppIsRunning exactly once, before \
+                 its first `{}` (found {})",
+                first_touch.trim(),
+                checks.len()
+            ));
+        }
     }
     let utils_squashed: Vec<String> = code_lines(utils).map(squash).collect();
     for needle in [
@@ -336,9 +440,46 @@ pub fn check_installer(nsi: &str, utils: &str) -> Vec<String> {
             ));
         }
     }
-    if !has(r#"RMDir /r "$LOCALAPPDATA\${BUNDLEID}\EBWebView""#) {
+    // ... in the Install section, after the copy (the app is closed by then),
+    // and only that subdirectory: the parent goes non-recursively.
+    let ebwebview = r#"RMDir /r "$LOCALAPPDATA\${BUNDLEID}\EBWebView""#;
+    let parent = r#"RMDir "$LOCALAPPDATA\${BUNDLEID}""#;
+    let last_file = install.iter().rposition(|l| l.starts_with("File "));
+    match install.iter().position(|l| l == ebwebview) {
+        None => problems.push(format!(
+            "{NSI_PATH}: Section Install must remove the old EBWebView profile (`{ebwebview}`)"
+        )),
+        Some(i) => {
+            if last_file.is_none_or(|f| i < f) {
+                problems.push(format!(
+                    "{NSI_PATH}: Section Install must remove EBWebView after copying the files"
+                ));
+            }
+            if install.get(i + 1).map(String::as_str) != Some(parent) {
+                problems.push(format!(
+                    "{NSI_PATH}: the EBWebView removal must be followed by `{parent}`"
+                ));
+            }
+        }
+    }
+    // A recursive delete of the app-data dirs is only allowed in the
+    // uninstaller's opt-in "Delete app data" block.
+    let app_data_dirs = ["$LOCALAPPDATA", "$APPDATA"]
+        .map(|base| expand(&format!(r"{base}\${{BUNDLEID}}"), &defines).to_ascii_lowercase());
+    let wipes_app_data = |l: &String| {
+        recursive_rmdir_target(l, &defines).is_some_and(|t| app_data_dirs.contains(&t))
+    };
+    let opt_in = uninstall_lines
+        .iter()
+        .position(|l| l == "${If} $DeleteAppDataCheckboxState = 1")
+        .map(|start| if_block(&uninstall_lines, start))
+        .unwrap_or_default();
+    let allowed = opt_in.iter().filter(|l| wipes_app_data(l)).count();
+    let total = lines.iter().filter(|l| wipes_app_data(l)).count();
+    if total > allowed {
         problems.push(format!(
-            "{NSI_PATH}: Install section must remove the old EBWebView profile"
+            "{NSI_PATH}: recursive delete of the app data dir outside the uninstaller's \
+             \"Delete app data\" block"
         ));
     }
 
@@ -485,6 +626,19 @@ mod tests {
         assert!(p.iter().any(|m| m.contains("uninstall.exe")), "{p:#?}");
     }
 
+    /// Apply several `(from, to)` edits (first occurrence each) in order.
+    fn real_nsi_edited(edits: &[(&str, &str)]) -> Vec<String> {
+        let mut nsi = repo_file(NSI_PATH);
+        for (from, to) in edits {
+            assert!(
+                nsi.contains(from),
+                "fixture text `{from}` not in the script"
+            );
+            nsi = nsi.replacen(from, to, 1);
+        }
+        check_installer(&nsi, &repo_file(UTILS_PATH))
+    }
+
     #[test]
     fn flags_and_relaunch_are_caught() {
         let p = real_nsi_with(
@@ -492,9 +646,77 @@ mod tests {
             r#"${GetOptions} $CMDLINE "/ARGUMENTS" $R0"#,
         );
         assert!(p.iter().any(|m| m.contains("/ARGS switch")), "{p:#?}");
+        // The first /UPDATE parse is the installer's .onInit; un.onInit's
+        // identical line must not stand in for it.
+        let p = real_nsi_with(r#"  ${GetOptions} $CMDLINE "/UPDATE" $UpdateMode"#, "");
+        assert!(
+            p.iter()
+                .any(|m| m.contains(".onInit must handle the /UPDATE")),
+            "{p:#?}"
+        );
+        let p = real_nsi_with("    StrCpy $PassiveMode 1\n", "    StrCpy $PassiveMode 0\n");
+        assert!(p.iter().any(|m| m.contains("/P switch")), "{p:#?}");
         let p = real_nsi_with("RequestExecutionLevel user", "RequestExecutionLevel admin");
         assert!(
             p.iter().any(|m| m.contains("RequestExecutionLevel")),
+            "{p:#?}"
+        );
+    }
+
+    #[test]
+    fn misplaced_cleanup_and_app_checks_are_caught() {
+        let ebwebview = "  RMDir /r \"$LOCALAPPDATA\\${BUNDLEID}\\EBWebView\"\n";
+        // Moved into the uninstaller.
+        let p = real_nsi_edited(&[
+            (ebwebview, ""),
+            (
+                "  RMDir \"$INSTDIR\"\n",
+                &format!("  RMDir \"$INSTDIR\"\n{ebwebview}"),
+            ),
+        ]);
+        assert!(
+            p.iter()
+                .any(|m| m.contains("must remove the old EBWebView")),
+            "{p:#?}"
+        );
+        // Moved before the copy.
+        let p = real_nsi_edited(&[(ebwebview, ""), ("  ; Copy main executable\n", ebwebview)]);
+        assert!(p.iter().any(|m| m.contains("after copying")), "{p:#?}");
+        // A recursive parent would wipe the user's app data on every update.
+        let p = real_nsi_with(
+            "  RMDir \"$LOCALAPPDATA\\${BUNDLEID}\"\n",
+            "  RMDir /r \"$LOCALAPPDATA\\${BUNDLEID}\"\n",
+        );
+        assert!(p.iter().any(|m| m.contains("followed by")), "{p:#?}");
+        assert!(
+            p.iter().any(|m| m.contains("outside the uninstaller")),
+            "{p:#?}"
+        );
+        // The uninstaller's opt-in wipe is fine, but not outside its ${If}.
+        let p = real_nsi_with(
+            "    RmDir /r \"$LOCALAPPDATA\\${BUNDLEID}\"\n  ${EndIf}\n",
+            "  ${EndIf}\n    RmDir /r \"$LOCALAPPDATA\\${BUNDLEID}\"\n",
+        );
+        assert!(
+            p.iter().any(|m| m.contains("outside the uninstaller")),
+            "{p:#?}"
+        );
+        // Both app checks in one section.
+        let app_check =
+            "  !insertmacro CheckIfAppIsRunning \"${MAINBINARYNAME}.exe\" \"${PRODUCTNAME}\"\n";
+        let p = real_nsi_edited(&[
+            (
+                &format!("\n{app_check}\n  ; Delete the app directory"),
+                "\n\n  ; Delete the app directory",
+            ),
+            (app_check, &format!("{app_check}{app_check}")),
+        ]);
+        assert!(
+            p.iter().any(|m| m.contains("Section Install must run")),
+            "{p:#?}"
+        );
+        assert!(
+            p.iter().any(|m| m.contains("Section Uninstall must run")),
             "{p:#?}"
         );
     }

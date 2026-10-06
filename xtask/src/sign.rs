@@ -271,8 +271,11 @@ pub fn sign_command(req: SignRequest) -> Result<()> {
 /// Sign `req.file`, self-check, write `<file>.sig` and optionally the feed.
 /// Returns the `.sig` path.
 pub fn sign_installer(sk: &minisign::SecretKey, req: &SignRequest) -> Result<PathBuf> {
-    let version = semver::Version::parse(req.version.trim_start_matches('v'))
-        .with_context(|| format!("--version {} is not semver", req.version))?
+    // The same plain X.Y.Z rule as `version`/`dist` (design §8.4): a semver
+    // prerelease would sort below its release on clients and can't be a
+    // numeric VIProductVersion anyway.
+    let version = crate::workspace::parse_release_version(req.version.trim_start_matches('v'))
+        .with_context(|| format!("--version {}", req.version))?
         .to_string();
     let file_name = req
         .file
@@ -579,6 +582,12 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("ProductVersion 0.3.1"), "{err}");
+        assert!(!dir.join("Witness_0.2.1_x64-setup.exe.sig").exists());
+        // Prerelease/build versions are refused even when forced.
+        for bad in ["0.3.1-rc.1", "0.3.1+x", "v0.3.1-beta"] {
+            let err = format!("{:#}", sign_installer(&sk, &req(bad, true)).unwrap_err());
+            assert!(err.contains("prerelease/build"), "{bad}: {err}");
+        }
         assert!(!dir.join("Witness_0.2.1_x64-setup.exe.sig").exists());
         // ... unless explicitly forced.
         sign_installer(&sk, &req("0.3.1", true)).unwrap();

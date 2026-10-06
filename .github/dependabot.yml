@@ -13,27 +13,28 @@ updates:
     commit-message:
       prefix: "chore(deps)"
     # Mirrors CLAUDE.md "do not upgrade casually": these move only by hand,
-    # together and deliberately (patch updates still come through).
+    # together and deliberately. Exact (`=`) pins get no PRs at all; the rest
+    # still take patch updates.
     ignore:
-      # Updater signing/verification must match what installed copies use.
+      # Updater signing/verification must match what installed copies use:
+      # minisign 0.7.4-0.8.0 were broken (see xtask/Cargo.toml), and the
+      # self-check must run the exact verifier 0.2.x clients ship. CI can't
+      # catch a drift: it signs and verifies with the bumped crates.
       - dependency-name: minisign
-        update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: minisign-verify
-        update-types: ["version-update:semver-major", "version-update:semver-minor"]
-      # egui/eframe minor releases break the API; winit and wgpu must match eframe.
+      # egui/eframe minor releases break the API; winit and wgpu must match
+      # eframe. eframe and egui-phosphor are exact pins.
       - dependency-name: eframe
-        update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: "egui*"
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: egui-phosphor
-        update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: winit
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: wgpu
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
-      # ML/audio stack: pinned for shared ort-sys, CUDA provider imports and APIs.
+      # ML/audio stack: pinned for shared ort-sys, CUDA provider imports and
+      # APIs. ort is an exact pin matching parakeet-rs.
       - dependency-name: ort
-        update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: hf-hub
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: parakeet-rs
