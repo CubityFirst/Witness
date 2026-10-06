@@ -19,13 +19,17 @@ const TRAY_ID: &str = "witness-tray";
 /// The exe's icon resource (build.rs embeds `icons/icon.ico` under this ID,
 /// the same one tauri-build used).
 const APP_ICON_RESOURCE: u16 = 32512;
-/// The shell uID of the process's first tray icon. tray-icon draws it from a
-/// process-wide counter starting at 1, but `TrayIconBuilder::new()` spends
-/// the first value on a default `TrayIconId` before `build()` takes the
-/// next one, so the first icon is uID 2. Tauri 2 (tray-icon 0.24) went
-/// through the same builder, so 0.2.x's icon was uID 2 as well, and
-/// Explorer's "always show" promotion (exe path + uID) carries over.
-const FIRST_TRAY_UID: u32 = 2;
+/// The shell uID the process's first tray icon is expected to get. tray-icon
+/// draws it from a private process-wide counter starting at 1, but
+/// `TrayIconBuilder::new()` spends the first value on a default
+/// `TrayIconId` before `build()` takes the next one, so the first icon is
+/// uID 2. Tauri 2 (tray-icon 0.24) went through the same builder, so
+/// 0.2.x's icon was uID 2 as well, and Explorer's "always show" promotion
+/// (exe path + uID) carries over. The real uID is probed, not assumed
+/// ([`probe_uid`]): any earlier `TrayIconId::new_unique()` shifts it.
+const EXPECTED_TRAY_UID: u32 = 2;
+/// The uIDs probed when the icon is not at the expected one.
+const PROBED_TRAY_UIDS: std::ops::RangeInclusive<u32> = 1..=16;
 
 const MENU_OPEN: &str = "open";
 const MENU_RECORD: &str = "record";
@@ -100,12 +104,24 @@ impl Tray {
             .build()?;
 
         let hwnd = icon.window_handle() as isize;
-        let ids = (hwnd, FIRST_TRAY_UID);
-        if !imp::icon_exists(hwnd, FIRST_TRAY_UID) {
-            // Only a log: the hook's NIM_DELETE would just miss.
-            log::warn!("tray icon is not uID {FIRST_TRAY_UID}; a crash may leave a ghost icon");
-        }
-        log::debug!("tray icon created (hwnd {hwnd:#x})");
+        let uid = match probe_uid(|uid| imp::icon_exists(hwnd, uid)) {
+            Some(uid) => {
+                if uid != EXPECTED_TRAY_UID {
+                    log::warn!(
+                        "tray icon is uID {uid}, not {EXPECTED_TRAY_UID}: Explorer may not \
+                         keep 0.2.x's \"always show\" setting"
+                    );
+                }
+                uid
+            }
+            None => {
+                // Only a log: the panic hook's NIM_DELETE would just miss.
+                log::warn!("tray icon uID not found; a crash may leave a ghost icon");
+                EXPECTED_TRAY_UID
+            }
+        };
+        let ids = (hwnd, uid);
+        log::debug!("tray icon created (hwnd {hwnd:#x}, uID {uid})");
         Ok(Tray {
             icon,
             record_item: record,
@@ -158,6 +174,15 @@ impl Tray {
     pub fn notify_ids(&self) -> (isize, u32) {
         self.ids
     }
+}
+
+/// The icon's shell uID: the expected one first, then the rest of the
+/// probed range. Each tray icon has its own hidden owner window, so any uID
+/// the shell knows for that window is ours.
+fn probe_uid(exists: impl Fn(u32) -> bool) -> Option<u32> {
+    std::iter::once(EXPECTED_TRAY_UID)
+        .chain(PROBED_TRAY_UIDS.filter(|&uid| uid != EXPECTED_TRAY_UID))
+        .find(|&uid| exists(uid))
 }
 
 /// The physical click position for a left click (button up) or a left
@@ -303,6 +328,26 @@ mod tests {
             button: MouseButton::Left,
         };
         assert_eq!(flyout_click(&double), Some((2300.0, 1415.0)));
+    }
+
+    #[test]
+    fn uid_probe_prefers_the_expected_uid_and_finds_others() {
+        assert_eq!(probe_uid(|_| true), Some(EXPECTED_TRAY_UID));
+        assert_eq!(probe_uid(|uid| uid == 1), Some(1));
+        assert_eq!(probe_uid(|uid| uid == 7), Some(7));
+        assert_eq!(probe_uid(|_| false), None);
+        // The expected uID is probed once, first.
+        let probed = std::cell::RefCell::new(Vec::new());
+        assert_eq!(
+            probe_uid(|uid| {
+                probed.borrow_mut().push(uid);
+                false
+            }),
+            None
+        );
+        let probed = probed.into_inner();
+        assert_eq!(probed[0], EXPECTED_TRAY_UID);
+        assert_eq!(probed.len(), PROBED_TRAY_UIDS.count());
     }
 
     #[test]

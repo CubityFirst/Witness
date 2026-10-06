@@ -45,8 +45,11 @@ const FLYOUT_REPLACE_TOLERANCE: i32 = 2;
 /// After `finish_ui_pass` re-minimizes the root, `logic()` sees the
 /// minimized edge one or two passes later; it is ours, not the user's.
 const UI_PASS_EDGE_GRACE: Duration = Duration::from_millis(500);
-/// Give up waiting for eframe's first-frame show after this long.
+/// Poll for eframe's first-frame show every pass for this long after the
+/// first `logic()` ...
 const STARTUP_SHOW_TIMEOUT: Duration = Duration::from_secs(5);
+/// ... and at this pace after that (the window stays cloaked meanwhile).
+const STARTUP_LATE_POLL: Duration = Duration::from_secs(1);
 
 /// An internal "restore for one pass" (see [`MainWindow::ensure_ui_pass`]).
 #[derive(Debug, Clone, Copy)]
@@ -66,6 +69,10 @@ pub struct MainWindow {
     ui_pass: Cell<Option<UiPass>>,
     /// `finish_ui_pass` just re-minimized the window (edge grace period).
     ui_pass_finished_at: Cell<Option<Instant>>,
+    /// A `--minimized` start is still waiting to hide the window (it is
+    /// cloaked and `WS_EX_NOACTIVATE` meanwhile). `show_normal` cancels it:
+    /// a show the user asked for (tray, second launch) always wins.
+    startup_hide: Cell<bool>,
 }
 
 impl MainWindow {
@@ -93,6 +100,7 @@ impl MainWindow {
             ctx: cc.egui_ctx.clone(),
             ui_pass: Cell::new(None),
             ui_pass_finished_at: Cell::new(None),
+            startup_hide: Cell::new(false),
         })
     }
 
@@ -167,6 +175,14 @@ impl MainWindow {
         // here without re-minimizing it.
         if self.ui_pass.take().is_some() {
             self.set_cloaked(false);
+        }
+        // Likewise a `--minimized` start that has not hidden the window yet
+        // (a second launch or tray click during the first frames): it must
+        // not hide it again, and the window must be visible and activatable.
+        if self.startup_hide.take() {
+            imp::set_no_activate(self.hwnd, false);
+            self.set_cloaked(false);
+            log::info!("--minimized start: shown on request before it was hidden");
         }
         self.window.set_minimized(false);
         self.window.set_visible(true);
@@ -482,43 +498,70 @@ pub fn flyout_position(click: (i32, i32), size_px: (i32, i32), work: RectI) -> (
 /// invisible window and take the keyboard focus from whatever the user is
 /// doing while Windows starts. `WS_EX_NOACTIVATE` is set for that one show
 /// and cleared again with the hide.
+///
+/// The pending state lives in [`MainWindow`] (`startup_hide`), so that
+/// `show_normal` (tray, second launch) cancels it: the window then stays up.
+/// Until eframe's show is seen the window stays cloaked, however long that
+/// takes; a cloaked window is neither on screen nor on the taskbar.
 pub struct StartupVisibility {
-    pending_since: Option<Instant>,
+    /// Waiting for eframe's first-frame show.
+    pending: bool,
+    /// The first `tick`, i.e. the first `logic()` (eframe shows the window
+    /// after that pass's paint). The timeout counts from here, not from the
+    /// creator: a slow cold start must not run it out before the first frame.
+    first_tick: Option<Instant>,
+    /// The timeout warning was logged.
+    warned: bool,
 }
 
 impl StartupVisibility {
     /// With `minimized`, cloak the (not yet shown) window now.
     pub fn new(minimized: bool, window: &MainWindow) -> Self {
-        if !minimized {
-            return StartupVisibility {
-                pending_since: None,
-            };
+        if minimized {
+            window.set_cloaked(true);
+            imp::set_no_activate(window.hwnd, true);
+            window.startup_hide.set(true);
         }
-        window.set_cloaked(true);
-        imp::set_no_activate(window.hwnd, true);
         StartupVisibility {
-            pending_since: Some(Instant::now()),
+            pending: minimized,
+            first_tick: None,
+            warned: false,
         }
     }
 
     /// After the first rendered frame (eframe has shown the cloaked window),
     /// hide it to the tray and uncloak it.
     pub fn tick(&mut self, window: &MainWindow, ctx: &egui::Context) {
-        let Some(since) = self.pending_since else {
+        if !self.pending {
             return;
-        };
-        let shown = window.window.is_visible() == Some(true);
-        if shown || since.elapsed() > STARTUP_SHOW_TIMEOUT {
-            if !shown {
-                log::warn!("--minimized start: the window was never shown; uncloaking anyway");
-            }
+        }
+        if !window.startup_hide.get() {
+            // `show_normal` took over: the user asked for the window.
+            self.pending = false;
+            return;
+        }
+        let first_tick = *self.first_tick.get_or_insert_with(Instant::now);
+        if window.window.is_visible() == Some(true) {
             window.hide_to_tray();
             imp::set_no_activate(window.hwnd, false);
             window.set_cloaked(false);
-            self.pending_since = None;
+            window.startup_hide.set(false);
+            self.pending = false;
             log::info!("started minimized to the tray");
-        } else {
+        } else if first_tick.elapsed() <= STARTUP_SHOW_TIMEOUT {
             ctx.request_repaint();
+        } else {
+            // Unexpected (eframe always shows the root after its first
+            // frame): stay cloaked and keep looking at a slow pace, so a late
+            // show is still hidden properly and never flashes.
+            if !self.warned {
+                self.warned = true;
+                log::warn!(
+                    "--minimized start: no first-frame show within {STARTUP_SHOW_TIMEOUT:?}; \
+                     the window stays cloaked until it is shown"
+                );
+            }
+            ctx.request_repaint_after(STARTUP_LATE_POLL);
         }
     }
 }
