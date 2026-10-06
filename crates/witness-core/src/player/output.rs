@@ -34,7 +34,8 @@ const DEVICE_CHECK_EVERY: Duration = Duration::from_secs(2);
 const REOPEN_DELAY: Duration = Duration::from_millis(500);
 /// Give up (and show the error) after this many failed reopens (~3 s).
 const MAX_REOPEN_FAILURES: u32 = 6;
-/// Position FIFO bound: far more than the 20 ms buffer ever holds.
+/// Position FIFO bound: far more than the 50 ms device buffer ever holds
+/// (one entry per write, about one write per 10 ms period).
 const FIFO_CAP: usize = 64;
 
 /// A device error, classified for the render loop.
@@ -182,6 +183,9 @@ struct Session {
     /// Speed new output is produced at (prepared output keeps its own).
     speed: f32,
     eof: bool,
+    /// Decoding stopped on an error rather than at the end of the file: the
+    /// drained stream ends where it is instead of claiming the full length.
+    cut_short: bool,
     ended: bool,
     /// Source frame being heard (last computed).
     position: f64,
@@ -207,6 +211,7 @@ impl Session {
             anchor: 0,
             speed,
             eof: false,
+            cut_short: false,
             ended: false,
             position: 0.0,
             reopen: None,
@@ -245,12 +250,12 @@ impl Session {
     /// and the stretcher's state.
     fn reanchor(&mut self, source: u64, speed: f32) {
         let source = source.min(self.total);
-        if let Err(e) = self.reader.seek(source) {
+        let failed = self.reader.seek(source).is_err_and(|e| {
             log::warn!("player: seek failed: {e:#}");
-            self.eof = true;
-        } else {
-            self.eof = false;
-        }
+            true
+        });
+        self.eof = failed;
+        self.cut_short = failed;
         self.chunks.clear();
         self.queued = 0;
         self.stretcher.flush();
@@ -264,8 +269,10 @@ impl Session {
         let got = match self.reader.read_stereo(&mut self.scratch) {
             Ok(n) => n,
             Err(e) => {
-                // A corrupt packet ends playback like EOF rather than looping.
-                log::warn!("player: decode error, stopping here: {e:#}");
+                // The reader already conceals bad packets and skips damaged
+                // pages; what is left (I/O failure) ends playback here.
+                log::warn!("player: read error, stopping here: {e:#}");
+                self.cut_short = true;
                 0
             }
         };
@@ -443,7 +450,6 @@ impl<B: Backend> Engine<B> {
                         );
                     }
                 }
-                (self.on_change)();
             }
             Cmd::Unload { generation, seq } => {
                 self.session = None; // Drop stops and releases the client
@@ -475,27 +481,35 @@ impl<B: Backend> Engine<B> {
             // Speed and volume are read from Shared on every fill.
             Cmd::Wake => {}
         }
+        // The one repaint request per UI command, made from this thread:
+        // `Player` methods never call `on_change` themselves, so the UI may
+        // call them inside egui's input/memory closures (a synchronous
+        // `request_repaint` there would deadlock on the Context lock).
+        (self.on_change)();
     }
 
-    /// HTML `play()`: starts a stopped stream, restarts an ended one at 0,
-    /// and leaves a stream that is already running alone (a segment click
-    /// sends seek + play while playing; the seek already restarted it).
+    /// HTML `play()`: starts a stopped stream, restarts at 0 from the end
+    /// of the media (ended, or a paused seek to the end), and leaves a
+    /// stream that is already running alone (a segment click sends seek +
+    /// play while playing; the seek already restarted it).
     fn play(&mut self) {
         self.playing = true;
         let Some(s) = self.session.as_mut() else {
             // Nothing (valid) loaded: the intent cannot be honoured.
             self.playing = false;
-            (self.on_change)();
             return;
         };
-        if s.ended {
+        // HTML "ended playback" is the position at the end, whether or not
+        // the stream drained there.
+        let restart = s.ended || s.position_ms() >= s.duration_ms;
+        if restart {
             s.position = 0.0;
         }
         if s.reopen.is_some() {
             // The pending reopen resumes playback once the device is back.
             return;
         }
-        if s.sink.is_some() && !s.ended {
+        if s.sink.is_some() && !restart {
             if !s.running {
                 if let Step::Failed(e) = self.resume() {
                     self.sink_failed(e);
@@ -598,7 +612,11 @@ impl<B: Backend> Engine<B> {
                     let _ = sink.stop();
                     s.running = false;
                     s.ended = true;
-                    s.position = s.total as f64;
+                    if !s.cut_short {
+                        // The final granule can overstate what decodes by
+                        // a few ms: a clean end is the full duration.
+                        s.position = s.total as f64;
+                    }
                 }
                 return Ok(());
             }
@@ -1401,6 +1419,52 @@ mod tests {
         assert_eq!(rig.position_ms(), 0);
         rig.ticks(3);
         assert!(rig.position_ms() > 0 && rig.position_ms() <= 30);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A paused seek to the very end (no drain, so not `ended`) followed by
+    /// play restarts at 0 instead of ending again immediately.
+    #[test]
+    fn play_from_the_end_restarts_at_zero() {
+        let dir = scratch("engine-end");
+        let path = make_archive(&dir, "pe", 2 * 48_000);
+        let mut rig = Rig::new(&path);
+        rig.seek(2_000);
+        assert!(!rig.ended());
+        rig.play();
+        assert_eq!(rig.position_ms(), 0);
+        assert!(rig.engine.rendering());
+        rig.ticks(10);
+        assert_eq!(rig.position_ms(), 100);
+        assert!(rig.playing() && !rig.ended());
+        // After an ended stream, a seek back to the end clears `ended`;
+        // play there still restarts.
+        rig.seek(1_990);
+        rig.ticks(200);
+        assert!(rig.ended());
+        rig.seek(2_000);
+        rig.play();
+        rig.ticks(3);
+        assert!(rig.playing() && rig.position_ms() <= 30);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A damaged page mid-file plays through (silence over the lost span)
+    /// and the stream still ends at the full duration.
+    #[test]
+    fn damaged_page_plays_through_to_the_end() {
+        let dir = scratch("engine-damaged");
+        let path = make_archive(&dir, "dm", 3 * 48_000);
+        let offset = OpusArchiveReader::open(&path).unwrap().pages()[1].offset as usize;
+        let mut bytes = std::fs::read(&path).unwrap();
+        let segments = bytes[offset + 26] as usize;
+        bytes[offset + 27 + segments + 5] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+        let mut rig = Rig::new(&path);
+        rig.play();
+        rig.ticks(400);
+        assert!(rig.ended() && !rig.playing());
+        assert_eq!(rig.position_ms(), 3_000);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

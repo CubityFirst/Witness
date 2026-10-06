@@ -253,17 +253,21 @@ pub(crate) enum Cmd {
 }
 
 /// Handle to the "player" thread. Every method is cheap and non-blocking,
-/// so the UI may call them from `ui()`.
+/// so the UI may call them from `ui()`/`logic()`, including inside egui
+/// `input`/`input_mut`/`memory` closures: no method calls `on_change` (i.e.
+/// `ctx.request_repaint`) itself — the player thread does, once it has
+/// handled the command.
 pub struct Player {
     tx: Sender<Cmd>,
     shared: Arc<Shared>,
-    on_change: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl Player {
-    /// Start the player; `on_change` runs whenever the snapshot changes
-    /// outside a UI call (the UI passes `ctx.request_repaint`). Position
-    /// updates during playback do *not* call it: the view polls at ~30 Hz.
+    /// Start the player; `on_change` runs on the player thread after it has
+    /// handled each command and whenever the snapshot changes on its own
+    /// (load ready/failed, ended, play error). The UI passes
+    /// `ctx.request_repaint`. Position updates during playback do *not* call
+    /// it: the view polls at ~30 Hz while playing (§6.5).
     pub fn spawn(on_change: Arc<dyn Fn() + Send + Sync>) -> Player {
         Self::spawn_with(output::default_backend, on_change)
     }
@@ -281,18 +285,13 @@ impl Player {
         let (tx, rx) = crossbeam_channel::unbounded();
         let shared = Arc::new(Shared::new());
         let thread_shared = shared.clone();
-        let thread_change = on_change.clone();
         if let Err(e) = std::thread::Builder::new()
             .name("player".into())
-            .spawn(move || output::run(make_backend, rx, thread_shared, thread_change))
+            .spawn(move || output::run(make_backend, rx, thread_shared, on_change))
         {
             log::error!("could not start the player thread: {e}");
         }
-        Player {
-            tx,
-            shared,
-            on_change,
-        }
+        Player { tx, shared }
     }
 
     fn send(&self, cmd: Cmd) {
@@ -344,7 +343,6 @@ impl Player {
             generation,
             seq,
         });
-        (self.on_change)();
     }
 
     /// Release the file and the audio device.
@@ -358,15 +356,20 @@ impl Player {
             self.reset(&mut meta, PlayerLoad::Unloaded, None)
         };
         self.send(Cmd::Unload { generation, seq });
-        (self.on_change)();
     }
 
-    /// Start (or resume) playback; after `ended` it restarts at 0. A no-op
-    /// for the device while already playing (HTML `play()` semantics). If no
-    /// output device can be opened, `playing` drops back to false and
+    /// Start (or resume) playback; at the end of the media (`ended`, or a
+    /// paused seek to the duration) it restarts at 0. A no-op for the device
+    /// while already playing (HTML `play()` semantics). If no output device
+    /// can be opened, `playing` drops back to false and
     /// [`Player::take_play_error`] says why.
     pub fn play(&self) {
-        if self.shared.ended.load(Ordering::Acquire) {
+        let at_end = {
+            let meta = self.shared.meta();
+            let (_, pos) = unpack_position(self.shared.position.load(Ordering::Acquire));
+            meta.load == PlayerLoad::Ready && pos >= self.shared.duration_ms()
+        };
+        if at_end || self.shared.ended.load(Ordering::Acquire) {
             self.seek_ms(0);
         }
         {
@@ -375,7 +378,6 @@ impl Player {
             self.shared.playing.store(true, Ordering::Release);
         }
         self.send(Cmd::Play);
-        (self.on_change)();
     }
 
     pub fn pause(&self) {
@@ -385,7 +387,6 @@ impl Player {
             self.shared.playing.store(false, Ordering::Release);
         }
         self.send(Cmd::Pause);
-        (self.on_change)();
     }
 
     /// Play/pause; play after `ended` restarts at 0.
@@ -416,7 +417,6 @@ impl Player {
             (ms, seq)
         };
         self.send(Cmd::Seek { ms, seq });
-        (self.on_change)();
     }
 
     /// Relative seek from the current position (±10 s buttons, ←/→ keys).
@@ -436,7 +436,6 @@ impl Player {
             .speed_bits
             .store(speed.to_bits(), Ordering::Relaxed);
         self.send(Cmd::Wake);
-        (self.on_change)();
     }
 
     /// Linear gain 0..1 (software gain, like HTML `volume`; the Windows
@@ -451,12 +450,16 @@ impl Player {
             .volume_bits
             .store(volume.to_bits(), Ordering::Relaxed);
         self.send(Cmd::Wake);
-        (self.on_change)();
     }
 
-    /// The reason the last `play` could not start (no usable audio output),
-    /// once: the view toasts "Could not play recording". The file stays
-    /// loaded at its position and the next `play` tries the device again.
+    /// The reason the last `play` could not start or keep going (no usable
+    /// audio output, device errors, reopens exhausted), returned once. This
+    /// is the native `play()` promise rejection: the view polls it every
+    /// frame while a meeting is shown and toasts "Could not play recording"
+    /// (player bar) / "Could not play the recording" (segment/bookmark
+    /// click) with the message. The file stays loaded at its position and
+    /// the next `play` tries the device again. Additive to design §6.1.
+    // TODO(I1): U5 must call this (see the U3 report); §6.1 lacks it.
     pub fn take_play_error(&self) -> Option<String> {
         self.shared.meta().play_error.take()
     }
@@ -547,6 +550,75 @@ mod tests {
             unpack_position(shared.position.load(Ordering::Acquire)).1,
             9_000
         );
+    }
+
+    /// egui's `request_repaint` takes the Context lock, and the view calls
+    /// player methods inside `ctx.input_mut(..)`, which holds it. Modelled
+    /// with a plain mutex: every UI method must return while it is held,
+    /// and the repaint requests arrive from the player thread afterwards.
+    #[test]
+    fn methods_never_call_on_change_on_the_calling_thread() {
+        let dir = scratch("reentrant");
+        let path = make_archive(&dir, "r", 48_000);
+        let device = FakeDevice::new(960);
+        let fake = device.clone();
+        let ctx_lock = Arc::new(Mutex::new(()));
+        let changes = Arc::new(AtomicUsize::new(0));
+        let (lock, counter) = (ctx_lock.clone(), changes.clone());
+        let player = Player::spawn_with(
+            move || FakeBackend::new(fake),
+            Arc::new(move || {
+                let _ctx = lock.lock().unwrap();
+                counter.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+        {
+            let _ctx = ctx_lock.lock().unwrap(); // "inside ctx.input_mut"
+            player.load(path);
+            player.seek_ms(500);
+            player.set_speed(1.5);
+            player.set_volume(0.4);
+            player.toggle();
+            player.pause();
+            player.skip_ms(100);
+            let _ = player.take_play_error();
+        }
+        wait_until(&player, "ready", |s| s.load == PlayerLoad::Ready);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // One per command: load, seek, speed, volume, play, pause, seek.
+        while changes.load(Ordering::Relaxed) < 7 {
+            assert!(Instant::now() < deadline, "repaints were not requested");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        player.unload();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// HTML `play()` from the end of the media restarts at 0 even when the
+    /// stream never drained there (scrubber dragged fully right while
+    /// paused): one press plays, not a blip and a second press.
+    #[test]
+    fn play_after_a_paused_seek_to_the_end_restarts() {
+        let dir = scratch("seekend");
+        let path = make_archive(&dir, "se", 2 * 48_000);
+        let device = FakeDevice::new(960);
+        device.state().realtime = true;
+        let fake = device.clone();
+        let player = Player::spawn_with(move || FakeBackend::new(fake), Arc::new(|| {}));
+        player.load(path);
+        wait_until(&player, "ready", |s| s.load == PlayerLoad::Ready);
+        player.seek_ms(u64::MAX);
+        assert_eq!(player.snapshot().position_ms, 2_000);
+        player.play();
+        let snap = player.snapshot();
+        assert!(snap.playing && !snap.ended);
+        assert!(snap.position_ms < 100, "{snap:?}");
+        std::thread::sleep(Duration::from_millis(50));
+        let snap = player.snapshot();
+        assert!(snap.playing && !snap.ended, "{snap:?}");
+        assert!(snap.position_ms < 1_500, "{snap:?}");
+        player.unload();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
