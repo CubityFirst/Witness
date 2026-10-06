@@ -10,7 +10,7 @@ use crate::bridge::{OpDone, Task};
 use crate::ui::format::{fmt_date, fmt_date_short, fmt_duration, fmt_thousands};
 use crate::ui::theme::{self, ACCENT, BG_HOVER, BG_RAISED, BORDER, TEXT, TEXT_MUTED};
 use crate::ui::toasts::Notice;
-use crate::ui::views::meetings::{open_transcript, paint_focus_ring, truncated};
+use crate::ui::views::meetings::{follow_focus, open_transcript, paint_focus_ring, truncated};
 use crate::ui::widgets::{self, KeyScroll};
 use crate::ui::{UiCtx, View};
 use chrono::{DateTime, Datelike, Days, Local, NaiveDate};
@@ -555,6 +555,7 @@ fn hover_area(
     if response.has_focus() {
         paint_focus_ring(ui, response.rect.shrink(2.0), 6);
     }
+    follow_focus(&response);
     response.on_hover_cursor(CursorIcon::PointingHand)
 }
 
@@ -681,6 +682,7 @@ fn person_card(
         if let (true, Some(id)) = (forget, p.person_id) {
             let button = widgets::btn_ghost(ui, "Forget voice…")
                 .on_hover_text("Forget this voice — Shift-click to skip confirmation");
+            follow_focus(&button);
             if button.clicked() {
                 actions.push(Action::Forget {
                     id,

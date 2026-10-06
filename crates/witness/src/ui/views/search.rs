@@ -15,7 +15,7 @@ use crate::ui::theme::{
     self, ACCENT, BG, BG_HOVER, BOOKMARK_GLYPH, BORDER, MARK_BG, MARK_TEXT, REC, TEXT, TEXT_MUTED,
     WARN,
 };
-use crate::ui::views::meetings::paint_focus_ring;
+use crate::ui::views::meetings::{follow_focus, paint_focus_ring};
 use crate::ui::widgets::{self, KeyScroll, Politeness};
 use crate::ui::{SearchFilters, UiCtx, View, Who};
 use chrono::NaiveDate;
@@ -47,6 +47,7 @@ const HIT_LINE: f32 = 21.0;
 pub fn search_box(ui: &mut egui::Ui, cx: &mut UiCtx, current: &View) {
     let id = egui::Id::new("search-box");
     let focused = ui.memory(|m| m.has_focus(id));
+    let modal_open = cx.confirm.is_open();
     let search = &mut cx.memory.search_box;
     let has_text = !search.text.is_empty();
     let margin = Margin {
@@ -66,6 +67,8 @@ pub fn search_box(ui: &mut egui::Ui, cx: &mut UiCtx, current: &View) {
             .id(id)
             .hint_text("Search transcripts…")
             .font(theme::regular(14.0))
+            // `<input type=search>` keeps focus on Enter.
+            .return_key(None::<egui::KeyboardShortcut>)
             .margin(margin)
             .frame(frame)
             .desired_width(ui.available_width().min(420.0)),
@@ -100,7 +103,9 @@ pub fn search_box(ui: &mut egui::Ui, cx: &mut UiCtx, current: &View) {
     if changed {
         search.debounce_at = Some(now + DEBOUNCE);
     }
-    if let Some(at) = search.debounce_at {
+    // Held while a confirmation is open: navigating would remount the view
+    // that asked and drop its answer (closing the modal repaints).
+    if let Some(at) = search.debounce_at.filter(|_| !modal_open) {
         if now >= at {
             search.debounce_at = None;
             // The navigation applies after this pass: draw the next one.
@@ -178,13 +183,13 @@ struct Applied {
     date_to: Option<String>,
 }
 
-/// The new applied bound for a date field: empty clears it, a valid date
-/// replaces it, and invalid (e.g. half-typed) text keeps the last one.
-fn applied_date(text: &str, previous: &Option<String>) -> Option<String> {
+/// The applied bound for a date field: only a valid date applies; empty
+/// and invalid (e.g. half-typed) text apply none, like the empty value of
+/// an incomplete `<input type=date>`. The field shows invalid text red.
+fn applied_date(text: &str) -> Option<String> {
     match parse_date(text) {
-        DateInput::Empty => None,
         DateInput::Valid(date) => Some(date),
-        DateInput::Invalid => previous.clone(),
+        DateInput::Empty | DateInput::Invalid => None,
     }
 }
 
@@ -383,6 +388,7 @@ fn hit_row(ui: &mut egui::Ui, hit: &SearchHit) -> bool {
         plain
     };
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label.trim()));
+    follow_focus(&response);
     response.on_hover_cursor(CursorIcon::PointingHand).clicked()
 }
 
@@ -406,9 +412,6 @@ enum Action {
 pub struct SearchView {
     /// The query of the current results.
     query: String,
-    /// Last valid dates (invalid text keeps these applied).
-    date_from: Option<String>,
-    date_to: Option<String>,
     /// The query + filters last searched; None until the first pass.
     searched: Option<(String, Applied)>,
     hits: Vec<SearchHit>,
@@ -418,14 +421,14 @@ pub struct SearchView {
     people: Vec<PersonInfo>,
     people_load: Option<Task<CoreResult<Vec<PersonInfo>>>>,
     people_requested: bool,
+    /// The people list arrived (so a Who id missing from it is stale).
+    people_loaded: bool,
 }
 
 impl SearchView {
     pub fn new(query: String) -> Self {
         SearchView {
             query,
-            date_from: None,
-            date_to: None,
             searched: None,
             hits: Vec::new(),
             has_more: false,
@@ -434,6 +437,7 @@ impl SearchView {
             people: Vec::new(),
             people_load: None,
             people_requested: false,
+            people_loaded: false,
         }
     }
 
@@ -449,14 +453,21 @@ impl SearchView {
         }
         self.poll(ui, cx);
 
+        // A person filter whose person is gone (forgotten since it was
+        // chosen) would filter by a stale id under an "Anyone"-looking
+        // control: drop it once the people list says so.
+        if let Who::Person(id) = cx.memory.search_filters.who {
+            if self.people_loaded && !self.people.iter().any(|p| p.id == id) {
+                cx.memory.search_filters.who = Who::Anyone;
+            }
+        }
+
         // Re-search when the query or an applied filter changes.
         let filters = &cx.memory.search_filters;
-        self.date_from = applied_date(&filters.date_from, &self.date_from);
-        self.date_to = applied_date(&filters.date_to, &self.date_to);
         let applied = Applied {
             who: filters.who,
-            date_from: self.date_from.clone(),
-            date_to: self.date_to.clone(),
+            date_from: applied_date(&filters.date_from),
+            date_to: applied_date(&filters.date_to),
         };
         let key = (self.query.clone(), applied);
         if self.searched.as_ref() != Some(&key) {
@@ -560,6 +571,7 @@ impl SearchView {
                     cx.fonts
                         .note_texts(ui.ctx(), people.iter().map(|p| p.name.as_str()));
                     self.people = people;
+                    self.people_loaded = true;
                 }
                 Err(error) => cx
                     .toasts
@@ -626,11 +638,11 @@ impl SearchView {
 
         if self.has_more {
             let label = if loading { "Loading…" } else { "Load more" };
-            let clicked = ui
+            let button = ui
                 .add_enabled_ui(!loading, |ui| widgets::btn_ghost(ui, label))
-                .inner
-                .clicked();
-            if clicked {
+                .inner;
+            follow_focus(&button);
+            if button.clicked() {
                 actions.push(Action::LoadMore);
             }
         }
@@ -639,6 +651,14 @@ impl SearchView {
     /// `.search-filters`: Who, from, to, Clear filters (gap 12, wraps).
     fn draw_filters(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
         let people = &self.people;
+        // A chosen person not in the list: the list is still loading (Back
+        // from a transcript) or failed to load. A loaded list without them
+        // has already reset the filter to Anyone.
+        let unknown_person = if self.people_load.is_some() {
+            "Person…"
+        } else {
+            "Unknown person"
+        };
         let filters: &mut SearchFilters = &mut cx.memory.search_filters;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
@@ -650,7 +670,7 @@ impl SearchView {
                     Who::Person(id) => people
                         .iter()
                         .find(|p| p.id == id)
-                        .map_or_else(|| "Anyone".into(), |p| p.name.clone()),
+                        .map_or_else(|| unknown_person.into(), |p| p.name.clone()),
                 }
             };
             let combo = egui::ComboBox::from_id_salt("search-who")
@@ -797,12 +817,11 @@ mod tests {
     }
 
     #[test]
-    fn half_typed_dates_keep_the_last_applied_bound() {
-        let last = Some("2026-10-05".to_string());
-        assert_eq!(applied_date("2026-1", &last), last);
-        assert_eq!(applied_date("", &last), None);
-        assert_eq!(applied_date("2026-11-01", &last), Some("2026-11-01".into()));
-        assert_eq!(applied_date("nope", &None), None);
+    fn only_valid_dates_apply_a_bound() {
+        assert_eq!(applied_date("2026-1"), None);
+        assert_eq!(applied_date("nope"), None);
+        assert_eq!(applied_date(""), None);
+        assert_eq!(applied_date("2026-11-1"), Some("2026-11-01".into()));
     }
 
     #[test]
@@ -866,19 +885,77 @@ mod tests {
         assert_eq!(marks, vec![8..13]);
     }
 
+    /// The expected highlight of `range` per row, from epaint's own cursor
+    /// positions (independent of `mark_rects`' glyph walk): (left, right,
+    /// row top, row bottom).
+    fn cursor_spans(galley: &egui::Galley, range: Range<usize>) -> Vec<(f32, f32, f32, f32)> {
+        use egui::text::CCursor;
+        let mut spans: Vec<(f32, f32, f32, f32)> = Vec::new();
+        for i in range {
+            let mut start = CCursor::new(i);
+            start.prefer_next_row = true;
+            let start = galley.pos_from_cursor(start);
+            // The right edge of char i, on its own row even at a wrap.
+            let end = galley.pos_from_cursor(CCursor::new(i + 1));
+            match spans.last_mut() {
+                Some(span) if span.2 == start.top() => span.1 = end.left(),
+                _ => spans.push((start.left(), end.left(), start.top(), start.bottom())),
+            }
+        }
+        spans
+    }
+
+    /// Within a pixel: cursor x positions are pixel-snapped, glyph extents
+    /// are not; a glyph is ~7 px wide, so an off-by-one glyph still fails.
+    fn assert_covers(rects: &[Rect], spans: &[(f32, f32, f32, f32)]) {
+        assert_eq!(rects.len(), spans.len(), "{rects:?} vs {spans:?}");
+        for (rect, &(left, right, top, bottom)) in rects.iter().zip(spans) {
+            assert!((rect.left() - left).abs() <= 1.0, "{rect:?} left {left}");
+            assert!(
+                (rect.right() - right).abs() <= 1.0,
+                "{rect:?} right {right}"
+            );
+            assert!(rect.top() >= top - 0.5 && rect.bottom() <= bottom + 0.5);
+        }
+    }
+
     #[test]
-    fn mark_rects_follow_wrapped_rows() {
+    fn mark_rects_cover_exactly_the_marked_glyphs() {
         let ctx = theme::test_context();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            // A one-row mark after several wrapped rows (the leading
+            // timestamp and speaker shift the char indices).
             let snippet = "word ".repeat(30) + "\x01match\x02 tail";
             let (job, marks) = hit_job(&hit(1, 5, &snippet), 120.0);
+            let start = job.text.chars().count() - "match tail".chars().count();
+            assert_eq!(marks, vec![start..start + 5]);
             let galley = ui.painter().layout_job(job);
             assert!(galley.rows.len() > 2, "the snippet wraps");
             let rects = mark_rects(&galley, &marks);
-            assert_eq!(rects.len(), 1);
-            let second_row = galley.rows[1].pos.y;
-            assert!(rects[0].top() > second_row, "on a later row");
-            assert!(rects[0].width() > 0.0);
+            assert_covers(&rects, &cursor_spans(&galley, marks[0].clone()));
+            assert!(rects[0].top() > galley.rows[1].pos.y, "on a later row");
+
+            // A marked run that itself wraps: one rect per row it spans.
+            let snippet = "lead \x01".to_string() + &"match ".repeat(12) + "end\x02 tail";
+            let (job, marks) = hit_job(&hit(1, 5, &snippet), 120.0);
+            let galley = ui.painter().layout_job(job);
+            let rects = mark_rects(&galley, &marks);
+            let spans = cursor_spans(&galley, marks[0].clone());
+            assert!(spans.len() >= 2, "the mark wraps: {spans:?}");
+            assert_covers(&rects, &spans);
+
+            // Two marks on one row stay separate; a note hit has no
+            // timestamp but a chip's leading space.
+            let (mut job, marks) = hit_job(&hit(1, -1, "\x01a\x02 b \x01c\x02"), 300.0);
+            job.sections[0].leading_space = 30.0;
+            let galley = ui.painter().layout_job(job);
+            let rects = mark_rects(&galley, &marks);
+            let spans: Vec<_> = marks
+                .iter()
+                .flat_map(|m| cursor_spans(&galley, m.clone()))
+                .collect();
+            assert_covers(&rects, &spans);
+
             assert!(!hit_row(ui, &hit(1, -1, "\x01n\x02")));
         });
         output.textures_delta.clear();

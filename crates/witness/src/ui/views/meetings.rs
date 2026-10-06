@@ -7,9 +7,10 @@
 //! mid-action. The list reloads whenever `shell.refresh_tick` changes.
 //!
 //! Rows have a uniform height, so the list is one allocation and only the
-//! rows inside the clip rect are laid out (hundreds of loaded rows stay
-//! cheap). The recycle bin is a separate, normally laid-out section after
-//! the list.
+//! rows inside the clip rect (plus one row either side, the focused row and
+//! the row being renamed) are laid out, so hundreds of loaded rows stay
+//! cheap while Tab can still walk the whole list. The recycle bin is a
+//! separate, normally laid-out section after the list.
 
 use crate::bridge::{OpDone, Task};
 use crate::ui::format::{fmt_date, fmt_duration};
@@ -33,6 +34,9 @@ use witness_core::CoreResult;
 
 /// Rows per page (Load more) and the minimum reload size.
 const PAGE: usize = 50;
+/// `AppCore::list_meetings` clamps its limit to this; larger reloads are
+/// fetched in chunks.
+const BACKEND_MAX: usize = 500;
 /// A single click opens after this delay unless a double-click (rename)
 /// arrives first.
 const OPEN_DELAY: Duration = Duration::from_millis(250);
@@ -132,6 +136,38 @@ pub(crate) fn paint_focus_ring(ui: &egui::Ui, rect: Rect, radius: u8) {
         Stroke::new(2.0, FOCUS),
         StrokeKind::Outside,
     );
+}
+
+/// Scroll a widget that just took keyboard focus (Tab) into view, as a
+/// browser does; egui only scrolls for AccessKit requests. Focus taken by a
+/// pointer press doesn't scroll.
+pub(crate) fn follow_focus(response: &Response) {
+    let by_pointer = response
+        .ctx
+        .input(|i| i.pointer.any_pressed() || i.pointer.any_released());
+    if response.gained_focus() && !by_pointer {
+        response.scroll_to_me(None);
+    }
+}
+
+/// Fetch `count` rows from `offset` with `fetch(offset, limit)`, in chunks
+/// of at most [`BACKEND_MAX`]; a short chunk means the end of the list.
+fn fetch_chunked<T, E>(
+    offset: usize,
+    count: usize,
+    mut fetch: impl FnMut(usize, usize) -> Result<Vec<T>, E>,
+) -> Result<Vec<T>, E> {
+    let mut rows = Vec::new();
+    while rows.len() < count {
+        let want = (count - rows.len()).min(BACKEND_MAX);
+        let chunk = fetch(offset + rows.len(), want)?;
+        let short = chunk.len() < want;
+        rows.extend(chunk);
+        if short {
+            break;
+        }
+    }
+    Ok(rows)
 }
 
 /// Paint `glyph` centred (on its ink box) in `rect`.
@@ -257,6 +293,9 @@ pub struct MeetingsView {
     editing: Option<Editing>,
     pending_open: Option<(i64, Instant)>,
     confirm_for: Option<ConfirmFor>,
+    /// The row holding keyboard focus last pass: it is drawn even when
+    /// scrolled out of view, since egui drops the focus of an undrawn widget.
+    focused_row: Option<i64>,
     /// The `shell.refresh_tick` the data was requested for; None until the
     /// first pass, so mounting loads.
     seen_tick: Option<u64>,
@@ -281,6 +320,7 @@ impl MeetingsView {
             editing: None,
             pending_open: None,
             confirm_for: None,
+            focused_row: None,
             seen_tick: None,
         }
     }
@@ -329,10 +369,13 @@ impl MeetingsView {
     }
 
     /// `load(offset, append, limit)`: asks for `limit + 1` rows to learn
-    /// whether there is another page.
+    /// whether there is another page (chunked past the backend's cap, so a
+    /// reload of 500+ rows keeps them all, and keeps Load more).
     fn load(&mut self, cx: &UiCtx, offset: usize, append: bool, limit: usize) {
         let task = cx.tasks.spawn("list-meetings", move |c| {
-            c.list_meetings(offset as i64, (limit + 1) as i64)
+            fetch_chunked(offset, limit + 1, |offset, limit| {
+                c.list_meetings(offset as i64, limit as i64)
+            })
         });
         self.list_load = Some(ListLoad {
             task,
@@ -411,8 +454,13 @@ impl MeetingsView {
     // ------------------------------------------------------------------
     // Actions
 
-    /// Navigate once the single-click delay has passed.
+    /// Navigate once the single-click delay has passed. Held while a
+    /// confirmation is open: navigating would remount this view and drop
+    /// the confirmation's answer (closing the modal repaints).
     fn fire_pending_open(&mut self, ui: &egui::Ui, cx: &mut UiCtx) {
+        if cx.confirm.is_open() {
+            return;
+        }
         if let Some((id, at)) = self.pending_open {
             let now = Instant::now();
             if now >= at {
@@ -444,7 +492,10 @@ impl MeetingsView {
         }
     }
 
+    /// Open the confirmation. A pending single-click open is dropped: the
+    /// click on a row button supersedes it.
     fn ask(&mut self, cx: &mut UiCtx, what: ConfirmFor, message: String, ok_label: &str) {
+        self.pending_open = None;
         self.confirm_for = Some(what);
         cx.confirm.ask(egui::Id::new(CONFIRM_ID), message, ok_label);
     }
@@ -594,11 +645,8 @@ impl MeetingsView {
             ui.add_space(ROW_GAP);
             let loading = self.loading();
             let label = if loading { "Loading…" } else { "Load more" };
-            let clicked = ui
-                .add_enabled_ui(!loading, |ui| widgets::btn_ghost(ui, label))
-                .inner
-                .clicked();
-            if clicked {
+            // A child of the `.meeting-list` flex column: full width.
+            if wide_ghost_button(ui, label, !loading).clicked() {
                 actions.push(RowAction::LoadMore);
             }
         }
@@ -606,25 +654,31 @@ impl MeetingsView {
     }
 
     /// The uniform-height list: one allocation; rows are drawn only when
-    /// they intersect the clip rect.
+    /// they are within a row of the clip rect, hold the keyboard focus or
+    /// are being renamed. The extra row either side gives Tab / Shift+Tab a
+    /// next row to move to, which [`follow_focus`] then scrolls into view.
     fn draw_list(&mut self, ui: &mut egui::Ui, actions: &mut Vec<RowAction>) {
         let metrics = RowMetrics::measure(ui);
         let pitch = metrics.height + ROW_GAP;
         let count = self.meetings.len();
         let total = count as f32 * pitch - ROW_GAP;
         let (_, list_rect) = ui.allocate_space(egui::vec2(ui.available_width(), total));
+        let band = ui.clip_rect().expand2(egui::vec2(0.0, pitch));
+        let keep = self.focused_row.take();
         for (index, meeting) in self.meetings.iter().enumerate() {
             let rect = Rect::from_min_size(
                 egui::pos2(list_rect.left(), list_rect.top() + index as f32 * pitch),
                 egui::vec2(list_rect.width(), metrics.height),
             );
             let editing = self.editing.as_mut().filter(|e| e.id == meeting.id);
-            // The editor's row is always drawn: a TextEdit that is not
-            // drawn loses its focus, which would commit the rename.
-            if editing.is_none() && !ui.is_rect_visible(rect) {
+            // The editor's and the focused row are always drawn: a widget
+            // that is not drawn loses its focus (and a rename would commit).
+            if editing.is_none() && keep != Some(meeting.id) && !band.intersects(rect) {
                 continue;
             }
-            meeting_row(ui, rect, metrics, meeting, editing, actions);
+            if meeting_row(ui, rect, metrics, meeting, editing, actions) {
+                self.focused_row = Some(meeting.id);
+            }
         }
     }
 
@@ -653,12 +707,16 @@ impl MeetingsView {
                 0.0
             };
             let head_width = (ui.available_width() - empty_width).max(60.0);
-            if bin_head(ui, head_width, count, open).clicked() {
+            let head = bin_head(ui, head_width, count, open);
+            follow_focus(&head);
+            if head.clicked() {
                 actions.push(RowAction::ToggleBin);
             }
             if open {
                 let label = egui::RichText::new("Empty bin").size(12.0);
-                if widgets::btn_ghost(ui, label).clicked() {
+                let button = widgets::btn_ghost(ui, label);
+                follow_focus(&button);
+                if button.clicked() {
                     let skip = ui.input(|i| i.modifiers.shift);
                     actions.push(RowAction::EmptyBin { skip });
                 }
@@ -762,7 +820,8 @@ fn empty_bin(cx: &mut UiCtx) {
 // ----------------------------------------------------------------------
 // Row widgets
 
-/// One meeting row at `rect` (uniform height).
+/// One meeting row at `rect` (uniform height); true when one of its
+/// widgets has the keyboard focus.
 fn meeting_row(
     ui: &mut egui::Ui,
     rect: Rect,
@@ -770,7 +829,7 @@ fn meeting_row(
     m: &Meeting,
     editing: Option<&mut Editing>,
     actions: &mut Vec<RowAction>,
-) {
+) -> bool {
     let mut row = ui.new_child(
         UiBuilder::new()
             .max_rect(rect)
@@ -812,7 +871,7 @@ fn meeting_row(
     let is_editing = editing.is_some();
 
     // 1. Main block: the open / double-click-rename button, or the editor.
-    match editing {
+    let mut focused = match editing {
         None => main_block(&mut row, main_rect, metrics, m, actions),
         Some(editing) => rename_editor(
             &mut row,
@@ -823,7 +882,7 @@ fn meeting_row(
             editing,
             actions,
         ),
-    }
+    };
 
     // 2. Status: a retry button for failed / recorded rows, else the icon.
     let mut status_ui = row.new_child(UiBuilder::new().max_rect(status_rect));
@@ -839,7 +898,9 @@ fn meeting_row(
                 format!("Transcribe {}", m.title),
             )
         };
-        if status_button(&mut status_ui, status_rect, &m.status, tooltip, &name).clicked() {
+        let button = status_button(&mut status_ui, status_rect, &m.status, tooltip, &name);
+        focused |= button.has_focus();
+        if button.clicked() {
             actions.push(RowAction::Retranscribe(m.id));
         }
     } else {
@@ -855,6 +916,8 @@ fn meeting_row(
     };
     let pencil = widgets::icon_btn(&mut pencil_ui, ph::PENCIL_SIMPLE, ICON, tooltip);
     pencil.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
+    follow_focus(&pencil);
+    focused |= pencil.has_focus();
     if pencil.clicked() {
         actions.push(if is_editing {
             RowAction::CommitEdit
@@ -871,6 +934,8 @@ fn meeting_row(
     let delete = widgets::icon_btn_danger(&mut delete_ui, ph::TRASH, ICON, "Delete");
     let name = format!("Move {} to the recycle bin", m.title);
     delete.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
+    follow_focus(&delete);
+    focused |= delete.has_focus();
     if delete.clicked() {
         actions.push(RowAction::Delete {
             id: m.id,
@@ -878,17 +943,19 @@ fn meeting_row(
             skip: delete_ui.input(|i| i.modifiers.shift),
         });
     }
+    focused
 }
 
 /// The title + meta button. A pointer click opens after 250 ms (a
 /// double-click cancels that and renames); Enter/Space opens at once.
+/// True while it has the keyboard focus.
 fn main_block(
     row: &mut egui::Ui,
     main_rect: Rect,
     metrics: RowMetrics,
     m: &Meeting,
     actions: &mut Vec<RowAction>,
-) {
+) -> bool {
     let response = row.interact(
         main_rect,
         egui::Id::new(("meeting-open", m.id)),
@@ -908,7 +975,9 @@ fn main_block(
 
     let name = format!("Open {}, {}", m.title, status_label(&m.status));
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
-    if response.has_focus() {
+    follow_focus(&response);
+    let focused = response.has_focus();
+    if focused {
         paint_focus_ring(row, main_rect, 4);
     }
     let response = response.on_hover_cursor(CursorIcon::PointingHand);
@@ -933,10 +1002,11 @@ fn main_block(
             actions.push(RowAction::OpenLater(m.id));
         }
     }
+    focused
 }
 
 /// The inline rename input with the meta line kept under it. Enter or
-/// focus loss commits; Escape cancels.
+/// focus loss commits; Escape cancels. True while it has the focus.
 fn rename_editor(
     row: &mut egui::Ui,
     main_rect: Rect,
@@ -945,7 +1015,7 @@ fn rename_editor(
     m: &Meeting,
     editing: &mut Editing,
     actions: &mut Vec<RowAction>,
-) {
+) -> bool {
     let edit_rect = Rect::from_min_size(main_rect.min, egui::vec2(main_rect.width(), metrics.line));
     let mut edit_ui = row.new_child(
         UiBuilder::new()
@@ -992,6 +1062,7 @@ fn rename_editor(
             });
         }
     }
+    response.has_focus()
 }
 
 /// The 12 pt muted meta line under the title line, kept to one line.
@@ -1046,10 +1117,53 @@ fn status_button(
     if response.has_focus() {
         paint_focus_ring(ui, rect, 6);
     }
+    follow_focus(&response);
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, name));
     response
         .on_hover_cursor(CursorIcon::PointingHand)
         .on_hover_text(tooltip)
+}
+
+/// `.btn.btn-ghost` stretched to the full width (Load more, a child of the
+/// `.meeting-list` flex column); disabled while a load runs.
+fn wide_ghost_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> Response {
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), theme::regular(theme::BASE_SIZE), TEXT);
+    // `.btn { padding: 6px 14px }`, at least the interact height.
+    let height = (galley.size().y + 12.0).max(ui.spacing().interact_size.y);
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), sense);
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
+    if ui.is_rect_visible(rect) {
+        let hot = enabled && (response.hovered() || response.has_focus());
+        let painter = ui.painter();
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(6),
+            Stroke::new(1.0, if hot { ACCENT } else { BORDER }),
+            StrokeKind::Inside,
+        );
+        let color = if enabled {
+            TEXT
+        } else {
+            TEXT.gamma_multiply(0.5)
+        };
+        painter.galley(rect.center() - galley.size() / 2.0, galley, color);
+        if response.has_focus() {
+            paint_focus_ring(ui, rect, 6);
+        }
+    }
+    follow_focus(&response);
+    if enabled {
+        response.on_hover_cursor(CursorIcon::PointingHand)
+    } else {
+        response.on_hover_cursor(CursorIcon::NotAllowed)
+    }
 }
 
 /// Width of the "Empty bin" ghost button (12 pt text + `.btn` padding).
@@ -1151,6 +1265,7 @@ fn bin_row(ui: &mut egui::Ui, slot: f32, d: &DeletedMeeting, actions: &mut Vec<R
                         widgets::icon_btn(ui, ph::ARROW_COUNTER_CLOCKWISE, ICON, "Restore");
                     let name = format!("Restore {}", m.title);
                     restore.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
+                    follow_focus(&restore);
                     if restore.clicked() {
                         actions.push(RowAction::Restore(m.id));
                     }
@@ -1158,6 +1273,7 @@ fn bin_row(ui: &mut egui::Ui, slot: f32, d: &DeletedMeeting, actions: &mut Vec<R
                     let purge = widgets::icon_btn_danger(ui, ph::TRASH, ICON, "Delete forever");
                     let name = format!("Permanently delete {}", m.title);
                     purge.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
+                    follow_focus(&purge);
                     if purge.clicked() {
                         actions.push(RowAction::Purge {
                             id: m.id,
@@ -1236,6 +1352,47 @@ mod tests {
         let line = bin_meta_line(&binned);
         assert!(line.contains(" · — · deleted "), "{line}");
         assert!(line.ends_with(" · auto-removed after 30 days"));
+    }
+
+    /// A fake `list_meetings` over `total` rows that clamps like the backend.
+    fn fake_list(
+        total: usize,
+        calls: &mut Vec<(usize, usize)>,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<usize> {
+        calls.push((offset, limit));
+        let limit = limit.clamp(1, BACKEND_MAX);
+        (offset..(offset + limit).min(total)).collect()
+    }
+
+    #[test]
+    fn reloads_past_the_backend_cap_are_chunked() {
+        // 550 loaded + 1 probe row over 1000 meetings: all 551 arrive, so
+        // the list keeps its length and Load more stays.
+        let mut calls = Vec::new();
+        let rows: Result<Vec<usize>, ()> =
+            fetch_chunked(0, 551, |o, l| Ok(fake_list(1000, &mut calls, o, l)));
+        let rows = rows.unwrap();
+        assert_eq!(rows.len(), 551);
+        assert_eq!(rows, (0..551).collect::<Vec<_>>());
+        assert_eq!(calls, vec![(0, 500), (500, 51)]);
+
+        // A short chunk ends the fetch (exactly 500 meetings: no Load more).
+        let mut calls = Vec::new();
+        let rows: Result<Vec<usize>, ()> =
+            fetch_chunked(0, 501, |o, l| Ok(fake_list(500, &mut calls, o, l)));
+        assert_eq!(rows.unwrap().len(), 500);
+        assert_eq!(calls, vec![(0, 500), (500, 1)]);
+
+        let mut calls = Vec::new();
+        let rows: Result<Vec<usize>, ()> =
+            fetch_chunked(50, 51, |o, l| Ok(fake_list(60, &mut calls, o, l)));
+        assert_eq!(rows.unwrap(), (50..60).collect::<Vec<_>>());
+        assert_eq!(calls, vec![(50, 51)]);
+
+        let failed: Result<Vec<usize>, &str> = fetch_chunked(0, 10, |_, _| Err("db"));
+        assert_eq!(failed, Err("db"));
     }
 
     #[test]
