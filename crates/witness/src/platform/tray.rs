@@ -228,10 +228,12 @@ fn tooltip(recording: bool, warning: Option<&str>) -> String {
     }
 }
 
-/// The exe's own icon (resource 32512), so Windows picks the right small
-/// size; the bundled PNG if the resource is missing.
+/// The exe's own icon (resource 32512) at the small-icon size, so
+/// `LoadImageW` picks `icon.ico`'s hand-tuned 16/24 px frame instead of the
+/// 32 px one the shell would downsample (`None` means `LR_DEFAULTSIZE`, the
+/// large size); the bundled PNG if the resource is missing.
 fn app_icon() -> anyhow::Result<Icon> {
-    match Icon::from_resource(APP_ICON_RESOURCE, None) {
+    match Icon::from_resource(APP_ICON_RESOURCE, imp::small_icon_size()) {
         Ok(icon) => Ok(icon),
         Err(error) => {
             log::warn!("tray icon resource {APP_ICON_RESOURCE}: {error}; using the PNG");
@@ -252,6 +254,16 @@ fn png_icon(bytes: &[u8]) -> anyhow::Result<Icon> {
 
 #[cfg(windows)]
 mod imp {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON, SM_CYSMICON};
+
+    /// The shell's small-icon size (16 px at 100 %, 24 px at 150 %), or
+    /// None (the default size) if the metrics are unavailable.
+    pub fn small_icon_size() -> Option<(u32, u32)> {
+        // SAFETY: plain metric queries.
+        let (w, h) = unsafe { (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)) };
+        (w > 0 && h > 0).then_some((w as u32, h as u32))
+    }
+
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::Shell::{Shell_NotifyIconW, NIM_MODIFY, NOTIFYICONDATAW};
 
@@ -276,6 +288,9 @@ mod imp {
 mod imp {
     pub fn icon_exists(_hwnd: isize, _uid: u32) -> bool {
         true
+    }
+    pub fn small_icon_size() -> Option<(u32, u32)> {
+        None
     }
 }
 

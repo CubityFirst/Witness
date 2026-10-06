@@ -4,15 +4,24 @@
 //! `com.github.cubityfirst.witness-sim`, window class `…-sic`, title
 //! `…-siw`, WM_COPYDATA `dwData = 1542`, payload `"{cwd}|{arg0}|…\0"`.
 //!
-//! Two fixes over the plugin:
+//! Fixes over the plugin:
 //! - A second launch that finds the mutex but not (yet) the window retries
 //!   for 2 s instead of falling through into a second full instance.
+//! - Once the window exists, a request that times out (the first instance
+//!   is still starting up and not pumping messages yet) is re-sent for up
+//!   to 30 s. A timed-out WM_COPYDATA is dropped, so giving up after one
+//!   attempt would lose the request; the plugin's blocking `SendMessageW`
+//!   waited indefinitely instead.
 //! - If the mutex owner lets go meanwhile (a restart: the old process
 //!   releases it at its point of no return), the new launch takes it over
 //!   and becomes the primary instance.
 //! - An exiting instance refuses requests (`begin_exit`), so a launch that
 //!   races the exit keeps waiting and takes over instead of being told
-//!   "shown" by a process that is about to disappear.
+//!   "shown" by a process that is about to disappear. A panicking main
+//!   thread refuses too (the panic hook's message box pumps messages after
+//!   the mutex is released), and a launch tries every window with the
+//!   instance's class and title, so a dying instance's leftover window
+//!   cannot hide the new primary's.
 
 use crate::bridge::UiSink;
 use crate::platform::ShellEvent;
@@ -39,11 +48,16 @@ const NAMES: Names = Names {
 
 /// `COPYDATASTRUCT::dwData` of a second-instance request.
 const COPYDATA_SINGLE_INSTANCE: usize = 1542;
-/// How long a second launch waits for the first instance's window (or for
-/// the mutex to be released, on a restart).
+/// How long a second launch waits for the first instance's window to appear
+/// (or for the mutex to be released, on a restart).
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a second launch keeps re-sending once the window exists: the
+/// first instance may still be starting up (settings, db, recovery, GPU
+/// context) before its message pump runs, or be exiting (a panic's
+/// emergency stop takes up to 10 s before the mutex is released).
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 const ACQUIRE_POLL: Duration = Duration::from_millis(100);
-/// How long the WM_COPYDATA send may block on the first instance.
+/// How long one WM_COPYDATA send may block on the first instance.
 const SEND_TIMEOUT_MS: u32 = 2000;
 
 /// Where second-instance requests go once the UI exists.
@@ -148,9 +162,21 @@ fn append_to_log_file(level: log::Level, line: &str) {
     let _ = writeln!(file, "{time} [{}] {line}", level.as_str().to_uppercase());
 }
 
-/// A second-instance request reached the hidden window (any thread that
-/// owns it; in the app, the main thread inside winit's message pump).
-fn on_second_instance(payload: &[u8]) {
+/// Hidden windows that accepted a request, so the thread tests can tell
+/// their "instances" apart (`SINK` is process-wide).
+#[cfg(test)]
+static ACCEPTED_BY: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+/// A second-instance request reached the hidden window `hwnd` (any thread
+/// that owns it; in the app, the main thread inside winit's message pump).
+fn on_second_instance(hwnd: isize, payload: &[u8]) {
+    #[cfg(test)]
+    ACCEPTED_BY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(hwnd);
+    #[cfg(not(test))]
+    let _ = hwnd;
     let (cwd, args) = decode_payload(payload);
     log::info!("second launch (cwd {cwd:?}, args {args:?}): showing the window");
     match SINK.get() {
@@ -181,7 +207,8 @@ fn decode_payload(bytes: &[u8]) -> (String, Vec<String>) {
 mod imp {
     use super::{
         append_to_log_file, early_log, encode_payload, on_second_instance, Acquire, InstanceGuard,
-        Names, ACQUIRE_POLL, ACQUIRE_TIMEOUT, COPYDATA_SINGLE_INSTANCE, SEND_TIMEOUT_MS,
+        Names, ACQUIRE_POLL, ACQUIRE_TIMEOUT, ANSWER_TIMEOUT, COPYDATA_SINGLE_INSTANCE,
+        SEND_TIMEOUT_MS,
     };
     use log::Level;
     use std::ffi::OsString;
@@ -195,7 +222,7 @@ mod imp {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
     use windows::Win32::UI::WindowsAndMessaging::{
-        AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowW,
+        AllowSetForegroundWindow, CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW,
         GetWindowLongPtrW, GetWindowThreadProcessId, RegisterClassExW, SendMessageTimeoutW,
         SetWindowLongPtrW, GWLP_USERDATA, SMTO_ABORTIFHUNG, WM_COPYDATA, WNDCLASSEXW,
         WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
@@ -248,7 +275,9 @@ mod imp {
         }
 
         let payload = encode_payload(&std::env::current_dir().unwrap_or_default(), args);
-        let deadline = Instant::now() + ACQUIRE_TIMEOUT;
+        let started = Instant::now();
+        // Short while there is no window yet; extended once one exists.
+        let mut deadline = started + ACQUIRE_TIMEOUT;
         loop {
             // The owner let go (it is exiting or restarting): take over.
             // SAFETY: a valid mutex handle, zero timeout.
@@ -260,20 +289,28 @@ mod imp {
                 );
                 return Acquire::Primary(primary(names, mutex));
             }
-            if let Some(target) = find_window(names) {
+            let targets = find_windows(names);
+            if !targets.is_empty() {
+                // The instance exists. It may not pump messages yet (still
+                // starting up) or be exiting: keep trying for longer.
+                deadline = deadline.max(started + ANSWER_TIMEOUT);
+            }
+            for target in targets {
                 if signal(target, &payload) {
                     close(mutex);
                     return Acquire::Secondary;
                 }
-                // The instance is exiting (it refused, or its window is
-                // going away): wait for the mutex instead.
+                // Refused (exiting or panicking) or no answer in time (not
+                // pumping yet; that send was dropped): try the next window,
+                // then the mutex and a fresh send again.
             }
             if Instant::now() >= deadline {
                 // This process exits before logging ever starts: leave the
                 // line in the running instance's log (and debugger output).
                 let line = format!(
                     "second launch: another Witness holds the instance mutex but did not \
-                     answer within {ACQUIRE_TIMEOUT:?}; exiting"
+                     answer within {:.1}s; exiting",
+                    started.elapsed().as_secs_f32()
                 );
                 append_to_log_file(Level::Warn, &line);
                 early_log(Level::Warn, line);
@@ -289,13 +326,31 @@ mod imp {
         let _ = unsafe { CloseHandle(mutex) };
     }
 
-    fn find_window(names: &Names) -> Option<HWND> {
+    /// Every top-level window with the instance's class and title, in
+    /// z-order. Normally one; a crashing instance's window lingers while its
+    /// panic message box is open, next to the new primary's.
+    pub(super) fn find_windows(names: &Names) -> Vec<HWND> {
+        /// Bound on the walk (a window destroyed mid-walk ends it early).
+        const MAX_WINDOWS: usize = 8;
         let class = wide(names.class);
         let title = wide(names.title);
-        // SAFETY: both buffers outlive the call.
-        unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR(title.as_ptr())) }
-            .ok()
-            .filter(|hwnd| !hwnd.is_invalid())
+        let mut found = Vec::new();
+        let mut after: Option<HWND> = None;
+        while found.len() < MAX_WINDOWS {
+            // SAFETY: both buffers outlive the call; `after` is a window
+            // this walk returned (a stale one just ends the walk).
+            let next = unsafe {
+                FindWindowExW(None, after, PCWSTR(class.as_ptr()), PCWSTR(title.as_ptr()))
+            };
+            match next {
+                Ok(hwnd) if !hwnd.is_invalid() => {
+                    found.push(hwnd);
+                    after = Some(hwnd);
+                }
+                _ => break,
+            }
+        }
+        found
     }
 
     /// Let the first instance take the foreground, then send it the
@@ -350,7 +405,7 @@ mod imp {
         }
     }
 
-    fn create_window(names: &Names) -> windows::core::Result<HWND> {
+    pub(super) fn create_window(names: &Names) -> windows::core::Result<HWND> {
         let class = wide(names.class);
         let title = wide(names.title);
         // SAFETY: plain window-class registration and creation on this
@@ -393,9 +448,15 @@ mod imp {
         lparam: LPARAM,
     ) -> LRESULT {
         if msg == WM_COPYDATA {
+            // Refused while exiting (`begin_exit`) or panicking: the panic
+            // hook releases the mutex and then pumps messages in its message
+            // box, possibly with a new primary already up. (The window lives
+            // on the main thread, the only one whose panic tears the process
+            // down.) The sender waits for the mutex and takes over, or tries
+            // the next window.
             // SAFETY: reading our own window's user data.
-            if unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } == EXITING {
-                // Refused: the sender waits for the mutex and takes over.
+            let exiting = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } == EXITING;
+            if exiting || std::thread::panicking() {
                 return LRESULT(0);
             }
             let data = lparam.0 as *const COPYDATASTRUCT;
@@ -409,7 +470,7 @@ mod imp {
                     } else {
                         std::slice::from_raw_parts((*data).lpData as *const u8, len)
                     };
-                    on_second_instance(bytes);
+                    on_second_instance(hwnd.0 as isize, bytes);
                 }
             }
             // The plugin answered TRUE to every WM_COPYDATA.
@@ -507,12 +568,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn second_launch_signals_the_first_and_backs_off() {
-        use crate::bridge::UiMsg;
         use std::sync::mpsc;
-        use std::time::Instant;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
-        };
 
         let names = Names {
             mutex: "com.github.cubityfirst.witness-test-sim-u1",
@@ -525,24 +581,13 @@ mod tests {
             let Acquire::Primary(guard) = imp::acquire(&names, &["first.exe".into()]) else {
                 panic!("first launch must be primary");
             };
-            let (sink, rx) = UiSink::new();
+            let (sink, _rx) = UiSink::new();
             guard.attach(sink);
             ready_tx.send(()).unwrap();
             // Pump until the second launch's request arrives.
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let mut shown = false;
-            while Instant::now() < deadline && !shown {
-                let mut msg = MSG::default();
-                // SAFETY: a standard message pump on this thread.
-                unsafe {
-                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                        let _ = TranslateMessage(&msg);
-                        DispatchMessageW(&msg);
-                    }
-                }
-                shown = matches!(rx.try_recv(), Ok(UiMsg::Shell(ShellEvent::SecondInstance)));
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            let hwnd = guard.hwnd;
+            pump_until(Duration::from_secs(10), || accepted_by(hwnd) > 0);
+            let shown = accepted_by(hwnd) == 1;
             release_rx.recv().unwrap();
             guard.release();
             shown
@@ -568,6 +613,37 @@ mod tests {
         assert!(third.join().unwrap());
     }
 
+    /// Pump this thread's messages until `done` or `limit` elapses.
+    #[cfg(windows)]
+    fn pump_until(limit: Duration, done: impl Fn() -> bool) {
+        use std::time::Instant;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+        };
+        let until = Instant::now() + limit;
+        while Instant::now() < until && !done() {
+            let mut msg = MSG::default();
+            // SAFETY: a standard message pump on this thread.
+            unsafe {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// How many requests the hidden window `hwnd` accepted.
+    fn accepted_by(hwnd: isize) -> usize {
+        ACCEPTED_BY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&h| h == hwnd)
+            .count()
+    }
+
     /// A launch on a thread of its own; true if it became primary (its guard
     /// is released on that thread, which owns the mutex).
     #[cfg(windows)]
@@ -590,9 +666,6 @@ mod tests {
     fn a_launch_racing_an_exit_takes_over_the_mutex() {
         use std::sync::mpsc;
         use std::time::Instant;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
-        };
 
         let names = Names {
             mutex: "com.github.cubityfirst.witness-test-sim-u1-exit",
@@ -607,18 +680,7 @@ mod tests {
             guard.begin_exit();
             ready_tx.send(()).unwrap();
             // Still pumping (and refusing) for a while, then let go.
-            let until = Instant::now() + Duration::from_millis(600);
-            while Instant::now() < until {
-                let mut msg = MSG::default();
-                // SAFETY: a standard message pump on this thread.
-                unsafe {
-                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                        let _ = TranslateMessage(&msg);
-                        DispatchMessageW(&msg);
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            pump_until(Duration::from_millis(600), || false);
             guard.release();
         });
 
@@ -661,5 +723,131 @@ mod tests {
                 mutex as *mut _,
             ))
         };
+    }
+
+    /// The first instance is still starting up and not pumping messages yet
+    /// (in the app: settings, db, recovery and the GL context come before
+    /// winit's loop) for longer than one send's 2 s timeout. The launch
+    /// re-sends instead of giving up, and the request arrives once the first
+    /// instance pumps. (0.2.x's blocking `SendMessageW` simply waited.)
+    #[cfg(windows)]
+    #[test]
+    fn a_launch_waits_for_a_primary_that_is_not_pumping_yet() {
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        let names = Names {
+            mutex: "com.github.cubityfirst.witness-test-sim-u1-busy",
+            class: "com.github.cubityfirst.witness-test-sic-u1-busy",
+            title: "com.github.cubityfirst.witness-test-siw-u1-busy",
+        };
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let first = std::thread::spawn(move || {
+            let Acquire::Primary(guard) = imp::acquire(&names, &["first.exe".into()]) else {
+                panic!("first launch must be primary");
+            };
+            ready_tx.send(()).unwrap();
+            // Busy starting up: no message pump for 3 s.
+            std::thread::sleep(Duration::from_secs(3));
+            let hwnd = guard.hwnd;
+            pump_until(Duration::from_secs(10), || accepted_by(hwnd) > 0);
+            // Keep pumping until the launch is done, so a late duplicate
+            // (an earlier, timed-out send) would be counted as well.
+            while release_rx.try_recv().is_err() {
+                pump_until(Duration::from_millis(50), || false);
+            }
+            pump_until(Duration::from_millis(300), || false);
+            guard.release();
+            accepted_by(hwnd)
+        });
+
+        ready_rx.recv().unwrap();
+        let started = Instant::now();
+        let second = imp::acquire(&names, &["second.exe".into()]);
+        let waited = started.elapsed();
+        release_tx.send(()).unwrap();
+        assert!(matches!(second, Acquire::Secondary));
+        assert!(
+            waited >= Duration::from_secs(2),
+            "answered after {waited:?}"
+        );
+        assert_eq!(
+            first.join().unwrap(),
+            1,
+            "the request must arrive exactly once"
+        );
+    }
+
+    /// A crashed instance's panic hook has released the mutex and pumps
+    /// messages in its message box while a new primary is up, both with
+    /// windows of the same class and title. The dying one refuses
+    /// (`thread::panicking`), and the launch goes on to the live primary
+    /// instead of being told "shown" by the dying process.
+    #[cfg(windows)]
+    #[test]
+    fn a_panicking_instance_refuses_and_the_live_one_answers() {
+        use std::sync::atomic::AtomicIsize;
+        use std::sync::{mpsc, Arc};
+
+        let names = Names {
+            mutex: "com.github.cubityfirst.witness-test-sim-u1-panic",
+            class: "com.github.cubityfirst.witness-test-sic-u1-panic",
+            title: "com.github.cubityfirst.witness-test-siw-u1-panic",
+        };
+        let (live_tx, live_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let live = std::thread::spawn(move || {
+            let Acquire::Primary(guard) = imp::acquire(&names, &["live.exe".into()]) else {
+                panic!("the live instance must be primary");
+            };
+            live_tx.send(guard.hwnd).unwrap();
+            while release_rx.try_recv().is_err() {
+                pump_until(Duration::from_millis(50), || false);
+            }
+            guard.release();
+        });
+        let live_hwnd = live_rx.recv().unwrap();
+
+        /// Pumps messages while its thread unwinds, like the panic hook's
+        /// message box, then destroys the window.
+        struct DyingPump(Arc<AtomicIsize>, mpsc::Sender<()>);
+        impl Drop for DyingPump {
+            fn drop(&mut self) {
+                assert!(std::thread::panicking());
+                let _ = self.1.send(());
+                pump_until(Duration::from_secs(5), || false);
+                imp::release(0, self.0.load(Ordering::SeqCst));
+            }
+        }
+        // Created after the live window, so it comes first in z-order and
+        // is the one a single FindWindowW would return.
+        let dying_hwnd = Arc::new(AtomicIsize::new(0));
+        let (unwinding_tx, unwinding_rx) = mpsc::channel();
+        let dying = {
+            let dying_hwnd = dying_hwnd.clone();
+            std::thread::spawn(move || {
+                let hwnd = imp::create_window(&names).expect("dying window");
+                dying_hwnd.store(hwnd.0 as isize, Ordering::SeqCst);
+                let _pump = DyingPump(dying_hwnd, unwinding_tx);
+                panic!("simulated main-thread panic (expected by this test)");
+            })
+        };
+        unwinding_rx.recv().unwrap();
+        let dying_hwnd = dying_hwnd.load(Ordering::SeqCst);
+        let windows = imp::find_windows(&names);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(
+            windows[0].0 as isize, dying_hwnd,
+            "the dying window comes first"
+        );
+
+        let second = imp::acquire(&names, &["second.exe".into()]);
+        assert!(matches!(second, Acquire::Secondary));
+        assert_eq!(accepted_by(live_hwnd), 1, "the live instance must answer");
+        assert_eq!(accepted_by(dying_hwnd), 0, "the dying one must refuse");
+        release_tx.send(()).unwrap();
+        live.join().unwrap();
+        assert!(dying.join().is_err());
     }
 }
