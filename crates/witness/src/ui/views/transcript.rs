@@ -221,6 +221,25 @@ fn stat_text(stat: &SpeakerStat) -> String {
     )
 }
 
+/// `.stat-chip` gap between the speaker chip and its numbers.
+const STAT_GAP: f32 = 6.0;
+/// The stats chips' `max-width` in em.
+const STAT_CHIP_MAX_EM: f32 = 16.0;
+
+/// The size `widgets::chip(ui, name, _, STAT_CHIP_MAX_EM)` will take, so a
+/// stat can claim its whole width before it is drawn. Mirrors the kit's
+/// chip metrics (11 pt semibold, truncated to the em cap, 8/2 px padding).
+fn stat_chip_size(ui: &egui::Ui, name: &str) -> egui::Vec2 {
+    let max_text = (STAT_CHIP_MAX_EM * 11.0 - 16.0).max(11.0);
+    let mut job = egui::text::LayoutJob::simple_singleline(
+        name.to_owned(),
+        crate::ui::theme::semibold(11.0),
+        egui::Color32::WHITE,
+    );
+    job.wrap = egui::text::TextWrapping::truncate_at_width(max_text);
+    ui.painter().layout_job(job).size() + egui::vec2(16.0, 4.0)
+}
+
 /// The status text under an empty transcript (map §4.6).
 fn empty_message(
     detail: &MeetingDetail,
@@ -2004,16 +2023,42 @@ impl TranscriptState {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(10.0, 6.0);
                     for stat in &self.stats {
-                        ui.scope(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            widgets::chip(ui, &stat.name, chip_color(&stat.label), 16.0)
+                        // `.stat-chip` is `nowrap`: measure chip + text and
+                        // claim that size as ONE item, so the wrapped row
+                        // breaks between stats, never inside one (a plain
+                        // label wraps into the leftover width, splitting
+                        // "30 s · 35 words" mid-word).
+                        let text = egui::WidgetText::from(
+                            egui::RichText::new(stat_text(stat))
+                                .size(12.0)
+                                .color(TEXT_MUTED),
+                        )
+                        .into_galley(
+                            ui,
+                            Some(egui::TextWrapMode::Extend),
+                            f32::INFINITY,
+                            egui::TextStyle::Body,
+                        );
+                        let chip = stat_chip_size(ui, &stat.name);
+                        let size = egui::vec2(
+                            chip.x + STAT_GAP + text.size().x,
+                            chip.y.max(text.size().y),
+                        );
+                        ui.allocate_ui_with_layout(
+                            size,
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = STAT_GAP;
+                                widgets::chip(
+                                    ui,
+                                    &stat.name,
+                                    chip_color(&stat.label),
+                                    STAT_CHIP_MAX_EM,
+                                )
                                 .on_hover_text(&stat.name);
-                            ui.label(
-                                egui::RichText::new(stat_text(stat))
-                                    .size(12.0)
-                                    .color(TEXT_MUTED),
-                            );
-                        });
+                                ui.label(text);
+                            },
+                        );
                     }
                 });
             });

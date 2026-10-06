@@ -19,7 +19,9 @@ use crate::ui::theme::{
 };
 use crate::ui::toasts::Notice;
 use crate::ui::UiCtx;
-use eframe::egui::{self, CornerRadius, Frame, Key, Margin, Response, Sense, Stroke};
+use eframe::egui::{
+    self, Align, CornerRadius, Frame, Key, Layout, Margin, Response, Sense, Stroke,
+};
 use std::time::{Duration, Instant};
 use witness_core::player::PlayerSnapshot;
 use witness_core::service::MeetingDetail;
@@ -346,7 +348,8 @@ fn scrubber(
 }
 
 /// Row 2: transport on the left; speed, volume and "Save a copy…" on the
-/// right (`justify-content: space-between`, wrapping when narrow).
+/// right (`justify-content: space-between`). When both clusters do not fit
+/// on one line, the right one wraps below, still right-aligned.
 fn controls_row(
     ui: &mut egui::Ui,
     cx: &mut UiCtx,
@@ -354,74 +357,130 @@ fn controls_row(
     snap: &PlayerSnapshot,
     out: &mut PlayerBarOutput,
 ) {
-    // The right cluster's width from last frame (first frame: an estimate),
-    // to right-align it when it fits on the same line.
-    let right_id = ui.id().with("player-right-cluster");
-    let right_width: f32 = ui.ctx().data(|d| d.get_temp(right_id)).unwrap_or(230.0);
+    // Both clusters' widths from last pass (first pass: estimates).
+    let width_id = ui.id().with("player-cluster-widths");
+    let (left_width, right_width): (f32, f32) = ui
+        .ctx()
+        .data(|d| d.get_temp(width_id))
+        .unwrap_or((150.0, 240.0));
+    let one_line = ui.available_width() >= left_width + right_width + 10.0;
 
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
-        if player_btn(
-            ui,
-            ph::REWIND,
-            15.0,
-            "Back 10 seconds",
-            "Back 10 s (←: 5 s)",
-            false,
-        )
-        .clicked()
-        {
-            cx.player.skip_ms(-SKIP_BUTTON_MS);
+    let mut widths = (left_width, right_width);
+    let row = ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        widths.0 = left_cluster(ui, cx, snap, out);
+        if one_line {
+            widths.1 = right_cluster(ui, cx, detail);
         }
-        let (glyph, label, tip) = if snap.playing {
-            (ph::PAUSE, "Pause", "Pause (space)")
-        } else {
-            (ph::PLAY, "Play", "Play (space)")
-        };
-        if player_btn(ui, glyph, 18.0, label, tip, true).clicked() {
-            cx.player.toggle();
-        }
-        if player_btn(
-            ui,
-            ph::FAST_FORWARD,
-            15.0,
-            "Forward 10 seconds",
-            "Forward 10 s (→: 5 s)",
-            false,
-        )
-        .clicked()
-        {
-            cx.player.skip_ms(SKIP_BUTTON_MS);
-        }
-        if player_btn(
-            ui,
-            ph::BOOKMARK_SIMPLE,
-            15.0,
-            "Add bookmark at the current position",
-            "Add bookmark here",
-            false,
-        )
-        .clicked()
-        {
-            out.add_bookmark_at_ms = Some(i64::try_from(snap.position_ms).unwrap_or(i64::MAX));
-        }
-
-        let gap = ui.available_width() - right_width - 1.0;
-        if gap > 0.0 {
-            ui.add_space(gap - ui.spacing().item_spacing.x);
-        }
-        let width = ui
-            .scope(|ui| right_cluster(ui, cx, detail))
-            .response
-            .rect
-            .width();
-        ui.ctx().data_mut(|d| d.insert_temp(right_id, width));
     });
+    if !one_line {
+        ui.allocate_ui_with_layout(
+            egui::vec2(row.response.rect.width().max(ui.available_width()), 0.0),
+            Layout::right_to_left(Align::Center),
+            |ui| widths.1 = right_cluster(ui, cx, detail),
+        );
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(width_id, widths));
 }
 
-fn right_cluster(ui: &mut egui::Ui, cx: &mut UiCtx, detail: &MeetingDetail) {
-    ui.horizontal(|ui| {
+/// ±10 s, play/pause, add bookmark. Returns the cluster's width.
+fn left_cluster(
+    ui: &mut egui::Ui,
+    cx: &mut UiCtx,
+    snap: &PlayerSnapshot,
+    out: &mut PlayerBarOutput,
+) -> f32 {
+    let start = ui.cursor().left();
+    if player_btn(
+        ui,
+        ph::REWIND,
+        15.0,
+        "Back 10 seconds",
+        "Back 10 s (←: 5 s)",
+        false,
+    )
+    .clicked()
+    {
+        cx.player.skip_ms(-SKIP_BUTTON_MS);
+    }
+    let (glyph, label, tip) = if snap.playing {
+        (ph::PAUSE, "Pause", "Pause (space)")
+    } else {
+        (ph::PLAY, "Play", "Play (space)")
+    };
+    if player_btn(ui, glyph, 18.0, label, tip, true).clicked() {
+        cx.player.toggle();
+    }
+    if player_btn(
+        ui,
+        ph::FAST_FORWARD,
+        15.0,
+        "Forward 10 seconds",
+        "Forward 10 s (→: 5 s)",
+        false,
+    )
+    .clicked()
+    {
+        cx.player.skip_ms(SKIP_BUTTON_MS);
+    }
+    if player_btn(
+        ui,
+        ph::BOOKMARK_SIMPLE,
+        15.0,
+        "Add bookmark at the current position",
+        "Add bookmark here",
+        false,
+    )
+    .clicked()
+    {
+        out.add_bookmark_at_ms = Some(i64::try_from(snap.position_ms).unwrap_or(i64::MAX));
+    }
+    ui.cursor().left() - start
+}
+
+/// Speed, volume and "Save a copy…", laid out right to left from the row's
+/// right edge (so the widgets are added in reverse). Returns its width.
+fn right_cluster(ui: &mut egui::Ui, cx: &mut UiCtx, detail: &MeetingDetail) -> f32 {
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
+        if player_btn(
+            ui,
+            ph::DOWNLOAD_SIMPLE,
+            18.0,
+            "Save a copy",
+            "Save a copy…",
+            false,
+        )
+        .clicked()
+        {
+            save_copy(cx, detail.meeting.id);
+        }
+
+        // Volume: muted speaker glyph + an 80 px slider, step 0.05.
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.spacing_mut().slider_width = 80.0;
+            let mut volume = cx.prefs.volume.clamp(0.0, 1.0);
+            let slider = egui::Slider::new(&mut volume, 0.0..=1.0)
+                .step_by(0.05)
+                .show_value(false)
+                .trailing_fill(true);
+            let response = ui.add(slider).on_hover_text("Volume");
+            response.widget_info(|| {
+                egui::WidgetInfo::slider(true, f64::from(volume) * 100.0, "Volume")
+            });
+            if response.changed() {
+                cx.prefs.volume = volume;
+                cx.player.set_volume(volume);
+            }
+            ui.label(
+                egui::RichText::new(ph::SPEAKER_HIGH)
+                    .size(18.0)
+                    .color(TEXT_MUTED),
+            )
+            .on_hover_text("Volume");
+        });
+
         // Speed (`.player-speed` select).
         let before = snap_speed(cx.prefs.speed);
         let mut speed = before;
@@ -443,45 +502,9 @@ fn right_cluster(ui: &mut egui::Ui, cx: &mut UiCtx, detail: &MeetingDetail) {
             cx.prefs.speed = speed;
             cx.player.set_speed(speed);
         }
-
-        // Volume: muted speaker glyph + an 80 px slider, step 0.05.
-        ui.scope(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            ui.label(
-                egui::RichText::new(ph::SPEAKER_HIGH)
-                    .size(18.0)
-                    .color(TEXT_MUTED),
-            )
-            .on_hover_text("Volume");
-            ui.spacing_mut().slider_width = 80.0;
-            let mut volume = cx.prefs.volume.clamp(0.0, 1.0);
-            let slider = egui::Slider::new(&mut volume, 0.0..=1.0)
-                .step_by(0.05)
-                .show_value(false)
-                .trailing_fill(true);
-            let response = ui.add(slider).on_hover_text("Volume");
-            response.widget_info(|| {
-                egui::WidgetInfo::slider(true, f64::from(volume) * 100.0, "Volume")
-            });
-            if response.changed() {
-                cx.prefs.volume = volume;
-                cx.player.set_volume(volume);
-            }
-        });
-
-        if player_btn(
-            ui,
-            ph::DOWNLOAD_SIMPLE,
-            18.0,
-            "Save a copy",
-            "Save a copy…",
-            false,
-        )
-        .clicked()
-        {
-            save_copy(cx, detail.meeting.id);
-        }
-    });
+        ui.min_rect().width()
+    })
+    .inner
 }
 
 /// "Save a copy…": check the archive exists BEFORE any dialog (the old
