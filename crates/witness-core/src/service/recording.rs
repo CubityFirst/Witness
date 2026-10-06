@@ -17,6 +17,11 @@ pub(crate) const STILL_STARTING: &str = "Recording is still starting";
 /// `stop_recording`'s answer while another thread is finalizing the WAVs.
 /// Transient: tray Quit waits it out.
 pub(crate) const ALREADY_STOPPING: &str = "Recording is already stopping";
+/// `start_recording(Auto)`'s answer once an exit path suspended
+/// auto-record.
+pub(crate) const EXITING: &str = "Witness is exiting";
+/// Re-ask interval while `emergency_stop` waits out another start/stop.
+const EMERGENCY_POLL: Duration = Duration::from_millis(100);
 
 /// Identity of a capture problem, independent of the numbers in its message.
 /// Health is re-evaluated every 500 ms and the dropped-audio counters only
@@ -91,9 +96,16 @@ impl AppCore {
     /// enabled and downloaded). ⏳
     pub fn start_recording(&self, trigger: Trigger) -> CoreResult<i64> {
         assert_off_ui_thread("start_recording");
+        let auto = trigger == Trigger::Auto;
         let trigger = trigger.as_str();
         let state = &self.state;
         let mut rec = state.recorder.lock().unwrap();
+        // Re-checked under the recorder lock: an exit path suspends
+        // auto-record before its Stop takes this lock, so either the Stop
+        // sees this start (and waits it out) or this start sees the flag.
+        if auto && state.watcher.exiting() {
+            return Err(EXITING.into());
+        }
         if *state.backup_in_progress.lock().unwrap() {
             return Err("A backup is in progress".into());
         }
@@ -483,6 +495,34 @@ impl AppCore {
         self.state.watcher.exiting.store(true, Ordering::SeqCst);
     }
 
+    /// Stop the recording, waiting out a start or stop already running on
+    /// another thread (as tray Quit does) until `deadline`. True when a
+    /// recording was stopped and saved — by this call or by the stop it
+    /// waited for.
+    fn stop_until_settled(&self, deadline: std::time::Instant) -> bool {
+        let mut waited_for_stop = false;
+        loop {
+            match self.stop_recording(true) {
+                Ok(()) => return true,
+                Err(e) if e == "Not recording" => return waited_for_stop,
+                Err(e) if e == STILL_STARTING || e == ALREADY_STOPPING => {
+                    if e == ALREADY_STOPPING {
+                        waited_for_stop = true;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        log::error!("emergency stop: {e} at the deadline");
+                        return false;
+                    }
+                    std::thread::sleep(EMERGENCY_POLL);
+                }
+                Err(e) => {
+                    log::error!("emergency stop: {e}");
+                    return false;
+                }
+            }
+        }
+    }
+
     /// Panic hook only: stop the recording on a fresh helper thread and wait
     /// up to `timeout`. True when a recording was stopped and saved. Never
     /// panics and never takes a lock on the calling thread.
@@ -494,19 +534,14 @@ impl AppCore {
             return false;
         };
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let deadline = std::time::Instant::now() + timeout;
         let spawned = std::thread::Builder::new()
             .name("emergency-stop".into())
             .spawn(move || {
                 let stopped = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    core.stop_recording(true)
+                    core.stop_until_settled(deadline)
                 })) {
-                    Ok(Ok(())) => true,
-                    Ok(Err(e)) => {
-                        if e != "Not recording" {
-                            log::error!("emergency stop: {e}");
-                        }
-                        false
-                    }
+                    Ok(stopped) => stopped,
                     Err(_) => {
                         log::error!("emergency stop panicked");
                         false
@@ -640,5 +675,59 @@ mod tests {
         watcher.enabled.store(true, Ordering::Relaxed);
         assert!(!watcher.auto_record());
         assert!(watcher.exiting());
+    }
+
+    #[test]
+    fn auto_start_is_refused_under_the_recorder_lock_once_exiting() {
+        let (core, _sink, _dir) = scratch_core("auto-exiting");
+        core.suspend_auto_record();
+        assert_eq!(core.start_recording(Trigger::Auto), Err(EXITING.into()));
+        assert!(matches!(
+            *core.state.recorder.lock().unwrap(),
+            RecorderState::Idle
+        ));
+        assert!(core.state.db.list_meetings(0, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn emergency_stop_waits_for_a_stop_running_elsewhere() {
+        let (core, _sink, _dir) = scratch_core("emergency-stopping");
+        *core.state.recorder.lock().unwrap() = RecorderState::Stopping {
+            meeting_id: 1,
+            started_at: chrono::Local::now(),
+        };
+        let other = core.clone();
+        let finisher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            *other.state.recorder.lock().unwrap() = RecorderState::Idle;
+        });
+        // The other thread's stop saved the recording: report it.
+        assert!(core.emergency_stop(Duration::from_secs(10)));
+        finisher.join().unwrap();
+    }
+
+    #[test]
+    fn emergency_stop_waits_out_a_start_that_then_fails() {
+        let (core, _sink, _dir) = scratch_core("emergency-starting");
+        *core.state.recorder.lock().unwrap() = RecorderState::Starting;
+        let other = core.clone();
+        let finisher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            *other.state.recorder.lock().unwrap() = RecorderState::Idle;
+        });
+        let started = std::time::Instant::now();
+        assert!(!core.emergency_stop(Duration::from_secs(10)));
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        finisher.join().unwrap();
+    }
+
+    #[test]
+    fn emergency_stop_gives_up_at_the_timeout() {
+        let (core, _sink, _dir) = scratch_core("emergency-stuck");
+        *core.state.recorder.lock().unwrap() = RecorderState::Starting;
+        let started = std::time::Instant::now();
+        assert!(!core.emergency_stop(Duration::from_millis(250)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        *core.state.recorder.lock().unwrap() = RecorderState::Idle;
     }
 }

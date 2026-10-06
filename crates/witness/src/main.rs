@@ -56,6 +56,10 @@ fn main() {
     let settings = match Settings::load_result() {
         Ok(settings) => settings,
         Err(error) => {
+            // The box pumps messages: the instance window must refuse a
+            // relaunch (which then waits and takes over) rather than answer
+            // "shown" for a process that is about to exit.
+            single_instance::begin_exit_raw(instance_hwnd);
             error_box(&format!("Witness could not start: {error}"));
             std::process::exit(1);
         }
@@ -66,6 +70,7 @@ fn main() {
     let core = match AppCore::start(settings, Arc::new(sink.clone()), Arc::new(WinToastNotifier)) {
         Ok(core) => core,
         Err(error) => {
+            single_instance::begin_exit_raw(instance_hwnd);
             error_box(&format!("Witness could not start: {error:#}"));
             std::process::exit(1);
         }

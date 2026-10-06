@@ -354,6 +354,11 @@ impl AppCore {
             }
             WatcherCommand::StartMeeting => match self.start_recording(Trigger::Auto) {
                 Ok(_) => self.toast("Witness is recording this meeting."),
+                // Lost the race with an exit path (re-checked under the
+                // recorder lock): same as the guard above.
+                Err(e) if e == recording::EXITING => {
+                    log::info!("meeting detected while exiting: not auto-recording");
+                }
                 Err(e) => {
                     // The user is in a call believing this is recorded.
                     log::warn!("auto-record start failed: {e}");

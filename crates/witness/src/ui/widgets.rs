@@ -189,6 +189,27 @@ pub fn btn_ghost(ui: &mut egui::Ui, text: impl Into<WidgetText>) -> Response {
     styled_button(ui, style, text.into(), None)
 }
 
+/// `.btn.btn-ghost.btn-with-icon` holding only an `icon` pt glyph: sized
+/// like [`btn_icon_only`] (30 pt for a 16 pt icon), not by Segoe's row.
+pub fn btn_ghost_icon(ui: &mut egui::Ui, glyph: impl Into<WidgetText>, icon: f32) -> Response {
+    let style = ButtonStyle {
+        fill: Color32::TRANSPARENT,
+        hover_fill: Color32::TRANSPARENT,
+        content_height: Some(icon + 2.0),
+        ..btn_style(ui)
+    };
+    styled_button(ui, style, glyph.into(), None)
+}
+
+/// Make the gap between the last widget and the next one `gap` pt: a CSS
+/// margin is the whole gap, while `add_space` adds to `item_spacing`.
+/// Only between two widgets of the same `ui` (a trailing gap at the end of
+/// a child ui gets the parent's spacing on top again).
+pub fn gap(ui: &mut egui::Ui, gap: f32) {
+    let spacing = ui.spacing().item_spacing.y;
+    ui.add_space(gap - spacing);
+}
+
 /// `.btn.btn-danger`: red, white semibold text, darker red on hover.
 pub fn btn_danger(ui: &mut egui::Ui, text: impl Into<WidgetText>) -> Response {
     let style = danger_style(ui);
@@ -720,9 +741,51 @@ pub fn checkbox(
     let on = *checked;
     ui.scope(|ui| {
         toggle_visuals(ui.style_mut(), on);
-        ui.add_enabled(enabled, egui::Checkbox::new(checked, text))
+        let response = ui.add_enabled(enabled, egui::Checkbox::new(checked, text));
+        toggle_focus_ring(ui, &response, false);
+        response
     })
     .inner
+}
+
+/// The box (or circle) of a checkbox / radio laid out in `rect`: egui puts
+/// it `icon_width` square at the left, vertically centred.
+fn toggle_box(ui: &egui::Ui, rect: egui::Rect) -> egui::Rect {
+    let side = ui.spacing().icon_width;
+    egui::Rect::from_center_size(
+        egui::pos2(rect.left() + side / 2.0, rect.center().y),
+        egui::vec2(side, side),
+    )
+}
+
+/// `:focus-visible` on a checkbox / radio: the 2 px FOCUS outline, 2 pt
+/// outside the box (or circle). egui draws focus only as the active
+/// visuals, which a checked toggle shares with its other states.
+fn toggle_focus_ring(ui: &egui::Ui, response: &Response, round: bool) {
+    if !(response.has_focus() && focus_visible(ui.ctx())) {
+        return;
+    }
+    let target = toggle_box(ui, response.rect);
+    let stroke = Stroke::new(2.0, theme::FOCUS);
+    if round {
+        // Centre of a 2 px stroke drawn 2 pt outside the circle.
+        ui.painter()
+            .circle_stroke(target.center(), target.width() / 2.0 + 3.0, stroke);
+    } else {
+        let radius = ui
+            .visuals()
+            .widgets
+            .inactive
+            .corner_radius
+            .nw
+            .saturating_add(2);
+        ui.painter().rect_stroke(
+            target.expand(2.0),
+            CornerRadius::same(radius),
+            stroke,
+            egui::StrokeKind::Outside,
+        );
+    }
 }
 
 /// `<input type=radio>` with the app's accent look: selects `alternative`.
@@ -735,7 +798,9 @@ pub fn radio_value<T: PartialEq>(
     let on = *current == alternative;
     ui.scope(|ui| {
         toggle_visuals(ui.style_mut(), on);
-        ui.radio_value(current, alternative, text)
+        let response = ui.radio_value(current, alternative, text);
+        toggle_focus_ring(ui, &response, true);
+        response
     })
     .inner
 }
@@ -863,14 +928,28 @@ pub const TEXT_INPUT_MARGIN: Margin = Margin::symmetric(10, 6);
 /// `.text-input`: `--bg` fill, 1 px `--border` that turns accent on focus,
 /// radius 6, 6/10 padding. Gives `edit` its `id` (needed to know focus).
 pub fn text_input<'t>(ui: &egui::Ui, id: egui::Id, edit: egui::TextEdit<'t>) -> egui::TextEdit<'t> {
+    framed_text_edit(ui, id, edit, theme::BG, 6, TEXT_INPUT_MARGIN)
+}
+
+/// A text field with its own frame: `fill`, a 1 px `--border` that turns
+/// accent only while focused (no hover change, no FOCUS-blue selection
+/// stroke), `radius`, `margin` padding. Gives `edit` its `id`.
+pub fn framed_text_edit<'t>(
+    ui: &egui::Ui,
+    id: egui::Id,
+    edit: egui::TextEdit<'t>,
+    fill: Color32,
+    radius: u8,
+    margin: Margin,
+) -> egui::TextEdit<'t> {
     let focused = ui.memory(|m| m.has_focus(id));
     let border = if focused { theme::ACCENT } else { BORDER };
-    edit.id(id).margin(TEXT_INPUT_MARGIN).frame(
+    edit.id(id).margin(margin).frame(
         Frame::new()
-            .fill(theme::BG)
+            .fill(fill)
             .stroke(Stroke::new(1.0, border))
-            .corner_radius(CornerRadius::same(6))
-            .inner_margin(TEXT_INPUT_MARGIN),
+            .corner_radius(CornerRadius::same(radius))
+            .inner_margin(margin),
     )
 }
 
@@ -1187,5 +1266,80 @@ mod tests {
         }
         clear_view_viewport(&ctx);
         assert_eq!(view_scroll_gutter(&ctx, 400.0), 0.0);
+    }
+
+    /// Paint shapes of one pass with a FOCUS-coloured stroke.
+    fn focus_strokes(shapes: &[egui::epaint::ClippedShape]) -> usize {
+        shapes
+            .iter()
+            .filter(|clipped| match &clipped.shape {
+                egui::Shape::Rect(rect) => rect.stroke.color == theme::FOCUS,
+                egui::Shape::Circle(circle) => circle.stroke.color == theme::FOCUS,
+                _ => false,
+            })
+            .count()
+    }
+
+    #[test]
+    fn checked_toggles_show_keyboard_focus() {
+        for radio in [false, true] {
+            let ctx = theme::test_context();
+            ctx.data_mut(|d| d.insert_temp(focus_visible_id(), true));
+            let mut rings = Vec::new();
+            for _ in 0..3 {
+                let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let response = if radio {
+                            let mut engine = 1;
+                            radio_value(ui, &mut engine, 1, "Parakeet")
+                        } else {
+                            let mut on = true;
+                            checkbox(ui, true, &mut on, "Auto-record")
+                        };
+                        response.request_focus();
+                    });
+                });
+                output.textures_delta.clear();
+                rings.push(focus_strokes(&output.shapes));
+            }
+            assert_eq!(rings.last(), Some(&1), "radio={radio}: {rings:?}");
+
+            // Not focused: no ring.
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.memory_mut(|m| m.surrender_focus(m.focused().unwrap_or(egui::Id::NULL)));
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let mut on = true;
+                    checkbox(ui, true, &mut on, "Other");
+                });
+            });
+            output.textures_delta.clear();
+            assert_eq!(focus_strokes(&output.shapes), 0);
+        }
+    }
+
+    /// CSS margins are whole gaps: `gap` subtracts the item spacing egui
+    /// adds after every widget, between siblings and after a child scope.
+    #[test]
+    fn gaps_are_exact_css_margins() {
+        run(|ui| {
+            let a = card_frame().show(ui, |ui| ui.label("a")).response.rect;
+            gap(ui, 14.0);
+            let b = card_frame().show(ui, |ui| ui.label("b")).response.rect;
+            assert!((b.top() - a.bottom() - 14.0).abs() < 0.01);
+
+            // The shell: a scope holding the search box, then 12 pt.
+            let field = ui
+                .scope(|ui| centered_column(ui, 900.0, |ui| ui.label("search")))
+                .inner
+                .rect;
+            gap(ui, 12.0);
+            let first = ui.label("first row").rect;
+            assert!((first.top() - field.bottom() - 12.0).abs() < 0.01);
+
+            // A gap smaller than the item spacing.
+            gap(ui, 6.0);
+            let next = ui.label("next row").rect;
+            assert!((next.top() - first.bottom() - 6.0).abs() < 0.01);
+        });
     }
 }

@@ -976,8 +976,14 @@ const BANNER_BODY: &str = " Recording works, but nothing gets transcribed. One-t
 
 /// The first-run "Transcription models not installed." banner: Download
 /// now (or the download progress) and Later, which persists the dismissal.
+/// Whether [`model_banner`] draws anything this pass.
+pub fn has_model_banner(cx: &UiCtx) -> bool {
+    cx.shell.models_missing
+}
+
+/// `.model-banner`; the caller adds its 14 pt bottom margin.
 pub fn model_banner(ui: &mut egui::Ui, cx: &mut UiCtx) {
-    if !cx.shell.models_missing {
+    if !has_model_banner(cx) {
         return;
     }
     let progress = cx
@@ -1004,7 +1010,6 @@ pub fn model_banner(ui: &mut egui::Ui, cx: &mut UiCtx) {
                 banner_contents(ui, cx, progress.as_deref());
             });
     });
-    ui.add_space(14.0);
 }
 
 fn banner_text(width: f32) -> egui::text::LayoutJob {

@@ -205,11 +205,20 @@ pub struct ViewMemory {
     pub meetings_loaded: usize,
     pub search_filters: SearchFilters,
     pub search_box: SearchBox,
-    /// meeting id → (seq, text) of the newest notes draft handed to the
-    /// writer this session, so reopening a meeting cannot adopt a database
-    /// read that raced the previous visit's last write (transcript.rs
-    /// `Notes::load`).
-    pub queued_notes: std::collections::BTreeMap<i64, (u64, String)>,
+    /// meeting id → the newest notes draft handed to the writer this
+    /// session, so reopening a meeting cannot adopt a database read that
+    /// raced the previous visit's last write (transcript.rs `Notes::load`).
+    pub queued_notes: std::collections::BTreeMap<i64, QueuedNotes>,
+}
+
+/// A notes draft handed to the writer. `started_at` pins it to one meeting:
+/// ids are reused after the newest meeting is purged, and a purged
+/// meeting's draft must never surface in its successor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedNotes {
+    pub started_at: String,
+    pub seq: u64,
+    pub text: String,
 }
 
 /// Everything a view may touch during a pass. Built fresh by `app.rs` for

@@ -206,9 +206,14 @@ fn icon_slot(ui: &egui::Ui) -> f32 {
 /// Vertical metrics of a list row.
 #[derive(Debug, Clone, Copy)]
 struct RowMetrics {
-    /// Height of the title line (the title, or the taller rename input).
+    /// Height of the title line: the title's own row (`.meeting-main`
+    /// stacks it 2 pt above the meta), or the rename input while editing.
     line: f32,
     title: f32,
+    /// The rename input's height (body row + padding + border). Rows are
+    /// not sized for it: the one row being edited spends that extra
+    /// ~8 pt of its 11 pt padding (the CSS row grew instead).
+    edit: f32,
     /// Height of the meta block: one line, or the tallest wrapped meta.
     meta: f32,
     /// Outer row height, border included.
@@ -230,8 +235,9 @@ impl RowMetrics {
         let slot = icon_slot(ui);
         let edit = body + f32::from(EDIT_MARGIN.top + EDIT_MARGIN.bottom) + 2.0;
         RowMetrics {
-            line: title.max(edit),
+            line: title,
             title,
+            edit,
             meta,
             height: 0.0,
             slot,
@@ -246,6 +252,15 @@ impl RowMetrics {
         RowMetrics {
             meta,
             height: content + 2.0 * ROW_PAD.y,
+            ..self
+        }
+    }
+
+    /// The metrics of the row being renamed: same outer height, the title
+    /// line as tall as the editor.
+    fn editing(self) -> RowMetrics {
+        RowMetrics {
+            line: self.edit.max(self.title),
             ..self
         }
     }
@@ -745,7 +760,7 @@ impl MeetingsView {
 
         self.draw_list(ui, actions);
         if self.has_more {
-            ui.add_space(ROW_GAP);
+            widgets::gap(ui, ROW_GAP);
             let loading = self.loading();
             let label = if loading { "Loading…" } else { "Load more" };
             // A child of the `.meeting-list` flex column: full width.
@@ -816,7 +831,7 @@ impl MeetingsView {
             return;
         }
         // `.recycle-bin`: margin-top 18, 1 px dashed top border, padding-top 10.
-        ui.add_space(18.0);
+        widgets::gap(ui, 18.0);
         let (_, line) = ui.allocate_space(egui::vec2(ui.available_width(), 1.0));
         ui.painter().extend(egui::Shape::dashed_line(
             &[line.left_center(), line.right_center()],
@@ -824,7 +839,7 @@ impl MeetingsView {
             3.0,
             3.0,
         ));
-        ui.add_space(9.0);
+        widgets::gap(ui, 10.0);
 
         let open = self.bin_open;
         let count = self.binned.len();
@@ -1002,6 +1017,13 @@ fn meeting_row(
         delete: delete_rect,
     } = RowRects::new(rect, metrics);
     let is_editing = editing.is_some();
+    // The editor's row: its block is ~8 pt taller, centred into the padding.
+    let (main_rect, metrics) = if is_editing {
+        let metrics = metrics.editing();
+        (RowRects::new(rect, metrics).main, metrics)
+    } else {
+        (main_rect, metrics)
+    };
 
     // 1. Main block: the open / double-click-rename button, or the editor.
     let mut focused = match editing {
@@ -1527,9 +1549,20 @@ mod tests {
     fn rows_have_room_for_the_editor_and_icons() {
         run(|ui| {
             let m = RowMetrics::measure(ui);
-            assert!(m.line >= m.title);
+            assert_eq!(m.line, m.title, "rows are sized for the title line");
             assert!(m.height >= m.slot + 2.0 * ROW_PAD.y);
-            assert!(m.height >= m.line + m.meta + 2.0 * ROW_PAD.y);
+            assert!(m.height >= m.line + TITLE_META_GAP + m.meta + 2.0 * ROW_PAD.y);
+            // `.meeting-row` in 0.2.x: 11 + title + 2 + meta + 11 ≈ 58-59 pt.
+            assert!(m.height < 61.0, "row height {}", m.height);
+            // The row being renamed keeps its height and fits its editor
+            // inside the border.
+            let e = m.editing();
+            assert_eq!(e.height, m.height);
+            assert!(e.line >= m.edit);
+            let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(420.0, m.height));
+            let main = RowRects::new(rect, e).main;
+            assert!(main.top() >= 1.0 && main.bottom() <= m.height - 1.0);
+            assert_eq!(main.height(), e.line + TITLE_META_GAP + e.meta);
         });
     }
 

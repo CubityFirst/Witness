@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 const SEGOE: &str = "segoe-ui";
 const SEGOE_SEMIBOLD: &str = "segoe-ui-semibold";
 const SEGOE_SYMBOL: &str = "segoe-ui-symbol";
+const CONSOLAS: &str = "consolas";
 
 fn fonts_dir() -> PathBuf {
     let windir = std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into());
@@ -43,6 +44,12 @@ fn read_font(file: &str) -> Option<Vec<u8>> {
 /// Segoe UI Semibold followed by the same fallbacks. Without Segoe the
 /// defaults are used as-is.
 pub fn install_eager(ctx: &egui::Context) {
+    let (fonts, eager_loaded) = eager_definitions();
+    log::info!("fonts: {}", eager_loaded.join(", "));
+    ctx.set_fonts(fonts);
+}
+
+fn eager_definitions() -> (FontDefinitions, Vec<&'static str>) {
     let mut fonts = FontDefinitions::default();
     let mut eager_loaded = Vec::new();
 
@@ -77,8 +84,26 @@ pub fn install_eager(ctx: &egui::Context) {
         .families
         .insert(FontFamily::Name(SEMIBOLD.into()), semibold);
 
-    log::info!("fonts: {}", eager_loaded.join(", "));
-    ctx.set_fonts(fonts);
+    // Monospace (paths, revisions): Consolas first, as Chromium's `<code>`
+    // used, then egui's defaults, then Segoe UI and Segoe UI Symbol, so a
+    // non-Latin user-profile path does not render as missing-glyph boxes.
+    let segoe_fallbacks: Vec<String> = [SEGOE, SEGOE_SYMBOL]
+        .into_iter()
+        .filter(|name| fonts.font_data.contains_key(*name))
+        .map(String::from)
+        .collect();
+    let consolas = read_font("consola.ttf");
+    let monospace = fonts.families.entry(FontFamily::Monospace).or_default();
+    monospace.extend(segoe_fallbacks);
+    if let Some(bytes) = consolas {
+        monospace.insert(0, CONSOLAS.into());
+        fonts
+            .font_data
+            .insert(CONSOLAS.into(), Arc::new(FontData::from_owned(bytes)));
+        eager_loaded.push("consola");
+    }
+
+    (fonts, eager_loaded)
 }
 
 fn proportional(fonts: &mut FontDefinitions) -> &mut Vec<String> {
@@ -227,7 +252,7 @@ impl FontLoader {
     }
 
     /// Add every font loaded since the last call, as the lowest-priority
-    /// fallback of both Proportional and semibold text. Called in `logic()`.
+    /// fallback of Proportional, semibold and Monospace text. Called in `logic()`.
     ///
     /// `add_font` only queues the font; egui applies it at the start of the
     /// next pass, so every viewport (the captions overlay too) is asked for
@@ -249,6 +274,10 @@ impl FontLoader {
                     },
                     InsertFontFamily {
                         family: FontFamily::Name(SEMIBOLD.into()),
+                        priority: FontPriority::Lowest,
+                    },
+                    InsertFontFamily {
+                        family: FontFamily::Monospace,
                         priority: FontPriority::Lowest,
                     },
                 ],
@@ -301,5 +330,24 @@ mod tests {
         loader.note_texts(&ctx, ["회의", "또 회의"]);
         loader.note_texts(&ctx, ["회의"]);
         assert_eq!(loader.requested.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn monospace_falls_back_to_segoe() {
+        let (fonts, _) = eager_definitions();
+        let monospace = &fonts.families[&FontFamily::Monospace];
+        let proportional = &fonts.families[&FontFamily::Proportional];
+        for face in [SEGOE, SEGOE_SYMBOL] {
+            if fonts.font_data.contains_key(face) {
+                assert!(monospace.iter().any(|f| f == face), "{face} missing");
+            }
+            assert_eq!(
+                monospace.iter().any(|f| f == face),
+                proportional.iter().any(|f| f == face)
+            );
+        }
+        if fonts.font_data.contains_key(CONSOLAS) {
+            assert_eq!(monospace[0], CONSOLAS);
+        }
     }
 }

@@ -447,7 +447,7 @@ impl WitnessApp {
             OpDone::ShutdownDone => {
                 log::info!("recording control shut down; exiting");
                 self.prepare_exit();
-                teardown_and_exit(self.shell_objects.take(), 0);
+                self.exit_now(0);
             }
             OpDone::Recording {
                 origin,
@@ -641,11 +641,20 @@ impl WitnessApp {
         // runs once the process has exited.
         self.settings
             .flush_for_exit(&self.core, SETTINGS_FLUSH_TIMEOUT);
+        // Persists the overlay's placement. Restart and update are refused
+        // while recording, so no overlay a failed step would need is lost.
         self.captions.close(&self.data_dir);
-        self.player.unload();
+        // The player is left alone: a failed restart/installer launch keeps
+        // the app running, playback included (`exit_now` stops it).
         self.prefs_writer.write_now(&self.prefs, &self.data_dir);
         self.saved_prefs = self.prefs.clone();
         self.prefs_deadline = None;
+    }
+
+    /// The point of no return after `prepare_exit` succeeded.
+    fn exit_now(&mut self, code: i32) -> ! {
+        self.player.unload();
+        teardown_and_exit(self.shell_objects.take(), code)
     }
 
     /// Persist `UiPrefs` shortly after they change (views mutate
@@ -690,7 +699,7 @@ impl WitnessApp {
         match spawned {
             Ok(_) => {
                 log::info!("restarting Witness");
-                teardown_and_exit(self.shell_objects.take(), 0);
+                self.exit_now(0);
             }
             Err(error) => {
                 drop(guard);
@@ -715,7 +724,7 @@ impl WitnessApp {
         match prepared.launch(&core.relaunch_args()) {
             Ok(()) => {
                 log::info!("installing Witness {}", prepared.version);
-                teardown_and_exit(self.shell_objects.take(), 0);
+                self.exit_now(0);
             }
             Err(error) => {
                 drop(guard);
@@ -1024,17 +1033,27 @@ impl eframe::App for WitnessApp {
                 let right = ui.max_rect().right();
                 let gutter = widgets::view_scroll_gutter(ui.ctx(), right);
                 widgets::clear_view_viewport(ui.ctx());
-                ui.scope(|ui| {
-                    ui.set_max_width((ui.available_width() - gutter).max(0.0));
-                    topbar::model_banner(ui, cx);
-                    if cx.view.has_search_box() {
-                        let current = cx.view.clone();
-                        widgets::centered_column(ui, 900.0, |ui| {
-                            views::search::search_box(ui, cx, &current);
-                        });
-                        ui.add_space(12.0);
-                    }
-                });
+                // CSS margins are whole gaps: `.model-banner` 14 below,
+                // `.list-toolbar` 12 below. An empty scope would still
+                // advance by the item spacing, so it only opens with content.
+                let banner = topbar::has_model_banner(cx);
+                let search = cx.view.has_search_box();
+                if banner || search {
+                    ui.scope(|ui| {
+                        ui.set_max_width((ui.available_width() - gutter).max(0.0));
+                        topbar::model_banner(ui, cx);
+                        if search {
+                            if banner {
+                                widgets::gap(ui, 14.0);
+                            }
+                            let current = cx.view.clone();
+                            widgets::centered_column(ui, 900.0, |ui| {
+                                views::search::search_box(ui, cx, &current);
+                            });
+                        }
+                    });
+                    widgets::gap(ui, if search { 12.0 } else { 14.0 });
+                }
                 view.show(ui, cx);
                 if (widgets::view_scroll_gutter(ui.ctx(), right) - gutter).abs() > 0.5 {
                     ui.ctx().request_discard("view scroll bar changed");

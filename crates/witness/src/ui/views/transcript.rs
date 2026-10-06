@@ -39,7 +39,7 @@ use crate::ui::theme::{
 };
 use crate::ui::toasts::Notice;
 use crate::ui::widgets::{self, KeyScroll, Politeness};
-use crate::ui::{UiCtx, View};
+use crate::ui::{QueuedNotes, UiCtx, View};
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Frame, Id, Key, Layout, Margin, Modifiers,
@@ -369,11 +369,19 @@ struct Notes {
 
 impl Notes {
     /// The first load: `text` from the database, `queued` the newest draft
-    /// an earlier visit handed to the writer. That draft wins when it
-    /// differs: the read may have beaten its write to the database (or the
-    /// write failed), and only this view writes notes, so it is the newest
-    /// text. Its ack then settles it like any other write.
-    fn load(&mut self, text: &str, queued: Option<(u64, String)>) {
+    /// an earlier visit handed to the writer (already matched to this
+    /// meeting's `started_at`), `ack` the writer's newest ack for the id.
+    /// That draft wins only while it may not have reached the database: its
+    /// write is still pending (the read may have beaten it) or it failed.
+    /// Only this view writes notes, so it is then the newest text, and its
+    /// ack settles it like any other write. Once its write succeeded the
+    /// database is the truth.
+    fn load(
+        &mut self,
+        text: &str,
+        queued: Option<(u64, String)>,
+        ack: Option<&(u64, Option<String>)>,
+    ) {
         if self.loaded {
             return;
         }
@@ -381,7 +389,11 @@ impl Notes {
         self.draft = text.to_string();
         self.queued = text.to_string();
         self.confirmed = text.to_string();
-        if let Some((seq, newer)) = queued.filter(|(_, newer)| newer != text) {
+        let unsaved = |seq: u64| match ack {
+            None => true,
+            Some((acked, error)) => *acked < seq || (*acked == seq && error.is_some()),
+        };
+        if let Some((seq, newer)) = queued.filter(|(seq, newer)| newer != text && unsaved(*seq)) {
             self.draft = newer.clone();
             self.queued = newer;
             self.seq = seq;
@@ -1390,7 +1402,7 @@ fn header_menu(
 ) -> Option<usize> {
     let trigger = ui
         .add_enabled_ui(enabled, |ui| {
-            widgets::btn_ghost(ui, icons::icon(glyph, 16.0))
+            widgets::btn_ghost_icon(ui, icons::icon(glyph, 16.0), 16.0)
         })
         .inner;
     trigger.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
@@ -1825,7 +1837,19 @@ impl TranscriptState {
             } else {
                 let seq = cx.core.queue_notes(self.meeting_id, text.clone());
                 self.notes.sent(seq);
-                cx.memory.queued_notes.insert(self.meeting_id, (seq, text));
+                let started_at = self
+                    .detail
+                    .as_ref()
+                    .map(|d| d.meeting.started_at.clone())
+                    .unwrap_or_default();
+                cx.memory.queued_notes.insert(
+                    self.meeting_id,
+                    QueuedNotes {
+                        started_at,
+                        seq,
+                        text,
+                    },
+                );
             }
         }
         cx.set_notes_deadline(None);
@@ -1976,9 +2000,17 @@ impl TranscriptState {
         let queued = if self.synthetic {
             None
         } else {
-            cx.memory.queued_notes.get(&self.meeting_id).cloned()
+            cx.memory
+                .queued_notes
+                .get(&self.meeting_id)
+                .filter(|q| q.started_at == detail.meeting.started_at)
+                .map(|q| (q.seq, q.text.clone()))
         };
-        self.notes.load(&detail.meeting.notes, queued);
+        self.notes.load(
+            &detail.meeting.notes,
+            queued,
+            cx.shell.notes_acks.get(&self.meeting_id),
+        );
         self.load_error = None;
         self.speakers = detail
             .speakers
@@ -2306,66 +2338,82 @@ impl TranscriptState {
         let mut engine_choice = None;
         let mut start_edit = false;
         let mut title_done = None;
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(12.0, 8.0);
-            let response = widgets::btn_ghost(ui, icons::icon(ph::ARROW_LEFT, 16.0));
-            response
-                .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Back"));
-            back = response.on_hover_text("Back").clicked();
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                engine_choice = header_menu(
-                    ui,
-                    ph::ARROWS_CLOCKWISE,
-                    "Retranscribe",
-                    "Retranscribe",
-                    true,
-                    &["with Parakeet", "with Whisper"],
-                );
-                let (glyph, tip) = if copied {
-                    (ph::CHECK_CIRCLE, "Copied to clipboard")
-                } else {
-                    (ph::EXPORT, "Export transcript")
-                };
-                export_choice = header_menu(
-                    ui,
-                    glyph,
-                    tip,
-                    "Export transcript",
-                    has_segments,
-                    &[
-                        "Copy to clipboard",
-                        "Markdown…",
-                        "Plain text…",
-                        "Subtitles (SRT)…",
-                        "Subtitles (WebVTT)…",
-                    ],
-                );
-                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        if let Some(edit) = self.title_edit.as_mut() {
-                            let width = (ui.available_width() - 14.0).max(80.0);
-                            let (_, outcome) = inline_editor(
-                                ui,
-                                Id::new(("title-edit", self.meeting_id)),
-                                edit,
-                                theme::semibold(17.0),
-                                width,
-                                "",
-                                "Meeting title",
-                            );
-                            if outcome != EditOutcome::Open {
-                                title_done = Some(outcome);
+        // `.transcript-header { align-items: center }`: the row is as tall as
+        // the title block, and the 30 pt buttons centre on it.
+        let title_font = theme::semibold(17.0);
+        let mut title_h = row_height(ui, &title_font);
+        if self.title_edit.is_some() {
+            // `.rename-input`: 3+3 padding and the 1 px border.
+            title_h += 8.0;
+        }
+        let block_h = title_h + 2.0 + row_height(ui, &theme::regular(12.0));
+        let width = ui.available_width();
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, block_h.max(30.0)),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(12.0, 8.0);
+                let response = widgets::btn_ghost_icon(ui, icons::icon(ph::ARROW_LEFT, 16.0), 16.0);
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Back")
+                });
+                back = response.on_hover_text("Back").clicked();
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    engine_choice = header_menu(
+                        ui,
+                        ph::ARROWS_CLOCKWISE,
+                        "Retranscribe",
+                        "Retranscribe",
+                        true,
+                        &["with Parakeet", "with Whisper"],
+                    );
+                    let (glyph, tip) = if copied {
+                        (ph::CHECK_CIRCLE, "Copied to clipboard")
+                    } else {
+                        (ph::EXPORT, "Export transcript")
+                    };
+                    export_choice = header_menu(
+                        ui,
+                        glyph,
+                        tip,
+                        "Export transcript",
+                        has_segments,
+                        &[
+                            "Copy to clipboard",
+                            "Markdown…",
+                            "Plain text…",
+                            "Subtitles (SRT)…",
+                            "Subtitles (WebVTT)…",
+                        ],
+                    );
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        let block = egui::vec2(ui.available_width(), block_h);
+                        ui.allocate_ui_with_layout(block, Layout::top_down(Align::Min), |ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            if let Some(edit) = self.title_edit.as_mut() {
+                                let width = (ui.available_width() - 14.0).max(80.0);
+                                let (_, outcome) = inline_editor(
+                                    ui,
+                                    Id::new(("title-edit", self.meeting_id)),
+                                    edit,
+                                    title_font.clone(),
+                                    width,
+                                    "",
+                                    "Meeting title",
+                                );
+                                if outcome != EditOutcome::Open {
+                                    title_done = Some(outcome);
+                                }
+                            } else {
+                                start_edit = title_row(ui, &title);
                             }
-                        } else {
-                            start_edit = title_row(ui, &title);
-                        }
-                        ui.label(egui::RichText::new(&meta).size(12.0).color(TEXT_MUTED));
+                            ui.label(egui::RichText::new(&meta).size(12.0).color(TEXT_MUTED));
+                        });
                     });
                 });
-            });
-        });
-        ui.add_space(8.0);
+            },
+        );
+        widgets::gap(ui, 8.0);
 
         if back {
             self.back(cx);
@@ -2446,7 +2494,8 @@ impl TranscriptState {
                     }
                 });
             });
-        ui.add_space(8.0);
+        // `.stats-bar { margin-bottom: 8px }`
+        widgets::gap(ui, 8.0);
     }
 
     fn notes_panel(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
@@ -2493,17 +2542,22 @@ impl TranscriptState {
         );
 
         if self.notes.open {
-            ui.add_space(6.0 - ui.spacing().item_spacing.y);
-            let response = ui.add(
-                egui::TextEdit::multiline(&mut self.notes.draft)
-                    .id(Id::new(("notes", self.meeting_id)))
-                    .font(theme::regular(13.0))
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(3)
-                    .hint_text("Meeting notes… (searchable)")
-                    .margin(Margin::symmetric(10, 8))
-                    .background_color(BG_RAISED),
-            );
+            widgets::gap(ui, 6.0);
+            // `.notes-input`: raised fill, 1 px border (accent while
+            // focused), radius 8, 8/10 padding.
+            let field = egui::TextEdit::multiline(&mut self.notes.draft)
+                .font(theme::regular(13.0))
+                .desired_width(f32::INFINITY)
+                .desired_rows(3)
+                .hint_text("Meeting notes… (searchable)");
+            let response = ui.add(widgets::framed_text_edit(
+                ui,
+                Id::new(("notes", self.meeting_id)),
+                field,
+                BG_RAISED,
+                8,
+                Margin::symmetric(10, 8),
+            ));
             set_accessible_label(ui.ctx(), response.id, "Meeting notes");
             widgets::text_edit_menu(&response);
             if response.changed() {
@@ -2514,7 +2568,8 @@ impl TranscriptState {
                 self.flush(cx);
             }
         }
-        ui.add_space(10.0);
+        // `.notes-panel { padding-bottom: 10px }`
+        widgets::gap(ui, 10.0);
     }
 
     // ------------------------------------------------------------------
@@ -2861,7 +2916,12 @@ fn transcription_progress(cx: &UiCtx, meeting_id: i64) -> Option<(String, f32)> 
 /// pencil. Returns true when a rename should start (double-click or pencil).
 fn title_row(ui: &mut egui::Ui, title: &str) -> bool {
     let mut start = false;
+    // As tall as the title line: `horizontal` would reserve the 30 pt
+    // interact height, padding the title down and away from its meta line.
+    let interact = ui.spacing().interact_size.y;
+    ui.spacing_mut().interact_size.y = 0.0;
     ui.horizontal(|ui| {
+        ui.spacing_mut().interact_size.y = interact;
         ui.spacing_mut().item_spacing.x = 4.0;
         let max = (ui.available_width() - 30.0).max(40.0);
         let label = ui
@@ -2888,6 +2948,7 @@ fn title_row(ui: &mut egui::Ui, title: &str) -> bool {
             start = true;
         }
     });
+    ui.spacing_mut().interact_size.y = interact;
     start
 }
 
@@ -2968,7 +3029,7 @@ fn live_feed(
                         .color(TEXT_MUTED),
                 );
             });
-            ui.add_space(6.0 - ui.spacing().item_spacing.y);
+            widgets::gap(ui, 6.0);
             let output = egui::ScrollArea::vertical()
                 .id_salt(("live-feed", meeting_id))
                 .max_height((max_height - 40.0).max(80.0))
@@ -3007,7 +3068,8 @@ fn live_feed(
             Politeness::Polite,
         );
     }
-    ui.add_space(10.0);
+    // `.live-feed { margin-bottom: 10px }`
+    widgets::gap(ui, 10.0);
 }
 
 /// A caption line: "Me" / "Them" chip (not clickable), `[ts]`, text.
@@ -3319,10 +3381,10 @@ mod tests {
     #[test]
     fn notes_save_through_the_writer_with_acks() {
         let mut notes = Notes::default();
-        notes.load("old", None);
+        notes.load("old", None, None);
         assert!(notes.open);
         assert_eq!(notes.take_flush(0), None, "nothing changed");
-        notes.load("ignored on reload", None);
+        notes.load("ignored on reload", None, None);
         assert_eq!(notes.draft, "old");
 
         notes.draft = "new".into();
@@ -3353,7 +3415,7 @@ mod tests {
     #[test]
     fn notes_saved_state_when_typing_back() {
         let mut notes = Notes::default();
-        notes.load("", None);
+        notes.load("", None, None);
         assert!(!notes.open);
         notes.draft = "x".into();
         notes.edited();
@@ -3671,7 +3733,7 @@ mod tests {
         // The read raced the last visit's write: the queued draft wins and
         // its (successful) ack confirms it quietly.
         let mut notes = Notes::default();
-        notes.load("db", Some((7, "newer".into())));
+        notes.load("db", Some((7, "newer".into())), None);
         assert_eq!(notes.draft, "newer");
         assert!(notes.open);
         assert_eq!(notes.take_flush(0), None, "already queued");
@@ -3682,15 +3744,28 @@ mod tests {
         // That write failed after the view was gone: report it now, and
         // the next flush retries the draft.
         let mut notes = Notes::default();
-        notes.load("db", Some((7, "newer".into())));
         let ack = (7, Some("disk full".to_string()));
+        notes.load("db", Some((7, "newer".into())), Some(&ack));
+        assert_eq!(notes.draft, "newer");
         assert_eq!(notes.on_ack(Some(&ack)).as_deref(), Some("disk full"));
         assert_eq!(notes.take_flush(7).as_deref(), Some("newer"));
 
         // The database already has it: a plain load.
         let mut notes = Notes::default();
-        notes.load("same", Some((3, "same".into())));
+        notes.load("same", Some((3, "same".into())), None);
         assert_eq!((notes.seq, notes.draft.as_str()), (0, "same"));
+
+        // Its write succeeded: the database is the truth, even when it
+        // differs (a reused id after a purge reads "").
+        let mut notes = Notes::default();
+        notes.load(
+            "",
+            Some((7, "purged meeting's notes".into())),
+            Some(&(7, None)),
+        );
+        assert_eq!((notes.seq, notes.draft.as_str()), (0, ""));
+        assert!(!notes.open);
+        assert_eq!(notes.take_flush(7), None);
     }
 
     #[test]

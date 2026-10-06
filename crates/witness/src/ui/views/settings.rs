@@ -250,6 +250,8 @@ impl SettingsState {
 
         // The sticky header stays above the scrolling sections.
         widgets::centered_column(ui, 720.0, |ui| self.header(ui, cx));
+        // The header ends with its own 12 pt gap: no item spacing on top.
+        ui.add_space(-ui.spacing().item_spacing.y);
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -508,7 +510,11 @@ impl SettingsState {
 
     fn header(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
         ui.add_space(4.0);
+        // As tall as the heading line, not the 30 pt interact height.
+        let interact = ui.spacing().interact_size.y;
+        ui.spacing_mut().interact_size.y = 0.0;
         ui.horizontal(|ui| {
+            ui.spacing_mut().interact_size.y = interact;
             ui.spacing_mut().item_spacing.x = 10.0;
             ui.label(
                 RichText::new("Settings")
@@ -527,7 +533,9 @@ impl SettingsState {
                 ui.ctx().request_repaint_after(left);
             }
         });
-        ui.add_space(12.0);
+        ui.spacing_mut().interact_size.y = interact;
+        // `.settings-head { padding-bottom: 12px }`
+        widgets::gap(ui, 12.0);
     }
 
     fn startup(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
@@ -561,6 +569,7 @@ impl SettingsState {
 
     fn storage(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
         let data_dir = cx.settings.current().data_dir.clone();
+        cx.fonts.note_texts(ui.ctx(), data_dir.as_deref());
         row(ui, |ui| {
             row_label(ui, "Data directory");
             path_code(ui, data_dir.as_deref().unwrap_or("(next to witness.exe)"));
@@ -592,6 +601,7 @@ impl SettingsState {
             );
         });
         if let Some(backup) = &self.last_backup {
+            cx.fonts.note_texts(ui.ctx(), [backup.path.as_str()]);
             // "Backup saved to <path> (N files, X MB). Models can be …"
             let details = backup_details(backup);
             ui.horizontal_wrapped(|ui| {
@@ -1013,6 +1023,15 @@ impl SettingsState {
             }
             return;
         };
+        // User-profile paths may hold any script: load its fallback font.
+        cx.fonts.note_texts(
+            ui.ctx(),
+            [
+                d.runtime_data_dir.as_str(),
+                d.database.path.as_str(),
+                d.log_path.as_str(),
+            ],
+        );
         row(ui, |ui| {
             row_label(ui, "Build");
             value(ui, &format!("Witness {} · {}", d.app_version, d.platform));
@@ -1361,7 +1380,8 @@ pub(super) fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui
             ui.add_space(2.0);
             add(ui);
         });
-    ui.add_space(14.0);
+    // `section { margin-bottom: 14px }`
+    widgets::gap(ui, 14.0);
 }
 
 /// `.setting-row`: a wrapping row with 10 pt gaps.
