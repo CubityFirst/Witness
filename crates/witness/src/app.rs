@@ -45,6 +45,11 @@ const UI_PASS_TIMEOUT: Duration = Duration::from_secs(2);
 const ANIMATION_FRAME: Duration = Duration::from_millis(33);
 /// How long exit paths wait for the notes writer.
 const NOTES_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long exit paths wait for a pending settings write.
+const SETTINGS_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+/// How soon a minimize the app performed itself must show up in the
+/// viewport state to be recognised as such.
+const APP_MINIMIZE_WINDOW: Duration = Duration::from_secs(1);
 /// Keyboard zoom step (WebView2 used ~10 % steps).
 const ZOOM_STEP: f32 = 1.1;
 /// Delay before changed `UiPrefs` are written, so a volume drag (a change
@@ -106,14 +111,25 @@ pub struct WitnessApp {
     status_dirty: bool,
     models_in_flight: bool,
     models_dirty: bool,
+    /// A top-bar Start/Stop reply arrived: clear `shell.recording_action`
+    /// once a status read issued *after* it lands (app.tsx awaited
+    /// `refreshStatus()` before `setRecordingAction(false)`), so the bar
+    /// never offers the pre-click action again for a few frames.
+    action_clear_pending: bool,
+    /// The status read in flight was issued after that reply.
+    action_clear_on_status: bool,
 
     /// Tray Quit is running (shutdown in flight).
     quitting: bool,
     /// Last `logic()`'s minimized / focused state (edge detection).
     was_minimized: bool,
-    /// The app minimized the window itself (and already ran `will_hide`):
-    /// the next not-minimized → minimized edge is not an outside minimize.
-    minimized_by_app: bool,
+    /// The app minimized the window itself — the minimize button (which
+    /// already ran `will_hide`) or `finish_ui_pass` re-minimizing after the
+    /// overlay's pass — until this deadline: the next not-minimized →
+    /// minimized edge is not an outside minimize. A deadline rather than a
+    /// flag, so a minimize that never shows up cannot swallow a later real
+    /// one.
+    minimized_by_app: Option<Instant>,
     was_focused: bool,
     /// Since when `ensure_ui_pass` has been waiting for the overlay.
     ui_pass_since: Option<Instant>,
@@ -209,9 +225,11 @@ impl WitnessApp {
             status_dirty: false,
             models_in_flight: false,
             models_dirty: false,
+            action_clear_pending: false,
+            action_clear_on_status: false,
             quitting: false,
             was_minimized: false,
-            minimized_by_app: false,
+            minimized_by_app: None,
             was_focused: false,
             ui_pass_since: None,
             user_zoom: 1.0,
@@ -292,8 +310,16 @@ impl WitnessApp {
                 self.fonts.note_texts(ctx, [line.text.as_str()]);
                 self.captions.push_line(&line);
             }
+            // captions.tsx: `setError(status.error ?? "Live captions stopped")`.
+            // Always `Some`, so the overlay never keeps saying "Listening…"
+            // after captions died without a reason; the banner is cleared
+            // only by `reset_for` / `open`.
             CoreEvent::LiveCaptionsStatus(status) if !status.active => {
-                self.captions.set_error(status.error);
+                self.captions.set_error(Some(
+                    status
+                        .error
+                        .unwrap_or_else(|| "Live captions stopped".into()),
+                ));
             }
             _ => {}
         }
@@ -320,6 +346,7 @@ impl WitnessApp {
             return;
         }
         self.status_in_flight = true;
+        self.action_clear_on_status |= std::mem::take(&mut self.action_clear_pending);
         self.tasks.spawn_op_or(
             "status",
             |c| OpDone::Status(c.status()),
@@ -341,6 +368,18 @@ impl WitnessApp {
         );
     }
 
+    /// A status read finished (or failed): end a pending top-bar spinner,
+    /// then issue the read that was asked for meanwhile.
+    fn status_landed(&mut self) {
+        self.status_in_flight = false;
+        if std::mem::take(&mut self.action_clear_on_status) {
+            self.shell.recording_action = false;
+        }
+        if std::mem::take(&mut self.status_dirty) {
+            self.request_status();
+        }
+    }
+
     fn handle_op(&mut self, done: OpDone) {
         match done {
             OpDone::Notice { notice, refresh } => {
@@ -353,17 +392,11 @@ impl WitnessApp {
             }
             OpDone::Status(status) => {
                 self.shell.set_status(status);
-                self.status_in_flight = false;
-                if std::mem::take(&mut self.status_dirty) {
-                    self.request_status();
-                }
+                self.status_landed();
             }
             OpDone::StatusFailed(error) => {
                 log::error!("status refresh failed: {error}");
-                self.status_in_flight = false;
-                if std::mem::take(&mut self.status_dirty) {
-                    self.request_status();
-                }
+                self.status_landed();
             }
             OpDone::Models(models) => {
                 self.shell.models_missing = models
@@ -437,16 +470,21 @@ impl WitnessApp {
                     Err(error) => self.toasts.error("Could not add bookmark", error),
                 },
                 RecCmd::Start(_) | RecCmd::Stop { .. } | RecCmd::ToggleWithToast => {
-                    self.shell.recording_action = false;
-                    self.request_status();
-                    if let Err(error) = result {
-                        let message = if matches!(cmd, RecCmd::Stop { .. }) {
-                            "Could not stop recording"
-                        } else {
-                            "Could not start recording"
-                        };
-                        self.toasts.error(message, error);
+                    match result {
+                        // Keep the spinner until the refreshed status shows
+                        // the new state (cleared in `status_landed`).
+                        Ok(_) => self.action_clear_pending = true,
+                        Err(error) => {
+                            self.shell.recording_action = false;
+                            let message = if matches!(cmd, RecCmd::Stop { .. }) {
+                                "Could not stop recording"
+                            } else {
+                                "Could not start recording"
+                            };
+                            self.toasts.error(message, error);
+                        }
                     }
+                    self.request_status();
                 }
             },
             // The core already OS-toasted tray / hotkey failures.
@@ -512,6 +550,11 @@ impl WitnessApp {
         }
     }
 
+    /// The app is about to minimize the window itself; see `minimized_by_app`.
+    fn expect_app_minimize(&mut self) {
+        self.minimized_by_app = Some(Instant::now() + APP_MINIMIZE_WINDOW);
+    }
+
     /// While minimized, a deferred viewport can only be created after the
     /// root is briefly restored (cloaked) for one pass (design §4.3, R1).
     fn ensure_ui_pass(&mut self) {
@@ -547,6 +590,10 @@ impl WitnessApp {
     fn prepare_exit(&mut self) {
         self.will_hide();
         self.core.flush_notes(NOTES_FLUSH_TIMEOUT);
+        // A queued settings write only starts from `on_written`, which never
+        // runs once the process has exited.
+        self.settings
+            .flush_for_exit(&self.core, SETTINGS_FLUSH_TIMEOUT);
         self.captions.close(&self.data_dir);
         self.player.unload();
         self.prefs_writer.write_now(&self.prefs, &self.data_dir);
@@ -692,13 +739,24 @@ impl WitnessApp {
 
     /// Apply a pending navigation: `on_leave` the old view, then remount
     /// when the view key changes.
-    fn apply_navigation(&mut self) {
+    ///
+    /// Always asks for another pass: the views have already drawn this one,
+    /// and a navigation fired by a timer (the delayed open in Meetings, the
+    /// search debounce) has no input that would schedule a follow-up pass,
+    /// so the old view would otherwise stay on screen until the mouse moved.
+    fn apply_navigation(&mut self, ctx: &egui::Context) {
         let Some(next) = self.nav.take() else { return };
         if next.key() != self.view.key() {
             self.with_view(|view, cx| view.on_leave(cx));
+            if matches!(next, View::Settings) {
+                // settings.tsx re-read get_settings on every mount, so it
+                // shows the stored (normalized) values after a round trip.
+                self.settings.reload(&self.core);
+            }
             self.active = ActiveView::for_view(&next);
         }
         self.view = next;
+        ctx.request_repaint();
     }
 
     fn handle_toast_action(&mut self, action: ToastAction) {
@@ -770,6 +828,11 @@ impl eframe::App for WitnessApp {
                 if timed_out && !self.captions.is_visible() {
                     log::warn!("captions overlay did not appear within {UI_PASS_TIMEOUT:?}");
                 }
+                // The window state only reports minimized on a later
+                // `logic()`, after `ui_pass_in_progress()` has ended, so the
+                // edge detector is told explicitly (design §4.3: no
+                // `will_hide` for this internal minimize).
+                self.expect_app_minimize();
                 self.window.finish_ui_pass();
                 self.ui_pass_since = None;
             } else {
@@ -787,8 +850,11 @@ impl eframe::App for WitnessApp {
             )
         });
         if minimized && !self.was_minimized {
-            // The minimize button already ran `will_hide`.
-            if !std::mem::take(&mut self.minimized_by_app) && !self.window.ui_pass_in_progress() {
+            let by_app = self
+                .minimized_by_app
+                .take()
+                .is_some_and(|until| Instant::now() <= until);
+            if !by_app && !self.window.ui_pass_in_progress() {
                 self.will_hide();
             }
         }
@@ -856,6 +922,12 @@ impl eframe::App for WitnessApp {
         self.handle_search_shortcuts(&ctx);
 
         let mut topbar_out = topbar::TopBarOutput::default();
+        // F0 → U7/U4 contract: besides the documented `show`, `resize_edges`
+        // and the banners, this calls `topbar::frame()` and
+        // `topbar::paint_bottom_border(ui, rect)` (U7 keeps both), and it
+        // owns the bar's panel and the search box's 900 px column + 12 px
+        // gap (U4's `search_box` draws inside it). Changing that layout is
+        // an I1 edit here, not a unit edit.
         self.with_view(|view, cx| {
             topbar::resize_edges(ui, cx);
             let bar = egui::Panel::top("topbar")
@@ -891,14 +963,14 @@ impl eframe::App for WitnessApp {
 
         if topbar_out.minimize {
             self.will_hide();
-            self.minimized_by_app = true;
+            self.expect_app_minimize();
             self.window.minimize();
         }
         if topbar_out.close {
             self.will_hide();
             self.window.hide_to_tray();
         }
-        self.apply_navigation();
+        self.apply_navigation(&ctx);
         // Start the save timer in the pass that changed the prefs.
         self.persist_prefs(&ctx);
 

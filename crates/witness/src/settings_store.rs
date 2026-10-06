@@ -6,9 +6,14 @@
 //! still persists the last value. A failed write reverts the optimistic
 //! copy to the last confirmed settings (unless a newer save is pending) and
 //! toasts "Could not save settings: …".
+//!
+//! Writes go through a shared gate that remembers the newest seq persisted,
+//! so the exit path can write the latest value synchronously
+//! (`flush_for_exit`) without an older in-flight write landing after it.
 
 use crate::bridge::{OpDone, Tasks};
 use crate::ui::toasts::Toasts;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use witness_core::settings::Settings;
 use witness_core::{AppCore, CoreResult};
@@ -19,8 +24,9 @@ pub const SAVED_FLASH: Duration = Duration::from_millis(1500);
 pub struct SettingsStore {
     /// What the UI shows (includes unsaved edits).
     current: Settings,
-    /// The last value known to be on disk.
+    /// The last value known to be on disk, and the seq that wrote it.
     confirmed: Settings,
+    confirmed_seq: u64,
     /// Seq of the write in flight, and the value it is writing.
     in_flight: Option<(u64, Settings)>,
     /// The next value to write once the in-flight one finishes.
@@ -28,6 +34,9 @@ pub struct SettingsStore {
     /// Seq of the newest `save`.
     seq: u64,
     saved_at: Option<Instant>,
+    /// The newest seq handed to `update_settings`; held while writing so
+    /// writes are serialised and an older one never overwrites a newer one.
+    gate: Arc<Mutex<u64>>,
 }
 
 /// What a finished write changed, for `app.rs`.
@@ -48,10 +57,24 @@ impl SettingsStore {
         SettingsStore {
             current: settings.clone(),
             confirmed: settings,
+            confirmed_seq: 0,
             in_flight: None,
             queued: None,
             seq: 0,
             saved_at: None,
+            gate: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    /// Re-seed from the stored settings, as settings.tsx did on every mount
+    /// (`get_settings`), so the view shows what `update_settings` actually
+    /// persisted (trimmed, de-duplicated junk phrases …). Skipped while a
+    /// write is pending: the optimistic value is newer than the store.
+    pub fn reload(&mut self, core: &AppCore) {
+        if !self.is_saving() {
+            let stored = core.settings();
+            self.current = stored.clone();
+            self.confirmed = stored;
         }
     }
 
@@ -63,7 +86,7 @@ impl SettingsStore {
     /// Save `next` (optimistically shown at once).
     pub fn save(&mut self, next: Settings, tasks: &Tasks) {
         if let Some((seq, settings)) = self.enqueue(next) {
-            start_write(tasks, seq, settings);
+            start_write(tasks, &self.gate, seq, settings);
         }
     }
 
@@ -91,9 +114,46 @@ impl SettingsStore {
     ) -> WriteOutcome {
         let (outcome, next) = self.finish(seq, result, toasts);
         if let Some((seq, settings)) = next {
-            start_write(tasks, seq, settings);
+            start_write(tasks, &self.gate, seq, settings);
         }
         outcome
+    }
+
+    /// Exit paths only (tray Quit, Restart, Install update): write the
+    /// newest pending value now, waiting at most `timeout`. A queued write
+    /// otherwise starts from `on_written`, which never runs once the
+    /// process has exited. The write runs on a helper thread (the UI thread
+    /// never does disk I/O); the gate orders it after any in-flight write,
+    /// which skips itself if it had not reached the gate yet.
+    pub fn flush_for_exit(&mut self, core: &Arc<AppCore>, timeout: Duration) {
+        if !self.is_saving() {
+            return;
+        }
+        let (seq, settings) = (self.seq, self.current.clone());
+        self.queued = None;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let core = core.clone();
+        let gate = self.gate.clone();
+        let spawned = std::thread::Builder::new()
+            .name("settings-exit-write".into())
+            .spawn(move || {
+                let result = write_through_gate(&gate, seq, || core.update_settings(settings));
+                let _ = tx.send(result);
+            });
+        if let Err(error) = spawned {
+            log::error!("could not save settings before exiting: {error}");
+            return;
+        }
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(())) => {
+                // If the exit is then abandoned (restart spawn failed), the
+                // older in-flight write's completion must not roll this back.
+                self.confirmed = settings_normalized(&self.current);
+                self.confirmed_seq = seq;
+            }
+            Ok(Err(error)) => log::error!("could not save settings before exiting: {error}"),
+            Err(_) => log::warn!("the settings write did not finish within {timeout:?}"),
+        }
     }
 
     fn finish(
@@ -114,8 +174,15 @@ impl SettingsStore {
         let latest = seq == self.seq;
         match result {
             Ok(()) => {
-                outcome.data_dir_saved = written.data_dir != self.confirmed.data_dir;
-                self.confirmed = written;
+                // What `update_settings` persisted. `current` keeps the
+                // typed value (no fighting a text field mid-edit); `reload`
+                // adopts the stored one on the next Settings mount.
+                if seq > self.confirmed_seq {
+                    let written = settings_normalized(&written);
+                    outcome.data_dir_saved = written.data_dir != self.confirmed.data_dir;
+                    self.confirmed = written;
+                    self.confirmed_seq = seq;
+                }
                 if latest {
                     self.saved_at = Some(Instant::now());
                 }
@@ -146,17 +213,40 @@ impl SettingsStore {
     }
 }
 
-fn start_write(tasks: &Tasks, seq: u64, settings: Settings) {
+fn start_write(tasks: &Tasks, gate: &Arc<Mutex<u64>>, seq: u64, settings: Settings) {
     // A panicking (or unstartable) write still completes `seq` — as a
     // failed write — so `in_flight` is cleared and the queue never stalls.
+    let gate = gate.clone();
     tasks.spawn_op_or(
         "settings-write",
         move |c| OpDone::SettingsWritten {
             seq,
-            result: c.update_settings(settings),
+            result: write_through_gate(&gate, seq, || c.update_settings(settings)),
         },
         write_failed(seq),
     );
+}
+
+/// What `update_settings` stores for `settings` (it normalized successfully
+/// if the write succeeded).
+fn settings_normalized(settings: &Settings) -> Settings {
+    settings.normalized().unwrap_or_else(|_| settings.clone())
+}
+
+/// Run `write` for `seq` under the gate, unless a newer seq was already
+/// written (then this older value is moot and reported as done).
+fn write_through_gate(
+    gate: &Mutex<u64>,
+    seq: u64,
+    write: impl FnOnce() -> CoreResult<()>,
+) -> CoreResult<()> {
+    // A panicking write poisons the gate; the seq it guards is still valid.
+    let mut newest = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *newest >= seq {
+        return Ok(());
+    }
+    *newest = seq;
+    write()
 }
 
 /// The `SettingsWritten` reported when write `seq` panicked or never started.
@@ -245,6 +335,44 @@ mod tests {
         let (_, next) = store.finish(done_seq, result, &mut toasts);
         assert!(next.is_some(), "the queued write still starts");
         assert!(!toasts.is_empty(), "the failure is toasted");
+    }
+
+    #[test]
+    fn the_gate_skips_writes_older_than_the_newest() {
+        let gate = Mutex::new(0);
+        let mut ran = Vec::new();
+        let mut write = |seq: u64, result: CoreResult<()>| {
+            write_through_gate(&gate, seq, || {
+                ran.push(seq);
+                result
+            })
+        };
+        assert_eq!(write(3, Ok(())), Ok(()));
+        // An older in-flight write that reaches the gate late is skipped.
+        assert_eq!(write(2, Err("stale".into())), Ok(()));
+        assert_eq!(write(4, Err("disk full".into())), Err("disk full".into()));
+        assert_eq!(ran, vec![3, 4]);
+    }
+
+    #[test]
+    fn confirmed_is_the_normalized_value() {
+        let mut store = SettingsStore::from_settings(settings(true));
+        let mut toasts = Toasts::new();
+        let mut typed = settings(true);
+        typed.junk_phrases = vec!["You".into(), " you ".into(), String::new()];
+        typed.data_dir = Some(" D:\\Witness ".into());
+        let (seq, _) = store.enqueue(typed).unwrap();
+        let (outcome, _) = store.finish(seq, Ok(()), &mut toasts);
+        assert!(outcome.data_dir_saved);
+        assert_eq!(store.confirmed.junk_phrases, vec!["You".to_owned()]);
+        assert_eq!(store.confirmed.data_dir.as_deref(), Some("D:\\Witness"));
+        assert_eq!(store.current().junk_phrases.len(), 3, "typed value kept");
+        // Only whitespace differs: not a data_dir change.
+        let mut same = settings(true);
+        same.data_dir = Some("D:\\Witness  ".into());
+        let (seq, _) = store.enqueue(same).unwrap();
+        let (outcome, _) = store.finish(seq, Ok(()), &mut toasts);
+        assert!(!outcome.data_dir_saved);
     }
 
     #[test]
