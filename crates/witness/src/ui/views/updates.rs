@@ -7,12 +7,11 @@
 //! flow is app-owned and preloaded from `core.pending_update()`, so the
 //! Install button shows as soon as the startup check has found a release.
 
-use super::settings::{badge, ghost_enabled, muted_paragraph, primary, row, section};
+use super::settings::{button, note, progress_bar, row, section, title, toggle, Slot};
 use crate::model::{UpdateFlow, UpdatePhase};
-use crate::ui::theme::TEXT;
 use crate::ui::widgets::{self, BadgeKind};
 use crate::ui::{UiCmd, UiCtx};
-use eframe::egui::{self, RichText};
+use eframe::egui;
 
 /// What the version row's trailing widget is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,7 +20,7 @@ enum Action {
     Install(String),
     /// The busy badge while downloading / verifying.
     Progress(String),
-    /// Ghost "Check for updates" ("Checking…", disabled, while checking).
+    /// "Check for updates" ("Checking…", disabled, while checking).
     Check { checking: bool },
 }
 
@@ -34,53 +33,81 @@ impl UpdatesSection {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
-        section(ui, "Updates", |ui| {
-            let flow = &cx.shell.update;
-            let label = version_label(env!("CARGO_PKG_VERSION"), &flow.phase);
-            let action = action(flow);
-            let notes = release_notes(&flow.phase).map(str::to_owned);
-            row(ui, |ui| {
-                ui.add(egui::Label::new(RichText::new(label).color(TEXT)).wrap());
-                match action {
+        let flow = &cx.shell.update;
+        let label = version_label(env!("CARGO_PKG_VERSION"), &flow.phase);
+        let action = action(flow);
+        let notes = release_notes(&flow.phase).map(str::to_owned);
+        let fraction = install_fraction(flow);
+        let mut check = cx.settings.current().check_for_updates;
+
+        let (clicked, check_changed) = section(ui, "Updates", |ui| {
+            let clicked = row(
+                ui,
+                "update-version",
+                Slot::Fit,
+                |ui| {
+                    let id = title(ui, &label);
+                    // Plain text, like the `<p>` (no markdown rendering).
+                    if let Some(notes) = &notes {
+                        note(ui, notes);
+                    }
+                    if let Some(fraction) = fraction {
+                        progress_bar(ui, fraction);
+                    }
+                    id
+                },
+                |ui, _| match &action {
                     Action::Install(version) => {
-                        if primary(ui, &format!("Install {version} & restart")).clicked() {
-                            cx.cmds.push(UiCmd::InstallUpdate);
-                        }
+                        widgets::btn_primary(ui, format!("Install {version} & restart")).clicked()
                     }
                     Action::Progress(text) => {
-                        badge(ui, BadgeKind::Busy, &text);
+                        widgets::badge(ui, BadgeKind::Busy, text);
+                        false
                     }
                     Action::Check { checking } => {
-                        let text = if checking {
+                        let text = if *checking {
                             "Checking…"
                         } else {
                             "Check for updates"
                         };
-                        if ghost_enabled(ui, !checking, text).clicked() {
-                            cx.cmds.push(UiCmd::CheckUpdate);
-                        }
+                        button(ui, !checking, text).clicked()
                     }
-                }
-            });
-            // Plain text, like the `<p>` (no markdown rendering).
-            if let Some(notes) = notes {
-                muted_paragraph(ui, &notes);
-            }
-            let mut check = cx.settings.current().check_for_updates;
-            if widgets::checkbox(
+                },
+            );
+            widgets::group_divider(ui);
+            let check_changed = toggle(
                 ui,
                 true,
                 &mut check,
-                "Check for updates at startup (no meeting data is sent)",
+                "Check for updates at startup",
+                "No meeting data is sent.",
             )
-            .changed()
-            {
-                let mut next = cx.settings.current().clone();
-                next.check_for_updates = check;
-                cx.settings.save(next, cx.tasks);
-            }
+            .changed();
+            (clicked, check_changed)
         });
+
+        if clicked {
+            cx.cmds.push(match action {
+                Action::Install(_) => UiCmd::InstallUpdate,
+                _ => UiCmd::CheckUpdate,
+            });
+        }
+        if check_changed {
+            let mut next = cx.settings.current().clone();
+            next.check_for_updates = check;
+            cx.settings.save(next, cx.tasks);
+        }
     }
+}
+
+/// The installer download's progress (0..1) once its size is known.
+fn install_fraction(flow: &UpdateFlow) -> Option<f32> {
+    if !matches!(flow.phase, UpdatePhase::Installing(_)) {
+        return None;
+    }
+    let p = flow.progress.as_ref()?;
+    let total = p.total.filter(|t| *t > 0)?;
+    Some((p.downloaded as f64 / total as f64).clamp(0.0, 1.0) as f32)
 }
 
 /// "Witness 0.3.0", plus " — up to date" after a check found nothing.
@@ -148,6 +175,9 @@ mod tests {
             total: Some(12_000_000),
         });
         assert_eq!(action(&flow), Action::Progress("downloading 25%".into()));
+        assert_eq!(install_fraction(&flow), Some(0.25));
+        flow.phase = UpdatePhase::Available(info(None));
+        assert_eq!(install_fraction(&flow), None, "only while installing");
     }
 
     #[test]
