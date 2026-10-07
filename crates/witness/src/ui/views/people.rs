@@ -5,13 +5,21 @@
 //! any failure fails the whole load. The trend reads only the meetings of
 //! the last 12 weeks (`meetings_started_since`) instead of paging through
 //! every meeting like the TSX did.
+//!
+//! ↑/↓ (j/k, Home/End) select a person and Enter / Space opens or closes
+//! their detail, as in the Meetings list. The first load shows a skeleton
+//! of the trend and the rows; no people a designed empty state.
 
 use crate::bridge::{OpDone, Task};
 use crate::ui::format::{fmt_date, fmt_date_short, fmt_duration, fmt_thousands};
 use crate::ui::icons;
+use crate::ui::icons::ph;
 use crate::ui::theme::{self, pal, S1, S2, S3, S4};
 use crate::ui::toasts::Notice;
-use crate::ui::views::meetings::{follow_focus, open_transcript};
+use crate::ui::views::meetings::{
+    debug_flag, debug_index, empty_hero, follow_focus, list_keys_free, open_transcript,
+    read_list_keys, skeleton_at, skeleton_due, step_selection, ListKeys,
+};
 use crate::ui::widgets::{self, KeyScroll};
 use crate::ui::{UiCtx, View};
 use chrono::{DateTime, Datelike, Days, Local, NaiveDate};
@@ -285,13 +293,22 @@ struct PeopleLoad {
     got_prints: Option<CoreResult<Vec<PersonInfo>>>,
     /// The day the buckets are computed for.
     today: NaiveDate,
+    /// When it was requested (the first load's skeleton waits a moment).
+    started: std::time::Instant,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 enum Action {
     Toggle(String),
     Open(i64),
-    Forget { id: i64, name: String, skip: bool },
+    Forget {
+        id: i64,
+        name: String,
+        skip: bool,
+    },
     TryAgain,
+    /// The empty state's way to the transcripts (where speakers are named).
+    GoMeetings,
 }
 
 pub struct PeopleView {
@@ -305,6 +322,13 @@ pub struct PeopleView {
     /// Who "Forget voice…" is asking about.
     confirm_for: Option<(i64, String)>,
     seen_tick: Option<u64>,
+    /// The keyboard selection: a person's key (↑/↓, j/k, Home/End; Enter
+    /// or Space opens / closes their detail).
+    cursor: Option<String>,
+    /// Scroll the selected person into view on the next draw.
+    reveal: bool,
+    /// `WITNESS_DEBUG_SELECT` has been applied.
+    debug_selected: bool,
 }
 
 impl Default for PeopleView {
@@ -324,6 +348,9 @@ impl PeopleView {
             load_error: None,
             confirm_for: None,
             seen_tick: None,
+            cursor: None,
+            reveal: false,
+            debug_selected: false,
         }
     }
 
@@ -335,19 +362,29 @@ impl PeopleView {
         self.poll(ui, cx);
         self.take_confirm_answer(cx);
 
+        // The list keys go before the scroller, which would otherwise
+        // scroll by the arrows / Home / End (and page by Space).
         let mut actions = Vec::new();
+        if list_keys_free(ui.ctx(), cx.confirm.is_open()) && !self.people.is_empty() {
+            // Space toggles only once there is a selection to toggle;
+            // before that it still pages down.
+            let keys = read_list_keys(ui.ctx(), self.cursor.is_some(), false);
+            actions.extend(self.key_actions(keys));
+        }
         widgets::scroll_column(ui, "people-scroll", KeyScroll { space: true }, |ui| {
             self.draw(ui, &mut actions)
         });
         for action in actions {
             match action {
                 Action::Toggle(key) => {
+                    self.cursor = Some(key.clone());
                     self.expanded = if self.expanded.as_ref() == Some(&key) {
                         None
                     } else {
                         Some(key)
                     };
                 }
+                Action::GoMeetings => cx.nav.go(View::Meetings),
                 Action::Open(meeting_id) => open_transcript(cx, meeting_id, View::People),
                 Action::Forget { id, name, skip } => {
                     if skip {
@@ -393,7 +430,26 @@ impl PeopleView {
             got_meetings: None,
             got_prints: None,
             today,
+            started: std::time::Instant::now(),
         });
+    }
+
+    /// Apply the list keys to the selection; Enter (or Space, once there
+    /// is a selection) opens or closes the selected person's detail.
+    fn key_actions(&mut self, keys: ListKeys) -> Vec<Action> {
+        let keys_in_order: Vec<String> = self.people.iter().map(|p| p.key.clone()).collect();
+        if let Some(motion) = keys.motion {
+            self.cursor = step_selection(&keys_in_order, self.cursor.as_ref(), motion);
+            self.reveal = true;
+        }
+        match self
+            .cursor
+            .as_ref()
+            .filter(|key| keys_in_order.contains(key))
+        {
+            Some(key) if keys.activate => vec![Action::Toggle(key.clone())],
+            _ => Vec::new(),
+        }
     }
 
     fn poll(&mut self, ui: &egui::Ui, cx: &mut UiCtx) {
@@ -435,6 +491,17 @@ impl PeopleView {
                 self.load_error = None;
                 #[cfg(debug_assertions)]
                 self.debug_expand();
+                // Debug builds only: `WITNESS_DEBUG_EMPTY=1` shows the empty
+                // state, `WITNESS_DEBUG_SELECT=<n>` selects the n-th person.
+                if debug_flag("WITNESS_DEBUG_EMPTY") {
+                    self.people.clear();
+                }
+                if let Some(n) = debug_index("WITNESS_DEBUG_SELECT") {
+                    if !std::mem::replace(&mut self.debug_selected, true) {
+                        self.cursor = self.people.get(n).map(|p| p.key.clone());
+                        self.reveal = true;
+                    }
+                }
             }
             (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
                 cx.toasts.error("Could not load people statistics", &error);
@@ -475,8 +542,14 @@ impl PeopleView {
                 node.set_role(egui::accesskit::Role::Heading);
                 node.set_label("People");
             });
-        if self.load.is_some() && self.people.is_empty() {
-            widgets::empty_state(ui, "Loading people…", None);
+        if (self.load.is_some() && self.people.is_empty()) || debug_flag("WITNESS_DEBUG_LOADING") {
+            let due = self
+                .load
+                .as_ref()
+                .is_none_or(|load| skeleton_due(ui, load.started));
+            if due {
+                people_skeleton(ui);
+            }
             return;
         }
         if self.people.is_empty() {
@@ -487,11 +560,17 @@ impl PeopleView {
                 }
                 return;
             }
-            widgets::empty_state(
+            let clicked = empty_hero(
                 ui,
-                "No people yet.",
-                Some("Stats appear once meetings are transcribed. Rename speakers in a transcript to track individual people across meetings."),
+                ph::USERS_THREE,
+                "No people yet",
+                "Speaking stats appear once a meeting is transcribed. Rename a speaker in a transcript to a person, and Witness recognises their voice in later meetings.",
+                &["Go to meetings"],
+                false,
             );
+            if clicked.is_some() {
+                actions.push(Action::GoMeetings);
+            }
             return;
         }
 
@@ -504,7 +583,16 @@ impl PeopleView {
                 .person_id
                 .and_then(|id| self.prints.iter().find(|p| p.id == id));
             let open = self.expanded.as_deref() == Some(person.key.as_str());
-            person_entry(ui, person, print, open, actions);
+            let selected = self.cursor.as_deref() == Some(person.key.as_str());
+            let header = person_entry(ui, person, print, open, selected, actions);
+            // Keyboard focus (Tab, egui's arrow moves) carries the
+            // selection with it.
+            if header.has_focus() && !selected {
+                self.cursor = Some(person.key.clone());
+            }
+            if selected && std::mem::take(&mut self.reveal) {
+                header.scroll_to_me(None);
+            }
         }
         ui.add_space(S4);
         ui.add(
@@ -573,6 +661,70 @@ fn trend_card(ui: &mut egui::Ui, weeks: &[Week]) {
             );
         }
     });
+}
+
+/// The first load's placeholder, on the real layout: the trend surface (a
+/// caption bar, twelve bars on the baseline, the axis ends), the "People"
+/// header and person rows (an avatar disc, a name bar over a summary bar).
+fn people_skeleton(ui: &mut egui::Ui) {
+    const BARS: [f32; WEEKS] = [
+        0.35, 0.6, 0.2, 0.75, 0.5, 0.0, 0.4, 0.9, 0.3, 0.55, 0.65, 0.45,
+    ];
+    let bar = |left: f32, center_y: f32, w: f32, h: f32| {
+        Rect::from_min_size(egui::pos2(left, center_y - h / 2.0), egui::vec2(w, h))
+    };
+    ui.add_space(S4);
+    widgets::group(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = S2;
+        let width = ui.available_width();
+        let caption_h = ui.fonts_mut(|f| f.row_height(&theme::regular(12.5)));
+        let (caption, _) = ui.allocate_exact_size(egui::vec2(width, caption_h), Sense::hover());
+        let caption_w = (width * 0.7).min(280.0);
+        skeleton_at(ui, bar(caption.left(), caption.center().y, caption_w, 10.0));
+        ui.add_space(S1);
+        let (chart, _) = ui.allocate_exact_size(egui::vec2(width, CHART_HEIGHT), Sense::hover());
+        ui.painter().hline(
+            chart.x_range(),
+            chart.bottom() - 0.5,
+            Stroke::new(1.0, pal().border),
+        );
+        let slot = chart.width() / WEEKS as f32;
+        let bar_w = (slot * 0.6).clamp(3.0, BAR_MAX_WIDTH);
+        for (i, fraction) in BARS.into_iter().enumerate() {
+            let center_x = chart.left() + (i as f32 + 0.5) * slot;
+            let h = (fraction * (chart.height() - S1)).max(3.0);
+            let rect = Rect::from_min_max(
+                egui::pos2(center_x - bar_w / 2.0, chart.bottom() - h),
+                egui::pos2(center_x + bar_w / 2.0, chart.bottom()),
+            );
+            skeleton_at(ui, rect);
+        }
+        let axis_h = ui.fonts_mut(|f| f.row_height(&axis_font()));
+        let (axis, _) = ui.allocate_exact_size(egui::vec2(width, axis_h), Sense::hover());
+        skeleton_at(ui, bar(axis.left(), axis.center().y, 40.0, 8.0));
+        skeleton_at(ui, bar(axis.right() - 56.0, axis.center().y, 56.0, 8.0));
+    });
+    widgets::section_header(ui, "People");
+    ui.spacing_mut().item_spacing.y = 2.0;
+    // `person_row`'s metrics: list_row padding 12 / 8 around the avatar and
+    // the two text lines.
+    let text_h = ui
+        .fonts_mut(|f| f.row_height(&theme::semibold(14.0)) + f.row_height(&theme::regular(12.0)))
+        + 1.0;
+    let row_h = text_h.max(AVATAR) + 16.0;
+    let width = ui.available_width();
+    let measure = (width - 2.0 * 12.0 - AVATAR - S3 - CHEVRON - S3).max(40.0);
+    for row in 0..5 {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, row_h), Sense::hover());
+        let avatar = egui::pos2(rect.left() + 12.0 + AVATAR / 2.0, rect.center().y);
+        ui.painter()
+            .circle_filled(avatar, AVATAR / 2.0, pal().bg_hover);
+        let left = rect.left() + 12.0 + AVATAR + S3;
+        let name_w = measure.min(220.0) * [0.7, 0.55, 0.85, 0.6, 0.75][row];
+        let summary_w = measure.min(220.0) * [0.9, 0.8, 0.95, 0.85, 0.8][row];
+        skeleton_at(ui, bar(left, rect.center().y - 8.0, name_w, 12.0));
+        skeleton_at(ui, bar(left, rect.center().y + 9.0, summary_w, 9.0));
+    }
 }
 
 /// The chart's axis labels.
@@ -679,11 +831,12 @@ fn paint_chevron(ui: &egui::Ui, rect: Rect, t: f32, color: Color32) {
 }
 
 /// A person's list row: avatar, name and the one-line summary, and the
-/// chevron that turns when the detail is open. Returns the row's response
-/// (click = toggle) and the content's rect.
-fn person_row(ui: &mut egui::Ui, p: &PersonAgg, open: bool) -> (Response, Rect) {
+/// chevron that turns when the detail is open; filled while it has the
+/// keyboard selection. Returns the row's response (click = toggle) and the
+/// content's rect.
+fn person_row(ui: &mut egui::Ui, p: &PersonAgg, open: bool, selected: bool) -> (Response, Rect) {
     let summary = summary_text(p);
-    let (row, content) = widgets::list_row(ui, ("person-row", &p.key), false, |ui, hovered| {
+    let (row, content) = widgets::list_row(ui, ("person-row", &p.key), selected, |ui, hovered| {
         let name_font = theme::semibold(14.0);
         let meta_font = theme::regular(12.0);
         let text_h = ui.fonts_mut(|f| f.row_height(&name_font) + f.row_height(&meta_font)) + 1.0;
@@ -801,16 +954,18 @@ fn meeting_row(ui: &mut egui::Ui, p: &PersonAgg, m: &PersonMeetingStat) -> Respo
 }
 
 /// One person: the row, and when open the detail under it: the stats
-/// grid, their meetings and "Forget voice…" (named people only).
+/// grid, their meetings and "Forget voice…" (named people only). Returns
+/// the row's response.
 fn person_entry(
     ui: &mut egui::Ui,
     p: &PersonAgg,
     print: Option<&PersonInfo>,
     open: bool,
+    selected: bool,
     actions: &mut Vec<Action>,
-) {
+) -> Response {
     let sample_seconds = print.map(|x| x.sample_seconds);
-    let (header, _) = person_row(ui, p, open);
+    let (header, _) = person_row(ui, p, open, selected);
     let name = format!("{}: {}", p.name, stats_text(p, sample_seconds));
     header.widget_info(|| {
         let mut info = WidgetInfo::labeled(WidgetType::Button, true, &name);
@@ -821,7 +976,7 @@ fn person_entry(
         actions.push(Action::Toggle(p.key.clone()));
     }
     if !open {
-        return;
+        return header;
     }
 
     // The detail hangs under the name (flush left when compact).
@@ -866,11 +1021,13 @@ fn person_entry(
             ui.add_space(S3);
         });
     });
+    header
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::views::meetings::Motion;
 
     fn day(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -1070,9 +1227,9 @@ mod tests {
                 let weeks = bucket_weeks(day(2026, 10, 7), &[]);
                 trend_card(ui, &weeks);
                 let mut actions = Vec::new();
-                person_entry(ui, &people[0], None, true, &mut actions);
-                person_entry(ui, &people[1], None, true, &mut actions);
-                person_entry(ui, &people[1], None, false, &mut actions);
+                person_entry(ui, &people[0], None, true, true, &mut actions);
+                person_entry(ui, &people[1], None, true, false, &mut actions);
+                person_entry(ui, &people[1], None, false, true, &mut actions);
                 assert!(actions.is_empty());
                 // Nothing grew past the window.
                 assert!(ui.min_rect().right() <= width + 0.5, "at {width}");
@@ -1108,7 +1265,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    let (row, content) = person_row(ui, &person, false);
+                    let (row, content) = person_row(ui, &person, false, true);
                     rows.push((row.rect, content));
                 },
             );
@@ -1131,6 +1288,68 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn keys_select_people_and_toggle_their_detail() {
+        let mut view = PeopleView::new();
+        view.people = aggregate(&[
+            stat(None, "Me", 1, 1_000, 500),
+            stat(Some(2), "Bob", 1, 1_000, 100),
+            stat(Some(3), "Cara", 2, 9_000, 100),
+        ]);
+        let order: Vec<String> = view.people.iter().map(|p| p.key.clone()).collect();
+        let step = |motion| ListKeys {
+            motion: Some(motion),
+            ..ListKeys::default()
+        };
+        let toggle = ListKeys {
+            activate: true,
+            ..ListKeys::default()
+        };
+        // Nothing selected: Enter does nothing.
+        assert!(view.key_actions(toggle).is_empty());
+        view.key_actions(step(Motion::By(1)));
+        assert_eq!(view.cursor.as_ref(), Some(&order[0]));
+        assert!(view.reveal);
+        view.key_actions(step(Motion::Last));
+        assert_eq!(
+            view.key_actions(toggle),
+            vec![Action::Toggle(order[2].clone())]
+        );
+        view.key_actions(step(Motion::By(-1)));
+        assert_eq!(view.cursor.as_ref(), Some(&order[1]));
+        // A forgotten person's selection is inert.
+        view.people.truncate(1);
+        assert!(view.key_actions(toggle).is_empty());
+    }
+
+    #[test]
+    fn the_people_skeleton_fits() {
+        let ctx = theme::test_context();
+        for width in [380.0, 1000.0] {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 760.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, people_skeleton);
+            output.textures_delta.clear();
+            let shapes: Vec<Rect> = output
+                .shapes
+                .iter()
+                .map(|c| c.shape.visual_bounding_rect())
+                .filter(|r| r.is_positive())
+                .collect();
+            // The caption, 12 bars, two axis ends, five avatars + ten bars.
+            assert!(shapes.len() >= 30, "{} shapes at {width}", shapes.len());
+            assert!(
+                shapes.iter().all(|r| r.right() <= width + 0.5),
+                "at {width}"
+            );
         }
     }
 }
