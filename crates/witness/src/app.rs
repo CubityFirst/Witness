@@ -23,16 +23,17 @@ use crate::settings_store::SettingsStore;
 use crate::ui::captions::{CaptionsOverlay, OpenReason};
 use crate::ui::confirm::Confirm;
 use crate::ui::fonts::FontLoader;
+use crate::ui::icons::ph;
 use crate::ui::onboarding::Onboarding;
 use crate::ui::palette::CommandPalette;
 use crate::ui::toasts::{Notice, ToastAction, Toasts};
 use crate::ui::{
-    icons, submit_recording, theme, topbar, views, widgets, ActiveView, Nav, PaneRole, UiCmd,
-    UiCtx, View, ViewMemory,
+    icons, list_column_width, submit_recording, theme, topbar, views, widgets, ActiveView, Nav,
+    PaneLayout, PaneRole, Screens, UiCmd, UiCtx, View, ViewMemory, LIST_WIDTH,
 };
 use crate::ui_state::{PrefsWriter, UiPrefs};
 use crossbeam_channel::Receiver;
-use eframe::egui::{self, Event, Key, Margin, Modifiers};
+use eframe::egui::{self, Event, Key, Margin, Modifiers, Rect};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -63,6 +64,41 @@ const PREFS_SAVE_DELAY: Duration = Duration::from_millis(500);
 /// How often the Settings view re-reads `pending_update` (the startup check
 /// stores its result without an event).
 const PENDING_UPDATE_POLL: Duration = Duration::from_secs(5);
+/// A page change fades in while rising this far; a new selection in a
+/// split's detail pane only fades, a little quicker.
+const PAGE_FADE: Duration = Duration::from_millis(150);
+const DETAIL_FADE: Duration = Duration::from_millis(120);
+const PAGE_RISE: f32 = 6.0;
+/// The split divider's grab strip, mostly on the detail side (the list's
+/// floating scroll bar sits just left of the line).
+const DIVIDER_GRAB_LEFT: f32 = 2.0;
+const DIVIDER_GRAB_RIGHT: f32 = 5.0;
+
+/// A `UiCtx` over the app's fields, for `$view` drawn as `$pane`. A macro
+/// rather than a method so the view instances in `self.screens` (and the
+/// layout state) stay borrowable beside it.
+macro_rules! ui_ctx {
+    ($app:expr, $view:expr, $pane:expr) => {
+        UiCtx {
+            core: &$app.core,
+            tasks: &$app.tasks,
+            shell: &mut $app.shell,
+            settings: &mut $app.settings,
+            toasts: &mut $app.toasts,
+            confirm: &mut $app.confirm,
+            nav: &mut $app.nav,
+            view: $view,
+            player: &$app.player,
+            prefs: &mut $app.prefs,
+            memory: &mut $app.memory,
+            window: &$app.window,
+            flyout: &mut $app.flyout,
+            cmds: &mut $app.cmds,
+            fonts: &$app.fonts,
+            pane: $pane,
+        }
+    };
+}
 
 /// What `main.rs` hands the app creator.
 pub struct StartParts {
@@ -101,7 +137,18 @@ pub struct WitnessApp {
     confirm: Confirm,
     nav: Nav,
     view: View,
-    active: ActiveView,
+    /// The view instances: the current view's, plus the list a transcript
+    /// was opened from (beside it in a split, kept behind it otherwise).
+    screens: Screens<ActiveView>,
+    /// The content area's width last pass: decides whether a navigation
+    /// lands in a split (the list stays on screen) before the next pass.
+    content_width: f32,
+    /// The split's list column width the user dragged to (this session).
+    list_width: f32,
+    /// Which split pane unfocused keys (arrows, Space, Page Up/Down) go to:
+    /// the one last clicked, or a transcript just opened.
+    key_pane: KeyPane,
+    transitions: Transitions,
     memory: ViewMemory,
     prefs: UiPrefs,
     /// What is on disk (or queued for the writer); `prefs` differing from
@@ -275,7 +322,7 @@ impl WitnessApp {
         shell.update.init(&core);
         let settings = SettingsStore::new(&core);
         let view = crate::ui::debug_start_view();
-        let active = ActiveView::for_view(&view);
+        let screens = Screens::new(ActiveView::for_view(&view));
 
         let mut app = WitnessApp {
             captions: CaptionsOverlay::new(&data_dir),
@@ -296,7 +343,11 @@ impl WitnessApp {
             confirm: Confirm::new(),
             nav: Nav::default(),
             view,
-            active,
+            screens,
+            content_width: 0.0,
+            list_width: LIST_WIDTH,
+            key_pane: KeyPane::List,
+            transitions: Transitions::default(),
             memory: ViewMemory::default(),
             saved_prefs: prefs.clone(),
             prefs_deadline: None,
@@ -338,33 +389,12 @@ impl WitnessApp {
         Ok(app)
     }
 
-    /// Build the per-pass view context and run `f` with the active view.
-    fn with_view<R>(&mut self, f: impl FnOnce(&mut ActiveView, &mut UiCtx) -> R) -> R {
-        let mut cx = UiCtx {
-            core: &self.core,
-            tasks: &self.tasks,
-            shell: &mut self.shell,
-            settings: &mut self.settings,
-            toasts: &mut self.toasts,
-            confirm: &mut self.confirm,
-            nav: &mut self.nav,
-            view: &self.view,
-            player: &self.player,
-            prefs: &mut self.prefs,
-            memory: &mut self.memory,
-            window: &self.window,
-            flyout: &mut self.flyout,
-            cmds: &mut self.cmds,
-            fonts: &self.fonts,
-            pane: PaneRole::Full,
-        };
-        f(&mut self.active, &mut cx)
-    }
-
     /// The single hook for every way the main window stops being visible:
-    /// enqueue the newest notes draft. Never blocks; the player keeps playing.
+    /// enqueue the newest notes draft (and commit a list rename beside it).
+    /// Never blocks; the player keeps playing.
     fn will_hide(&mut self) {
-        self.with_view(|view, cx| view.flush(cx));
+        let mut cx = ui_ctx!(self, &self.view, PaneRole::Full);
+        self.screens.each_live(|view| view.flush(&mut cx));
     }
 
     // ------------------------------------------------------------------
@@ -885,23 +915,29 @@ impl WitnessApp {
         if self.palette.is_open() {
             return;
         }
-        // In a transcript Ctrl+F is find-in-transcript (the view's).
-        let in_transcript = matches!(self.view, View::Transcript { .. });
+        // In a transcript Ctrl+F is find-in-transcript (the view's) — in a
+        // split only while the transcript pane has the keys.
+        let split = !self.onboarding.is_active()
+            && PaneLayout::of(&self.view, self.content_width).is_split();
+        let in_transcript = matches!(self.view, View::Transcript { .. })
+            && !(split && self.key_pane == KeyPane::List);
         let jump = ctx.input_mut(|i| {
             let ctrl_f = !in_transcript && consume_key_exact(i, Key::F, |m| m.command && !m.alt);
             let slash = !typing && consume_key_exact(i, Key::Slash, |m| !m.command && !m.alt);
             ctrl_f || slash
         });
         if jump {
-            if !self.view.has_search_box() {
+            // A split shows the search box beside the transcript already.
+            if !self.view.has_search_box() && !split {
                 self.nav.go(View::Meetings);
             }
             self.memory.search_box.request_focus = true;
+            self.key_pane = KeyPane::List;
         }
     }
 
-    /// Apply a pending navigation: `on_leave` the old view, then remount
-    /// when the view key changes.
+    /// Apply a pending navigation: `on_leave` what is replaced, remount when
+    /// the view key changes (a kept list is reused; see [`Screens`]).
     ///
     /// Always asks for another pass: the views have already drawn this one,
     /// and a navigation fired by a timer (the delayed open in Meetings, the
@@ -909,18 +945,29 @@ impl WitnessApp {
     /// so the old view would otherwise stay on screen until the mouse moved.
     fn apply_navigation(&mut self, ctx: &egui::Context) {
         let Some(next) = self.nav.take() else { return };
-        if next.key() != self.view.key() {
-            // `on_leave` still reads an answer given in this pass; a modal
+        let split =
+            !self.onboarding.is_active() && PaneLayout::of(&next, self.content_width).is_split();
+        let replaced = {
+            let mut cx = ui_ctx!(self, &self.view, PaneRole::Full);
+            self.screens
+                .navigate(cx.view, &next, split, ActiveView::for_view, |view| {
+                    view.on_leave(&mut cx)
+                })
+        };
+        if replaced {
+            // `on_leave` still read an answer given in this pass; a modal
             // left open would outlive the view that asked (its answer would
             // do nothing), so it closes with the view.
-            self.with_view(|view, cx| view.on_leave(cx));
             self.confirm.withdraw();
             if matches!(next, View::Settings) {
                 // settings.tsx re-read get_settings on every mount, so it
                 // shows the stored (normalized) values after a round trip.
                 self.settings.reload(&self.core);
             }
-            self.active = ActiveView::for_view(&next);
+            // A newly opened transcript takes the keys (Space plays it).
+            if matches!(next, View::Transcript { .. }) {
+                self.key_pane = KeyPane::Detail;
+            }
         }
         self.view = next;
         ctx.request_repaint();
@@ -968,6 +1015,408 @@ fn consume_key_exact(
         !hit
     });
     found
+}
+
+// ---------------------------------------------------------------------------
+// Layout: one view, or the list and the transcript side by side
+
+/// The split pane that receives unfocused keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyPane {
+    List,
+    Detail,
+}
+
+/// Page and selection transitions: a page change fades in while rising
+/// [`PAGE_RISE`]; a new transcript in a split's detail pane only fades.
+/// Never on the first pass, nor when a resize merely switches between the
+/// split and one view (nothing new appears).
+#[derive(Debug, Default)]
+struct Transitions {
+    /// The pane keys (`PaneLayout::keys`) and split state of the last pass.
+    last: Option<((String, Option<String>), bool)>,
+    page: Option<Instant>,
+    detail: Option<Instant>,
+}
+
+/// This pass's fade-ins: eased progress 0..1, `None` when settled.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Fades {
+    page: Option<f32>,
+    detail: Option<f32>,
+}
+
+impl Fades {
+    fn running(&self) -> bool {
+        self.page.is_some() || self.detail.is_some()
+    }
+}
+
+impl Transitions {
+    /// Note what this pass shows (`keys` and whether it is a split) and
+    /// return the fades to draw it with. `animate` is false while Windows
+    /// animations are off or the window is hidden or minimized: everything
+    /// settles at once.
+    fn update(
+        &mut self,
+        keys: (String, Option<String>),
+        split: bool,
+        animate: bool,
+        now: Instant,
+    ) -> Fades {
+        if let Some((last, last_split)) = &self.last {
+            if animate && *last_split == split {
+                if last.0 != keys.0 {
+                    self.page = Some(now);
+                    self.detail = None;
+                } else if last.1 != keys.1 && keys.1.is_some() {
+                    self.detail = Some(now);
+                }
+            }
+        }
+        self.last = Some((keys, split));
+        if !animate {
+            self.page = None;
+            self.detail = None;
+        }
+        Fades {
+            page: progress(&mut self.page, PAGE_FADE, now),
+            detail: progress(&mut self.detail, DETAIL_FADE, now),
+        }
+    }
+}
+
+/// Eased progress of a fade started at `*started` lasting `length`; clears
+/// it (and returns `None`) once done.
+fn progress(started: &mut Option<Instant>, length: Duration, now: Instant) -> Option<f32> {
+    let t = now.saturating_duration_since((*started)?).as_secs_f32() / length.as_secs_f32();
+    if t >= 1.0 {
+        *started = None;
+        return None;
+    }
+    // Ease out (cubic): quick to appear, gentle to settle.
+    Some(1.0 - (1.0 - t.max(0.0)).powi(3))
+}
+
+/// Draw `add` faded in to `fade` (eased progress), risen `rise × (1 −
+/// fade)` points below its place and clipped to it; plain while settled.
+fn faded<R>(
+    ui: &mut egui::Ui,
+    fade: Option<f32>,
+    rise: f32,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let Some(t) = fade else { return add(ui) };
+    let rect = ui.available_rect_before_wrap();
+    let clip = ui.clip_rect().intersect(rect);
+    let layout = *ui.layout();
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(rect.translate(egui::vec2(0.0, rise * (1.0 - t))))
+            .layout(layout),
+        |ui| {
+            ui.set_clip_rect(clip);
+            ui.multiply_opacity(t);
+            add(ui)
+        },
+    )
+    .inner
+}
+
+/// Draw a view in a ui whose id depends only on `key` (its `View::key`),
+/// not on where the shell nests it, so the view's widget state (scroll
+/// offset, open sections…) is the same full-width, in a split pane and in
+/// the middle of a fade.
+fn view_root<R>(ui: &mut egui::Ui, key: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.scope_builder(
+        egui::UiBuilder::new().id(egui::Id::new(("witness-view", key))),
+        add,
+    )
+    .inner
+}
+
+/// The banner and search box above a view, in the content column.
+fn view_header(ui: &mut egui::Ui, cx: &mut UiCtx) {
+    let banner = topbar::has_model_banner(cx);
+    let search = cx.view.has_search_box();
+    if banner || search {
+        widgets::padded_column(ui, |ui| {
+            topbar::model_banner(ui, cx);
+            if search {
+                if banner {
+                    widgets::gap(ui, theme::S3);
+                }
+                let current = cx.view.clone();
+                views::search::search_box(ui, cx, &current);
+            }
+        });
+        widgets::gap(ui, theme::S2);
+    }
+}
+
+/// One view over the whole content area (narrow windows, and every view
+/// without a list beside it); first-run setup replaces the view.
+fn draw_single(
+    ui: &mut egui::Ui,
+    cx: &mut UiCtx,
+    view: &mut ActiveView,
+    onboarding: &mut Onboarding,
+    fades: Fades,
+) {
+    view_header(ui, cx);
+    faded(ui, fades.page, PAGE_RISE, |ui| {
+        if onboarding.is_active() {
+            view_root(ui, "onboarding", |ui| onboarding.show(ui, cx));
+        } else {
+            let key = cx.view.key();
+            view_root(ui, &key, |ui| view.show(ui, cx));
+        }
+    });
+}
+
+/// What [`draw_split`] draws (`'v`: the views' context lifetime).
+struct SplitPanes<'a, 'v> {
+    /// The list's view (Meetings, or Search with its query).
+    list: &'v View,
+    selected: Option<i64>,
+    list_view: &'a mut ActiveView,
+    /// The transcript; `None` while nothing is selected.
+    detail: Option<&'a mut ActiveView>,
+    list_width: &'a mut f32,
+    key_pane: &'a mut KeyPane,
+    fades: Fades,
+}
+
+/// The list column (search box + list) and the detail column (the open
+/// transcript, or a placeholder), a draggable hairline between them. The
+/// model banner spans both, above them.
+fn draw_split<'v>(ui: &mut egui::Ui, cx: &mut UiCtx<'v>, panes: SplitPanes<'_, 'v>) {
+    let SplitPanes {
+        list,
+        selected,
+        list_view,
+        detail,
+        list_width,
+        key_pane,
+        fades,
+    } = panes;
+    let top_gap = if topbar::has_model_banner(cx) {
+        ui.add_space(12.0);
+        full_width_row(ui, |ui| topbar::model_banner(ui, cx));
+        theme::S3
+    } else {
+        12.0
+    };
+
+    let area = ui.available_rect_before_wrap();
+    let width = list_column_width(*list_width, area.width()).round();
+    let list_rect = Rect::from_min_max(area.min, egui::pos2(area.left() + width, area.bottom()));
+    let detail_rect = Rect::from_min_max(egui::pos2(list_rect.right() + 1.0, area.top()), area.max);
+
+    // The pane last clicked gets the unfocused keys.
+    if let Some(press) = ui.input(|i| {
+        i.pointer
+            .primary_pressed()
+            .then(|| i.pointer.press_origin())
+            .flatten()
+    }) {
+        if list_rect.contains(press) {
+            *key_pane = KeyPane::List;
+        } else if detail_rect.contains(press) {
+            *key_pane = KeyPane::Detail;
+        }
+    }
+
+    // A page change rises both columns into place (each clipped to its
+    // own rect); `faded` below only fades them.
+    let rise = fades.page.map_or(0.0, |t| PAGE_RISE * (1.0 - t));
+    let pane = |ui: &mut egui::Ui, rect: Rect, keys: bool, add: &mut dyn FnMut(&mut egui::Ui)| {
+        let held = (!keys).then(|| hold_keys(ui.ctx())).flatten();
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(rect.translate(egui::vec2(0.0, rise)))
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+            |ui| {
+                ui.set_clip_rect(rect.intersect(ui.clip_rect()));
+                ui.add_space(top_gap);
+                add(ui);
+            },
+        );
+        if let Some(held) = held {
+            restore_keys(ui.ctx(), held);
+        }
+    };
+
+    faded(ui, fades.page, 0.0, |ui| {
+        let app_view = cx.view;
+        // The list, drawn as its own view (the transcript's `from`).
+        cx.view = list;
+        cx.pane = PaneRole::List { selected };
+        pane(ui, list_rect, *key_pane == KeyPane::List, &mut |ui| {
+            widgets::padded_column(ui, |ui| {
+                views::search::search_box(ui, cx, list);
+            });
+            widgets::gap(ui, theme::S2);
+            view_root(ui, &list.key(), |ui| list_view.show(ui, cx));
+        });
+        cx.view = app_view;
+        cx.pane = PaneRole::Detail;
+        let detail_keys = *key_pane == KeyPane::Detail;
+        let mut detail = detail;
+        pane(
+            ui,
+            detail_rect,
+            detail_keys,
+            &mut |ui| match detail.as_deref_mut() {
+                Some(view) => faded(ui, fades.detail, 0.0, |ui| {
+                    let key = cx.view.key();
+                    view_root(ui, &key, |ui| view.show(ui, cx));
+                }),
+                None => nothing_selected(ui),
+            },
+        );
+        cx.pane = PaneRole::Full;
+    });
+
+    divider(ui, list_rect.right(), area, width, list_width);
+}
+
+/// `add` across the whole content width with the page's side padding (the
+/// split's banner spans both columns).
+fn full_width_row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    let pad = widgets::pad_x(ui.available_width());
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.add_space(pad);
+        let inner = (ui.available_width() - pad).max(0.0);
+        ui.vertical(|ui| {
+            ui.set_width(inner);
+            add(ui);
+        });
+    });
+}
+
+/// The hairline between the columns; dragging it resizes the list
+/// (double-click restores the default width).
+fn divider(ui: &mut egui::Ui, x: f32, area: Rect, width: f32, list_width: &mut f32) {
+    let grab = Rect::from_x_y_ranges(
+        x - DIVIDER_GRAB_LEFT..=x + DIVIDER_GRAB_RIGHT,
+        area.y_range(),
+    );
+    let response = ui
+        .interact(
+            grab,
+            egui::Id::new("witness-split-divider"),
+            egui::Sense::click_and_drag(),
+        )
+        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "Resize the meeting list")
+    });
+    if response.dragged() {
+        // From the width on screen, so a preference wider than the window
+        // allows does not make the line lag behind the pointer.
+        *list_width = list_column_width(width + response.drag_delta().x, area.width());
+    }
+    if response.double_clicked() {
+        *list_width = LIST_WIDTH;
+    }
+    let p = theme::pal();
+    let hot = response.hovered() || response.dragged();
+    let (stroke_w, color) = if hot {
+        (2.0, p.border_strong)
+    } else {
+        (1.0, p.border)
+    };
+    ui.painter().vline(
+        x + stroke_w / 2.0,
+        area.y_range(),
+        egui::Stroke::new(stroke_w, color),
+    );
+}
+
+/// The detail column with no meeting open: a calm placeholder, centred a
+/// little above the middle.
+fn nothing_selected(ui: &mut egui::Ui) {
+    let p = theme::pal();
+    let rect = ui.available_rect_before_wrap();
+    let column = egui::Rect::from_center_size(
+        egui::pos2(rect.center().x, rect.top() + rect.height() * 0.4),
+        egui::vec2((rect.width() - 2.0 * theme::S5).clamp(0.0, 320.0), 160.0),
+    );
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(column)
+            .layout(egui::Layout::top_down(egui::Align::Center)),
+        |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let (disc, _) = ui.allocate_exact_size(egui::vec2(48.0, 48.0), egui::Sense::hover());
+            ui.painter().circle_filled(disc.center(), 24.0, p.bg_hover);
+            let glyph = ui.painter().layout_no_wrap(
+                ph::WAVEFORM.to_owned(),
+                egui::FontId::proportional(22.0),
+                p.text_muted,
+            );
+            ui.painter()
+                .galley(disc.center() - glyph.size() / 2.0, glyph, p.text_muted);
+            ui.add_space(theme::S4);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("Select a meeting")
+                        .font(theme::semibold(15.0))
+                        .color(p.text),
+                )
+                .wrap(),
+            );
+            ui.add_space(theme::S1 + 2.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("Its transcript, notes and recording open here.")
+                        .font(theme::regular(13.0))
+                        .color(p.text_muted),
+                )
+                .halign(egui::Align::Center)
+                .wrap(),
+            );
+            ui.add_space(theme::S3);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("Press / to search transcripts")
+                        .font(theme::regular(12.0))
+                        .color(p.text_faint),
+                )
+                .wrap(),
+            );
+        },
+    );
+}
+
+/// Take this pass's unmodified key presses (arrows, Space, Page Up/Down…)
+/// out of the input while the pane without the keys draws, so a list and a
+/// transcript side by side do not both act on one key. Nothing is held
+/// while a widget has focus: it receives keys by focus wherever it sits,
+/// and the views' unfocused shortcuts stand down anyway.
+fn hold_keys(ctx: &egui::Context) -> Option<Vec<Event>> {
+    if ctx.memory(|m| m.focused().is_some()) {
+        return None;
+    }
+    let held = ctx.input_mut(|i| {
+        let mut held = Vec::new();
+        i.events.retain(|event| match event {
+            Event::Key { modifiers, .. } if !modifiers.command && !modifiers.alt => {
+                held.push(event.clone());
+                false
+            }
+            _ => true,
+        });
+        held
+    });
+    (!held.is_empty()).then_some(held)
+}
+
+/// Put back what [`hold_keys`] took (the rest of the pass still sees it).
+fn restore_keys(ctx: &egui::Context, held: Vec<Event>) {
+    ctx.input_mut(|i| i.events.extend(held));
 }
 
 /// Irreversible: release the shell objects and exit. A free function so it
@@ -1121,67 +1570,100 @@ impl eframe::App for WitnessApp {
             snapshot.tick(&ctx);
         }
 
-        let mut topbar_out = topbar::TopBarOutput::default();
+        let topbar_out;
         // Drawn with the views' `UiCtx`; moved out for the closure's borrow.
         let mut palette = std::mem::take(&mut self.palette);
         let mut onboarding = std::mem::take(&mut self.onboarding);
+
+        // Split or single, decided on the whole window's width (the content
+        // area spans it). A list that leaves the screen gets its `on_leave`.
+        let width = ui.available_width();
+        self.content_width = width;
+        let layout = if onboarding.is_active() {
+            PaneLayout::Single
+        } else {
+            PaneLayout::of(&self.view, width)
+        };
+        if !layout.is_split() {
+            let mut cx = ui_ctx!(self, &self.view, PaneRole::Full);
+            self.screens.hide_list(|view| view.on_leave(&mut cx));
+        }
+        // Never animate a hidden or minimized window (design §4.2).
+        let animate =
+            icons::animations_enabled() && self.window.is_shown() && !self.window.is_minimized();
+        let fades = self.transitions.update(
+            layout.keys(&self.view),
+            layout.is_split(),
+            animate,
+            Instant::now(),
+        );
+        let split_list = match &layout {
+            PaneLayout::Split { list, .. } => Some(list),
+            PaneLayout::Single => None,
+        };
+
         // F0 → U7/U4 contract: besides the documented `show`, `resize_edges`
         // and the banners, this calls `topbar::frame()` and
         // `topbar::paint_bottom_border(ui, rect)` (U7 keeps both), and it
-        // owns the bar's panel and the search box's 900 px column + 12 px
-        // gap (U4's `search_box` draws inside it). Changing that layout is
-        // an I1 edit here, not a unit edit.
-        self.with_view(|view, cx| {
-            topbar::resize_edges(ui, cx);
+        // owns the bar's panel and the search box's column + 12 px gap
+        // (U4's `search_box` draws inside it). Changing that layout is an
+        // I1 edit here, not a unit edit.
+        {
+            let mut cx = ui_ctx!(self, &self.view, PaneRole::Full);
+            topbar::resize_edges(ui, &mut cx);
             let bar = egui::Panel::top("topbar")
                 .frame(topbar::frame())
                 .resizable(false)
                 .show_separator_line(false)
-                .show(ui, |ui| topbar::show(ui, cx));
+                .show(ui, |ui| topbar::show(ui, &mut cx, split_list));
             topbar::paint_bottom_border(ui, bar.response.rect);
             topbar_out = bar.inner;
-            topbar::health_banner(ui, cx);
+            topbar::health_banner(ui, &mut cx, layout.is_split());
 
             // Views own their full-width scroller (bar at the window edge)
             // and centre their content in `widgets::scroll_column`; the shell
-            // only pads the banner and the search box the same way.
+            // only pads the banner and the search box the same way. A split
+            // pads inside its columns, so the divider meets the top bar.
             let content = egui::Frame::new()
                 .fill(theme::pal().window_bg)
                 .inner_margin(Margin {
                     left: 0,
                     right: 0,
-                    top: 12,
+                    top: if layout.is_split() { 0 } else { 12 },
                     bottom: 0,
                 });
             egui::CentralPanel::default().frame(content).show(ui, |ui| {
                 widgets::clear_view_viewport(ui.ctx());
-                let banner = topbar::has_model_banner(cx);
-                let search = cx.view.has_search_box();
-                if banner || search {
-                    widgets::padded_column(ui, |ui| {
-                        topbar::model_banner(ui, cx);
-                        if search {
-                            if banner {
-                                widgets::gap(ui, theme::S3);
-                            }
-                            let current = cx.view.clone();
-                            views::search::search_box(ui, cx, &current);
-                        }
-                    });
-                    widgets::gap(ui, theme::S2);
-                }
-                if onboarding.is_active() {
-                    onboarding.show(ui, cx);
-                } else {
-                    view.show(ui, cx);
+                match &layout {
+                    PaneLayout::Single => {
+                        draw_single(ui, &mut cx, self.screens.main(), &mut onboarding, fades);
+                    }
+                    PaneLayout::Split { list, selected } => {
+                        let current = cx.view;
+                        let (list_view, detail) =
+                            self.screens.split(current, list, ActiveView::for_view);
+                        let panes = SplitPanes {
+                            list,
+                            selected: *selected,
+                            list_view,
+                            detail,
+                            list_width: &mut self.list_width,
+                            key_pane: &mut self.key_pane,
+                            fades,
+                        };
+                        draw_split(ui, &mut cx, panes);
+                    }
                 }
             });
             if palette.is_open() {
-                palette.show(ui.ctx(), cx);
+                palette.show(ui.ctx(), &mut cx);
             }
-        });
+        }
         self.palette = palette;
         self.onboarding = onboarding;
+        if fades.running() && animate {
+            ctx.request_repaint();
+        }
 
         self.confirm.show(&ctx);
         if let Some(action) = self.toasts.show(&ctx) {
@@ -1239,6 +1721,95 @@ mod tests {
         ] {
             assert!(!ignored_while_quitting(&event), "{event:?}");
         }
+    }
+
+    fn keys(page: &str, detail: Option<&str>) -> (String, Option<String>) {
+        (page.to_owned(), detail.map(str::to_owned))
+    }
+
+    #[test]
+    fn page_changes_fade_in_and_settle() {
+        let mut t = Transitions::default();
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        // The first pass never animates.
+        assert_eq!(
+            t.update(keys("lists", None), false, true, t0),
+            Fades::default()
+        );
+        let fades = t.update(keys("people", None), false, true, ms(10));
+        assert_eq!(fades.page, Some(0.0));
+        let half = t
+            .update(keys("people", None), false, true, ms(85))
+            .page
+            .unwrap();
+        assert!(half > 0.5 && half < 1.0, "eased out: {half}");
+        assert!(!t
+            .update(keys("people", None), false, true, ms(170))
+            .running());
+    }
+
+    #[test]
+    fn a_new_selection_fades_only_the_detail() {
+        let mut t = Transitions::default();
+        let t0 = Instant::now();
+        t.update(keys("lists", None), true, true, t0);
+        let fades = t.update(keys("lists", Some("transcript-1")), true, true, t0);
+        assert_eq!((fades.page, fades.detail), (None, Some(0.0)));
+        let fades = t.update(keys("lists", Some("transcript-2")), true, true, t0);
+        assert_eq!(fades.detail, Some(0.0));
+        // Closing the transcript (Back, a new query) fades nothing in.
+        let later = t0 + DETAIL_FADE;
+        assert!(!t.update(keys("lists", None), true, true, later).running());
+    }
+
+    #[test]
+    fn resizes_and_disabled_animations_never_fade() {
+        let mut t = Transitions::default();
+        let t0 = Instant::now();
+        t.update(keys("lists", Some("transcript-1")), true, true, t0);
+        // Narrower: the transcript becomes the page, but nothing is new.
+        assert!(!t
+            .update(keys("transcript-1", None), false, true, t0)
+            .running());
+        // Animations off (or a hidden window): a page change just shows.
+        assert!(!t.update(keys("people", None), false, false, t0).running());
+        // A fade under way stops when the window hides.
+        t.update(keys("settings", None), false, true, t0);
+        assert!(!t.update(keys("settings", None), false, false, t0).running());
+    }
+
+    #[test]
+    fn held_keys_skip_shortcuts_and_come_back() {
+        let ctx = egui::Context::default();
+        let key = |key, modifiers| Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let input = egui::RawInput {
+            events: vec![
+                key(Key::Space, Modifiers::NONE),
+                key(Key::ArrowDown, Modifiers::SHIFT),
+                key(Key::F, Modifiers::COMMAND),
+                Event::Text("a".into()),
+            ],
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            let held = hold_keys(ui.ctx()).expect("keys held");
+            assert_eq!(held.len(), 2);
+            ui.input(|i| {
+                assert!(!i.key_pressed(Key::Space));
+                assert!(i.key_pressed(Key::F), "Ctrl shortcuts stay");
+                assert_eq!(i.events.len(), 2);
+            });
+            restore_keys(ui.ctx(), held);
+            ui.input(|i| assert!(i.key_pressed(Key::Space)));
+        });
+        output.textures_delta.clear(); // no renderer to upload the font atlas
     }
 
     #[test]
