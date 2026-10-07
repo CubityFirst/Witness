@@ -16,6 +16,15 @@
 //! side, the focused row and the row being renamed) are laid out: hundreds
 //! of loaded rows stay cheap while Tab can still walk the whole list. The
 //! recycle bin is a separate, normally laid-out section after the list.
+//!
+//! While nothing holds the keyboard focus, ↑/↓ (j/k) and Home/End move a
+//! selection highlight over the rows (and the open bin's), scrolling it
+//! into view; Enter opens, Delete moves to the bin, F2 renames. In a wide
+//! window's split (`PaneRole::List`) the meeting open beside the list is
+//! marked with the accent pill and takes the selection. A first load shows
+//! a row-shaped skeleton; an empty library a designed empty state. The
+//! selection, skeleton and empty-state helpers are shared with Search and
+//! People.
 
 use crate::bridge::{OpDone, Task};
 use crate::ui::format::fmt_duration;
@@ -23,7 +32,7 @@ use crate::ui::icons::{self, ph};
 use crate::ui::theme::{self, pal};
 use crate::ui::toasts::{Notice, ToastAction};
 use crate::ui::widgets::{self, KeyScroll};
-use crate::ui::{UiCtx, View};
+use crate::ui::{PaneRole, UiCtx, View};
 use chrono::{DateTime, Datelike, Local, NaiveDate};
 use eframe::egui::{
     self, text::LayoutJob, text::TextWrapping, Align, Color32, CornerRadius, CursorIcon, FontId,
@@ -34,7 +43,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use witness_core::db::Meeting;
 use witness_core::service::DeletedMeeting;
-use witness_core::CoreResult;
+use witness_core::{CoreResult, RecCmd, Trigger};
 
 /// Rows per page (Load more) and the minimum reload size.
 const PAGE: usize = 50;
@@ -227,6 +236,277 @@ pub(crate) fn follow_focus(response: &Response) {
     if response.gained_focus() && !by_pointer {
         response.scroll_to_me(None);
     }
+}
+
+// ----------------------------------------------------------------------
+// Keyboard selection, loading and empty states (shared with Search and
+// People, which build their lists on the same model)
+
+/// How a list key moves the selection highlight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Motion {
+    /// ↓ / j (positive) and ↑ / k (negative), net of this pass's presses.
+    By(i32),
+    /// Home.
+    First,
+    /// End.
+    Last,
+}
+
+/// The item `motion` selects in `items` (in display order) from `current`.
+/// Without a current item (or one no longer listed) a step lands on the
+/// first item, End on the last; steps stop at either end. None only for an
+/// empty list.
+pub(crate) fn step_selection<T: PartialEq + Clone>(
+    items: &[T],
+    current: Option<&T>,
+    motion: Motion,
+) -> Option<T> {
+    let last = items.len().checked_sub(1)?;
+    let at = current.and_then(|c| items.iter().position(|item| item == c));
+    let index = match (motion, at) {
+        (Motion::First, _) => 0,
+        (Motion::Last, _) => last,
+        (Motion::By(_), None) => 0,
+        (Motion::By(n), Some(at)) => (at as i64 + i64::from(n)).clamp(0, last as i64) as usize,
+    };
+    items.get(index).cloned()
+}
+
+/// The list keys pressed this pass (consumed, so the view's scroller does
+/// not also scroll by them).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ListKeys {
+    pub motion: Option<Motion>,
+    /// Enter (and Space where the view lets it): open / toggle.
+    pub activate: bool,
+    /// Delete: `Some(shift)` (Shift skips the confirmation, like Shift-click).
+    pub delete: Option<bool>,
+    /// F2: rename.
+    pub rename: bool,
+}
+
+/// Whether the list keys drive the selection now: nothing holds the
+/// keyboard focus — a focused text field types, a focused button takes
+/// Enter / Space itself and egui moves the focus with the arrows — and no
+/// modal is open.
+pub(crate) fn list_keys_free(ctx: &egui::Context, modal_open: bool) -> bool {
+    !modal_open && ctx.memory(|m| m.focused().is_none())
+}
+
+/// Read (and consume) the list keys: ↑/↓ and j/k step, Home/End jump,
+/// Enter activates, and so does Space when `space` (else Space is left to
+/// the scroller's page down). `edit_keys` also reads Delete and F2.
+pub(crate) fn read_list_keys(ctx: &egui::Context, space: bool, edit_keys: bool) -> ListKeys {
+    use egui::Modifiers;
+    ctx.input_mut(|i| {
+        let mut count = |key| i.count_and_consume_key(Modifiers::NONE, key) as i32;
+        let down = count(Key::ArrowDown) + count(Key::J);
+        let up = count(Key::ArrowUp) + count(Key::K);
+        let home = count(Key::Home) > 0;
+        let end = count(Key::End) > 0;
+        let mut activate = count(Key::Enter) > 0;
+        if space {
+            activate |= count(Key::Space) > 0;
+        }
+        // From the press itself: Shift may be up again by the time the
+        // pass runs (and tests feed modifiers only on the event).
+        let shift = i.modifiers.shift
+            || i.events.iter().any(|e| {
+                matches!(e, egui::Event::Key { key: Key::Delete, pressed: true, modifiers, .. } if modifiers.shift)
+            });
+        let (delete, rename) = if edit_keys {
+            (
+                (i.count_and_consume_key(Modifiers::NONE, Key::Delete) > 0).then_some(shift),
+                i.count_and_consume_key(Modifiers::NONE, Key::F2) > 0,
+            )
+        } else {
+            (None, false)
+        };
+        let motion = if home {
+            Some(Motion::First)
+        } else if end {
+            Some(Motion::Last)
+        } else {
+            (down != up).then_some(Motion::By(down - up))
+        };
+        ListKeys {
+            motion,
+            activate,
+            delete,
+            rename,
+        }
+    })
+}
+
+/// The selected-row fill and, for the meeting open beside the list (a
+/// split's `PaneRole::List`), the accent indicator at the row's left edge
+/// (the Windows 11 list-selection pill).
+pub(crate) fn paint_selection(ui: &egui::Ui, rect: Rect, open: bool) {
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(theme::R_MD), pal().bg_active);
+    if open {
+        paint_open_pill(ui, rect);
+    }
+}
+
+/// Only the accent pill of [`paint_selection`] (rows that fill themselves).
+pub(crate) fn paint_open_pill(ui: &egui::Ui, rect: Rect) {
+    let height = (rect.height() * 0.4).clamp(12.0, 18.0);
+    let pill = Rect::from_center_size(
+        egui::pos2(rect.left() + 4.0, rect.center().y),
+        egui::vec2(3.0, height),
+    );
+    ui.painter()
+        .rect_filled(pill, CornerRadius::same(2), pal().accent);
+}
+
+/// A first load shows nothing for this long, then its skeleton: most
+/// loads finish well within it, and a flash of placeholders reads as
+/// flicker.
+const SKELETON_DELAY: Duration = Duration::from_millis(120);
+
+/// Whether a first load that started at `started` has run long enough to
+/// show its skeleton (else a repaint is scheduled for when it will have).
+pub(crate) fn skeleton_due(ui: &egui::Ui, started: Instant) -> bool {
+    if debug_flag("WITNESS_DEBUG_LOADING") {
+        return true;
+    }
+    let due = started + SKELETON_DELAY;
+    let now = Instant::now();
+    if now >= due {
+        true
+    } else {
+        ui.ctx().request_repaint_after(due - now);
+        false
+    }
+}
+
+/// A designed empty state: a large muted Phosphor icon, a title, one
+/// helpful sentence and up to two buttons (a primary and a ghost one).
+/// `compact` is the inline variant (an emptied recycle bin). Returns the
+/// index of the clicked button.
+pub(crate) fn empty_hero(
+    ui: &mut egui::Ui,
+    glyph: &str,
+    title: &str,
+    body: &str,
+    buttons: &[&str],
+    compact: bool,
+) -> Option<usize> {
+    let (pad, icon, title_size) = if compact {
+        (theme::S4, 28.0, 14.0)
+    } else {
+        (48.0, 44.0, 16.0)
+    };
+    let mut clicked = None;
+    ui.add_space(pad);
+    ui.vertical_centered(|ui| {
+        // Sentences read best at a measure, not the column's full width.
+        let measure = ui.available_width().min(340.0);
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.label(icons::icon(glyph, icon).color(pal().text_faint));
+        ui.add_space(if compact { theme::S2 } else { theme::S3 });
+        ui.scope(|ui| {
+            ui.set_max_width(measure);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(title)
+                        .font(theme::semibold(title_size))
+                        .color(pal().text),
+                )
+                .wrap(),
+            );
+            ui.add_space(theme::S1 + 2.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(body)
+                        .font(theme::regular(13.0))
+                        .color(pal().text_muted),
+                )
+                .wrap(),
+            );
+        });
+        if !buttons.is_empty() {
+            ui.add_space(theme::S4);
+            // The centred layout centres a block of the row's exact width.
+            let size = egui::vec2(
+                hero_buttons_width(ui, buttons).min(ui.available_width()),
+                ui.spacing().interact_size.y,
+            );
+            ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = theme::S2;
+                for (index, label) in buttons.iter().enumerate() {
+                    let response = if index == 0 {
+                        widgets::btn_primary(ui, *label)
+                    } else {
+                        widgets::btn_ghost(ui, *label)
+                    };
+                    follow_focus(&response);
+                    if response.clicked() {
+                        clicked = Some(index);
+                    }
+                }
+            });
+        }
+    });
+    ui.add_space(pad);
+    clicked
+}
+
+/// The width of [`empty_hero`]'s button row (labels + button padding +
+/// gaps), for centring it.
+fn hero_buttons_width(ui: &egui::Ui, buttons: &[&str]) -> f32 {
+    let pad = 2.0 * ui.spacing().button_padding.x;
+    let widths: f32 = buttons
+        .iter()
+        .enumerate()
+        .map(|(index, label)| {
+            let font = if index == 0 {
+                theme::semibold(theme::BASE_SIZE)
+            } else {
+                theme::regular(theme::BASE_SIZE)
+            };
+            ui.painter()
+                .layout_no_wrap((*label).to_owned(), font, pal().text)
+                .size()
+                .x
+                + pad
+        })
+        .sum();
+    widths + theme::S2 * buttons.len().saturating_sub(1) as f32
+}
+
+/// A placeholder bar at an absolute `rect` (a child ui so the kit's
+/// [`widgets::skeleton`] can allocate it).
+pub(crate) fn skeleton_at(ui: &mut egui::Ui, rect: Rect) {
+    let mut child = ui.new_child(UiBuilder::new().max_rect(rect));
+    widgets::skeleton(&mut child, rect.size());
+}
+
+/// Debug builds only: whether the env var `name` is `1` (passive snapshot
+/// hooks such as `WITNESS_DEBUG_LOADING`, which pins every first-load
+/// skeleton).
+pub(crate) fn debug_flag(name: &str) -> bool {
+    debug_value(name).is_some_and(|v| v == "1")
+}
+
+/// Debug builds only: the env var `name`'s value.
+pub(crate) fn debug_value(name: &str) -> Option<String> {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var(name).ok()
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = name;
+        None
+    }
+}
+
+/// Debug builds only: `name` as an index (`WITNESS_DEBUG_SELECT=<n>`, …).
+pub(crate) fn debug_index(name: &str) -> Option<usize> {
+    debug_value(name).and_then(|v| v.trim().parse().ok())
 }
 
 /// Fetch `count` rows from `offset` with `fetch(offset, limit)`, in chunks
@@ -437,6 +717,26 @@ struct ListLoad {
     task: Task<CoreResult<Vec<Meeting>>>,
     append: bool,
     limit: usize,
+    /// When it was requested (a first load's skeleton waits a moment).
+    started: Instant,
+}
+
+/// A keyboard-selectable item: a meeting of the list or a recycle-bin row
+/// (while the bin is open), in display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sel {
+    Meeting(i64),
+    Binned(i64),
+}
+
+/// What the empty library offers, refreshed from the shell every pass.
+#[derive(Debug, Default, Clone)]
+struct EmptyEnv {
+    auto_record: bool,
+    /// A recording is running or starting (no "Start recording" then).
+    recording: bool,
+    /// The bound recording hotkey (`ctrl+alt+r`), if any.
+    record_hotkey: Option<String>,
 }
 
 /// What the open confirmation is for.
@@ -447,7 +747,7 @@ enum ConfirmFor {
 }
 
 /// Something the user asked for during the pass; applied after drawing.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum RowAction {
     /// Keyboard (Enter/Space) or accessibility activation: open now.
     OpenNow(i64),
@@ -479,6 +779,10 @@ enum RowAction {
     },
     LoadMore,
     TryAgain,
+    /// The empty library's "Start recording" (the top bar's record path).
+    StartRecording,
+    /// The empty library's way to the auto-record setting.
+    OpenSettings,
 }
 
 pub struct MeetingsView {
@@ -506,6 +810,18 @@ pub struct MeetingsView {
     /// The `shell.refresh_tick` the data was requested for; None until the
     /// first pass, so mounting loads.
     seen_tick: Option<u64>,
+    /// The keyboard selection highlight (↑/↓, j/k, Home/End; Enter opens).
+    /// Follows clicks, keyboard focus and the meeting open beside the list.
+    cursor: Option<Sel>,
+    /// Scroll this item into view on the next draw.
+    reveal: Option<Sel>,
+    /// The meeting open in a split's detail pane (`PaneRole::List`).
+    pane_open: Option<i64>,
+    /// `pane_open` as last seen, so only a change moves the cursor.
+    pane_seen: Option<i64>,
+    env: EmptyEnv,
+    /// `WITNESS_DEBUG_SELECT` has been applied (once, after the first load).
+    debug_selected: bool,
 }
 
 impl Default for MeetingsView {
@@ -531,6 +847,12 @@ impl MeetingsView {
             focused_row: None,
             days: None,
             seen_tick: None,
+            cursor: None,
+            reveal: None,
+            pane_open: None,
+            pane_seen: None,
+            env: EmptyEnv::default(),
+            debug_selected: false,
         }
     }
 
@@ -541,10 +863,24 @@ impl MeetingsView {
             self.load_bin(cx);
         }
         self.poll(ui, cx);
+        self.debug_states();
         self.fire_pending_open(ui, cx);
         self.take_confirm_answer(cx);
+        self.env = EmptyEnv {
+            auto_record: cx.settings.current().auto_record,
+            recording: cx.shell.recording() || cx.shell.recording_action,
+            record_hotkey: cx.shell.record_hotkey.clone(),
+        };
+        let open = self.pane_selection(cx.pane);
+        self.follow_pane(open);
 
+        // The list keys go before the scroller, which would otherwise
+        // scroll by the arrows / Home / End.
         let mut actions = Vec::new();
+        if list_keys_free(ui.ctx(), cx.confirm.is_open()) && !self.nav_items().is_empty() {
+            let keys = read_list_keys(ui.ctx(), false, true);
+            actions.extend(self.key_actions(keys));
+        }
         widgets::scroll_column(ui, "meetings-scroll", KeyScroll { space: true }, |ui| {
             self.draw(ui, &mut actions)
         });
@@ -591,6 +927,7 @@ impl MeetingsView {
             task,
             append,
             limit,
+            started: Instant::now(),
         });
     }
 
@@ -660,6 +997,129 @@ impl MeetingsView {
                 Err(error) => cx.toasts.error("Could not load the recycle bin", error),
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Selection
+
+    /// The meeting open beside the list: a split's `PaneRole::List`
+    /// selection (debug builds: `WITNESS_DEBUG_PANE=<row index>` fakes one).
+    fn pane_selection(&self, pane: PaneRole) -> Option<i64> {
+        if let Some(index) = debug_index("WITNESS_DEBUG_PANE") {
+            return self.meetings.get(index).map(|m| m.id);
+        }
+        match pane {
+            PaneRole::List { selected } => selected,
+            PaneRole::Full | PaneRole::Detail => None,
+        }
+    }
+
+    /// Track the meeting open beside the list: when it changes (the shell
+    /// opened another), the keyboard selection moves to it and it scrolls
+    /// into view — once it is loaded.
+    fn follow_pane(&mut self, open: Option<i64>) {
+        self.pane_open = open;
+        if open != self.pane_seen {
+            self.pane_seen = open;
+            if let Some(id) = open {
+                self.cursor = Some(Sel::Meeting(id));
+                self.reveal = self.cursor;
+            }
+        }
+    }
+
+    /// The keyboard-selectable items in display order: the meetings, then
+    /// the recycle-bin rows while the bin is open.
+    fn nav_items(&self) -> Vec<Sel> {
+        let mut items: Vec<Sel> = self.meetings.iter().map(|m| Sel::Meeting(m.id)).collect();
+        if self.bin_open {
+            items.extend(self.binned.iter().map(|d| Sel::Binned(d.meeting.id)));
+        }
+        items
+    }
+
+    /// Apply the list keys to the selection; returns what they ask for:
+    /// Enter opens a meeting (restores a binned one), Delete moves it to the
+    /// bin (deletes a binned one for good) after the usual confirmation, F2
+    /// renames. Keys on a selection that is no longer listed do nothing.
+    fn key_actions(&mut self, keys: ListKeys) -> Vec<RowAction> {
+        let items = self.nav_items();
+        if let Some(motion) = keys.motion {
+            self.cursor = step_selection(&items, self.cursor.as_ref(), motion);
+            self.reveal = self.cursor;
+        }
+        let Some(sel) = self.cursor.filter(|sel| items.contains(sel)) else {
+            return Vec::new();
+        };
+        let title = |id: i64| {
+            match sel {
+                Sel::Meeting(_) => self.meetings.iter().find(|m| m.id == id),
+                Sel::Binned(_) => self.binned.iter().map(|d| &d.meeting).find(|m| m.id == id),
+            }
+            .map(|m| m.title.clone())
+            .unwrap_or_default()
+        };
+        let mut actions = Vec::new();
+        match sel {
+            Sel::Meeting(id) => {
+                if keys.activate {
+                    actions.push(RowAction::OpenNow(id));
+                }
+                if let Some(skip) = keys.delete {
+                    let title = title(id);
+                    actions.push(RowAction::Delete { id, title, skip });
+                }
+                if keys.rename {
+                    let title = title(id);
+                    actions.push(RowAction::StartEdit { id, title });
+                }
+            }
+            Sel::Binned(id) => {
+                if keys.activate {
+                    actions.push(RowAction::Restore(id));
+                }
+                if let Some(skip) = keys.delete {
+                    let title = title(id);
+                    actions.push(RowAction::Purge { id, title, skip });
+                }
+            }
+        }
+        actions
+    }
+
+    /// Debug builds only, for passive snapshots: `WITNESS_DEBUG_EMPTY=1`
+    /// shows an empty library (`=bin`: just an empty recycle bin; with
+    /// `WITNESS_DEBUG_BIN=1` it shows open) and `WITNESS_DEBUG_SELECT=<n>`
+    /// puts the keyboard selection on the n-th meeting once the list loads
+    /// (`=bin:<n>`: on the n-th recycle-bin row).
+    fn debug_states(&mut self) {
+        match debug_value("WITNESS_DEBUG_EMPTY").as_deref() {
+            Some("1") => {
+                self.meetings.clear();
+                self.binned.clear();
+                self.has_more = false;
+                self.days = None;
+            }
+            Some("bin") => self.binned.clear(),
+            _ => {}
+        }
+        if self.debug_selected || self.meetings.is_empty() || self.bin_load.is_some() {
+            return;
+        }
+        let Some(spec) = debug_value("WITNESS_DEBUG_SELECT") else {
+            return;
+        };
+        self.debug_selected = true;
+        let index = |n: &str| n.trim().parse::<usize>().ok();
+        self.cursor = match spec.split_once(':') {
+            Some(("bin", n)) => index(n)
+                .and_then(|n| self.binned.get(n))
+                .map(|d| Sel::Binned(d.meeting.id)),
+            _ => index(&spec)
+                .and_then(|n| self.meetings.get(n))
+                .map(|m| Sel::Meeting(m.id)),
+        };
+        self.reveal = self.cursor;
     }
 
     // ------------------------------------------------------------------
@@ -758,9 +1218,11 @@ impl MeetingsView {
         match action {
             RowAction::OpenNow(id) => {
                 self.pending_open = None;
+                self.cursor = Some(Sel::Meeting(id));
                 open_transcript(cx, id, View::Meetings);
             }
             RowAction::OpenLater(id) => {
+                self.cursor = Some(Sel::Meeting(id));
                 self.pending_open = Some((id, Instant::now() + OPEN_DELAY));
                 ui.ctx().request_repaint_after(OPEN_DELAY);
             }
@@ -823,6 +1285,10 @@ impl MeetingsView {
             }
             // `load(0, false)`: the default page size, not loadedCount.
             RowAction::TryAgain => self.load(cx, 0, false, PAGE),
+            // The top bar's path: its pill shows the start, and the new
+            // meeting arrives through the usual refresh.
+            RowAction::StartRecording => cx.submit_rec(RecCmd::Start(Trigger::Manual)),
+            RowAction::OpenSettings => cx.nav.go(View::Settings),
         }
     }
 
@@ -837,8 +1303,14 @@ impl MeetingsView {
                 node.set_label("Meetings");
             });
 
-        if self.loading() && self.meetings.is_empty() {
-            widgets::empty_state(ui, "Loading meetings…", None);
+        if (self.loading() && self.meetings.is_empty()) || debug_flag("WITNESS_DEBUG_LOADING") {
+            let due = self
+                .list_load
+                .as_ref()
+                .is_none_or(|load| skeleton_due(ui, load.started));
+            if due {
+                list_skeleton(ui);
+            }
             return;
         }
         if self.meetings.is_empty() {
@@ -849,11 +1321,12 @@ impl MeetingsView {
                 }
                 return;
             }
-            widgets::empty_state(
-                ui,
-                "No meetings yet.",
-                Some("Join a meeting or hit record."),
-            );
+            let (body, buttons) = empty_library(&self.env);
+            let labels: Vec<&str> = buttons.iter().map(|(label, _)| *label).collect();
+            let clicked = empty_hero(ui, ph::WAVEFORM, "No meetings yet", &body, &labels, false);
+            if let Some(index) = clicked {
+                actions.push(buttons[index].1.clone());
+            }
             self.draw_bin(ui, actions);
             return;
         }
@@ -910,6 +1383,9 @@ impl MeetingsView {
         let today = Local::now().date_naive();
         let days = self.days.as_deref().unwrap_or_default();
         let mut drawn = 0;
+        // The current group's header (its first row index and rect): a
+        // revealed first row brings its day header into view with it.
+        let mut header: Option<(usize, Rect)> = None;
         for &(item, top, height) in &layout.items {
             let rect = Rect::from_min_size(
                 egui::pos2(list_rect.left(), list_rect.top() + top),
@@ -917,6 +1393,7 @@ impl MeetingsView {
             );
             match item {
                 Item::Header(first) => {
+                    header = Some((first, rect));
                     if !band.intersects(rect) {
                         continue;
                     }
@@ -926,6 +1403,15 @@ impl MeetingsView {
                 }
                 Item::Row(index) => {
                     let meeting = &self.meetings[index];
+                    let sel = Sel::Meeting(meeting.id);
+                    if self.reveal == Some(sel) {
+                        self.reveal = None;
+                        let target = match header {
+                            Some((first, header)) if first == index => header.union(rect),
+                            _ => rect,
+                        };
+                        ui.scroll_to_rect(target, None);
+                    }
                     let editing = self.editing.as_mut().filter(|e| e.id == meeting.id);
                     // The editor's and the focused row are always drawn: a
                     // widget that is not drawn loses its focus (and a rename
@@ -935,11 +1421,26 @@ impl MeetingsView {
                         continue;
                     }
                     drawn += 1;
-                    if meeting_row(ui, rect, metrics, meeting, editing, kept, actions) {
+                    let mark = RowMark {
+                        selected: self.cursor == Some(sel),
+                        open: self.pane_open == Some(meeting.id),
+                        focus_kept: kept,
+                    };
+                    let focused = meeting_row(ui, rect, metrics, meeting, editing, mark, actions);
+                    if focused {
                         self.focused_row = Some(meeting.id);
+                        // Keyboard focus (Tab, egui's arrow moves) carries
+                        // the selection with it.
+                        self.cursor = Some(sel);
                     }
                 }
             }
+        }
+        // A meeting to reveal that the loaded list doesn't have (the open
+        // one is older than the loaded pages) is dropped, so it can't jump
+        // the list later on Load more.
+        if matches!(self.reveal, Some(Sel::Meeting(_))) && !self.loading() {
+            self.reveal = None;
         }
         // Each drawn item took one auto id from `ui`; take the skipped
         // items' too, so the ids of Load more and the bin (and so their
@@ -947,16 +1448,19 @@ impl MeetingsView {
         ui.skip_ahead_auto_ids(layout.items.len() - drawn);
     }
 
+    /// The recycle bin: shown while it has meetings, and while open (so
+    /// emptying it shows its empty state rather than whisking it away).
     fn draw_bin(&mut self, ui: &mut egui::Ui, actions: &mut Vec<RowAction>) {
-        if self.binned.is_empty() {
+        if self.binned.is_empty() && !self.bin_open {
             return;
         }
         widgets::gap(ui, theme::S5);
         let open = self.bin_open;
         let count = self.binned.len();
+        let can_empty = open && count > 0;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = theme::S2;
-            let empty_width = if open {
+            let empty_width = if can_empty {
                 empty_bin_width(ui) + ui.spacing().item_spacing.x
             } else {
                 0.0
@@ -970,7 +1474,7 @@ impl MeetingsView {
             if head.clicked() {
                 actions.push(RowAction::ToggleBin);
             }
-            if open {
+            if can_empty {
                 let label = egui::RichText::new("Empty bin")
                     .size(13.0)
                     .color(pal().text_muted);
@@ -983,6 +1487,17 @@ impl MeetingsView {
             }
         });
         if !open {
+            return;
+        }
+        if count == 0 {
+            empty_hero(
+                ui,
+                ph::TRASH,
+                "The recycle bin is empty",
+                "Deleted meetings wait here for 30 days before they are removed for good.",
+                &[],
+                true,
+            );
             return;
         }
         // The 30-day rule, said once for every row (aligned with row text).
@@ -1011,7 +1526,16 @@ impl MeetingsView {
             if index > 0 {
                 ui.add_space(ROW_GAP);
             }
-            bin_row(ui, slot, deleted, today, actions);
+            let sel = Sel::Binned(deleted.meeting.id);
+            let selected = self.cursor == Some(sel);
+            let row = bin_row(ui, slot, deleted, today, selected, actions);
+            if self.reveal == Some(sel) {
+                self.reveal = None;
+                ui.scroll_to_rect(row.rect, None);
+            }
+            if row.has_focus {
+                self.cursor = Some(sel);
+            }
         }
     }
 }
@@ -1027,6 +1551,98 @@ fn debug_bin_open() -> bool {
     #[cfg(not(debug_assertions))]
     {
         false
+    }
+}
+
+/// `ctrl+alt+r` → `Ctrl+Alt+R`.
+fn hotkey_text(combo: &str) -> String {
+    combo
+        .split('+')
+        .map(|part| {
+            let mut chars = part.trim().chars();
+            chars.next().map_or_else(String::new, |first| {
+                first
+                    .to_uppercase()
+                    .chain(chars.flat_map(char::to_lowercase))
+                    .collect()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+/// The empty library's sentence and buttons: how meetings get here (auto-
+/// record on or off, the hotkey when one is bound), "Start recording"
+/// unless one is already starting, and Settings while auto-record is off.
+fn empty_library(env: &EmptyEnv) -> (String, Vec<(&'static str, RowAction)>) {
+    let hotkey = env
+        .record_hotkey
+        .as_deref()
+        .map(|combo| format!(" ({})", hotkey_text(combo)))
+        .unwrap_or_default();
+    let body = if env.auto_record {
+        format!(
+            "Witness records Teams calls by itself as they begin. To capture anything else, start a recording yourself{hotkey}."
+        )
+    } else {
+        format!(
+            "Start a recording yourself{hotkey}, or turn on auto-record in Settings to capture Teams calls as they begin."
+        )
+    };
+    let mut buttons = Vec::new();
+    if !env.recording {
+        buttons.push(("Start recording", RowAction::StartRecording));
+    }
+    if !env.auto_record {
+        buttons.push(("Open Settings", RowAction::OpenSettings));
+    }
+    (body, buttons)
+}
+
+/// The first load's placeholder: day groups of row-shaped skeletons on the
+/// real rows' metrics (a title bar over a meta bar), enough to fill the
+/// viewport.
+fn list_skeleton(ui: &mut egui::Ui) {
+    let metrics = RowMetrics::measure(ui);
+    let (first, header) = header_heights(ui);
+    let pitch = metrics.height + ROW_GAP;
+    let rows = ((ui.clip_rect().height() / pitch).ceil() as usize).clamp(4, 16);
+    // Fake days: groups of 2, 4, then the rest, like a working week.
+    let days: Vec<Option<NaiveDate>> = (0..rows)
+        .map(|row| NaiveDate::from_ymd_opt(2000, 1, 1 + u32::from(row >= 2) + u32::from(row >= 6)))
+        .collect();
+    let layout = list_layout(&days, metrics.height, first, header);
+    let width = ui.available_width();
+    let (_, list_rect) = ui.allocate_space(egui::vec2(width, layout.height));
+    // Real titles rarely run past ~480 pt, whatever the column's width.
+    let measure = (width - 2.0 * ROW_PAD.x).min(480.0);
+    let bar = |left: f32, center_y: f32, w: f32, h: f32| {
+        Rect::from_min_size(egui::pos2(left, center_y - h / 2.0), egui::vec2(w, h))
+    };
+    for (n, &(item, top, height)) in layout.items.iter().enumerate() {
+        let rect = Rect::from_min_size(
+            egui::pos2(list_rect.left(), list_rect.top() + top),
+            egui::vec2(list_rect.width(), height),
+        );
+        let left = rect.left() + ROW_PAD.x;
+        match item {
+            Item::Header(_) => {
+                // The label sits at the header's foot, above the gap.
+                let y = rect.bottom() - HEADER_BELOW - 7.0;
+                let w = [44.0, 76.0, 68.0][n % 3];
+                skeleton_at(ui, bar(left, y, w, 9.0));
+            }
+            Item::Row(row) => {
+                let inner = rect.shrink2(ROW_PAD);
+                let block = metrics.line + TITLE_META_GAP + metrics.meta;
+                let top = inner.center().y - block / 2.0;
+                let title = measure * [0.62, 0.48, 0.71, 0.55, 0.66, 0.44][row % 6];
+                let meta: f32 = [120.0, 96.0, 136.0, 108.0][row % 4];
+                skeleton_at(ui, bar(left, top + metrics.title / 2.0, title, 12.0));
+                let meta_y = top + metrics.line + TITLE_META_GAP + metrics.meta / 2.0;
+                skeleton_at(ui, bar(left, meta_y, meta.min(measure), 9.0));
+            }
+        }
     }
 }
 
@@ -1148,20 +1764,47 @@ fn day_header_item(ui: &mut egui::Ui, rect: Rect, first: usize, label: &str) {
     widgets::day_header(&mut header, label);
 }
 
+/// How a meeting row is marked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RowMark {
+    /// The keyboard selection: the selected-row fill.
+    selected: bool,
+    /// Open in the split's detail pane: the fill plus the accent pill.
+    open: bool,
+    /// One of its widgets held the keyboard focus last pass.
+    focus_kept: bool,
+}
+
+impl RowMark {
+    /// The row's fill: selected (or open) rows keep theirs under the
+    /// pointer; others fill on hover.
+    fn fill(self, hovered: bool) -> Option<Color32> {
+        if self.selected || self.open {
+            Some(pal().bg_active)
+        } else if hovered {
+            Some(pal().bg_hover)
+        } else {
+            None
+        }
+    }
+}
+
 /// One meeting row at `rect` (uniform height): a flat row that fills on
-/// hover. The whole row opens the meeting; rename and delete show while
-/// the row is hovered, holds the keyboard focus (`focus_kept`: it did last
-/// pass) or is being renamed — they stay in the Tab order when hidden.
-/// True when one of its widgets has the keyboard focus.
+/// hover, and stays filled while selected or open beside the list. The
+/// whole row opens the meeting; rename and delete show while the row is
+/// hovered, holds the keyboard focus (`mark.focus_kept`: it did last pass)
+/// or is being renamed — they stay in the Tab order when hidden. True when
+/// one of its widgets has the keyboard focus.
 fn meeting_row(
     ui: &mut egui::Ui,
     rect: Rect,
     metrics: RowMetrics,
     m: &Meeting,
     editing: Option<&mut Editing>,
-    focus_kept: bool,
+    mark: RowMark,
     actions: &mut Vec<RowAction>,
 ) -> bool {
+    let focus_kept = mark.focus_kept;
     // An id that doesn't depend on how many rows were drawn before this one:
     // an auto id would change on scrolling, and egui would drop the focus
     // of the row's buttons.
@@ -1179,9 +1822,12 @@ fn meeting_row(
     let is_editing = editing.is_some();
     let ring = widgets::focus_visible(row.ctx());
     let revealed = hovered || is_editing || (focus_kept && ring);
-    if hovered {
+    if let Some(fill) = mark.fill(hovered) {
         row.painter()
-            .rect_filled(rect, CornerRadius::same(theme::R_MD), pal().bg_hover);
+            .rect_filled(rect, CornerRadius::same(theme::R_MD), fill);
+    }
+    if mark.open {
+        paint_open_pill(&row, rect);
     }
 
     let metrics = if is_editing {
@@ -1593,16 +2239,26 @@ fn bin_head(ui: &mut egui::Ui, width: f32, count: usize, open: bool) -> Response
     response.on_hover_cursor(CursorIcon::PointingHand)
 }
 
-/// One recycle-bin row: a flat row (hover fill) with the title and meta
-/// elided, then Restore and Delete forever. Not clickable itself.
+/// What a drawn recycle-bin row reports.
+struct BinRowOut {
+    rect: Rect,
+    /// Restore or Delete forever holds the keyboard focus.
+    has_focus: bool,
+}
+
+/// One recycle-bin row: a flat row (hover fill; the selected fill while it
+/// has the keyboard selection) with the title and meta elided, then Restore
+/// and Delete forever. Not clickable itself.
 fn bin_row(
     ui: &mut egui::Ui,
     slot: f32,
     d: &DeletedMeeting,
     today: NaiveDate,
+    selected: bool,
     actions: &mut Vec<RowAction>,
-) {
+) -> BinRowOut {
     let m = &d.meeting;
+    let mut has_focus = false;
     let background = ui.painter().add(egui::Shape::Noop);
     let row = egui::Frame::new()
         .inner_margin(Margin::symmetric(ROW_PAD.x as i8, ROW_PAD.y as i8))
@@ -1628,6 +2284,7 @@ fn bin_row(
                 let name = format!("Restore {}", m.title);
                 restore.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
                 follow_focus(&restore);
+                has_focus |= restore.has_focus();
                 if restore.clicked() {
                     actions.push(RowAction::Restore(m.id));
                 }
@@ -1636,6 +2293,7 @@ fn bin_row(
                 let name = format!("Permanently delete {}", m.title);
                 purge.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
                 follow_focus(&purge);
+                has_focus |= purge.has_focus();
                 if purge.clicked() {
                     actions.push(RowAction::Purge {
                         id: m.id,
@@ -1646,15 +2304,19 @@ fn bin_row(
             });
         })
         .response;
-    if ui.rect_contains_pointer(row.rect) {
+    let mark = RowMark {
+        selected,
+        ..RowMark::default()
+    };
+    if let Some(fill) = mark.fill(ui.rect_contains_pointer(row.rect)) {
         ui.painter().set(
             background,
-            egui::epaint::RectShape::filled(
-                row.rect,
-                CornerRadius::same(theme::R_MD),
-                pal().bg_hover,
-            ),
+            egui::epaint::RectShape::filled(row.rect, CornerRadius::same(theme::R_MD), fill),
         );
+    }
+    BinRowOut {
+        rect: row.rect,
+        has_focus,
     }
 }
 
@@ -1858,7 +2520,15 @@ mod tests {
             .enumerate()
             {
                 let m = meeting(10 + id as i64, status, "auto", Some(1000));
-                meeting_row(ui, rect, metrics, &m, None, false, &mut actions);
+                meeting_row(
+                    ui,
+                    rect,
+                    metrics,
+                    &m,
+                    None,
+                    RowMark::default(),
+                    &mut actions,
+                );
             }
             let m = meeting(4, "transcribed", "manual", None);
             let mut editing = Editing {
@@ -1874,7 +2544,11 @@ mod tests {
                 metrics,
                 &m,
                 Some(&mut editing),
-                true,
+                RowMark {
+                    selected: true,
+                    open: true,
+                    focus_kept: true,
+                },
                 &mut actions,
             );
             assert!(!editing.focus_pending, "focus is requested once");
@@ -1883,7 +2557,7 @@ mod tests {
                 deleted_at: "2026-10-06T10:00:00+01:00".into(),
             };
             let today = Local::now().date_naive();
-            bin_row(ui, metrics.slot, &binned, today, &mut actions);
+            bin_row(ui, metrics.slot, &binned, today, true, &mut actions);
             bin_head(ui, 300.0, 3, true);
             assert!(actions.is_empty(), "no input, no actions");
         });
@@ -2180,5 +2854,334 @@ mod tests {
             let end = text.pos.x + text.galley.size().x;
             assert!(end <= right + 0.5, "{:?} ends at {end}", text.galley.text());
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Keyboard selection, the split's open meeting, loading / empty states
+
+    fn key(key: Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// `read_list_keys` over one pass fed `events`.
+    fn keys_of(events: Vec<egui::Event>, space: bool, edit_keys: bool) -> ListKeys {
+        let ctx = theme::test_context();
+        let mut keys = ListKeys::default();
+        let input = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            keys = read_list_keys(ui.ctx(), space, edit_keys)
+        });
+        output.textures_delta.clear();
+        keys
+    }
+
+    #[test]
+    fn selection_steps_and_stops_at_the_ends() {
+        let items = [10, 20, 30, 40];
+        let step = |current: Option<i32>, motion| step_selection(&items, current.as_ref(), motion);
+        // No selection (or a stale one): a step lands on the first item.
+        assert_eq!(step(None, Motion::By(1)), Some(10));
+        assert_eq!(step(None, Motion::By(-1)), Some(10));
+        assert_eq!(step(Some(99), Motion::By(1)), Some(10));
+        assert_eq!(step(None, Motion::Last), Some(40));
+        assert_eq!(step(Some(20), Motion::By(1)), Some(30));
+        assert_eq!(step(Some(20), Motion::By(-1)), Some(10));
+        assert_eq!(step(Some(20), Motion::By(5)), Some(40), "clamped");
+        assert_eq!(step(Some(10), Motion::By(-1)), Some(10));
+        assert_eq!(step(Some(30), Motion::First), Some(10));
+        assert_eq!(step(Some(10), Motion::Last), Some(40));
+        assert_eq!(step_selection::<i32>(&[], None, Motion::By(1)), None);
+    }
+
+    #[test]
+    fn list_keys_are_read_and_netted() {
+        use egui::Modifiers as M;
+        let none = M::NONE;
+        let down = keys_of(
+            vec![key(Key::ArrowDown, none), key(Key::J, none)],
+            false,
+            false,
+        );
+        assert_eq!(down.motion, Some(Motion::By(2)));
+        let net = keys_of(
+            vec![key(Key::ArrowDown, none), key(Key::K, none)],
+            false,
+            false,
+        );
+        assert_eq!(net.motion, None, "down and up cancel out");
+        let home = keys_of(
+            vec![key(Key::ArrowDown, none), key(Key::Home, none)],
+            false,
+            false,
+        );
+        assert_eq!(home.motion, Some(Motion::First));
+        assert_eq!(
+            keys_of(vec![key(Key::End, none)], false, false).motion,
+            Some(Motion::Last)
+        );
+        assert!(keys_of(vec![key(Key::Enter, none)], false, false).activate);
+        // Space activates only where the view lets it.
+        assert!(!keys_of(vec![key(Key::Space, none)], false, false).activate);
+        assert!(keys_of(vec![key(Key::Space, none)], true, false).activate);
+        // Delete / F2 only with the edit keys; Shift+Delete skips confirming.
+        let del = vec![key(Key::Delete, M::SHIFT), key(Key::F2, none)];
+        assert_eq!(keys_of(del.clone(), false, false), ListKeys::default());
+        let edit = keys_of(del, false, true);
+        assert_eq!((edit.delete, edit.rename), (Some(true), true));
+        // Ctrl+J / Ctrl+K belong to someone else (Ctrl+K: the palette).
+        assert_eq!(
+            keys_of(vec![key(Key::K, M::COMMAND)], false, false).motion,
+            None
+        );
+    }
+
+    #[test]
+    fn list_keys_wait_for_a_free_keyboard() {
+        let ctx = theme::test_context();
+        assert!(list_keys_free(&ctx, false));
+        assert!(!list_keys_free(&ctx, true), "a modal is open");
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("search-box")));
+        assert!(!list_keys_free(&ctx, false), "a widget has the focus");
+    }
+
+    #[test]
+    fn keys_move_the_selection_and_act_on_it() {
+        let mut view = list_view(3);
+        view.binned = vec![DeletedMeeting {
+            meeting: meeting(99, "transcribed", "manual", None),
+            deleted_at: "2026-10-06T10:00:00+01:00".into(),
+        }];
+        let keys = |motion| ListKeys {
+            motion: Some(motion),
+            ..ListKeys::default()
+        };
+        assert!(view.key_actions(keys(Motion::By(1))).is_empty());
+        assert_eq!(view.cursor, Some(Sel::Meeting(1)));
+        assert_eq!(view.reveal, view.cursor, "a keyboard move scrolls");
+        view.key_actions(keys(Motion::By(1)));
+        let act = ListKeys {
+            activate: true,
+            delete: Some(true),
+            rename: true,
+            ..ListKeys::default()
+        };
+        assert_eq!(
+            view.key_actions(act),
+            vec![
+                RowAction::OpenNow(2),
+                RowAction::Delete {
+                    id: 2,
+                    title: "Meeting 2".into(),
+                    skip: true
+                },
+                RowAction::StartEdit {
+                    id: 2,
+                    title: "Meeting 2".into()
+                },
+            ]
+        );
+        // The closed bin is not in the walk; the open one follows the list.
+        view.key_actions(keys(Motion::Last));
+        assert_eq!(view.cursor, Some(Sel::Meeting(3)));
+        view.bin_open = true;
+        view.key_actions(keys(Motion::By(1)));
+        assert_eq!(view.cursor, Some(Sel::Binned(99)));
+        let act = ListKeys {
+            activate: true,
+            delete: Some(false),
+            rename: true,
+            ..ListKeys::default()
+        };
+        assert_eq!(
+            view.key_actions(act),
+            vec![
+                RowAction::Restore(99),
+                RowAction::Purge {
+                    id: 99,
+                    title: "Meeting 99".into(),
+                    skip: false
+                },
+            ],
+            "Enter restores, Delete purges, F2 does nothing in the bin"
+        );
+        // A selection that is gone (restored, purged, bin closed) is inert.
+        view.bin_open = false;
+        let enter = ListKeys {
+            activate: true,
+            ..ListKeys::default()
+        };
+        assert!(view.key_actions(enter).is_empty());
+    }
+
+    #[test]
+    fn the_open_meeting_takes_the_selection_once() {
+        let mut view = list_view(5);
+        view.follow_pane(Some(4));
+        assert_eq!(view.pane_open, Some(4));
+        assert_eq!(
+            (view.cursor, view.reveal),
+            (Some(Sel::Meeting(4)), Some(Sel::Meeting(4)))
+        );
+        // The user moves on; the same open meeting doesn't pull them back.
+        view.cursor = Some(Sel::Meeting(1));
+        view.reveal = None;
+        view.follow_pane(Some(4));
+        assert_eq!((view.cursor, view.reveal), (Some(Sel::Meeting(1)), None));
+        // Full width again: nothing is open; the selection stays.
+        view.follow_pane(None);
+        assert_eq!((view.pane_open, view.cursor), (None, Some(Sel::Meeting(1))));
+        assert_eq!(
+            view.pane_selection(PaneRole::List { selected: Some(7) }),
+            Some(7)
+        );
+        assert_eq!(view.pane_selection(PaneRole::Full), None);
+        assert_eq!(view.pane_selection(PaneRole::Detail), None);
+    }
+
+    #[test]
+    fn selected_and_open_rows_keep_their_fill() {
+        let selected = RowMark {
+            selected: true,
+            ..RowMark::default()
+        };
+        let open = RowMark {
+            open: true,
+            ..RowMark::default()
+        };
+        assert_eq!(selected.fill(false), Some(pal().bg_active));
+        assert_eq!(selected.fill(true), Some(pal().bg_active), "not hover's");
+        assert_eq!(open.fill(false), Some(pal().bg_active));
+        assert_eq!(RowMark::default().fill(true), Some(pal().bg_hover));
+        assert_eq!(RowMark::default().fill(false), None);
+    }
+
+    /// The texts `view` draws in one 600 × 300 pass (after a settling
+    /// pass), with the list scrolled as its reveal asks.
+    fn drawn_texts(ctx: &egui::Context, view: &mut MeetingsView) -> Vec<String> {
+        // Test time stands still: scroll at once.
+        ctx.all_styles_mut(|s| s.scroll_animation = egui::style::ScrollAnimation::none());
+        let mut texts = Vec::new();
+        for _ in 0..3 {
+            let (_, _) = pass(ctx, view, Vec::new(), None);
+        }
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 400.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("meetings-scroll")
+                .max_height(300.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| view.draw(ui, &mut Vec::new()));
+        });
+        output.textures_delta.clear();
+        for clipped in output.shapes {
+            if let egui::Shape::Text(text) = clipped.shape {
+                if clipped.clip_rect.intersects(text.visual_bounding_rect()) {
+                    texts.push(text.galley.text().to_owned());
+                }
+            }
+        }
+        texts
+    }
+
+    #[test]
+    fn a_selection_off_screen_scrolls_into_view() {
+        let ctx = theme::test_context();
+        let mut view = list_view(40);
+        assert!(!drawn_texts(&ctx, &mut view).contains(&"Meeting 40".to_owned()));
+        view.key_actions(ListKeys {
+            motion: Some(Motion::Last),
+            ..ListKeys::default()
+        });
+        let texts = drawn_texts(&ctx, &mut view);
+        assert!(texts.contains(&"Meeting 40".to_owned()), "{texts:?}");
+        assert_eq!(view.reveal, None, "revealed once");
+    }
+
+    #[test]
+    fn empty_library_offers_a_way_to_record() {
+        let env = EmptyEnv {
+            auto_record: false,
+            recording: false,
+            record_hotkey: Some("ctrl+alt+r".into()),
+        };
+        let (body, buttons) = empty_library(&env);
+        assert!(body.contains("(Ctrl+Alt+R)"), "{body}");
+        assert!(body.contains("auto-record"), "{body}");
+        assert_eq!(
+            buttons,
+            vec![
+                ("Start recording", RowAction::StartRecording),
+                ("Open Settings", RowAction::OpenSettings),
+            ]
+        );
+        // Auto-record on, already recording, no hotkey bound.
+        let env = EmptyEnv {
+            auto_record: true,
+            recording: true,
+            record_hotkey: None,
+        };
+        let (body, buttons) = empty_library(&env);
+        assert!(
+            body.starts_with("Witness records Teams calls by itself"),
+            "{body}"
+        );
+        assert!(!body.contains('('), "{body}");
+        assert!(buttons.is_empty());
+        assert_eq!(hotkey_text("ctrl+shift+R"), "Ctrl+Shift+R");
+    }
+
+    #[test]
+    fn first_load_skeleton_then_the_empty_state() {
+        let ctx = theme::test_context();
+        // A first load: a skeleton, no text at all.
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(380.0, 760.0),
+            )),
+            ..Default::default()
+        };
+        let mut skeleton = Vec::new();
+        let mut output = ctx.run_ui(input(), list_skeleton);
+        output.textures_delta.clear();
+        for clipped in &output.shapes {
+            assert!(!matches!(clipped.shape, egui::Shape::Text(_)));
+            let rect = clipped.shape.visual_bounding_rect();
+            if rect.is_positive() {
+                skeleton.push(rect);
+            }
+        }
+        assert!(skeleton.len() >= 8, "{} bars", skeleton.len());
+        assert!(skeleton.iter().all(|r| r.right() <= 380.5), "no overflow");
+
+        // Loaded and empty: the designed empty state.
+        let mut view = MeetingsView::new();
+        let texts = drawn_texts(&ctx, &mut view);
+        assert!(texts.contains(&"No meetings yet".to_owned()), "{texts:?}");
+        assert!(texts.contains(&"Start recording".to_owned()), "{texts:?}");
+        // An open bin that was emptied keeps its head and says so.
+        let mut view = list_view(1);
+        view.bin_open = true;
+        let texts = drawn_texts(&ctx, &mut view);
+        assert!(
+            texts.contains(&"The recycle bin is empty".to_owned()),
+            "{texts:?}"
+        );
+        assert!(!texts.contains(&"Empty bin".to_owned()), "{texts:?}");
     }
 }

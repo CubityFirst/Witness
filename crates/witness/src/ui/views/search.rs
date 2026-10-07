@@ -7,14 +7,23 @@
 //! does not remount it) and re-searches whenever the query or an applied
 //! filter changes; old results are dropped first so they never show under
 //! a new heading. Search never auto-refreshes on `refresh_tick` (parity).
+//!
+//! The hits take the Meetings list's keyboard selection (↑/↓, j/k,
+//! Home/End, Enter opens) in display order; in a split the meeting open
+//! beside the results has its group marked. The first page shows a
+//! skeleton of the result layout, and no results a designed empty state.
 
 use crate::bridge::Task;
 use crate::ui::format::{fmt_ts, parse_snippet, SnippetPart};
 use crate::ui::icons::{self, ph};
 use crate::ui::theme::{self, pal};
-use crate::ui::views::meetings::{follow_focus, load_more_button, paint_focus_ring};
+use crate::ui::views::meetings::{
+    debug_flag, debug_index, empty_hero, follow_focus, list_keys_free, load_more_button,
+    paint_focus_ring, paint_selection, read_list_keys, skeleton_at, skeleton_due, step_selection,
+    ListKeys,
+};
 use crate::ui::widgets::{self, KeyScroll, Politeness};
-use crate::ui::{SearchFilters, UiCtx, View, Who};
+use crate::ui::{PaneRole, SearchFilters, UiCtx, View, Who};
 use chrono::{DateTime, Local, NaiveDate};
 use eframe::egui::{
     self, text::LayoutJob, text::TextWrapping, CornerRadius, CursorIcon, Key, Margin, Rect, Sense,
@@ -244,10 +253,40 @@ fn group_hits(hits: &[SearchHit]) -> Vec<Vec<usize>> {
 fn heading(query: &str, count: usize, has_more: bool) -> (String, String) {
     let plus = if has_more { "+" } else { "" };
     let noun = if count == 1 { "match" } else { "matches" };
-    (
-        format!("Results for \u{201c}{query}\u{201d}"),
-        format!(" — {count}{plus} {noun}"),
-    )
+    (heading_main(query), format!(" — {count}{plus} {noun}"))
+}
+
+/// The heading while the first page is on its way (no count yet).
+const SEARCHING: &str = " — searching…";
+
+/// `Results for “{q}”`.
+fn heading_main(query: &str) -> String {
+    format!("Results for \u{201c}{query}\u{201d}")
+}
+
+/// The no-results state: (title, sentence, button). With filters set, the
+/// way out is clearing them; otherwise a hint at what search covers.
+fn no_results(query: &str, filtered: bool) -> (String, &'static str, Option<&'static str>) {
+    // Long queries are cut: the title is a heading, not a transcript.
+    const MAX: usize = 32;
+    let mut shown: String = query.trim().chars().take(MAX).collect();
+    if query.trim().chars().count() > MAX {
+        shown.push('…');
+    }
+    let title = format!("No matches for \u{201c}{shown}\u{201d}");
+    if filtered {
+        (
+            title,
+            "Nothing matches with the current filters. Clear them to search every meeting.",
+            Some("Clear filters"),
+        )
+    } else {
+        (
+            title,
+            "Search covers every transcript and your meeting notes. Try another word, or fewer of them.",
+            None,
+        )
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -374,9 +413,10 @@ fn mark_rects(galley: &egui::Galley, marks: &[Range<usize>]) -> Vec<Rect> {
 }
 
 /// One hit: a flat [`widgets::list_row`] with the meta line over the
-/// wrapped snippet; true when activated (click, Enter or Space).
-fn hit_row(ui: &mut egui::Ui, index: usize, hit: &SearchHit) -> bool {
-    let (response, ()) = widgets::list_row(ui, ("search-hit", index), false, |ui, _| {
+/// wrapped snippet, filled while it has the keyboard selection; clicked
+/// when activated (click, or Enter / Space while focused).
+fn hit_row(ui: &mut egui::Ui, index: usize, hit: &SearchHit, selected: bool) -> egui::Response {
+    let (response, ()) = widgets::list_row(ui, ("search-hit", index), selected, |ui, _| {
         ui.spacing_mut().item_spacing.y = 2.0;
         let width = ui.available_width();
         let meta = ui.painter().layout_job(hit_meta_job(hit, width));
@@ -401,13 +441,15 @@ fn hit_row(ui: &mut egui::Ui, index: usize, hit: &SearchHit) -> bool {
     let label = hit_label(hit);
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &label));
     follow_focus(&response);
-    response.clicked()
+    response
 }
 
 /// A meeting group's header: the meeting title as an elided link (opens
-/// the meeting) with its short date muted on the right; true when
-/// activated.
-fn group_title(ui: &mut egui::Ui, hit: &SearchHit, today: NaiveDate) -> bool {
+/// the meeting) with its short date muted on the right. `open`: the
+/// meeting is open beside the results (a split), marked with the selected
+/// fill and the accent pill. Returns the header's rect and whether the
+/// link was activated.
+fn group_title(ui: &mut egui::Ui, hit: &SearchHit, today: NaiveDate, open: bool) -> (Rect, bool) {
     let width = ui.available_width();
     let inner = (width - 2.0 * ROW_INSET).max(40.0);
     let date = ui.painter().layout_no_wrap(
@@ -440,6 +482,9 @@ fn group_title(ui: &mut egui::Ui, hit: &SearchHit, today: NaiveDate) -> bool {
     let hot = response.hovered();
     let color = if hot { pal().accent } else { pal().text };
     if ui.is_rect_visible(rect) {
+        if open {
+            paint_selection(ui, rect, true);
+        }
         let painter = ui.painter();
         let elided = title.elided;
         painter.galley(title_rect.min, title, color);
@@ -466,7 +511,62 @@ fn group_title(ui: &mut egui::Ui, hit: &SearchHit, today: NaiveDate) -> bool {
     }
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Link, true, &hit.meeting_title));
     follow_focus(&response);
-    response.on_hover_cursor(CursorIcon::PointingHand).clicked()
+    (
+        rect,
+        response.on_hover_cursor(CursorIcon::PointingHand).clicked(),
+    )
+}
+
+/// The first page's placeholder, on the real layout: meeting groups (a
+/// title bar with the date bar on the right) of hit rows (a short meta bar
+/// over two snippet lines).
+fn results_skeleton(ui: &mut egui::Ui) {
+    let width = ui.available_width();
+    let inner = (width - 2.0 * ROW_INSET).max(40.0);
+    let measure = inner.min(560.0);
+    let (title_h, meta_h) = ui.fonts_mut(|f| {
+        (
+            f.row_height(&theme::semibold(14.0)),
+            f.row_height(&theme::regular(12.0)),
+        )
+    });
+    let header_h = title_h + 8.0;
+    // list_row's 8 pt padding, the meta line, 2 pt, two snippet lines.
+    let hit_h = 8.0 + meta_h + 2.0 + 2.0 * HIT_LINE + 8.0;
+    let bar = |left: f32, center_y: f32, w: f32, h: f32| {
+        Rect::from_min_size(egui::pos2(left, center_y - h / 2.0), egui::vec2(w, h))
+    };
+    ui.spacing_mut().item_spacing.y = 0.0;
+    for (group, hits) in [2usize, 1, 2].into_iter().enumerate() {
+        if group > 0 {
+            ui.add_space(theme::S4);
+        }
+        let (header, _) = ui.allocate_exact_size(egui::vec2(width, header_h), Sense::hover());
+        let left = header.left() + ROW_INSET;
+        let title = measure * [0.52, 0.4, 0.6][group];
+        skeleton_at(ui, bar(left, header.center().y, title, 12.0));
+        // The date gives way first on narrow columns, as in `group_title`.
+        if 96.0 + theme::S3 <= inner * 0.45 {
+            let date = bar(
+                header.right() - ROW_INSET - 96.0,
+                header.center().y,
+                96.0,
+                9.0,
+            );
+            skeleton_at(ui, date);
+        }
+        for hit in 0..hits {
+            ui.add_space(2.0);
+            let (row, _) = ui.allocate_exact_size(egui::vec2(width, hit_h), Sense::hover());
+            let mut y = row.top() + 8.0 + meta_h / 2.0;
+            skeleton_at(ui, bar(left, y, [88.0_f32, 64.0][hit % 2].min(inner), 9.0));
+            y += meta_h / 2.0 + 2.0 + HIT_LINE / 2.0;
+            for line in [0.94, [0.58, 0.72][(group + hit) % 2]] {
+                skeleton_at(ui, bar(left, y, inner * line, 11.0));
+                y += HIT_LINE;
+            }
+        }
+    }
 }
 
 /// A result group's short date: `"Wed 22 Jul, 12:10"` (local), with the
@@ -486,18 +586,18 @@ fn group_date(rfc3339: &str, today: NaiveDate) -> String {
     }
 }
 
-/// The results heading, wrapping onto at most two lines. A query too long
-/// for that is shortened inside its quotes (`“very long que…”`) so the
-/// match count always shows; the tooltip has the whole heading.
+/// The results heading (`Results for “q”` + the muted `suffix`), wrapping
+/// onto at most two lines. A query too long for that is shortened inside
+/// its quotes (`“very long que…”`) so the suffix (the match count) always
+/// shows; the tooltip has the whole heading.
 fn heading_galley(
     ui: &egui::Ui,
     query: &str,
-    count: usize,
-    has_more: bool,
+    suffix: &str,
     width: f32,
 ) -> std::sync::Arc<egui::Galley> {
     let layout = |query: &str| {
-        let (main, suffix) = heading(query, count, has_more);
+        let main = heading_main(query);
         let mut job = LayoutJob::default();
         job.append(
             &main,
@@ -505,7 +605,7 @@ fn heading_galley(
             TextFormat::simple(theme::semibold(17.0), pal().text),
         );
         job.append(
-            &suffix,
+            suffix,
             0.0,
             TextFormat::simple(theme::semibold(17.0), pal().text_muted),
         );
@@ -543,15 +643,33 @@ fn heading_galley(
 struct SearchLoad {
     task: Task<CoreResult<Vec<SearchHit>>>,
     append: bool,
+    /// When it was requested (the first page's skeleton waits a moment).
+    started: Instant,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 enum Action {
     Open {
         meeting_id: i64,
         segment_id: Option<i64>,
+        /// The hit opened (None: a group title), which takes the selection.
+        hit: Option<usize>,
     },
     LoadMore,
     TryAgain,
+    /// The no-results state's way out.
+    ClearFilters,
+}
+
+/// The `Open` action for hit `index`: its meeting, seeking to its segment
+/// (a notes hit opens the meeting without a seek).
+fn open_hit(hits: &[SearchHit], index: usize) -> Action {
+    let hit = &hits[index];
+    Action::Open {
+        meeting_id: hit.meeting_id,
+        segment_id: (!is_note(hit)).then_some(hit.segment_id),
+        hit: Some(index),
+    }
 }
 
 pub struct SearchView {
@@ -570,6 +688,19 @@ pub struct SearchView {
     people_loaded: bool,
     /// The compact layout's "Filters" disclosure is open.
     filters_open: bool,
+    /// The keyboard selection: an index into `hits` (↑/↓ walk the hits in
+    /// display order, Enter opens). Reset with the results.
+    cursor: Option<usize>,
+    /// Scroll the selected hit into view on the next draw.
+    reveal: bool,
+    /// The meeting open beside the results (a split's `PaneRole::List`).
+    pane_open: Option<i64>,
+    /// `pane_open` as last seen, so only a change scrolls to it.
+    pane_seen: Option<i64>,
+    /// Scroll this meeting's group into view (once its results are in).
+    reveal_group: Option<i64>,
+    /// `WITNESS_DEBUG_SELECT` has been applied.
+    debug_selected: bool,
 }
 
 impl SearchView {
@@ -586,6 +717,12 @@ impl SearchView {
             people_requested: false,
             people_loaded: false,
             filters_open: debug_filters_open(),
+            cursor: None,
+            reveal: false,
+            pane_open: None,
+            pane_seen: None,
+            reveal_group: None,
+            debug_selected: false,
         }
     }
 
@@ -622,10 +759,20 @@ impl SearchView {
             self.searched = Some(key);
             self.hits.clear();
             self.has_more = false;
+            self.cursor = None;
             self.start(cx, 0, false);
         }
+        self.debug_select();
+        let open = self.pane_selection(cx.pane);
+        self.follow_pane(open);
 
+        // The list keys go before the scroller, which would otherwise
+        // scroll by the arrows / Home / End.
         let mut actions = Vec::new();
+        if list_keys_free(ui.ctx(), cx.confirm.is_open()) && !self.hits.is_empty() {
+            let keys = read_list_keys(ui.ctx(), false, false);
+            actions.extend(self.key_actions(keys));
+        }
         widgets::scroll_column(ui, "search-scroll", KeyScroll { space: true }, |ui| {
             self.draw(ui, cx, &mut actions)
         });
@@ -634,7 +781,11 @@ impl SearchView {
                 Action::Open {
                     meeting_id,
                     segment_id,
+                    hit,
                 } => {
+                    if hit.is_some() {
+                        self.cursor = hit;
+                    }
                     let query = self.query.clone();
                     cx.nav.go(View::Transcript {
                         meeting_id,
@@ -648,7 +799,61 @@ impl SearchView {
                     self.start(cx, offset, true);
                 }
                 Action::TryAgain => self.start(cx, 0, false),
+                Action::ClearFilters => cx.memory.search_filters = SearchFilters::default(),
             }
+        }
+    }
+
+    /// The hit indices in display order (grouped by meeting).
+    fn order(&self) -> Vec<usize> {
+        group_hits(&self.hits).concat()
+    }
+
+    /// Apply the list keys to the selection; Enter opens the selected hit.
+    fn key_actions(&mut self, keys: ListKeys) -> Vec<Action> {
+        let order = self.order();
+        if let Some(motion) = keys.motion {
+            self.cursor = step_selection(&order, self.cursor.as_ref(), motion);
+            self.reveal = true;
+        }
+        match self.cursor.filter(|index| order.contains(index)) {
+            Some(index) if keys.activate => vec![open_hit(&self.hits, index)],
+            _ => Vec::new(),
+        }
+    }
+
+    /// The meeting open beside the results: a split's `PaneRole::List`
+    /// selection (debug builds: `WITNESS_DEBUG_PANE=<hit index>` fakes one).
+    fn pane_selection(&self, pane: PaneRole) -> Option<i64> {
+        if let Some(index) = debug_index("WITNESS_DEBUG_PANE") {
+            return self.hits.get(index).map(|h| h.meeting_id);
+        }
+        match pane {
+            PaneRole::List { selected } => selected,
+            PaneRole::Full | PaneRole::Detail => None,
+        }
+    }
+
+    /// When the meeting open beside the results changes, its group scrolls
+    /// into view.
+    fn follow_pane(&mut self, open: Option<i64>) {
+        self.pane_open = open;
+        if open != self.pane_seen {
+            self.pane_seen = open;
+            self.reveal_group = open;
+        }
+    }
+
+    /// Debug builds only: `WITNESS_DEBUG_SELECT=<n>` selects the n-th hit
+    /// (display order) once the results are in, for passive snapshots.
+    fn debug_select(&mut self) {
+        if self.debug_selected || self.hits.is_empty() || self.loading() {
+            return;
+        }
+        if let Some(n) = debug_index("WITNESS_DEBUG_SELECT") {
+            self.debug_selected = true;
+            self.cursor = self.order().get(n).copied();
+            self.reveal = true;
         }
     }
 
@@ -673,7 +878,11 @@ impl SearchView {
         };
         let q = search_query(query, offset, applied);
         let task = cx.tasks.spawn("search", move |c| c.search(&q));
-        self.load = Some(SearchLoad { task, append });
+        self.load = Some(SearchLoad {
+            task,
+            append,
+            started: Instant::now(),
+        });
     }
 
     fn poll(&mut self, ui: &egui::Ui, cx: &mut UiCtx) {
@@ -725,16 +934,17 @@ impl SearchView {
     }
 
     fn draw(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx, actions: &mut Vec<Action>) {
-        // h2.search-heading (aria-live polite).
-        let (main, suffix) = heading(&self.query, self.hits.len(), self.has_more);
+        // h2.search-heading (aria-live polite). No count while the first
+        // page is on its way ("0 matches" would be a lie).
+        let loading = self.loading();
+        let first_page = (loading && self.hits.is_empty()) || debug_flag("WITNESS_DEBUG_LOADING");
+        let (main, suffix) = if first_page {
+            (heading_main(&self.query), SEARCHING.to_owned())
+        } else {
+            heading(&self.query, self.hits.len(), self.has_more)
+        };
         let full = format!("{main}{suffix}");
-        let galley = heading_galley(
-            ui,
-            &self.query,
-            self.hits.len(),
-            self.has_more,
-            ui.available_width(),
-        );
+        let galley = heading_galley(ui, &self.query, &suffix, ui.available_width());
         let elided = galley.text() != full;
         let response = ui.add(egui::Label::new(galley).selectable(false));
         response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, &full));
@@ -759,40 +969,74 @@ impl SearchView {
             }
             return;
         }
-        let loading = self.loading();
+        if first_page {
+            let due = self
+                .load
+                .as_ref()
+                .is_none_or(|load| skeleton_due(ui, load.started));
+            if due {
+                results_skeleton(ui);
+            }
+            return;
+        }
         if self.hits.is_empty() {
-            let text = if loading {
-                "Searching…"
+            let filtered = active_filters(&cx.memory.search_filters) > 0;
+            let (title, body, button) = no_results(&self.query, filtered);
+            let buttons: Vec<&str> = button.into_iter().collect();
+            let glyph = if filtered {
+                ph::FUNNEL_X
             } else {
-                "No matches."
+                ph::MAGNIFYING_GLASS
             };
-            widgets::empty_state(ui, "", Some(text));
+            if empty_hero(ui, glyph, &title, body, &buttons, false).is_some() {
+                actions.push(Action::ClearFilters);
+            }
             return;
         }
 
         let today = Local::now().date_naive();
         ui.spacing_mut().item_spacing.y = 0.0;
+        let mut group_found = false;
         for (n, group) in group_hits(&self.hits).into_iter().enumerate() {
             if n > 0 {
                 ui.add_space(theme::S4);
             }
             let first = &self.hits[group[0]];
-            if group_title(ui, first, today) {
+            let open = self.pane_open == Some(first.meeting_id);
+            let (header, clicked) = group_title(ui, first, today, open);
+            if clicked {
                 actions.push(Action::Open {
                     meeting_id: first.meeting_id,
                     segment_id: None,
+                    hit: None,
                 });
+            }
+            if self.reveal_group == Some(first.meeting_id) {
+                group_found = true;
+                self.reveal_group = None;
+                ui.scroll_to_rect(header, None);
             }
             for &index in &group {
                 let hit = &self.hits[index];
                 ui.add_space(2.0);
-                if hit_row(ui, index, hit) {
-                    actions.push(Action::Open {
-                        meeting_id: hit.meeting_id,
-                        segment_id: (!is_note(hit)).then_some(hit.segment_id),
-                    });
+                let selected = self.cursor == Some(index);
+                let response = hit_row(ui, index, hit, selected);
+                if response.clicked() {
+                    actions.push(open_hit(&self.hits, index));
+                }
+                // Keyboard focus (Tab, egui's arrow moves) carries the
+                // selection with it.
+                if response.has_focus() {
+                    self.cursor = Some(index);
+                }
+                if selected && std::mem::take(&mut self.reveal) {
+                    response.scroll_to_me(None);
                 }
             }
+        }
+        // An open meeting without results here: nothing to scroll to.
+        if !group_found && !loading {
+            self.reveal_group = None;
         }
 
         if self.has_more {
@@ -1057,6 +1301,7 @@ fn date_field(ui: &mut egui::Ui, name: &str, id: &str, text: &mut String, width:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::views::meetings::Motion;
 
     fn hit(meeting_id: i64, segment_id: i64, snippet: &str) -> SearchHit {
         SearchHit {
@@ -1146,7 +1391,7 @@ mod tests {
     fn long_queries_shorten_inside_the_heading() {
         let ctx = theme::test_context();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let short = heading_galley(ui, "server", 11, false, 300.0);
+            let short = heading_galley(ui, "server", &heading("server", 11, false).1, 300.0);
             assert_eq!(
                 short.text(),
                 "Results for \u{201c}server\u{201d} — 11 matches"
@@ -1155,7 +1400,7 @@ mod tests {
 
             // Long (and unbroken) queries: two rows at most, the count kept.
             for query in ["budget ".repeat(30), "x".repeat(200)] {
-                let galley = heading_galley(ui, &query, 3, true, 300.0);
+                let galley = heading_galley(ui, &query, &heading(&query, 3, true).1, 300.0);
                 let text = galley.text();
                 assert!(galley.rows.len() <= 2, "{text}");
                 assert!(!galley.elided, "{text}");
@@ -1164,6 +1409,114 @@ mod tests {
             }
         });
         output.textures_delta.clear();
+    }
+
+    #[test]
+    fn keys_walk_the_hits_in_display_order() {
+        let mut view = SearchView::new("q".into());
+        // Meeting 2's hits group together: display order 0, 2, 1, 3.
+        view.hits = vec![
+            hit(2, 10, "a"),
+            hit(1, 11, "b"),
+            hit(2, 12, "c"),
+            hit(1, -1, "n"),
+        ];
+        let step = |motion| ListKeys {
+            motion: Some(motion),
+            ..ListKeys::default()
+        };
+        let mut walk = Vec::new();
+        for _ in 0..5 {
+            assert!(view.key_actions(step(Motion::By(1))).is_empty());
+            walk.push(view.cursor.unwrap());
+        }
+        assert_eq!(walk, [0, 2, 1, 3, 3], "grouped order, stopping at the end");
+        assert!(view.reveal);
+        let enter = ListKeys {
+            activate: true,
+            ..ListKeys::default()
+        };
+        // A notes hit opens its meeting without a seek.
+        assert_eq!(
+            view.key_actions(enter),
+            vec![Action::Open {
+                meeting_id: 1,
+                segment_id: None,
+                hit: Some(3),
+            }]
+        );
+        view.key_actions(step(Motion::First));
+        assert_eq!(
+            view.key_actions(enter),
+            vec![Action::Open {
+                meeting_id: 2,
+                segment_id: Some(10),
+                hit: Some(0),
+            }]
+        );
+        // New results drop a selection that no longer points anywhere.
+        view.hits.truncate(0);
+        assert!(view.key_actions(enter).is_empty());
+    }
+
+    #[test]
+    fn the_open_meeting_scrolls_its_group_into_view_once() {
+        let mut view = SearchView::new("q".into());
+        view.follow_pane(Some(2));
+        assert_eq!((view.pane_open, view.reveal_group), (Some(2), Some(2)));
+        view.reveal_group = None;
+        view.follow_pane(Some(2));
+        assert_eq!(view.reveal_group, None);
+        assert_eq!(
+            view.pane_selection(PaneRole::List { selected: Some(5) }),
+            Some(5)
+        );
+        assert_eq!(view.pane_selection(PaneRole::Full), None);
+    }
+
+    #[test]
+    fn no_results_suggest_a_way_out() {
+        let (title, body, button) = no_results("budget", false);
+        assert_eq!(title, "No matches for \u{201c}budget\u{201d}");
+        assert!(body.contains("every transcript"), "{body}");
+        assert_eq!(button, None);
+        let (_, body, button) = no_results("budget", true);
+        assert!(body.contains("filters"), "{body}");
+        assert_eq!(button, Some("Clear filters"));
+        // Long queries are cut in the title.
+        let (title, ..) = no_results(&"x".repeat(100), false);
+        assert_eq!(
+            title.chars().count(),
+            "No matches for “”…".chars().count() + 32
+        );
+        assert!(title.ends_with("x…\u{201d}"), "{title}");
+        // While the first page loads, the heading has no count.
+        assert_eq!(heading_main("q"), heading("q", 0, false).0);
+        assert!(!SEARCHING.contains('0'));
+    }
+
+    #[test]
+    fn the_results_skeleton_fits_narrow_columns() {
+        let ctx = theme::test_context();
+        for width in [380.0, 1000.0] {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 760.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, results_skeleton);
+            output.textures_delta.clear();
+            let bars: Vec<Rect> = output
+                .shapes
+                .iter()
+                .map(|c| c.shape.visual_bounding_rect())
+                .filter(|r| r.is_positive())
+                .collect();
+            assert!(bars.len() >= 15, "{} bars at {width}", bars.len());
+            assert!(bars.iter().all(|r| r.right() <= width + 0.5), "at {width}");
+        }
     }
 
     #[test]
@@ -1274,10 +1627,10 @@ mod tests {
                 .collect();
             assert_covers(&rects, &spans);
 
-            assert!(!hit_row(ui, 0, &hit(1, -1, "\x01n\x02")));
-            assert!(!hit_row(ui, 1, &hit(1, 5, &"long ".repeat(80))));
+            assert!(!hit_row(ui, 0, &hit(1, -1, "\x01n\x02"), false).clicked());
+            assert!(!hit_row(ui, 1, &hit(1, 5, &"long ".repeat(80)), true).clicked());
             let today = NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
-            assert!(!group_title(ui, &hit(1, 5, "x"), today));
+            assert!(!group_title(ui, &hit(1, 5, "x"), today, true).1);
         });
         output.textures_delta.clear();
     }
