@@ -169,12 +169,22 @@ pub(crate) fn style(s: &mut egui::Style) {
     s.spacing.button_padding = egui::vec2(10.0, 6.0);
     s.spacing.interact_size.y = 32.0;
     s.spacing.menu_margin = Margin::same(6);
+    // Floating bars: they overlay the page padding instead of taking
+    // width, so a view's scrolled column lines up exactly with the shell's
+    // search box and banners. Thin and visible at rest, wider on hover.
     s.spacing.scroll = egui::style::ScrollStyle {
-        bar_width: 6.0,
+        floating: true,
+        bar_width: 8.0,
+        floating_width: 4.0,
+        floating_allocated_width: 0.0,
+        bar_outer_margin: 2.0,
+        foreground_color: false,
+        dormant_background_opacity: 0.0,
+        dormant_handle_opacity: 0.7,
         ..egui::style::ScrollStyle::solid()
     };
-    // No edge fade: CSS scrollers have none, and it dimmed the rows at the
-    // edges (the last meeting row, the segment above the player bar).
+    // No edge fade: it dimmed the rows at the edges (the last meeting row,
+    // the segment above the player bar).
     s.spacing.scroll.fade.strength = 0.0;
 
     let v = &mut s.visuals;

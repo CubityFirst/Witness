@@ -99,6 +99,9 @@ const LINE_HEIGHT: f32 = TEXT_SIZE * 1.45;
 const EST_CHAR_W: f32 = 6.3;
 const EST_WRAP_LOSS: f32 = 3.0;
 const EST_LINE: f32 = 20.0;
+/// Passes after a width change that keep restoring the reading anchor
+/// while newly drawn rows replace their estimates with measurements.
+const RESIZE_SETTLE_PASSES: u8 = 6;
 /// A row measured at a width this far from the current one is estimated
 /// instead (see `RowList::heights`).
 const STALE_WIDTH: f32 = 8.0;
@@ -878,6 +881,12 @@ struct RowList {
     anchor: Option<(RowKey, f32)>,
     /// The width the rows were laid out at last pass.
     last_width: Option<f32>,
+    /// Passes left in which a width change keeps re-applying `anchor`:
+    /// rows first measured after the resize pass (estimated until then)
+    /// would otherwise shift the reader by their estimate error.
+    resize_settle: u8,
+    /// A resize shift was issued last pass and has not been applied yet.
+    shift_pending: bool,
 }
 
 impl RowList {
@@ -1030,7 +1039,18 @@ impl RowList {
         // (reflowed), which the pass-start heights do not know yet.
         let resized = self.last_width.is_some_and(|w| (w - width).abs() > 0.5);
         self.last_width = Some(width);
-        let resize_anchor = match (resized, req, self.anchor) {
+        if resized {
+            self.resize_settle = RESIZE_SETTLE_PASSES;
+        }
+        let resizing = self.resize_settle > 0;
+        self.resize_settle = self.resize_settle.saturating_sub(1);
+        if req.is_some() {
+            // A scroll request repositions anyway; nothing to keep.
+            self.resize_settle = 0;
+        }
+        // The pass after a shift still sees the old offset: skip it.
+        let waiting = std::mem::take(&mut self.shift_pending);
+        let resize_anchor = match (resizing && !waiting, req, self.anchor) {
             (true, None, Some((key, above))) => self
                 .keys
                 .iter()
@@ -1094,13 +1114,15 @@ impl RowList {
                         egui::vec2(0.0, -shift),
                         egui::style::ScrollAnimation::none(),
                     );
+                    // egui applies it next pass: measure again after that.
+                    self.shift_pending = true;
                 }
             }
             // No anchor while the list starts below the viewport top (the
-            // header is in view and reflows with the rest). A resize pass
-            // keeps the one it restores: what it saw at the top was laid
-            // out before the shift (a window drag resizes every pass).
-            if resize_anchor.is_none() {
+            // header is in view and reflows with the rest). Resize passes
+            // (and the settle passes after them) keep the one they restore:
+            // what they saw at the top was laid out before the shift.
+            if !resizing {
                 self.anchor = anchor;
             }
             if let (Some(req), Some(rect)) = (req, target_rect) {

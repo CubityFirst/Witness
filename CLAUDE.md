@@ -71,9 +71,13 @@ UI (`crates/witness`): eframe 0.36 (glow renderer), no router — a `View` enum
 in `ui/mod.rs` (`ActiveView` owns the live view). Views in `ui/views/`:
 Meetings (+ recycle bin), People (stats + weekly trend), Transcript (+
 `player_bar.rs`: player, live captions, bookmarks, notes), Search (filters),
-Settings (+ `updates.rs`). Shared kit (use it, don't fork it): `ui/theme.rs`
-(palette constants from the old styles.css, fonts, Visuals), `icons.rs`
-(egui-phosphor regular), `widgets.rs` (buttons, pills, cards,
+Settings (+ `updates.rs`). The look follows **docs/UI.md** (flat rows,
+grouped surfaces, elide-don't-overflow, nothing wraps or clips at ≥ 380 pt,
+the 380 pt minimum width). Shared kit (use it, don't fork it): `ui/theme.rs`
+(tokens: palette, spacing `S1..S5`, radii, `CONTENT_MAX`, `COMPACT_BELOW`,
+speaker colours; fonts; Visuals with floating scroll bars), `icons.rs`
+(egui-phosphor regular), `widgets.rs` (buttons, pills, `list_row`, `group`,
+`switch`, `elide`, `avatar`, `scroll_column`/`padded_column`,
 `keyboard_scroll`, `announce` = AccessKit live region), `fonts.rs` (Segoe UI
 eager + lazy script fallbacks via `note_texts`), `format.rs`, `confirm.rs`
 (in-app confirm modal), `toasts.rs` (in-app notices). Global UI state is
@@ -404,9 +408,14 @@ validated with newer LLVM releases. The toolchain is pinned in
   input** (no SendInput/SetCursorPos/SendKeys, posted WM_KEY*/mouse/hotkey
   messages, SetForegroundWindow on test windows, UI Automation Invoke, or
   screen-wide CopyFromScreen): the developer uses the machine concurrently.
-  Launch the test exe, wait, capture *its own* window with
+  Preferred: the debug-only **off-screen snapshot mode**
+  (`WITNESS_DEBUG_SNAPSHOT=<out.bmp>` + `WITNESS_DEBUG_SIZE=<w>x<h>`, see
+  docs/UI.md) — cloaked, never activated, no tray/hotkeys, per-process
+  instance names, exits by itself; check UI changes at 380/460/640/1000.
+  Otherwise launch the test exe, wait, capture *its own* window with
   `PrintWindow(PW_RENDERFULLCONTENT)`, kill it. Reach states through
-  debug-build-only env hooks instead of clicks: `WITNESS_DEBUG_START_VIEW`
+  debug-build-only env hooks instead of clicks (full list in docs/UI.md):
+  `WITNESS_DEBUG_START_VIEW`
   (`meetings|people|settings|search:<q>|transcript:<id>`),
   `WITNESS_DEBUG_TOASTS=1`, `WITNESS_DEBUG_CONFIRM=1`,
   `WITNESS_DEBUG_CAPTIONS=1` (overlay with sample lines),

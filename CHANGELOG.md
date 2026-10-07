@@ -13,6 +13,13 @@ still evolve quickly.
   TypeScript are gone; Witness is a single `witness.exe` with a far smaller
   dependency tree. The backend, database, archive format, settings file and
   data directory are unchanged, so existing data opens as before.
+- A cleaner, modern look: flat meeting rows grouped by day with actions on
+  hover, a one-row top bar that compacts instead of wrapping, transcript
+  lines grouped by speaker turn with a speaker-share bar, a two-row player,
+  People rows with avatars and a one-line summary, Settings as grouped rows
+  with toggle switches. Nothing overflows or clips down to the new 380 pt
+  minimum window width; long titles and paths are shortened with "…" and a
+  tooltip.
 - Updates continue through the same feed and signing key: 0.2.x installs
   update into this release through their built-in updater, into the same
   per-user install location, keeping shortcuts, the autostart entry and all
