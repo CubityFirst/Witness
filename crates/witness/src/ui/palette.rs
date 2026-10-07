@@ -1355,8 +1355,11 @@ fn run(command: Command, cx: &mut UiCtx) {
         }
         Command::OpenRecording(id) | Command::OpenMeeting(id) => open_transcript(cx, id),
         Command::GoMeetings => cx.go_meetings_clear_search(),
-        // TODO(v2): expand that person once PeopleView can be asked to.
-        Command::GoPeople | Command::OpenPerson(_) => cx.nav.go(View::People),
+        Command::GoPeople => cx.nav.go(View::People),
+        Command::OpenPerson(id) => {
+            cx.memory.expand_person = Some(id);
+            cx.nav.go(View::People);
+        }
         Command::GoSettings => cx.nav.go(View::Settings),
         Command::Theme { dark } => {
             cx.prefs.appearance = if dark {

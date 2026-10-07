@@ -26,6 +26,8 @@ pub struct UiPrefs {
     pub backdrop: bool,
     /// The first-run setup was finished or skipped.
     pub onboarded: bool,
+    /// The split layout's list column width (dragged at its divider).
+    pub list_width: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -55,6 +57,7 @@ impl Default for UiPrefs {
             accent: AccentSource::Windows,
             backdrop: true,
             onboarded: false,
+            list_width: crate::ui::LIST_WIDTH,
         }
     }
 }
@@ -95,6 +98,12 @@ impl UiPrefs {
             self.speed.clamp(0.75, 2.0)
         } else {
             defaults.speed
+        };
+        self.list_width = if self.list_width.is_finite() {
+            self.list_width
+                .clamp(crate::ui::LIST_MIN_WIDTH, crate::ui::LIST_MAX_WIDTH)
+        } else {
+            defaults.list_width
         };
         self
     }
@@ -183,6 +192,7 @@ mod tests {
             accent: AccentSource::Witness,
             backdrop: false,
             onboarded: true,
+            list_width: 420.0,
         };
         prefs.save(&dir).unwrap();
         assert_eq!(UiPrefs::load(&dir), prefs);

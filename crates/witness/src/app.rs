@@ -345,7 +345,7 @@ impl WitnessApp {
             view,
             screens,
             content_width: 0.0,
-            list_width: LIST_WIDTH,
+            list_width: prefs.list_width,
             key_pane: KeyPane::List,
             transitions: Transitions::default(),
             memory: ViewMemory::default(),
@@ -1239,7 +1239,9 @@ fn draw_split<'v>(ui: &mut egui::Ui, cx: &mut UiCtx<'v>, panes: SplitPanes<'_, '
             |ui| {
                 ui.set_clip_rect(rect.intersect(ui.clip_rect()));
                 ui.add_space(top_gap);
+                theme::set_pane_width(ui.ctx(), Some(rect.width()));
                 add(ui);
+                theme::set_pane_width(ui.ctx(), None);
             },
         );
         if let Some(held) = held {
@@ -1661,6 +1663,10 @@ impl eframe::App for WitnessApp {
         }
         self.palette = palette;
         self.onboarding = onboarding;
+        // The divider's width is a UI pref (saved like the others).
+        if self.list_width != self.prefs.list_width {
+            self.prefs.list_width = self.list_width;
+        }
         if fades.running() && animate {
             ctx.request_repaint();
         }

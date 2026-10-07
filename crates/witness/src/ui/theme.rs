@@ -287,9 +287,30 @@ pub fn regular(size: f32) -> FontId {
 }
 
 /// The `@media (max-width: 620px)` switch. At the default 460 px window the
-/// narrow look is the normal look.
+/// narrow look is the normal look. Inside a split column it measures the
+/// column ([`set_pane_width`]), not the window.
 pub fn narrow(ui: &egui::Ui) -> bool {
-    ui.ctx().content_rect().width() <= 620.0
+    let ctx = ui.ctx();
+    let width = ctx
+        .data(|d| d.get_temp::<f32>(pane_width_id()))
+        .unwrap_or_else(|| ctx.content_rect().width());
+    width <= 620.0
+}
+
+fn pane_width_id() -> egui::Id {
+    egui::Id::new("witness-pane-width")
+}
+
+/// The shell draws a split column `width` wide (`None` after it).
+pub fn set_pane_width(ctx: &egui::Context, width: Option<f32>) {
+    ctx.data_mut(|d| match width {
+        Some(w) => {
+            d.insert_temp(pane_width_id(), w);
+        }
+        None => {
+            d.remove::<f32>(pane_width_id());
+        }
+    });
 }
 
 /// Spacing scale (pt).

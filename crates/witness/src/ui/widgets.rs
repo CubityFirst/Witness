@@ -800,8 +800,8 @@ pub fn btn_primary(ui: &mut egui::Ui, text: impl Into<WidgetText>) -> Response {
         hover_fill: theme::pal().accent_hover,
         stroke: Color32::TRANSPARENT,
         hover_stroke: Color32::TRANSPARENT,
-        text: pal().white,
-        hover_text: pal().white,
+        text: pal().on_accent,
+        hover_text: pal().on_accent,
         font: Font::Semibold(theme::BASE_SIZE),
         ..btn_style(ui)
     };

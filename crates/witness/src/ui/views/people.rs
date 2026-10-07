@@ -491,6 +491,7 @@ impl PeopleView {
                 self.load_error = None;
                 #[cfg(debug_assertions)]
                 self.debug_expand();
+                self.expand_requested(cx);
                 // Debug builds only: `WITNESS_DEBUG_EMPTY=1` shows the empty
                 // state, `WITNESS_DEBUG_SELECT=<n>` selects the n-th person.
                 if debug_flag("WITNESS_DEBUG_EMPTY") {
@@ -507,6 +508,17 @@ impl PeopleView {
                 cx.toasts.error("Could not load people statistics", &error);
                 self.load_error = Some(error);
             }
+        }
+    }
+
+    /// Open the person the command palette asked for (once, after a load).
+    fn expand_requested(&mut self, cx: &mut UiCtx) {
+        let Some(id) = cx.memory.expand_person.take() else {
+            return;
+        };
+        let key = format!("p{id}");
+        if self.people.iter().any(|p| p.key == key) {
+            self.expanded = Some(key);
         }
     }
 

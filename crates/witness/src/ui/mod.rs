@@ -302,6 +302,9 @@ pub struct ViewMemory {
     /// session, so reopening a meeting cannot adopt a database read that
     /// raced the previous visit's last write (transcript.rs `Notes::load`).
     pub queued_notes: std::collections::BTreeMap<i64, QueuedNotes>,
+    /// A person to open expanded when People next loads (the command
+    /// palette's person rows); taken by `PeopleView`.
+    pub expand_person: Option<i64>,
 }
 
 /// A notes draft handed to the writer. `started_at` pins it to one meeting:
@@ -333,7 +336,6 @@ pub struct UiCtx<'a> {
     pub flyout: &'a mut FlyoutState,
     pub cmds: &'a mut Vec<UiCmd>,
     pub fonts: &'a FontLoader,
-    #[allow(dead_code)] // TODO(v2): the library and transcript views read it
     /// Where the view being drawn sits (wide windows split the meeting
     /// list and the open transcript side by side). In a split the list is
     /// drawn with `cx.view` = the list's own view (the transcript's `from`)
