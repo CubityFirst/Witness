@@ -1,10 +1,17 @@
 //! The transcript's player bar (map-ui-transcript §10.4): a raised surface
 //! docked at the bottom of the view, in the page's padded column. Row 1 is
-//! the scrubber (with bookmark markers) between the current and the total
-//! time; row 2 is the transport on the left (±10 s around a round
-//! play/pause, add bookmark) and speed, volume and "Save a copy…" on the
-//! right. When the bar is too narrow for the volume slider it collapses to
-//! an icon button with a popover slider, so nothing ever wraps.
+//! the scrubber between the current and the total time; row 2 is the
+//! transport on the left (±10 s around a round play/pause, add bookmark)
+//! and speed, volume and "Save a copy…" on the right. When the bar is too
+//! narrow for the volume slider it collapses to an icon button with a
+//! popover slider, so nothing ever wraps.
+//!
+//! The scrubber's track is a speaker timeline: who spoke when, in speaker
+//! colours (full strength where already played, faded ahead of the thumb),
+//! silence neutral, bookmark markers on top. Thousands of segments are
+//! reduced to one dominant speaker per point of track width and merged
+//! into runs, cached per width ([`timeline_runs`]); hovering the track
+//! names the time and the speaker.
 //!
 //! The bar only drives `witness_core::player::Player` (every call is cheap
 //! and non-blocking); it never touches the database. Scrubbing previews the
@@ -22,8 +29,8 @@ use crate::ui::toasts::Notice;
 use crate::ui::widgets;
 use crate::ui::UiCtx;
 use eframe::egui::{
-    self, Align, CornerRadius, Frame, Key, Layout, Margin, Popup, PopupCloseBehavior, Rect,
-    RectAlign, Response, Sense, Stroke,
+    self, Align, Color32, CornerRadius, FontId, Frame, Key, Layout, Margin, Popup,
+    PopupCloseBehavior, Rect, RectAlign, Response, Sense, Stroke,
 };
 use std::time::{Duration, Instant};
 use witness_core::player::PlayerSnapshot;
@@ -44,6 +51,19 @@ const SCRUB_HEIGHT: f32 = 24.0;
 const TRACK_HEIGHT: f32 = 4.0;
 const THUMB_RADIUS: f32 = 7.0;
 const THUMB_RADIUS_REST: f32 = 6.0;
+/// The speaker timeline is a little thicker than the plain track, so the
+/// colours read; the thumb sits in a ring of the surface colour over it.
+const TIMELINE_HEIGHT: f32 = 6.0;
+const THUMB_RING: f32 = 2.0;
+/// Speaker colour strength ahead of the thumb (not played yet).
+const UNPLAYED_ALPHA: f32 = 0.6;
+/// A timeline column shows its dominant speaker once speech covers this
+/// share of it; below that it is silence.
+const COLUMN_SPEECH_MIN: f64 = 0.3;
+/// Runs narrower than this many columns are smoothed away when they are
+/// a pause between two lines or an interjection inside someone else's
+/// turn: one-point slivers only made the track look noisy.
+const MIN_RUN: usize = 3;
 /// Bookmark marker hit target (centred on the point) and dot radius; the
 /// dot sits in a ring of the surface colour so it reads on the track.
 const MARKER_HIT: f32 = 24.0;
@@ -69,6 +89,8 @@ pub struct PlayerBarState {
     last_scrub_seek: Option<Instant>,
     /// Open the compact volume popover on the next pass (debug snapshots).
     open_volume_once: bool,
+    /// The timeline's runs for (timeline version, columns, duration).
+    timeline_cache: Option<((u64, usize, u64), Vec<Run>)>,
 }
 
 impl PlayerBarState {
@@ -80,6 +102,144 @@ impl PlayerBarState {
             ..PlayerBarState::default()
         }
     }
+}
+
+/// One speaker on the scrubber's timeline.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimelineSpeaker {
+    /// The name the hover tooltip shows.
+    pub name: String,
+    /// The immutable label: picks the colour (`theme::speaker_text`).
+    pub label: String,
+    /// Filtered out of the transcript: drawn like silence, so the speakers
+    /// being shown stand out.
+    pub dimmed: bool,
+}
+
+/// One segment on the timeline: start and end (ms) and its speaker (an
+/// index into [`Timeline::speakers`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimelineSpan {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub speaker: u16,
+}
+
+/// Who spoke when, for the scrubber. The transcript rebuilds it when its
+/// data, a name or the speaker filter changes.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Timeline {
+    /// Bumped on every rebuild: the bar's cache key.
+    pub version: u64,
+    pub speakers: Vec<TimelineSpeaker>,
+    /// Ordered by start.
+    pub spans: Vec<TimelineSpan>,
+}
+
+impl Timeline {
+    /// Who speaks at `ms`: the last segment started by then, if it has not
+    /// ended (gaps between segments are silence).
+    fn speaker_at(&self, ms: i64) -> Option<&TimelineSpeaker> {
+        let i = self
+            .spans
+            .partition_point(|s| s.start_ms <= ms)
+            .checked_sub(1)?;
+        let span = self.spans[i];
+        (ms < span.end_ms)
+            .then(|| self.speakers.get(usize::from(span.speaker)))
+            .flatten()
+    }
+}
+
+/// A stretch of track columns with one dominant speaker (`None`: silence,
+/// or only filtered-out speakers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Run {
+    from: usize,
+    to: usize,
+    who: Option<u16>,
+}
+
+/// The timeline reduced to `columns` columns (one per point of track
+/// width) over `duration_ms`: each column takes the speaker who covers most
+/// of it — or silence when speech covers less than `COLUMN_SPEECH_MIN` of
+/// it — and neighbouring columns with the same result merge into one run
+/// ([`smooth_runs`] then bridges short pauses and interjections).
+/// O(segments + columns), so a multi-hour meeting paints a few hundred
+/// rectangles at most.
+fn timeline_runs(timeline: &Timeline, duration_ms: u64, columns: usize) -> Vec<Run> {
+    let n = timeline.speakers.len();
+    if columns == 0 || duration_ms == 0 || n == 0 {
+        return Vec::new();
+    }
+    let duration = duration_ms as f64;
+    let col_ms = duration / columns as f64;
+    // Milliseconds of speech per (column, speaker).
+    let mut cover = vec![0f64; columns * n];
+    for span in &timeline.spans {
+        let who = usize::from(span.speaker);
+        if timeline.speakers.get(who).is_none_or(|s| s.dimmed) {
+            continue;
+        }
+        let start = span.start_ms.max(0) as f64;
+        let end = (span.end_ms as f64).min(duration);
+        if end <= start {
+            continue;
+        }
+        let first = ((start / col_ms) as usize).min(columns - 1);
+        let last = ((end / col_ms).ceil() as usize).clamp(first + 1, columns);
+        for column in first..last {
+            let lo = column as f64 * col_ms;
+            let overlap = end.min(lo + col_ms) - start.max(lo);
+            if overlap > 0.0 {
+                cover[column * n + who] += overlap;
+            }
+        }
+    }
+    let mut runs: Vec<Run> = Vec::new();
+    for (column, row) in cover.chunks_exact(n).enumerate() {
+        let speech: f64 = row.iter().sum();
+        let who = (speech >= COLUMN_SPEECH_MIN * col_ms)
+            .then(|| {
+                row.iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .and_then(|(i, _)| u16::try_from(i).ok())
+            })
+            .flatten();
+        match runs.last_mut() {
+            Some(run) if run.who == who => run.to = column + 1,
+            _ => runs.push(Run {
+                from: column,
+                to: column + 1,
+                who,
+            }),
+        }
+    }
+    smooth_runs(&runs)
+}
+
+/// Bridge runs narrower than `MIN_RUN` columns into the run before them
+/// when they are a pause followed by more speech, or another speaker's
+/// interjection inside one speaker's turn. A short line alone in silence
+/// stays: it is the only trace of that speaker there.
+fn smooth_runs(runs: &[Run]) -> Vec<Run> {
+    let mut out: Vec<Run> = Vec::with_capacity(runs.len());
+    for (i, run) in runs.iter().enumerate() {
+        let next = runs.get(i + 1).map(|r| r.who);
+        if let Some(prev) = out.last_mut() {
+            let short = run.to - run.from < MIN_RUN;
+            let pause = run.who.is_none() && next.is_some_and(|w| w.is_some());
+            let interjection = run.who.is_some() && next == Some(prev.who);
+            let bridge = short && prev.who.is_some() && (pause || interjection);
+            if bridge || prev.who == run.who {
+                prev.to = run.to;
+                continue;
+            }
+        }
+        out.push(*run);
+    }
+    out
 }
 
 /// What the bar asks the transcript view to do.
@@ -120,6 +280,21 @@ fn clock(ms: u64) -> String {
     fmt_ts(i64::try_from(ms).unwrap_or(i64::MAX))
 }
 
+/// `text`'s width in `font` with every digit measured as `0` (as the top
+/// bar measures its timer), so a time label keeps one width while its
+/// digits change.
+pub(crate) fn stable_width(ui: &egui::Ui, text: &str, font: FontId) -> f32 {
+    let template: String = text
+        .chars()
+        .map(|c| if c.is_ascii_digit() { '0' } else { c })
+        .collect();
+    ui.painter()
+        .layout_no_wrap(template, font, pal().text)
+        .size()
+        .x
+        .ceil()
+}
+
 /// The docked panel around the bar: the page background, so rows never
 /// show through, with breathing room above and below the surface.
 pub fn bar_frame() -> Frame {
@@ -149,12 +324,13 @@ pub fn bar_column<R>(ui: &mut egui::Ui, gutter: f32, add: impl FnOnce(&mut egui:
     .inner
 }
 
-/// Draw the bar for `detail`'s archived audio. `gutter`: see
-/// [`bar_column`].
+/// Draw the bar for `detail`'s archived audio, with `timeline` on the
+/// scrubber. `gutter`: see [`bar_column`].
 pub fn show(
     ui: &mut egui::Ui,
     cx: &mut UiCtx,
     detail: &MeetingDetail,
+    timeline: &Timeline,
     st: &mut PlayerBarState,
     gutter: f32,
 ) -> PlayerBarOutput {
@@ -176,7 +352,7 @@ pub fn show(
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing = egui::vec2(10.0, 2.0);
-                time_row(ui, cx, detail, st, &snap);
+                time_row(ui, cx, detail, timeline, st, &snap);
 
                 let mut volume = cx.prefs.volume.clamp(0.0, 1.0);
                 let mut speed = snap_speed(cx.prefs.speed);
@@ -202,8 +378,9 @@ fn sync_preferences(cx: &mut UiCtx, snap: &PlayerSnapshot) {
     }
 }
 
-/// Paint a 12 pt muted time label in a `width` × `SCRUB_HEIGHT` box,
-/// right- or left-aligned, and expose it to screen readers.
+/// Paint a 12 pt muted time label in a `min_width` (or wider) ×
+/// `SCRUB_HEIGHT` box, right- or left-aligned, and expose it to screen
+/// readers.
 fn time_label(ui: &mut egui::Ui, text: String, min_width: f32, right_align: bool) {
     let galley = ui
         .painter()
@@ -220,12 +397,14 @@ fn time_label(ui: &mut egui::Ui, text: String, min_width: f32, right_align: bool
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &text));
 }
 
-/// Row 1: current time, scrubber + markers, total time. The current time
-/// is as wide as the total, so the scrubber never shifts while it counts.
+/// Row 1: current time, scrubber + markers, total time. Both times are
+/// as wide as the total measured with `0` digits ([`stable_width`]), so
+/// the scrubber never shifts while the current time counts.
 fn time_row(
     ui: &mut egui::Ui,
     cx: &mut UiCtx,
     detail: &MeetingDetail,
+    timeline: &Timeline,
     st: &mut PlayerBarState,
     snap: &PlayerSnapshot,
 ) {
@@ -234,27 +413,25 @@ fn time_row(
         .unwrap_or(snap.position_ms)
         .min(snap.duration_ms);
     let total = clock(snap.duration_ms);
-    let total_width = ui
-        .painter()
-        .layout_no_wrap(total.clone(), theme::regular(12.0), pal().text_muted)
-        .size()
-        .x;
+    let time_width = stable_width(ui, &total, theme::regular(12.0));
     ui.horizontal(|ui| {
-        time_label(ui, clock(current), total_width, true);
+        time_label(ui, clock(current), time_width, true);
         let scrub_width =
-            (ui.available_width() - total_width - ui.spacing().item_spacing.x).max(60.0);
-        scrubber(ui, cx, detail, st, snap, scrub_width);
-        time_label(ui, total, 0.0, false);
+            (ui.available_width() - time_width - ui.spacing().item_spacing.x).max(60.0);
+        scrubber(ui, cx, detail, timeline, st, snap, scrub_width);
+        time_label(ui, total, time_width, false);
     });
 }
 
-/// The seek slider (`<input type=range step=0.1>`) plus the bookmark
-/// markers on top of it. Markers are registered after the track, so they
-/// win the click where they overlap it; the thumb is painted last.
+/// The seek slider (`<input type=range step=0.1>`) over the speaker
+/// timeline, plus the bookmark markers on top of it. Markers are
+/// registered after the track, so they win the click where they overlap
+/// it; the thumb is painted last.
 fn scrubber(
     ui: &mut egui::Ui,
     cx: &mut UiCtx,
     detail: &MeetingDetail,
+    timeline: &Timeline,
     st: &mut PlayerBarState,
     snap: &PlayerSnapshot,
     width: f32,
@@ -358,7 +535,21 @@ fn scrubber(
 
     let visible = ui.is_rect_visible(rect);
     let cy = rect.center().y;
-    if visible {
+    let has_timeline = duration > 0 && !timeline.spans.is_empty();
+    if visible && has_timeline {
+        let columns = track.span().round().max(0.0) as usize;
+        let key = (timeline.version, columns, duration);
+        if st.timeline_cache.as_ref().is_none_or(|(k, _)| *k != key) {
+            st.timeline_cache = Some((key, timeline_runs(timeline, duration, columns)));
+        }
+        let runs = st.timeline_cache.as_ref().map_or(&[][..], |(_, r)| r);
+        let bar = egui::Rect::from_x_y_ranges(
+            track.min..=track.max,
+            (cy - TIMELINE_HEIGHT / 2.0)..=(cy + TIMELINE_HEIGHT / 2.0),
+        );
+        paint_timeline(ui.painter(), bar, runs, columns, timeline, to_x(value));
+    } else if visible {
+        // No transcript yet: the plain track, played part in the accent.
         let painter = ui.painter();
         let bar = egui::Rect::from_x_y_ranges(
             track.min..=track.max,
@@ -381,7 +572,12 @@ fn scrubber(
         let hot = response.hovered() || held;
         let radius = if hot { THUMB_RADIUS } else { THUMB_RADIUS_REST };
         let painter = ui.painter();
-        painter.circle_filled(egui::pos2(to_x(value), cy), radius, pal().accent);
+        let thumb = egui::pos2(to_x(value), cy);
+        if has_timeline {
+            // Set off from the coloured track around it.
+            painter.circle_filled(thumb, radius + THUMB_RING, pal().bg_raised);
+        }
+        painter.circle_filled(thumb, radius, pal().accent);
         if response.has_focus() && widgets::focus_visible(ui.ctx()) {
             painter.rect_stroke(
                 rect.expand(2.0),
@@ -392,7 +588,78 @@ fn scrubber(
         }
     }
     if duration > 0 {
-        response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        // The time under the pointer, and who speaks there.
+        let hover = response
+            .hover_pos()
+            .filter(|_| response.hovered())
+            .map(|pos| hover_text(timeline, to_ms(pos.x)));
+        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        if let Some(text) = hover {
+            response.on_hover_text_at_pointer(text);
+        }
+    }
+}
+
+/// The scrubber's hover tooltip at `ms`: the time, and the speaker when
+/// someone speaks there.
+fn hover_text(timeline: &Timeline, ms: u64) -> String {
+    let at = i64::try_from(ms).unwrap_or(i64::MAX);
+    match timeline.speaker_at(at) {
+        Some(speaker) => format!("{} · {}", clock(ms), speaker.name),
+        None => clock(ms),
+    }
+}
+
+/// Paint the timeline `runs` (over `columns` equal columns of `bar`):
+/// speakers in their colour — full strength left of `played_x`, faded
+/// right of it — and silence (or filtered-out speakers) neutral, a step
+/// stronger where played. Only the bar's two ends are round.
+fn paint_timeline(
+    painter: &egui::Painter,
+    bar: Rect,
+    runs: &[Run],
+    columns: usize,
+    timeline: &Timeline,
+    played_x: f32,
+) {
+    if columns == 0 {
+        return;
+    }
+    let p = pal();
+    let column = bar.width() / columns as f32;
+    let round = (bar.height() / 2.0) as u8;
+    let piece = |x0: f32, x1: f32, color: Color32| {
+        if x1 - x0 <= 0.01 {
+            return;
+        }
+        let rect = Rect::from_x_y_ranges(x0..=x1, bar.y_range());
+        let left = if x0 <= bar.left() + 0.5 { round } else { 0 };
+        let right = if x1 >= bar.right() - 0.5 { round } else { 0 };
+        let radius = CornerRadius {
+            nw: left,
+            sw: left,
+            ne: right,
+            se: right,
+        };
+        painter.rect_filled(rect, radius, color);
+    };
+    for run in runs {
+        let x0 = bar.left() + run.from as f32 * column;
+        let x1 = bar.left() + run.to as f32 * column;
+        let speaker = run
+            .who
+            .and_then(|i| timeline.speakers.get(usize::from(i)))
+            .filter(|s| !s.dimmed);
+        let (played, ahead) = match speaker {
+            Some(s) => {
+                let color = theme::speaker_text(&s.label);
+                (color, theme::alpha(color, UNPLAYED_ALPHA))
+            }
+            None => (p.text_faint, p.border_strong),
+        };
+        let split = played_x.clamp(x0, x1);
+        piece(x0, split, played);
+        piece(split, x1, ahead);
     }
 }
 
@@ -839,6 +1106,132 @@ mod tests {
         assert_eq!(clock(0), "0:00");
         assert_eq!(clock(61_999), "1:01");
         assert_eq!(clock(3_600_000), "1:00:00");
+    }
+
+    fn timeline(spans: &[(i64, i64, u16)], dimmed: &[u16]) -> Timeline {
+        Timeline {
+            version: 1,
+            speakers: (0..3)
+                .map(|i| TimelineSpeaker {
+                    name: format!("P{i}"),
+                    label: format!("S{}", i + 1),
+                    dimmed: dimmed.contains(&i),
+                })
+                .collect(),
+            spans: spans
+                .iter()
+                .map(|&(start_ms, end_ms, speaker)| TimelineSpan {
+                    start_ms,
+                    end_ms,
+                    speaker,
+                })
+                .collect(),
+        }
+    }
+
+    fn summary(runs: &[Run]) -> Vec<(usize, usize, Option<u16>)> {
+        runs.iter().map(|r| (r.from, r.to, r.who)).collect()
+    }
+
+    #[test]
+    fn timeline_runs_merge_columns_by_dominant_speaker() {
+        // 20 columns of 1 s: P0 for 0–3 s, a breath, 4–7.5 s; silence; P1
+        // for 12–20 s with a 2 s P2 interjection and a 0.3 s one.
+        let t = timeline(
+            &[
+                (0, 3_000, 0),
+                (4_000, 7_500, 0),
+                (12_000, 14_000, 1),
+                (14_000, 16_000, 2),
+                (16_000, 20_000, 1),
+                (17_100, 17_400, 2),
+            ],
+            &[],
+        );
+        let runs = timeline_runs(&t, 20_000, 20);
+        // Column 7 is half P0 (≥ 30 % speech): still P0. The breath and
+        // the interjections are bridged; the 4.5 s silence stays.
+        assert_eq!(
+            summary(&runs),
+            [(0, 8, Some(0)), (8, 12, None), (12, 20, Some(1))],
+            "{runs:?}"
+        );
+        // The runs tile the track exactly.
+        assert_eq!(runs.first().map(|r| r.from), Some(0));
+        assert!(runs.windows(2).all(|w| w[0].to == w[1].from));
+        assert_eq!(runs.last().map(|r| r.to), Some(20));
+    }
+
+    #[test]
+    fn a_short_line_alone_in_silence_stays() {
+        let t = timeline(&[(5_000, 6_000, 0), (12_000, 20_000, 1)], &[]);
+        assert_eq!(
+            summary(&timeline_runs(&t, 20_000, 20)),
+            [
+                (0, 5, None),
+                (5, 6, Some(0)),
+                (6, 12, None),
+                (12, 20, Some(1))
+            ]
+        );
+    }
+
+    #[test]
+    fn timeline_runs_drop_filtered_speakers_and_bad_spans() {
+        let t = timeline(
+            &[(0, 5_000, 0), (5_000, 10_000, 1), (8_000, 7_000, 2)],
+            &[1],
+        );
+        // P1 is filtered out (neutral), the inverted span ignored.
+        assert_eq!(
+            summary(&timeline_runs(&t, 10_000, 4)),
+            [(0, 2, Some(0)), (2, 4, None)]
+        );
+        assert!(timeline_runs(&t, 0, 4).is_empty());
+        assert!(timeline_runs(&t, 10_000, 0).is_empty());
+        // Spans past the end (a duration shorter than the transcript) clamp.
+        let late = timeline(&[(0, 50_000, 2)], &[]);
+        let runs = timeline_runs(&late, 10_000, 5);
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].from, runs[0].to, runs[0].who), (0, 5, Some(2)));
+    }
+
+    #[test]
+    fn thousands_of_segments_become_few_runs() {
+        // Three hours, 3,000 segments alternating speakers every 10.
+        let spans: Vec<(i64, i64, u16)> = (0..3_000i64)
+            .map(|i| (i * 3_600, i * 3_600 + 3_200, ((i / 10) % 3) as u16))
+            .collect();
+        let t = timeline(&spans, &[]);
+        let runs = timeline_runs(&t, 3_000 * 3_600, 700);
+        assert!(runs.len() <= 700, "{}", runs.len());
+        assert!(runs.iter().all(|r| r.who.is_some()), "no false silences");
+    }
+
+    #[test]
+    fn hovering_names_the_speaker_or_just_the_time() {
+        let t = timeline(&[(1_000, 4_000, 1), (6_000, 9_000, 0)], &[]);
+        assert_eq!(hover_text(&t, 500), "0:00");
+        assert_eq!(hover_text(&t, 2_000), "0:02 · P1");
+        // In the gap after a segment: silence.
+        assert_eq!(hover_text(&t, 5_000), "0:05");
+        assert_eq!(hover_text(&t, 61_000), "1:01");
+        assert_eq!(hover_text(&t, 8_999), "0:08 · P0");
+    }
+
+    #[test]
+    fn time_labels_keep_one_width_while_digits_change() {
+        let ctx = theme::test_context();
+        let mut widths = Vec::new();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            for text in ["1:11", "0:00", "8:48", "1:00:00"] {
+                widths.push(stable_width(ui, text, theme::regular(12.0)));
+            }
+        });
+        output.textures_delta.clear();
+        assert_eq!(widths[0], widths[1]);
+        assert_eq!(widths[1], widths[2]);
+        assert!(widths[3] > widths[0]);
     }
 
     #[test]
