@@ -93,6 +93,7 @@ fn nav_font() -> FontId {
 
 /// What `WITNESS_DEBUG_FAKE_RECORDING` asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(debug_assertions), allow(dead_code))] // debug-only hook
 enum Fake {
     /// `=1`; `=warn` with a capture warning (pill ⚠ + the health banner).
     Recording { warning: bool },
