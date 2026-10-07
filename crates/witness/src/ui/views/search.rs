@@ -9,19 +9,18 @@
 //! a new heading. Search never auto-refreshes on `refresh_tick` (parity).
 
 use crate::bridge::Task;
-use crate::ui::format::{fmt_date, fmt_ts, parse_snippet, SnippetPart};
-use crate::ui::icons::ph;
+use crate::ui::format::{fmt_ts, parse_snippet, SnippetPart};
+use crate::ui::icons::{self, ph};
 use crate::ui::theme::{
-    self, ACCENT, BG, BG_HOVER, BOOKMARK_GLYPH, BORDER, MARK_BG, MARK_TEXT, REC, TEXT, TEXT_MUTED,
-    WARN,
+    self, ACCENT, BG_HOVER, BG_RAISED, MARK_BG, MARK_TEXT, REC, TEXT, TEXT_FAINT, TEXT_MUTED,
 };
-use crate::ui::views::meetings::{follow_focus, paint_focus_ring};
+use crate::ui::views::meetings::{follow_focus, load_more_button, paint_focus_ring};
 use crate::ui::widgets::{self, KeyScroll, Politeness};
 use crate::ui::{SearchFilters, UiCtx, View, Who};
-use chrono::NaiveDate;
+use chrono::{DateTime, Local, NaiveDate};
 use eframe::egui::{
-    self, text::LayoutJob, CornerRadius, CursorIcon, FontId, Key, Margin, Rect, Sense, Stroke,
-    TextFormat, WidgetInfo, WidgetType,
+    self, text::LayoutJob, text::TextWrapping, CornerRadius, CursorIcon, Key, Margin, Rect, Sense,
+    Stroke, StrokeKind, TextFormat, WidgetInfo, WidgetType,
 };
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -33,10 +32,17 @@ use witness_core::CoreResult;
 const PAGE: usize = 40;
 /// Typing settles for this long before the query runs.
 const DEBOUNCE: Duration = Duration::from_millis(250);
-/// `.search-hit { padding: 7px 10px }`.
-const HIT_PAD: egui::Vec2 = egui::vec2(10.0, 7.0);
-/// `.search-hit { line-height: 1.5 }` at 14 px.
-const HIT_LINE: f32 = 21.0;
+/// Snippet line height (14 pt text, 1.45).
+const HIT_LINE: f32 = 20.0;
+/// Row text inset (`widgets::list_row`'s 12 pt): group headers align with it.
+const ROW_INSET: f32 = 12.0;
+/// The search box's left padding, which holds the magnifier.
+const BOX_ICON_PAD: i8 = 34;
+/// Filter controls' widths in the wrapping (wide) filter row.
+const WHO_WIDTH: f32 = 160.0;
+const DATE_WIDTH: f32 = 112.0;
+/// The label column of the stacked (compact) filters.
+const STACK_LABEL: f32 = 64.0;
 
 // ----------------------------------------------------------------------
 // The search box
@@ -50,28 +56,32 @@ pub fn search_box(ui: &mut egui::Ui, cx: &mut UiCtx, current: &View) {
     let modal_open = cx.confirm.is_open();
     let search = &mut cx.memory.search_box;
     let has_text = !search.text.is_empty();
+    // One input across the column: a leading magnifier in the left
+    // padding, the × in the right one while there is text.
     let margin = Margin {
-        left: 12,
-        right: if has_text { 32 } else { 12 },
+        left: BOX_ICON_PAD,
+        right: if has_text { BOX_ICON_PAD } else { 12 },
         top: 7,
         bottom: 7,
     };
-    // `.search-input`: --bg fill, 1 px border that turns accent on focus.
-    let frame = egui::Frame::new()
-        .fill(BG)
-        .stroke(Stroke::new(1.0, if focused { ACCENT } else { BORDER }))
-        .corner_radius(CornerRadius::same(6))
-        .inner_margin(margin);
-    let response = ui.add(
-        egui::TextEdit::singleline(&mut search.text)
-            .id(id)
-            .hint_text("Search transcripts…")
-            .font(theme::regular(14.0))
-            // `<input type=search>` keeps focus on Enter.
-            .return_key(None::<egui::KeyboardShortcut>)
-            .margin(margin)
-            .frame(frame)
-            .desired_width(ui.available_width().min(420.0)),
+    let edit = egui::TextEdit::singleline(&mut search.text)
+        .hint_text("Search transcripts…")
+        .font(theme::regular(14.0))
+        // `<input type=search>` keeps focus on Enter.
+        .return_key(None::<egui::KeyboardShortcut>)
+        .desired_width(f32::INFINITY);
+    let edit = widgets::framed_text_edit(ui, id, edit, BG_RAISED, theme::R_MD, margin);
+    let response = ui.add(edit);
+    icons::paint_rotated_glyph(
+        ui.painter(),
+        egui::pos2(
+            response.rect.left() + f32::from(BOX_ICON_PAD) / 2.0 + 1.0,
+            response.rect.center().y,
+        ),
+        ph::MAGNIFYING_GLASS,
+        15.0,
+        if focused { TEXT_MUTED } else { TEXT_FAINT },
+        0.0,
     );
     widgets::text_edit_menu(&response);
     ui.ctx().accesskit_node_builder(id, |node| {
@@ -125,13 +135,13 @@ pub fn search_box(ui: &mut egui::Ui, cx: &mut UiCtx, current: &View) {
 fn clear_button(ui: &mut egui::Ui, field: Rect) -> bool {
     let rect = Rect::from_center_size(
         egui::pos2(field.right() - 17.0, field.center().y),
-        egui::vec2(22.0, 22.0),
+        egui::vec2(24.0, 24.0),
     );
     let response = ui.interact(rect, egui::Id::new("search-box-clear"), Sense::click());
     let hot = response.hovered() || response.has_focus();
     if hot {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(4), BG_HOVER);
+            .rect_filled(rect, CornerRadius::same(theme::R_SM), BG_HOVER);
     }
     crate::ui::icons::paint_rotated_glyph(
         ui.painter(),
@@ -142,7 +152,7 @@ fn clear_button(ui: &mut egui::Ui, field: Rect) -> bool {
         0.0,
     );
     if response.has_focus() {
-        paint_focus_ring(ui, rect, 4);
+        paint_focus_ring(ui, rect, theme::R_SM);
     }
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Clear search"));
     response
@@ -241,61 +251,88 @@ fn heading(query: &str, count: usize, has_more: bool) -> (String, String) {
 // ----------------------------------------------------------------------
 // Hit layout
 
-/// One hit's text as a layout job, plus the char ranges of the marked
-/// (matching) runs, which get rounded backgrounds painted behind them.
+/// One hit's snippet as a layout job wrapped at `wrap_width`, plus the
+/// char ranges of the marked (matching) runs, which get rounded accent
+/// backgrounds painted behind them. The timestamp and speaker go on the
+/// row's meta line ([`hit_meta_job`]).
 fn hit_job(hit: &SearchHit, wrap_width: f32) -> (LayoutJob, Vec<Range<usize>>) {
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap_width;
-    let format = |font: FontId, color| TextFormat {
-        font_id: font,
+    let format = |color| TextFormat {
+        font_id: theme::regular(14.0),
         color,
         line_height: Some(HIT_LINE),
         ..Default::default()
     };
     let mut marks = Vec::new();
     let mut chars = 0usize;
-    let mut push = |job: &mut LayoutJob, text: &str, fmt: TextFormat, mark: bool| {
+    for part in parse_snippet(&hit.snippet) {
+        let (text, mark) = match part {
+            SnippetPart::Plain(text) => (text, false),
+            SnippetPart::Mark(text) => (text, true),
+        };
         if text.is_empty() {
-            return;
+            continue;
         }
         let n = text.chars().count();
         if mark {
             marks.push(chars..chars + n);
         }
         chars += n;
-        job.append(text, 0.0, fmt);
+        job.append(&text, 0.0, format(if mark { MARK_TEXT } else { TEXT }));
+    }
+    (job, marks)
+}
+
+/// The meta line above a snippet: the muted timestamp and the speaker
+/// (`"1:37  Christopher Warriner"`), or "Meeting notes" for a notes hit;
+/// one line, elided at `width`.
+fn hit_meta_job(hit: &SearchHit, width: f32) -> LayoutJob {
+    let mut job = LayoutJob {
+        wrap: TextWrapping::truncate_at_width(width.max(1.0)),
+        ..Default::default()
     };
-    if !is_note(hit) {
-        push(
-            &mut job,
-            &format!("[{}]", fmt_ts(hit.start_ms)),
-            format(theme::regular(12.0), TEXT_MUTED),
-            false,
+    if is_note(hit) {
+        job.append(
+            "Meeting notes",
+            0.0,
+            TextFormat::simple(theme::semibold(12.0), TEXT_MUTED),
+        );
+        return job;
+    }
+    job.append(
+        &fmt_ts(hit.start_ms),
+        0.0,
+        TextFormat::simple(theme::regular(12.0), TEXT_FAINT),
+    );
+    if let Some(speaker) = hit.speaker_name.as_deref().filter(|s| !s.is_empty()) {
+        job.append(
+            speaker,
+            8.0,
+            TextFormat::simple(theme::semibold(12.0), TEXT_MUTED),
         );
     }
-    push(&mut job, " ", format(theme::regular(14.0), TEXT), false);
+    job
+}
+
+/// A hit's accessible name: `"[1:05] Alice: the budget plan"`, or
+/// `"note Notes: …"` for a notes hit (as in 0.2.x).
+fn hit_label(hit: &SearchHit) -> String {
+    let mut label = if is_note(hit) {
+        "note ".to_owned()
+    } else {
+        format!("[{}] ", fmt_ts(hit.start_ms))
+    };
     if let Some(speaker) = hit.speaker_name.as_deref().filter(|s| !s.is_empty()) {
-        push(
-            &mut job,
-            &format!("{speaker}: "),
-            format(theme::regular(14.0), TEXT_MUTED),
-            false,
-        );
+        label.push_str(speaker);
+        label.push_str(": ");
     }
     for part in parse_snippet(&hit.snippet) {
         match part {
-            SnippetPart::Plain(text) => {
-                push(&mut job, &text, format(theme::regular(14.0), TEXT), false)
-            }
-            SnippetPart::Mark(text) => push(
-                &mut job,
-                &text,
-                format(theme::regular(14.0), MARK_TEXT),
-                true,
-            ),
+            SnippetPart::Plain(text) | SnippetPart::Mark(text) => label.push_str(&text),
         }
     }
-    (job, marks)
+    label.trim().to_owned()
 }
 
 /// The rects (galley-relative) behind each marked run, one per row it spans.
@@ -330,65 +367,164 @@ fn mark_rects(galley: &egui::Galley, marks: &[Range<usize>]) -> Vec<Rect> {
     rects
 }
 
-/// The "note" chip (`.chip.chip-bookmark`): size, then painting.
-fn note_chip(ui: &egui::Ui) -> std::sync::Arc<egui::Galley> {
-    ui.painter()
-        .layout_no_wrap("note".into(), theme::semibold(11.0), BOOKMARK_GLYPH)
+/// One hit: a flat [`widgets::list_row`] with the meta line over the
+/// wrapped snippet; true when activated (click, Enter or Space).
+fn hit_row(ui: &mut egui::Ui, index: usize, hit: &SearchHit) -> bool {
+    let (response, ()) = widgets::list_row(ui, ("search-hit", index), false, |ui, _| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        let width = ui.available_width();
+        let meta = ui.painter().layout_job(hit_meta_job(hit, width));
+        ui.add(egui::Label::new(meta).selectable(false));
+
+        let (job, marks) = hit_job(hit, width.max(40.0));
+        let galley = ui.painter().layout_job(job);
+        let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
+        if ui.is_rect_visible(rect) {
+            // Matches: an accent tint behind, radius 3, 2 pt either side.
+            for mark in mark_rects(&galley, &marks) {
+                ui.painter().rect_filled(
+                    mark.translate(rect.min.to_vec2())
+                        .expand2(egui::vec2(2.0, 0.0)),
+                    CornerRadius::same(3),
+                    MARK_BG,
+                );
+            }
+            ui.painter().galley(rect.min, galley, TEXT);
+        }
+    });
+    let label = hit_label(hit);
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &label));
+    follow_focus(&response);
+    response.clicked()
 }
 
-/// One `.search-hit` button; true when activated.
-fn hit_row(ui: &mut egui::Ui, hit: &SearchHit) -> bool {
+/// A meeting group's header: the meeting title as an elided link (opens
+/// the meeting) with its short date muted on the right; true when
+/// activated.
+fn group_title(ui: &mut egui::Ui, hit: &SearchHit, today: NaiveDate) -> bool {
     let width = ui.available_width();
-    let chip = is_note(hit).then(|| note_chip(ui));
-    let chip_size = chip
-        .as_ref()
-        .map(|g| g.size() + egui::vec2(14.0, 6.0))
-        .unwrap_or_default();
-    let (mut job, marks) = hit_job(hit, (width - 2.0 * HIT_PAD.x).max(40.0));
-    if let Some(first) = job.sections.first_mut() {
-        first.leading_space = chip_size.x;
-    }
-    let plain = job.text.clone();
-    let galley = ui.painter().layout_job(job);
-    let size = egui::vec2(width, galley.size().y + 2.0 * HIT_PAD.y);
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let inner = (width - 2.0 * ROW_INSET).max(40.0);
+    let date = ui.painter().layout_no_wrap(
+        group_date(&hit.started_at, today),
+        theme::regular(12.0),
+        TEXT_MUTED,
+    );
+    // The date gives way first on very narrow columns.
+    let show_date = date.size().x + theme::S3 <= inner * 0.45;
+    let title_width = if show_date {
+        inner - date.size().x - theme::S3
+    } else {
+        inner
+    };
+    let font = theme::semibold(14.0);
+    let mut job = LayoutJob::simple_singleline(hit.meeting_title.clone(), font, TEXT);
+    job.wrap = TextWrapping::truncate_at_width(title_width.max(1.0));
+    let title = ui.painter().layout_job(job);
+    let height = title.size().y.max(date.size().y) + 8.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
+    let title_rect = Rect::from_min_size(
+        egui::pos2(
+            rect.left() + ROW_INSET,
+            rect.center().y - title.size().y / 2.0,
+        ),
+        title.size(),
+    );
+    let id = ui.id().with(("search-group", hit.meeting_id));
+    let response = ui.interact(title_rect, id, Sense::click());
+    let hot = response.hovered();
+    let color = if hot { ACCENT } else { TEXT };
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        if response.hovered() || response.has_focus() {
-            painter.rect_filled(rect, CornerRadius::same(6), BG_HOVER);
+        let elided = title.elided;
+        painter.galley(title_rect.min, title, color);
+        if hot {
+            let y = title_rect.bottom() - 1.0;
+            painter.hline(title_rect.x_range(), y, Stroke::new(1.0, ACCENT));
         }
-        let origin = rect.min + HIT_PAD;
-        // `mark`: rgba(213,160,33,.35) behind, radius 3, padding 0 2px.
-        for mark in mark_rects(&galley, &marks) {
-            painter.rect_filled(
-                mark.translate(origin.to_vec2())
-                    .expand2(egui::vec2(2.0, 0.0)),
-                CornerRadius::same(3),
-                MARK_BG,
+        if show_date {
+            painter.galley(
+                egui::pos2(
+                    rect.right() - ROW_INSET - date.size().x,
+                    rect.center().y - date.size().y / 2.0,
+                ),
+                date,
+                TEXT_MUTED,
             );
         }
-        if let (Some(chip), Some(first)) = (chip, galley.rows.first()) {
-            let row = first.rect().translate(origin.to_vec2());
-            let chip_rect = Rect::from_min_size(
-                egui::pos2(origin.x, row.center().y - chip_size.y / 2.0),
-                chip_size,
-            );
-            painter.rect_filled(chip_rect, CornerRadius::same(255), WARN);
-            painter.galley(chip_rect.center() - chip.size() / 2.0, chip, BOOKMARK_GLYPH);
+        if response.has_focus() && widgets::focus_visible(ui.ctx()) {
+            paint_focus_ring(ui, title_rect.expand2(egui::vec2(2.0, 0.0)), theme::R_SM);
         }
-        painter.galley(origin, galley, TEXT);
-        if response.has_focus() {
-            paint_focus_ring(ui, rect, 6);
+        if elided {
+            response.clone().on_hover_text(&hit.meeting_title);
         }
     }
-    let label = if is_note(hit) {
-        format!("note{plain}")
-    } else {
-        plain
-    };
-    response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label.trim()));
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Link, true, &hit.meeting_title));
     follow_focus(&response);
     response.on_hover_cursor(CursorIcon::PointingHand).clicked()
+}
+
+/// A result group's short date: `"Wed 22 Jul, 12:10"` (local), with the
+/// year when it isn't this one; unparseable input unchanged.
+fn group_date(rfc3339: &str, today: NaiveDate) -> String {
+    use chrono::Datelike;
+    match DateTime::parse_from_rfc3339(rfc3339) {
+        Ok(at) => {
+            let at = at.with_timezone(&Local);
+            if at.year() == today.year() {
+                at.format("%a %-d %b, %H:%M").to_string()
+            } else {
+                at.format("%a %-d %b %Y, %H:%M").to_string()
+            }
+        }
+        Err(_) => rfc3339.to_owned(),
+    }
+}
+
+/// The results heading, wrapping onto at most two lines. A query too long
+/// for that is shortened inside its quotes (`“very long que…”`) so the
+/// match count always shows; the tooltip has the whole heading.
+fn heading_galley(
+    ui: &egui::Ui,
+    query: &str,
+    count: usize,
+    has_more: bool,
+    width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let layout = |query: &str| {
+        let (main, suffix) = heading(query, count, has_more);
+        let mut job = LayoutJob::default();
+        job.append(&main, 0.0, TextFormat::simple(theme::semibold(17.0), TEXT));
+        job.append(
+            &suffix,
+            0.0,
+            TextFormat::simple(theme::semibold(17.0), TEXT_MUTED),
+        );
+        job.wrap = TextWrapping {
+            max_width: width.max(40.0),
+            max_rows: 2,
+            break_anywhere: false,
+            overflow_character: Some('…'),
+        };
+        ui.painter().layout_job(job)
+    };
+    let galley = layout(query);
+    if !galley.elided {
+        return galley;
+    }
+    // The longest prefix of the query that fits (binary search on chars).
+    let chars: Vec<char> = query.chars().collect();
+    let (mut lo, mut hi) = (0, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let short: String = chars[..mid].iter().collect::<String>() + "…";
+        if layout(&short).elided {
+            hi = mid - 1;
+        } else {
+            lo = mid;
+        }
+    }
+    let short: String = chars[..lo].iter().collect::<String>() + "…";
+    layout(&short)
 }
 
 // ----------------------------------------------------------------------
@@ -422,6 +558,8 @@ pub struct SearchView {
     people_requested: bool,
     /// The people list arrived (so a Who id missing from it is stale).
     people_loaded: bool,
+    /// The compact layout's "Filters" disclosure is open.
+    filters_open: bool,
 }
 
 impl SearchView {
@@ -437,6 +575,7 @@ impl SearchView {
             people_load: None,
             people_requested: false,
             people_loaded: false,
+            filters_open: debug_filters_open(),
         }
     }
 
@@ -477,13 +616,9 @@ impl SearchView {
         }
 
         let mut actions = Vec::new();
-        egui::ScrollArea::vertical()
-            .id_salt("search-scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                widgets::keyboard_scroll(ui, KeyScroll { space: true });
-                widgets::centered_column(ui, 900.0, |ui| self.draw(ui, cx, &mut actions));
-            });
+        widgets::scroll_column(ui, "search-scroll", KeyScroll { space: true }, |ui| {
+            self.draw(ui, cx, &mut actions)
+        });
         for action in actions {
             match action {
                 Action::Open {
@@ -582,24 +717,30 @@ impl SearchView {
     fn draw(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx, actions: &mut Vec<Action>) {
         // h2.search-heading (aria-live polite).
         let (main, suffix) = heading(&self.query, self.hits.len(), self.has_more);
-        let mut job = LayoutJob::default();
-        job.append(&main, 0.0, TextFormat::simple(theme::semibold(17.0), TEXT));
-        job.append(
-            &suffix,
-            0.0,
-            TextFormat::simple(theme::semibold(17.0), TEXT_MUTED),
+        let full = format!("{main}{suffix}");
+        let galley = heading_galley(
+            ui,
+            &self.query,
+            self.hits.len(),
+            self.has_more,
+            ui.available_width(),
         );
-        let response = ui.add(egui::Label::new(job).wrap());
+        let elided = galley.text() != full;
+        let response = ui.add(egui::Label::new(galley).selectable(false));
+        response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, &full));
         widgets::announce(
             ui.ctx(),
             response.id.with("live"),
-            &format!("{main}{suffix}"),
+            &full,
             Politeness::Polite,
         );
-        ui.add_space(4.0);
+        if elided {
+            response.on_hover_text(&full);
+        }
+        widgets::gap(ui, theme::S3);
 
         self.draw_filters(ui, cx);
-        ui.add_space(10.0);
+        widgets::gap(ui, theme::S4);
 
         if let Some(error) = &self.error {
             let message = format!("Search failed: {error}");
@@ -619,35 +760,43 @@ impl SearchView {
             return;
         }
 
+        let today = Local::now().date_naive();
         ui.spacing_mut().item_spacing.y = 0.0;
-        for group in group_hits(&self.hits) {
+        for (n, group) in group_hits(&self.hits).into_iter().enumerate() {
+            if n > 0 {
+                ui.add_space(theme::S4);
+            }
             let first = &self.hits[group[0]];
-            group_title(ui, first);
+            if group_title(ui, first, today) {
+                actions.push(Action::Open {
+                    meeting_id: first.meeting_id,
+                    segment_id: None,
+                });
+            }
             for &index in &group {
                 let hit = &self.hits[index];
-                if hit_row(ui, hit) {
+                ui.add_space(2.0);
+                if hit_row(ui, index, hit) {
                     actions.push(Action::Open {
                         meeting_id: hit.meeting_id,
                         segment_id: (!is_note(hit)).then_some(hit.segment_id),
                     });
                 }
             }
-            ui.add_space(18.0);
         }
 
         if self.has_more {
+            ui.add_space(theme::S3);
             let label = if loading { "Loading…" } else { "Load more" };
-            let button = ui
-                .add_enabled_ui(!loading, |ui| widgets::btn_ghost(ui, label))
-                .inner;
-            follow_focus(&button);
-            if button.clicked() {
+            if load_more_button(ui, label, !loading).clicked() {
                 actions.push(Action::LoadMore);
             }
         }
     }
 
-    /// `.search-filters`: Who, from, to, Clear filters (gap 12, wraps).
+    /// The filters: speaker, from, to and Clear filters in one row that
+    /// wraps; in a compact column, a "Filters" disclosure that shows them
+    /// stacked at full width.
     fn draw_filters(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
         let people = &self.people;
         // A chosen person not in the list: the list is still loading (Back
@@ -659,46 +808,76 @@ impl SearchView {
             "Unknown person"
         };
         let filters: &mut SearchFilters = &mut cx.memory.search_filters;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 12.0;
-            let who_label = |who: Who| -> String {
-                match who {
-                    Who::Anyone => "Anyone".into(),
-                    Who::Me => "Me".into(),
-                    Who::Them => "Them".into(),
-                    Who::Person(id) => people
-                        .iter()
-                        .find(|p| p.id == id)
-                        .map_or_else(|| unknown_person.into(), |p| p.name.clone()),
-                }
-            };
-            let combo = widgets::select(ui, widgets::SelectKind::Compact, |ui| {
-                egui::ComboBox::from_id_salt("search-who")
-                    .selected_text(egui::RichText::new(who_label(filters.who)).size(12.0))
-                    .width(110.0)
-                    .show_ui(ui, |ui| {
-                        let mut option = |ui: &mut egui::Ui, value: Who| {
-                            ui.selectable_value(&mut filters.who, value, who_label(value));
-                        };
-                        option(ui, Who::Anyone);
-                        option(ui, Who::Me);
-                        option(ui, Who::Them);
-                        for person in people {
-                            option(ui, Who::Person(person.id));
+        let who = WhoOptions {
+            people,
+            unknown_person,
+        };
+        let height = ui.spacing().interact_size.y;
+
+        if widgets::is_compact(ui) {
+            let toggle = filters_toggle(ui, self.filters_open, active_filters(filters));
+            follow_focus(&toggle);
+            if toggle.clicked() {
+                self.filters_open = !self.filters_open;
+            }
+            if !self.filters_open {
+                return;
+            }
+            widgets::gap(ui, theme::S2);
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.y = theme::S2;
+                stacked(ui, "Speaker", height, |ui| {
+                    let width = ui.available_width();
+                    who.select(ui, &mut filters.who, width);
+                });
+                stacked(ui, "From", height, |ui| {
+                    date_field(ui, "from", "search-date-from", &mut filters.date_from, None);
+                });
+                stacked(ui, "To", height, |ui| {
+                    date_field(ui, "to", "search-date-to", &mut filters.date_to, None);
+                });
+                if active_filters(filters) > 0 {
+                    ui.horizontal(|ui| {
+                        ui.add_space(STACK_LABEL);
+                        if widgets::btn_ghost(ui, "Clear filters").clicked() {
+                            *filters = SearchFilters::default();
                         }
-                    })
+                    });
+                }
             });
-            let combo = combo.response.on_hover_text("Who said it");
-            ui.ctx().accesskit_node_builder(combo.id, |node| {
-                node.set_label("Filter by speaker");
+            return;
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(theme::S3, theme::S2);
+            // Each group is allocated at its exact width, so the row wraps
+            // between groups instead of letting one run past the edge.
+            ui.allocate_ui(egui::vec2(WHO_WIDTH, height), |ui| {
+                who.select(ui, &mut filters.who, WHO_WIDTH);
             });
-
-            date_field(ui, "from", "search-date-from", &mut filters.date_from);
-            date_field(ui, "to", "search-date-to", &mut filters.date_to);
-
-            let any = filters.who != Who::Anyone
-                || !filters.date_from.is_empty()
-                || !filters.date_to.is_empty();
+            for (label, name, id, text) in [
+                ("From", "from", "search-date-from", &mut filters.date_from),
+                ("To", "to", "search-date-to", &mut filters.date_to),
+            ] {
+                let label_width = ui
+                    .painter()
+                    .layout_no_wrap(label.into(), theme::regular(13.0), TEXT_MUTED)
+                    .size()
+                    .x;
+                let width = label_width + theme::S2 + DATE_WIDTH;
+                ui.allocate_ui(egui::vec2(width, height), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = theme::S2;
+                        ui.label(
+                            egui::RichText::new(label)
+                                .font(theme::regular(13.0))
+                                .color(TEXT_MUTED),
+                        );
+                        date_field(ui, name, id, text, Some(DATE_WIDTH));
+                    });
+                });
+            }
+            let any = active_filters(filters) > 0;
             if any && widgets::btn_ghost(ui, "Clear filters").clicked() {
                 *filters = SearchFilters::default();
             }
@@ -706,78 +885,159 @@ impl SearchView {
     }
 }
 
-/// `from [YYYY-MM-DD]`: a validated text field replacing `<input
-/// type=date>`. Invalid input gets a red border and is not applied.
-fn date_field(ui: &mut egui::Ui, label: &str, id: &str, text: &mut String) {
+/// `WITNESS_DEBUG_FILTERS=1` (debug builds) mounts Search with the compact
+/// filters open, so off-screen snapshots can show them without input.
+fn debug_filters_open() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var_os("WITNESS_DEBUG_FILTERS").is_some_and(|v| v == "1")
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
+/// How many filters are set (the compact toggle's count).
+fn active_filters(filters: &SearchFilters) -> usize {
+    usize::from(filters.who != Who::Anyone)
+        + usize::from(!filters.date_from.is_empty())
+        + usize::from(!filters.date_to.is_empty())
+}
+
+/// The compact "Filters" disclosure button: funnel, label, the number of
+/// active filters, caret.
+fn filters_toggle(ui: &mut egui::Ui, open: bool, active: usize) -> egui::Response {
+    let caret = if open { ph::CARET_UP } else { ph::CARET_DOWN };
+    let count = if active > 0 {
+        format!(" · {active}")
+    } else {
+        String::new()
+    };
+    let text = egui::RichText::new(format!("{}  Filters{count}  {caret}", ph::FUNNEL))
+        .size(13.0)
+        .color(if active > 0 { ACCENT } else { TEXT_MUTED });
+    let response = widgets::btn_ghost(ui, text);
+    let name = if active > 0 {
+        format!("Filters ({active} active)")
+    } else {
+        "Filters".to_owned()
+    };
+    response.widget_info(|| {
+        let mut info = WidgetInfo::labeled(WidgetType::Button, true, &name);
+        info.selected = Some(open); // aria-expanded
+        info
+    });
+    response
+}
+
+/// A stacked filter row: a fixed label column, the control filling the rest.
+fn stacked(ui: &mut egui::Ui, label: &str, height: f32, control: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        ui.label(egui::RichText::new(label).color(TEXT_MUTED));
-        let id = egui::Id::new(id);
-        let focused = ui.memory(|m| m.has_focus(id));
-        let invalid = parse_date(text) == DateInput::Invalid;
-        let border = if invalid {
-            REC
-        } else if focused {
-            ACCENT
-        } else {
-            BORDER
-        };
-        let margin = Margin::symmetric(8, 4);
-        let response = ui.add(
-            egui::TextEdit::singleline(text)
-                .id(id)
-                .hint_text("YYYY-MM-DD")
-                .font(theme::regular(12.0))
-                .char_limit(10)
-                .margin(margin)
-                .frame(
-                    egui::Frame::new()
-                        .fill(BG)
-                        .stroke(Stroke::new(1.0, border))
-                        .corner_radius(CornerRadius::same(6))
-                        .inner_margin(margin),
-                )
-                .desired_width(118.0),
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.allocate_ui_with_layout(
+            egui::vec2(STACK_LABEL, height),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.set_min_size(egui::vec2(STACK_LABEL, height));
+                ui.label(
+                    egui::RichText::new(label)
+                        .font(theme::regular(13.0))
+                        .color(TEXT_MUTED),
+                );
+            },
         );
-        widgets::text_edit_menu(&response);
-        let name = if invalid {
-            format!("{label} (YYYY-MM-DD, invalid date)")
-        } else {
-            format!("{label} (YYYY-MM-DD)")
-        };
-        ui.ctx().accesskit_node_builder(id, |node| {
-            node.set_label(name.as_str());
-        });
-        if invalid {
-            response.on_hover_text("Enter a date as YYYY-MM-DD");
-        }
+        control(ui);
     });
 }
 
-/// `h3.search-group-title`: title + muted ` · date`, wrapping, 1 px rule.
-fn group_title(ui: &mut egui::Ui, hit: &SearchHit) {
-    ui.add_space(6.0);
-    let mut job = LayoutJob::default();
-    job.append(
-        &hit.meeting_title,
-        0.0,
-        TextFormat::simple(theme::semibold(14.0), TEXT),
+/// The speaker ("Who said it") select's options.
+struct WhoOptions<'a> {
+    people: &'a [PersonInfo],
+    unknown_person: &'a str,
+}
+
+impl WhoOptions<'_> {
+    fn label(&self, who: Who) -> String {
+        match who {
+            Who::Anyone => "Anyone".into(),
+            Who::Me => "Me".into(),
+            Who::Them => "Them".into(),
+            Who::Person(id) => self
+                .people
+                .iter()
+                .find(|p| p.id == id)
+                .map_or_else(|| self.unknown_person.into(), |p| p.name.clone()),
+        }
+    }
+
+    /// The select, `width` wide (the selected name elides inside it).
+    fn select(&self, ui: &mut egui::Ui, who: &mut Who, width: f32) {
+        let combo = widgets::select(ui, widgets::SelectKind::TextInput, |ui| {
+            egui::ComboBox::from_id_salt("search-who")
+                .selected_text(egui::RichText::new(self.label(*who)).size(13.0))
+                .width(width)
+                .truncate()
+                .show_ui(ui, |ui| {
+                    let mut option = |ui: &mut egui::Ui, value: Who| {
+                        ui.selectable_value(who, value, self.label(value));
+                    };
+                    option(ui, Who::Anyone);
+                    option(ui, Who::Me);
+                    option(ui, Who::Them);
+                    for person in self.people {
+                        option(ui, Who::Person(person.id));
+                    }
+                })
+        });
+        let combo = combo.response.on_hover_text("Who said it");
+        ui.ctx().accesskit_node_builder(combo.id, |node| {
+            node.set_label("Filter by speaker");
+        });
+    }
+}
+
+/// A `YYYY-MM-DD` field (replacing `<input type=date>`), `width` wide or
+/// filling the row. Invalid input gets a red border and is not applied.
+/// `name` ("from" / "to") is the accessible name's stem.
+fn date_field(ui: &mut egui::Ui, name: &str, id: &str, text: &mut String, width: Option<f32>) {
+    let id = egui::Id::new(id);
+    let invalid = parse_date(text) == DateInput::Invalid;
+    let edit = egui::TextEdit::singleline(text)
+        .hint_text("YYYY-MM-DD")
+        .font(theme::regular(13.0))
+        .char_limit(10)
+        .desired_width(width.unwrap_or(f32::INFINITY));
+    let edit = widgets::framed_text_edit(
+        ui,
+        id,
+        edit,
+        BG_RAISED,
+        theme::R_MD,
+        widgets::TEXT_INPUT_MARGIN,
     );
-    job.append(
-        &format!(" · {}", fmt_date(&hit.started_at)),
-        0.0,
-        TextFormat::simple(theme::semibold(14.0), TEXT_MUTED),
-    );
-    let response = ui.add(egui::Label::new(job).wrap());
-    response
-        .widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, hit.meeting_title.as_str()));
-    ui.add_space(6.0);
-    let (_, line) = ui.allocate_space(egui::vec2(ui.available_width(), 1.0));
-    ui.painter().line_segment(
-        [line.left_center(), line.right_center()],
-        Stroke::new(1.0, BORDER),
-    );
-    ui.add_space(4.0);
+    let response = ui.add(edit);
+    if invalid {
+        // Red over the kit's border (accent while focused).
+        ui.painter().rect_stroke(
+            response.rect,
+            CornerRadius::same(theme::R_MD),
+            Stroke::new(1.0, REC),
+            StrokeKind::Inside,
+        );
+    }
+    widgets::text_edit_menu(&response);
+    let label = if invalid {
+        format!("{name} (YYYY-MM-DD, invalid date)")
+    } else {
+        format!("{name} (YYYY-MM-DD)")
+    };
+    ui.ctx().accesskit_node_builder(id, |node| {
+        node.set_label(label.as_str());
+    });
+    if invalid {
+        response.on_hover_text("Enter a date as YYYY-MM-DD");
+    }
 }
 
 #[cfg(test)]
@@ -869,9 +1129,44 @@ mod tests {
     }
 
     #[test]
+    fn long_queries_shorten_inside_the_heading() {
+        let ctx = theme::test_context();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let short = heading_galley(ui, "server", 11, false, 300.0);
+            assert_eq!(
+                short.text(),
+                "Results for \u{201c}server\u{201d} — 11 matches"
+            );
+            assert!(!short.elided);
+
+            // Long (and unbroken) queries: two rows at most, the count kept.
+            for query in ["budget ".repeat(30), "x".repeat(200)] {
+                let galley = heading_galley(ui, &query, 3, true, 300.0);
+                let text = galley.text();
+                assert!(galley.rows.len() <= 2, "{text}");
+                assert!(!galley.elided, "{text}");
+                assert!(text.ends_with("\u{2026}\u{201d} — 3+ matches"), "{text}");
+                assert!(galley.size().x <= 300.5, "{}", galley.size().x);
+            }
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn group_dates_are_short() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
+        let date = group_date("2026-07-22T12:10:00+01:00", today);
+        assert!(date.starts_with("Wed 22 Jul, "), "{date}");
+        let next_year = NaiveDate::from_ymd_opt(2027, 2, 1).unwrap();
+        let date = group_date("2026-07-22T12:10:00+01:00", next_year);
+        assert!(date.starts_with("Wed 22 Jul 2026, "), "{date}");
+        assert_eq!(group_date("nope", today), "nope");
+    }
+
+    #[test]
     fn hit_text_marks_the_matches() {
         let (job, marks) = hit_job(&hit(1, 5, "the \x01budget\x02 plan"), 300.0);
-        assert_eq!(job.text, "[1:05] Alice: the budget plan");
+        assert_eq!(job.text, "the budget plan");
         assert_eq!(marks.len(), 1);
         let marked: String = job
             .text
@@ -880,10 +1175,18 @@ mod tests {
             .take(marks[0].len())
             .collect();
         assert_eq!(marked, "budget");
+        // The timestamp and speaker moved to the meta line; the accessible
+        // name keeps the 0.2.x wording.
+        let budget = hit(1, 5, "the \x01budget\x02 plan");
+        assert_eq!(hit_label(&budget), "[1:05] Alice: the budget plan");
+        assert_eq!(hit_meta_job(&budget, 300.0).text, "1:05Alice");
 
-        let (job, marks) = hit_job(&hit(1, -1, "\x01notes\x02"), 300.0);
-        assert_eq!(job.text, " Notes: notes");
-        assert_eq!(marks, vec![8..13]);
+        let note = hit(1, -1, "\x01notes\x02");
+        let (job, marks) = hit_job(&note, 300.0);
+        assert_eq!(job.text, "notes");
+        assert_eq!(marks, vec![0..5]);
+        assert_eq!(hit_label(&note), "note Notes: notes");
+        assert_eq!(hit_meta_job(&note, 300.0).text, "Meeting notes");
     }
 
     /// The expected highlight of `range` per row, from epaint's own cursor
@@ -957,7 +1260,10 @@ mod tests {
                 .collect();
             assert_covers(&rects, &spans);
 
-            assert!(!hit_row(ui, &hit(1, -1, "\x01n\x02")));
+            assert!(!hit_row(ui, 0, &hit(1, -1, "\x01n\x02")));
+            assert!(!hit_row(ui, 1, &hit(1, 5, &"long ".repeat(80))));
+            let today = NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
+            assert!(!group_title(ui, &hit(1, 5, "x"), today));
         });
         output.textures_delta.clear();
     }

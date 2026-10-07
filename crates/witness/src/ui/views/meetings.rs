@@ -6,21 +6,27 @@
 //! `Tasks::spawn_op`, so its toast and list refresh survive navigating away
 //! mid-action. The list reloads whenever `shell.refresh_tick` changes.
 //!
-//! Rows have a uniform height, so the list is one allocation and only the
-//! rows inside the clip rect (plus one row either side, the focused row and
-//! the row being renamed) are laid out, so hundreds of loaded rows stay
-//! cheap while Tab can still walk the whole list. The recycle bin is a
-//! separate, normally laid-out section after the list.
+//! The list is flat rows (no per-row cards) grouped under day headers
+//! ("Today", "Yesterday", "Thu 23 Jul"). Rows show a title and a one-line
+//! meta (time · duration · trigger); a status icon only for non-default
+//! states; rename / delete appear on hover or keyboard focus.
+//!
+//! Rows have a uniform height and day headers another, so the list is one
+//! allocation and only the items inside the clip rect (plus a row either
+//! side, the focused row and the row being renamed) are laid out: hundreds
+//! of loaded rows stay cheap while Tab can still walk the whole list. The
+//! recycle bin is a separate, normally laid-out section after the list.
 
 use crate::bridge::{OpDone, Task};
-use crate::ui::format::{fmt_date, fmt_duration};
+use crate::ui::format::fmt_duration;
 use crate::ui::icons::{self, ph};
 use crate::ui::theme::{
-    self, ACCENT, BG, BG_HOVER, BG_RAISED, BORDER, FOCUS, OK, REC, TEXT, TEXT_MUTED, WARN,
+    self, ACCENT, BG, BG_HOVER, FOCUS, REC, TEXT, TEXT_FAINT, TEXT_MUTED, WARN,
 };
 use crate::ui::toasts::{Notice, ToastAction};
 use crate::ui::widgets::{self, KeyScroll};
 use crate::ui::{UiCtx, View};
+use chrono::{DateTime, Datelike, Local, NaiveDate};
 use eframe::egui::{
     self, text::LayoutJob, text::TextWrapping, Align, Color32, CornerRadius, CursorIcon, FontId,
     Key, Layout, Margin, PointerButton, Rect, Response, Sense, Stroke, StrokeKind, UiBuilder,
@@ -40,17 +46,21 @@ const BACKEND_MAX: usize = 500;
 /// A single click opens after this delay unless a double-click (rename)
 /// arrives first.
 const OPEN_DELAY: Duration = Duration::from_millis(250);
-/// `.meeting-list { gap: 6px }`.
-const ROW_GAP: f32 = 6.0;
-/// `.meeting-row { padding: 10px 14px }` plus its 1 px border.
-const ROW_PAD: egui::Vec2 = egui::vec2(15.0, 11.0);
-/// `.meeting-row { gap: 10px }`.
-const COL_GAP: f32 = 10.0;
+/// Between two flat rows: just enough that adjacent hover fills don't merge.
+const ROW_GAP: f32 = 2.0;
+/// Row padding (`widgets::list_row`'s 12 / 8).
+const ROW_PAD: egui::Vec2 = egui::vec2(12.0, 8.0);
+/// Between two trailing icon buttons.
+const COL_GAP: f32 = 2.0;
+/// Between the title block and the first trailing icon.
+const MAIN_GAP: f32 = 8.0;
 /// Status and action glyphs.
 const ICON: f32 = 16.0;
-/// `.meeting-main { gap: 2px }` between the title and the meta line.
+/// Between the title and the meta line.
 const TITLE_META_GAP: f32 = 2.0;
-/// `.rename-input { padding: 3px 6px }`.
+/// Below a day header, before its first row.
+const HEADER_BELOW: f32 = 4.0;
+/// The rename input's padding.
 const EDIT_MARGIN: Margin = Margin {
     left: 6,
     right: 6,
@@ -80,47 +90,89 @@ fn status_glyph(status: &str) -> (&'static str, Color32) {
         "recorded" => (ph::WAVEFORM, WARN),
         "processing" => (ph::CIRCLE_NOTCH, WARN),
         "failed" => (ph::WARNING_CIRCLE, REC),
-        _ => (ph::CHECK_CIRCLE, OK),
+        _ => (ph::CHECK_CIRCLE, theme::OK),
     }
 }
 
-/// `"{date} · {duration}"`, plus `" · auto"` for auto-started meetings.
+/// Whether a row shows a trailing status: only the non-default states (a
+/// transcribed meeting — the normal case — shows nothing).
+fn shows_status(status: &str) -> bool {
+    matches!(status, "recording" | "recorded" | "processing" | "failed")
+}
+
+/// `started_at` in local time; None when it doesn't parse.
+fn local_start(rfc3339: &str) -> Option<DateTime<Local>> {
+    DateTime::parse_from_rfc3339(rfc3339)
+        .ok()
+        .map(|at| at.with_timezone(&Local))
+}
+
+/// The day group a meeting falls in (local date of its start).
+fn local_day(rfc3339: &str) -> Option<NaiveDate> {
+    local_start(rfc3339).map(|at| at.date_naive())
+}
+
+/// A day header: "Today", "Yesterday", "Thu 23 Jul", or "Thu 23 Jul 2025"
+/// outside the current year; "Unknown date" for an unparseable start.
+fn day_label(day: Option<NaiveDate>, today: NaiveDate) -> String {
+    let Some(day) = day else {
+        return "Unknown date".into();
+    };
+    if day == today {
+        "Today".into()
+    } else if today.pred_opt() == Some(day) {
+        "Yesterday".into()
+    } else if day.year() == today.year() {
+        day.format("%a %-d %b").to_string()
+    } else {
+        day.format("%a %-d %b %Y").to_string()
+    }
+}
+
+/// `"14:07"` local time (the date is the row's day header); unparseable
+/// input is returned unchanged.
+fn fmt_time(rfc3339: &str) -> String {
+    local_start(rfc3339).map_or_else(|| rfc3339.to_owned(), |at| at.format("%H:%M").to_string())
+}
+
+/// A short local date + time for rows outside the day groups (the bin):
+/// `"Thu 23 Jul, 14:07"`, with the year when it isn't this one.
+fn fmt_short_date(rfc3339: &str, today: NaiveDate) -> String {
+    match local_start(rfc3339) {
+        Some(at) if at.year() == today.year() => at.format("%a %-d %b, %H:%M").to_string(),
+        Some(at) => at.format("%a %-d %b %Y, %H:%M").to_string(),
+        None => rfc3339.to_owned(),
+    }
+}
+
+/// `"{time} · {duration}"`, plus `" · auto"` for auto-started meetings.
 fn meta_line(m: &Meeting) -> String {
     let auto = if m.trigger == "auto" { " · auto" } else { "" };
     format!(
         "{} · {}{auto}",
-        fmt_date(&m.started_at),
+        fmt_time(&m.started_at),
         fmt_duration(m.duration_ms)
     )
 }
 
-/// The meta line of `meetings` that is widest unwrapped. The lines share
-/// one format, so wrapped it is also the one that needs the most lines.
-fn widest_meta(ui: &egui::Ui, meetings: &[Meeting]) -> String {
-    let font = theme::regular(12.0);
-    let mut widest = (0.0, String::new());
-    for m in meetings {
-        let text = meta_line(m);
-        let width = ui
-            .painter()
-            .layout_no_wrap(text.clone(), font.clone(), TEXT_MUTED)
-            .size()
-            .x;
-        if width > widest.0 {
-            widest = (width, text);
-        }
-    }
-    widest.1
+/// The recycle-bin row's meta line (the 30-day rule is said once, in the
+/// bin's caption, so the line stays short enough not to elide).
+fn bin_meta_line(d: &DeletedMeeting, today: NaiveDate) -> String {
+    format!(
+        "{} · {} · deleted {}",
+        fmt_short_date(&d.meeting.started_at, today),
+        fmt_duration(d.meeting.duration_ms),
+        in_sentence(day_label(local_day(&d.deleted_at), today))
+    )
 }
 
-/// The recycle-bin row's meta line.
-fn bin_meta_line(d: &DeletedMeeting) -> String {
-    format!(
-        "{} · {} · deleted {} · auto-removed after 30 days",
-        fmt_date(&d.meeting.started_at),
-        fmt_duration(d.meeting.duration_ms),
-        fmt_date(&d.deleted_at)
-    )
+/// A day label inside a sentence: the relative words lower-cased
+/// ("deleted yesterday"), dates as they are ("deleted Thu 23 Jul").
+fn in_sentence(label: String) -> String {
+    match label.as_str() {
+        "Today" | "Yesterday" | "Unknown date" => label.to_lowercase(),
+        _ => label,
+    }
 }
 
 /// Open the transcript of `meeting_id`; Back returns to `from`.
@@ -154,6 +206,16 @@ pub(crate) fn paint_focus_ring(ui: &egui::Ui, rect: Rect, radius: u8) {
         CornerRadius::same(radius + 2),
         Stroke::new(2.0, FOCUS),
         StrokeKind::Outside,
+    );
+}
+
+/// The row-style focus ring (inside the row, like `widgets::list_row`).
+fn paint_row_focus(ui: &egui::Ui, rect: Rect) {
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(theme::R_MD),
+        Stroke::new(2.0, FOCUS),
+        StrokeKind::Inside,
     );
 }
 
@@ -194,36 +256,35 @@ fn paint_glyph(ui: &egui::Ui, rect: Rect, glyph: &str, color: Color32) {
     icons::paint_rotated_glyph(ui.painter(), rect.center(), glyph, ICON, color, 0.0);
 }
 
-/// Side of the square `.icon-btn` box for a 16 pt glyph (the formula of
-/// `widgets::icon_btn`, so status icons and buttons line up).
+/// Side of the square `widgets::icon_btn` box for a 16 pt glyph (the
+/// kit's formula, so status icons and buttons line up).
 fn icon_slot(ui: &egui::Ui) -> f32 {
     let galley = ui
         .painter()
         .layout_no_wrap(ph::TRASH.to_owned(), theme::regular(ICON), TEXT);
-    galley.size().x.max(ICON) + 8.0
+    (galley.size().x.max(ICON) + 12.0).max(28.0)
 }
 
 /// Vertical metrics of a list row.
 #[derive(Debug, Clone, Copy)]
 struct RowMetrics {
-    /// Height of the title line: the title's own row (`.meeting-main`
-    /// stacks it 2 pt above the meta), or the rename input while editing.
+    /// Height of the title line: the title's own row, or the rename input
+    /// while editing.
     line: f32,
     title: f32,
     /// The rename input's height (body row + padding + border). Rows are
-    /// not sized for it: the one row being edited spends that extra
-    /// ~8 pt of its 11 pt padding (the CSS row grew instead).
+    /// not sized for it: the one row being edited spends that extra ~8 pt
+    /// of its padding.
     edit: f32,
-    /// Height of the meta block: one line, or the tallest wrapped meta.
+    /// Height of the (single-line) meta line.
     meta: f32,
-    /// Outer row height, border included.
+    /// Outer row height.
     height: f32,
-    /// `.icon-btn` box side.
+    /// Icon button side.
     slot: f32,
 }
 
 impl RowMetrics {
-    /// Metrics with a one-line meta block.
     fn measure(ui: &egui::Ui) -> RowMetrics {
         let (title, body, meta) = ui.ctx().fonts_mut(|f| {
             (
@@ -234,25 +295,14 @@ impl RowMetrics {
         });
         let slot = icon_slot(ui);
         let edit = body + f32::from(EDIT_MARGIN.top + EDIT_MARGIN.bottom) + 2.0;
+        let content = (title + TITLE_META_GAP + meta).max(slot);
         RowMetrics {
             line: title,
             title,
             edit,
             meta,
-            height: 0.0,
-            slot,
-        }
-        .with_meta(meta)
-    }
-
-    /// The same metrics with a meta block `meta` tall (at least one line).
-    fn with_meta(self, meta: f32) -> RowMetrics {
-        let meta = meta.max(self.meta);
-        let content = (self.line + TITLE_META_GAP + meta).max(self.slot);
-        RowMetrics {
-            meta,
             height: content + 2.0 * ROW_PAD.y,
-            ..self
+            slot,
         }
     }
 
@@ -264,25 +314,20 @@ impl RowMetrics {
             ..self
         }
     }
-
-    /// Width of the title + meta block in a row `width` wide: what is left
-    /// after the padding and the status, rename and delete columns.
-    fn main_width(&self, width: f32) -> f32 {
-        (width - 2.0 * ROW_PAD.x - 3.0 * (self.slot + COL_GAP)).max(1.0)
-    }
 }
 
-/// Where a row's parts go: the main block on the left, then the status,
-/// rename and delete slots from the right.
+/// Where a row's parts go: the title block on the left; from the right the
+/// status (when shown), delete and rename. The block only gives way to the
+/// actions while they are revealed, so idle titles use the whole row.
 struct RowRects {
     main: Rect,
-    status: Rect,
+    status: Option<Rect>,
     pencil: Rect,
     delete: Rect,
 }
 
 impl RowRects {
-    fn new(rect: Rect, metrics: RowMetrics) -> RowRects {
+    fn new(rect: Rect, metrics: RowMetrics, status: bool, revealed: bool) -> RowRects {
         let inner = rect.shrink2(ROW_PAD);
         let slot = metrics.slot;
         let slot_rect = |n: f32| {
@@ -292,30 +337,88 @@ impl RowRects {
                 egui::vec2(slot, slot),
             )
         };
+        let mut used = 0.0;
+        let status = status.then(|| {
+            used += 1.0;
+            slot_rect(0.0)
+        });
+        let delete = slot_rect(used);
+        let pencil = slot_rect(used + 1.0);
+        if revealed {
+            used += 2.0;
+        }
+        let trailing = if used > 0.0 {
+            used * slot + (used - 1.0) * COL_GAP + MAIN_GAP
+        } else {
+            0.0
+        };
         let block_height = metrics.line + TITLE_META_GAP + metrics.meta;
         let main = Rect::from_min_size(
             egui::pos2(inner.left(), inner.center().y - block_height / 2.0),
-            egui::vec2(metrics.main_width(rect.width()), block_height),
+            egui::vec2((inner.width() - trailing).max(1.0), block_height),
         );
         RowRects {
             main,
-            status: slot_rect(2.0),
-            pencil: slot_rect(1.0),
-            delete: slot_rect(0.0),
+            status,
+            pencil,
+            delete,
         }
     }
 }
 
-/// The 12 pt muted meta text wrapped at `width` (`.meeting-meta` wraps;
-/// only the title is cut with an ellipsis).
-fn meta_galley(ui: &egui::Ui, text: &str, width: f32) -> Arc<egui::Galley> {
-    let job = LayoutJob::simple(
-        text.to_owned(),
-        theme::regular(12.0),
-        TEXT_MUTED,
-        width.max(1.0),
-    );
-    ui.painter().layout_job(job)
+/// One item of the grouped list.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Item {
+    /// The day header above the group starting at this meeting index.
+    Header(usize),
+    Row(usize),
+}
+
+/// The grouped list's items with their offsets from the list's top.
+#[derive(Debug, Default)]
+struct ListLayout {
+    /// (item, top, height).
+    items: Vec<(Item, f32, f32)>,
+    height: f32,
+}
+
+/// Lay out rows `row_height` tall under day headers: a header wherever the
+/// day changes, the first `first_header` tall, later ones `header` tall
+/// (they carry the gap between groups). Rows are [`ROW_GAP`] apart.
+fn list_layout(
+    days: &[Option<NaiveDate>],
+    row_height: f32,
+    first_header: f32,
+    header: f32,
+) -> ListLayout {
+    let mut layout = ListLayout::default();
+    let mut y = 0.0;
+    let mut prev_row = false;
+    for (index, day) in days.iter().enumerate() {
+        if index == 0 || days[index - 1] != *day {
+            let h = if index == 0 { first_header } else { header };
+            layout.items.push((Item::Header(index), y, h));
+            y += h;
+            prev_row = false;
+        }
+        if prev_row {
+            y += ROW_GAP;
+        }
+        layout.items.push((Item::Row(index), y, row_height));
+        y += row_height;
+        prev_row = true;
+    }
+    layout.height = y;
+    layout
+}
+
+/// Heights of the first and the later day headers: the kit header (its own
+/// space above + the 12 pt label) plus the gap to the first row; later
+/// headers add the space between groups.
+fn header_heights(ui: &egui::Ui) -> (f32, f32) {
+    let label = ui.ctx().fonts_mut(|f| f.row_height(&theme::semibold(12.0)));
+    let first = theme::S2 + label + HEADER_BELOW;
+    (first, first + theme::S3)
 }
 
 /// The inline rename editor (one at a time).
@@ -391,15 +494,17 @@ pub struct MeetingsView {
     bin_load: Option<Task<CoreResult<Vec<DeletedMeeting>>>>,
     /// Collapsed again on every remount (parity).
     bin_open: bool,
+    /// Debug snapshots: scroll the (debug-opened) bin into view once.
+    scroll_to_bin: bool,
     editing: Option<Editing>,
     pending_open: Option<(i64, Instant)>,
     confirm_for: Option<ConfirmFor>,
     /// The row holding keyboard focus last pass: it is drawn even when
     /// scrolled out of view, since egui drops the focus of an undrawn widget.
     focused_row: Option<i64>,
-    /// The meta line with the widest unwrapped text, which sets the uniform
-    /// row height when meta lines wrap. None after the rows change.
-    widest_meta: Option<String>,
+    /// Each meeting's local start day (its group), parsed once per load.
+    /// None after the rows change.
+    days: Option<Vec<Option<NaiveDate>>>,
     /// The `shell.refresh_tick` the data was requested for; None until the
     /// first pass, so mounting loads.
     seen_tick: Option<u64>,
@@ -420,12 +525,13 @@ impl MeetingsView {
             list_load: None,
             binned: Vec::new(),
             bin_load: None,
-            bin_open: false,
+            bin_open: debug_bin_open(),
+            scroll_to_bin: debug_bin_open(),
             editing: None,
             pending_open: None,
             confirm_for: None,
             focused_row: None,
-            widest_meta: None,
+            days: None,
             seen_tick: None,
         }
     }
@@ -441,13 +547,9 @@ impl MeetingsView {
         self.take_confirm_answer(cx);
 
         let mut actions = Vec::new();
-        egui::ScrollArea::vertical()
-            .id_salt("meetings-scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                widgets::keyboard_scroll(ui, KeyScroll { space: true });
-                widgets::centered_column(ui, 900.0, |ui| self.draw(ui, &mut actions));
-            });
+        widgets::scroll_column(ui, "meetings-scroll", KeyScroll { space: true }, |ui| {
+            self.draw(ui, &mut actions)
+        });
         for action in actions {
             self.apply(action, ui, cx);
         }
@@ -527,7 +629,7 @@ impl MeetingsView {
                     } else {
                         self.meetings = rows;
                     }
-                    self.widest_meta = None;
+                    self.days = None;
                     self.load_error = None;
                     // The editor goes away with its row.
                     let editing_gone = self
@@ -760,91 +862,102 @@ impl MeetingsView {
 
         self.draw_list(ui, actions);
         if self.has_more {
-            widgets::gap(ui, ROW_GAP);
+            widgets::gap(ui, theme::S2);
             let loading = self.loading();
             let label = if loading { "Loading…" } else { "Load more" };
-            // A child of the `.meeting-list` flex column: full width.
-            if wide_ghost_button(ui, label, !loading).clicked() {
+            if load_more_button(ui, label, !loading).clicked() {
                 actions.push(RowAction::LoadMore);
             }
         }
         self.draw_bin(ui, actions);
     }
 
-    /// The uniform-height list: one allocation; rows are drawn only when
-    /// they are within a row of the clip rect, hold the keyboard focus or
-    /// are being renamed. The extra row either side gives Tab / Shift+Tab a
-    /// next row to move to, which [`follow_focus`] then scrolls into view.
-    ///
-    /// Every row is as tall as the widest meta line needs when wrapped at
-    /// the current width (the web rows wrap theirs one by one), so nothing
-    /// is cut off in the narrow tray flyout.
-    fn draw_list(&mut self, ui: &mut egui::Ui, actions: &mut Vec<RowAction>) {
-        let width = ui.available_width();
-        let metrics = self.list_metrics(ui, width);
-        let pitch = metrics.height + ROW_GAP;
-        let count = self.meetings.len();
-        let total = count as f32 * pitch - ROW_GAP;
-        let (_, list_rect) = ui.allocate_space(egui::vec2(width, total));
-        let band = ui.clip_rect().expand2(egui::vec2(0.0, pitch));
-        let keep = self.focused_row.take();
-        let mut drawn = 0;
-        for (index, meeting) in self.meetings.iter().enumerate() {
-            let rect = Rect::from_min_size(
-                egui::pos2(list_rect.left(), list_rect.top() + index as f32 * pitch),
-                egui::vec2(list_rect.width(), metrics.height),
+    /// The grouped list for the current rows (day keys parsed once per load).
+    fn layout(&mut self, ui: &egui::Ui, metrics: RowMetrics) -> ListLayout {
+        let stale = self
+            .days
+            .as_ref()
+            .is_none_or(|days| days.len() != self.meetings.len());
+        if stale {
+            self.days = Some(
+                self.meetings
+                    .iter()
+                    .map(|m| local_day(&m.started_at))
+                    .collect(),
             );
-            let editing = self.editing.as_mut().filter(|e| e.id == meeting.id);
-            // The editor's and the focused row are always drawn: a widget
-            // that is not drawn loses its focus (and a rename would commit).
-            if editing.is_none() && keep != Some(meeting.id) && !band.intersects(rect) {
-                continue;
-            }
-            drawn += 1;
-            if meeting_row(ui, rect, metrics, meeting, editing, actions) {
-                self.focused_row = Some(meeting.id);
-            }
         }
-        // Each drawn row took one auto id from `ui`; take the skipped rows'
-        // too, so the ids of Load more and the bin (and so their keyboard
-        // focus) don't depend on how far the list is scrolled.
-        ui.skip_ahead_auto_ids(count - drawn);
+        let (first, header) = header_heights(ui);
+        list_layout(
+            self.days.as_deref().unwrap_or_default(),
+            metrics.height,
+            first,
+            header,
+        )
     }
 
-    /// Row metrics for a list `width` wide, the meta block sized for the
-    /// widest meta line wrapped at that width.
-    fn list_metrics(&mut self, ui: &egui::Ui, width: f32) -> RowMetrics {
+    /// The uniform-height list: one allocation; items are drawn only when
+    /// they are within a row of the clip rect, and rows also when they hold
+    /// the keyboard focus or are being renamed. The extra row either side
+    /// gives Tab / Shift+Tab a next row to move to, which [`follow_focus`]
+    /// then scrolls into view.
+    fn draw_list(&mut self, ui: &mut egui::Ui, actions: &mut Vec<RowAction>) {
+        let width = ui.available_width();
         let metrics = RowMetrics::measure(ui);
-        let widest = self
-            .widest_meta
-            .get_or_insert_with(|| widest_meta(ui, &self.meetings));
-        let wrapped = meta_galley(ui, widest, metrics.main_width(width));
-        if wrapped.rows.len() > 1 {
-            metrics.with_meta(wrapped.size().y)
-        } else {
-            metrics
+        let layout = self.layout(ui, metrics);
+        let (_, list_rect) = ui.allocate_space(egui::vec2(width, layout.height));
+        let band = ui
+            .clip_rect()
+            .expand2(egui::vec2(0.0, metrics.height + ROW_GAP));
+        let keep = self.focused_row.take();
+        let today = Local::now().date_naive();
+        let days = self.days.as_deref().unwrap_or_default();
+        let mut drawn = 0;
+        for &(item, top, height) in &layout.items {
+            let rect = Rect::from_min_size(
+                egui::pos2(list_rect.left(), list_rect.top() + top),
+                egui::vec2(list_rect.width(), height),
+            );
+            match item {
+                Item::Header(first) => {
+                    if !band.intersects(rect) {
+                        continue;
+                    }
+                    drawn += 1;
+                    let label = day_label(days.get(first).copied().flatten(), today);
+                    day_header_item(ui, rect, first, &label);
+                }
+                Item::Row(index) => {
+                    let meeting = &self.meetings[index];
+                    let editing = self.editing.as_mut().filter(|e| e.id == meeting.id);
+                    // The editor's and the focused row are always drawn: a
+                    // widget that is not drawn loses its focus (and a rename
+                    // would commit).
+                    let kept = keep == Some(meeting.id);
+                    if editing.is_none() && !kept && !band.intersects(rect) {
+                        continue;
+                    }
+                    drawn += 1;
+                    if meeting_row(ui, rect, metrics, meeting, editing, kept, actions) {
+                        self.focused_row = Some(meeting.id);
+                    }
+                }
+            }
         }
+        // Each drawn item took one auto id from `ui`; take the skipped
+        // items' too, so the ids of Load more and the bin (and so their
+        // keyboard focus) don't depend on how far the list is scrolled.
+        ui.skip_ahead_auto_ids(layout.items.len() - drawn);
     }
 
     fn draw_bin(&mut self, ui: &mut egui::Ui, actions: &mut Vec<RowAction>) {
         if self.binned.is_empty() {
             return;
         }
-        // `.recycle-bin`: margin-top 18, 1 px dashed top border, padding-top 10.
-        widgets::gap(ui, 18.0);
-        let (_, line) = ui.allocate_space(egui::vec2(ui.available_width(), 1.0));
-        ui.painter().extend(egui::Shape::dashed_line(
-            &[line.left_center(), line.right_center()],
-            Stroke::new(1.0, BORDER),
-            3.0,
-            3.0,
-        ));
-        widgets::gap(ui, 10.0);
-
+        widgets::gap(ui, theme::S5);
         let open = self.bin_open;
         let count = self.binned.len();
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.spacing_mut().item_spacing.x = theme::S2;
             let empty_width = if open {
                 empty_bin_width(ui) + ui.spacing().item_spacing.x
             } else {
@@ -853,11 +966,16 @@ impl MeetingsView {
             let head_width = (ui.available_width() - empty_width).max(60.0);
             let head = bin_head(ui, head_width, count, open);
             follow_focus(&head);
+            if std::mem::take(&mut self.scroll_to_bin) {
+                head.scroll_to_me(Some(Align::TOP));
+            }
             if head.clicked() {
                 actions.push(RowAction::ToggleBin);
             }
             if open {
-                let label = egui::RichText::new("Empty bin").size(12.0);
+                let label = egui::RichText::new("Empty bin")
+                    .size(13.0)
+                    .color(TEXT_MUTED);
                 let button = widgets::btn_ghost(ui, label);
                 follow_focus(&button);
                 if button.clicked() {
@@ -869,12 +987,48 @@ impl MeetingsView {
         if !open {
             return;
         }
+        // The 30-day rule, said once for every row (aligned with row text).
+        widgets::gap(ui, theme::S1);
+        egui::Frame::new()
+            .inner_margin(Margin {
+                left: ROW_PAD.x as i8,
+                right: ROW_PAD.x as i8,
+                ..Margin::ZERO
+            })
+            .show(ui, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("Meetings here are deleted for good after 30 days.")
+                            .font(theme::regular(12.0))
+                            .color(TEXT_FAINT),
+                    )
+                    .wrap(),
+                );
+            });
+        widgets::gap(ui, theme::S2);
         let slot = icon_slot(ui);
+        let today = Local::now().date_naive();
         ui.spacing_mut().item_spacing.y = 0.0;
-        for deleted in &self.binned {
-            ui.add_space(ROW_GAP);
-            bin_row(ui, slot, deleted, actions);
+        for (index, deleted) in self.binned.iter().enumerate() {
+            if index > 0 {
+                ui.add_space(ROW_GAP);
+            }
+            bin_row(ui, slot, deleted, today, actions);
         }
+    }
+}
+
+/// `WITNESS_DEBUG_BIN=1` (debug builds) mounts the list with the recycle
+/// bin open and scrolled into view, so off-screen snapshots can show it
+/// without input.
+fn debug_bin_open() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var_os("WITNESS_DEBUG_BIN").is_some_and(|v| v == "1")
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
     }
 }
 
@@ -979,14 +1133,35 @@ fn empty_bin(cx: &mut UiCtx) {
 // ----------------------------------------------------------------------
 // Row widgets
 
-/// One meeting row at `rect` (uniform height); true when one of its
-/// widgets has the keyboard focus.
+/// A day header ("Today", "Thu 23 Jul") at `rect`, aligned with the row
+/// text. One child of `ui` with an id of its own (see `draw_list`).
+fn day_header_item(ui: &mut egui::Ui, rect: Rect, first: usize, label: &str) {
+    let mut header = ui.new_child(
+        UiBuilder::new()
+            .max_rect(rect.with_min_x(rect.left() + ROW_PAD.x))
+            .id(ui.id().with(("day-header", first)))
+            .layout(Layout::top_down(Align::Min)),
+    );
+    header.spacing_mut().item_spacing.y = 0.0;
+    if first > 0 {
+        // The space between two day groups.
+        header.add_space(theme::S3);
+    }
+    widgets::day_header(&mut header, label);
+}
+
+/// One meeting row at `rect` (uniform height): a flat row that fills on
+/// hover. The whole row opens the meeting; rename and delete show while
+/// the row is hovered, holds the keyboard focus (`focus_kept`: it did last
+/// pass) or is being renamed — they stay in the Tab order when hidden.
+/// True when one of its widgets has the keyboard focus.
 fn meeting_row(
     ui: &mut egui::Ui,
     rect: Rect,
     metrics: RowMetrics,
     m: &Meeting,
     editing: Option<&mut Editing>,
+    focus_kept: bool,
     actions: &mut Vec<RowAction>,
 ) -> bool {
     // An id that doesn't depend on how many rows were drawn before this one:
@@ -998,37 +1173,35 @@ fn meeting_row(
             .id(ui.id().with(("meeting-row", m.id)))
             .layout(Layout::left_to_right(Align::Center)),
     );
-    // `.meeting-row:hover` also applies while a child button is hovered.
+    // The row's own click target goes in first, so the buttons on top of
+    // it win the pointer (egui hit-tests the last-added widget first).
+    let open = row.interact(rect, egui::Id::new(("meeting-open", m.id)), Sense::click());
+    // Hover also counts while a child button is hovered.
     let hovered = row.rect_contains_pointer(rect);
-    row.painter().rect(
-        rect,
-        CornerRadius::same(8),
-        if hovered { BG_HOVER } else { BG_RAISED },
-        Stroke::new(1.0, BORDER),
-        StrokeKind::Inside,
-    );
+    let is_editing = editing.is_some();
+    let ring = widgets::focus_visible(row.ctx());
+    let revealed = hovered || is_editing || (focus_kept && ring);
+    if hovered {
+        row.painter()
+            .rect_filled(rect, CornerRadius::same(theme::R_MD), BG_HOVER);
+    }
 
-    // Columns from the right: delete, rename, status; the main block
-    // takes the rest. Widgets are still added left to right (tab order).
+    let metrics = if is_editing {
+        metrics.editing()
+    } else {
+        metrics
+    };
     let RowRects {
         main: main_rect,
         status: status_rect,
         pencil: pencil_rect,
         delete: delete_rect,
-    } = RowRects::new(rect, metrics);
-    let is_editing = editing.is_some();
-    // The editor's row: its block is ~8 pt taller, centred into the padding.
-    let (main_rect, metrics) = if is_editing {
-        let metrics = metrics.editing();
-        (RowRects::new(rect, metrics).main, metrics)
-    } else {
-        (main_rect, metrics)
-    };
+    } = RowRects::new(rect, metrics, shows_status(&m.status), revealed);
 
-    // 1. Main block: the open / double-click-rename button, or the editor.
-    let mut focused = match editing {
-        None => main_block(&mut row, main_rect, metrics, m, actions),
-        Some(editing) => rename_editor(
+    // 1. The title block (the row button), or the rename editor.
+    let mut focused = open_row(&row, &open, rect, main_rect, metrics, m, actions);
+    if let Some(editing) = editing {
+        focused |= rename_editor(
             &mut row,
             main_rect,
             pencil_rect,
@@ -1036,43 +1209,28 @@ fn meeting_row(
             m,
             editing,
             actions,
-        ),
-    };
-
-    // 2. Status: a retry button for failed / recorded rows, else the icon.
-    let mut status_ui = row.new_child(UiBuilder::new().max_rect(status_rect));
-    if m.status == "failed" || m.status == "recorded" {
-        let (tooltip, name) = if m.status == "failed" {
-            (
-                "Transcription failed — click to retry",
-                format!("Retry transcription of {}", m.title),
-            )
-        } else {
-            (
-                "Not transcribed — click to transcribe",
-                format!("Transcribe {}", m.title),
-            )
-        };
-        let button = status_button(&mut status_ui, status_rect, &m.status, tooltip, &name);
-        focused |= button.has_focus();
-        if button.clicked() {
-            actions.push(RowAction::Retranscribe(m.id));
-        }
-    } else {
-        status_icon(&mut status_ui, status_rect, &m.status);
+        );
     }
 
-    // 3. Rename / Done.
+    // 2. Rename / Done, then delete (move to the recycle bin): painted
+    // only while revealed, but always present for Tab and screen readers.
+    let mut hidden_focus = false;
     let mut pencil_ui = row.new_child(UiBuilder::new().max_rect(pencil_rect));
-    let (tooltip, name) = if is_editing {
-        ("Done", format!("Save {}", m.title))
+    let mut delete_ui = row.new_child(UiBuilder::new().max_rect(delete_rect));
+    if !revealed {
+        pencil_ui.set_opacity(0.0);
+        delete_ui.set_opacity(0.0);
+    }
+    let (glyph, tooltip, name) = if is_editing {
+        (ph::CHECK, "Done", format!("Save {}", m.title))
     } else {
-        ("Rename", format!("Rename {}", m.title))
+        (ph::PENCIL_SIMPLE, "Rename", format!("Rename {}", m.title))
     };
-    let pencil = widgets::icon_btn(&mut pencil_ui, ph::PENCIL_SIMPLE, ICON, tooltip);
+    let pencil = widgets::icon_btn(&mut pencil_ui, glyph, ICON, tooltip);
     pencil.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
     follow_focus(&pencil);
     focused |= pencil.has_focus();
+    hidden_focus |= pencil.has_focus();
     if pencil.clicked() {
         actions.push(if is_editing {
             RowAction::CommitEdit(m.id)
@@ -1084,13 +1242,12 @@ fn meeting_row(
         });
     }
 
-    // 4. Delete (move to the recycle bin).
-    let mut delete_ui = row.new_child(UiBuilder::new().max_rect(delete_rect));
     let delete = widgets::icon_btn_danger(&mut delete_ui, ph::TRASH, ICON, "Delete");
     let name = format!("Move {} to the recycle bin", m.title);
     delete.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
     follow_focus(&delete);
     focused |= delete.has_focus();
+    hidden_focus |= delete.has_focus();
     if delete.clicked() {
         actions.push(RowAction::Delete {
             id: m.id,
@@ -1098,53 +1255,106 @@ fn meeting_row(
             skip: delete_ui.input(|i| i.modifiers.shift),
         });
     }
+    // Tab reached a hidden action: show it on the next pass.
+    if hidden_focus && !revealed {
+        row.ctx().request_repaint();
+    }
+
+    // 3. Status (non-default states only): a retry button for failed /
+    // recorded rows, else the icon.
+    if let Some(status_rect) = status_rect {
+        let mut status_ui = row.new_child(UiBuilder::new().max_rect(status_rect));
+        if m.status == "failed" || m.status == "recorded" {
+            let (tooltip, name) = if m.status == "failed" {
+                (
+                    "Transcription failed — click to retry",
+                    format!("Retry transcription of {}", m.title),
+                )
+            } else {
+                (
+                    "Not transcribed — click to transcribe",
+                    format!("Transcribe {}", m.title),
+                )
+            };
+            let button = status_button(&mut status_ui, status_rect, &m.status, tooltip, &name);
+            focused |= button.has_focus();
+            if button.clicked() {
+                actions.push(RowAction::Retranscribe(m.id));
+            }
+        } else {
+            status_icon(&mut status_ui, status_rect, &m.status);
+        }
+    }
     focused
 }
 
-/// The title + meta button. A pointer click opens after 250 ms (a
-/// double-click cancels that and renames); Enter/Space opens at once.
-/// True while it has the keyboard focus.
-fn main_block(
-    row: &mut egui::Ui,
+/// The row button's content and clicks: the title (elided) over the meta
+/// line. A pointer click opens after 250 ms (a double-click cancels that
+/// and renames); Enter/Space opens at once. While renaming, the editor
+/// covers the title and only the meta line is painted here. True while
+/// the row button has the keyboard focus.
+fn open_row(
+    row: &egui::Ui,
+    response: &Response,
+    rect: Rect,
     main_rect: Rect,
     metrics: RowMetrics,
     m: &Meeting,
     actions: &mut Vec<RowAction>,
 ) -> bool {
-    let response = row.interact(
-        main_rect,
-        egui::Id::new(("meeting-open", m.id)),
-        Sense::click(),
-    );
-    let title = truncated(
+    let editing = metrics.line > metrics.title;
+    let mut title_rect = Rect::NOTHING;
+    let mut elided = false;
+    if !editing {
+        let title = truncated(
+            row,
+            &m.title,
+            theme::semibold(14.0),
+            TEXT,
+            main_rect.width(),
+        );
+        elided = title.elided;
+        let title_top = main_rect.top() + (metrics.line - metrics.title) / 2.0;
+        title_rect = Rect::from_min_size(egui::pos2(main_rect.left(), title_top), title.size());
+        row.painter().galley(title_rect.min, title, TEXT);
+    }
+    let meta = truncated(
         row,
-        &m.title,
-        theme::semibold(14.0),
-        TEXT,
+        &meta_line(m),
+        theme::regular(12.0),
+        TEXT_MUTED,
         main_rect.width(),
     );
-    let title_top = main_rect.top() + (metrics.line - metrics.title) / 2.0;
-    let title_rect = Rect::from_min_size(egui::pos2(main_rect.left(), title_top), title.size());
-    row.painter().galley(title_rect.min, title, TEXT);
-    paint_meta(row, main_rect, metrics, &meta_line(m));
+    let meta_top = main_rect.top() + metrics.line + TITLE_META_GAP;
+    row.painter()
+        .galley(egui::pos2(main_rect.left(), meta_top), meta, TEXT_MUTED);
 
     let name = format!("Open {}, {}", m.title, status_label(&m.status));
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
-    follow_focus(&response);
+    follow_focus(response);
     let focused = response.has_focus();
-    if focused {
-        paint_focus_ring(row, main_rect, 4);
+    if focused && widgets::focus_visible(row.ctx()) {
+        paint_row_focus(row, rect);
     }
-    let response = response.on_hover_cursor(CursorIcon::PointingHand);
-    // The tooltip sits on the title only, like the TSX `title` attribute.
+    let response = response.clone().on_hover_cursor(CursorIcon::PointingHand);
+    // The tooltip sits on the title only, like the TSX `title` attribute
+    // (with the whole title first when it had to be cut).
     let on_title = row
         .ctx()
         .pointer_hover_pos()
         .is_some_and(|p| title_rect.contains(p));
     if on_title {
-        response.clone().on_hover_text("Double-click to rename");
+        let tip = if elided {
+            format!("{}\nDouble-click to rename", m.title)
+        } else {
+            "Double-click to rename".to_owned()
+        };
+        response.clone().on_hover_text(tip);
     }
 
+    if editing {
+        return focused;
+    }
     if response.double_clicked() {
         actions.push(RowAction::StartEdit {
             id: m.id,
@@ -1160,8 +1370,8 @@ fn main_block(
     focused
 }
 
-/// The inline rename input with the meta line kept under it. Enter or
-/// focus loss commits; Escape cancels. True while it has the focus.
+/// The inline rename input over the title line. Enter or focus loss
+/// commits; Escape cancels. True while it has the focus.
 fn rename_editor(
     row: &mut egui::Ui,
     main_rect: Rect,
@@ -1180,7 +1390,7 @@ fn rename_editor(
     let frame = egui::Frame::new()
         .fill(BG)
         .stroke(Stroke::new(1.0, ACCENT))
-        .corner_radius(CornerRadius::same(4))
+        .corner_radius(CornerRadius::same(theme::R_SM))
         .inner_margin(EDIT_MARGIN);
     if row.input(|i| i.key_pressed(Key::Escape)) {
         editing.escaped = true;
@@ -1198,7 +1408,6 @@ fn rename_editor(
     row.ctx().accesskit_node_builder(response.id, |node| {
         node.set_label(name.as_str());
     });
-    paint_meta(row, main_rect, metrics, &meta_line(m));
 
     if std::mem::take(&mut editing.focus_pending) {
         response.request_focus();
@@ -1220,15 +1429,6 @@ fn rename_editor(
     response.has_focus()
 }
 
-/// The 12 pt muted meta text under the title line, wrapped (every row has
-/// room for the tallest meta block in the list).
-fn paint_meta(ui: &egui::Ui, main_rect: Rect, metrics: RowMetrics, text: &str) {
-    let galley = meta_galley(ui, text, main_rect.width());
-    let top = main_rect.top() + metrics.line + TITLE_META_GAP;
-    ui.painter()
-        .galley(egui::pos2(main_rect.left(), top), galley, TEXT_MUTED);
-}
-
 /// The non-interactive `StatusIcon` (the tooltip carries the words).
 /// Recording pulses and processing spins, unless Windows animations are off.
 fn status_icon(ui: &mut egui::Ui, rect: Rect, status: &str) -> Response {
@@ -1247,8 +1447,9 @@ fn status_icon(ui: &mut egui::Ui, rect: Rect, status: &str) -> Response {
     response.on_hover_text(label)
 }
 
-/// `.icon-btn.status-failed|recorded`: the status glyph in its colour,
-/// turning to the text colour on hover; a click queues a transcription.
+/// The failed / recorded status as a button: the status glyph in its
+/// colour, turning to the text colour on hover; a click queues a
+/// transcription.
 fn status_button(
     ui: &mut egui::Ui,
     rect: Rect,
@@ -1261,11 +1462,11 @@ fn status_button(
     let hot = response.hovered() || response.has_focus();
     if hot {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(6), BG_HOVER);
+            .rect_filled(rect, CornerRadius::same(theme::R_MD), theme::BG_ACTIVE);
     }
     paint_glyph(ui, rect, glyph, if hot { TEXT } else { color });
-    if response.has_focus() {
-        paint_focus_ring(ui, rect, 6);
+    if response.has_focus() && widgets::focus_visible(ui.ctx()) {
+        paint_focus_ring(ui, rect, theme::R_MD);
     }
     follow_focus(&response);
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, name));
@@ -1274,14 +1475,14 @@ fn status_button(
         .on_hover_text(tooltip)
 }
 
-/// `.btn.btn-ghost` stretched to the full width (Load more, a child of the
-/// `.meeting-list` flex column); disabled while a load runs.
-fn wide_ghost_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> Response {
-    let galley =
-        ui.painter()
-            .layout_no_wrap(label.to_owned(), theme::regular(theme::BASE_SIZE), TEXT);
-    // `.btn { padding: 6px 14px }`, at least the interact height.
-    let height = (galley.size().y + 12.0).max(ui.spacing().interact_size.y);
+/// A full-width, flat "Load more" (accent text, hover fill), as wide as
+/// the rows above it; disabled while a load runs. Shared with Search.
+pub(crate) fn load_more_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> Response {
+    let color = if enabled { ACCENT } else { TEXT_MUTED };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), theme::semibold(13.0), color);
+    let height = 36.0_f32.max(galley.size().y + 12.0);
     let sense = if enabled {
         Sense::click()
     } else {
@@ -1290,22 +1491,15 @@ fn wide_ghost_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> Response 
     let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), sense);
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, enabled, label));
     if ui.is_rect_visible(rect) {
-        let hot = enabled && (response.hovered() || response.has_focus());
-        let painter = ui.painter();
-        painter.rect_stroke(
-            rect,
-            CornerRadius::same(6),
-            Stroke::new(1.0, if hot { ACCENT } else { BORDER }),
-            StrokeKind::Inside,
-        );
-        let color = if enabled {
-            TEXT
-        } else {
-            TEXT.gamma_multiply(0.5)
-        };
-        painter.galley(rect.center() - galley.size() / 2.0, galley, color);
-        if response.has_focus() {
-            paint_focus_ring(ui, rect, 6);
+        let hot = enabled && response.hovered();
+        if hot {
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(theme::R_MD), BG_HOVER);
+        }
+        ui.painter()
+            .galley(rect.center() - galley.size() / 2.0, galley, color);
+        if response.has_focus() && widgets::focus_visible(ui.ctx()) {
+            paint_row_focus(ui, rect);
         }
     }
     follow_focus(&response);
@@ -1316,137 +1510,140 @@ fn wide_ghost_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> Response 
     }
 }
 
-/// Width of the "Empty bin" ghost button (12 pt text + `.btn` padding).
+/// Width of the "Empty bin" ghost button (13 pt text + button padding).
 fn empty_bin_width(ui: &egui::Ui) -> f32 {
     let galley = ui
         .painter()
-        .layout_no_wrap("Empty bin".into(), theme::regular(12.0), TEXT);
-    let pad = if theme::narrow(ui) { 10.0 } else { 14.0 };
-    galley.size().x + 2.0 * pad
+        .layout_no_wrap("Empty bin".into(), theme::regular(13.0), TEXT);
+    galley.size().x + 2.0 * ui.spacing().button_padding.x
 }
 
-/// `.recycle-head`: the "🗑 Recycle bin (n) ▸/▾" disclosure button.
+/// The "▸ 🗑 Recycle bin  3" disclosure: a flat row-style button, `width`
+/// wide, styled like a section header.
 fn bin_head(ui: &mut egui::Ui, width: f32, count: usize, open: bool) -> Response {
-    let font = theme::regular(13.0);
-    let text = format!("Recycle bin ({count})");
+    let text = "Recycle bin";
+    let font = theme::semibold(12.5);
     let galley = ui
         .painter()
-        .layout_no_wrap(text.clone(), font.clone(), TEXT_MUTED);
-    let height = galley.size().y + 12.0;
+        .layout_no_wrap(text.to_owned(), font.clone(), TEXT_MUTED);
+    let count_galley =
+        ui.painter()
+            .layout_no_wrap(count.to_string(), theme::regular(12.0), TEXT_FAINT);
+    let height = ui.spacing().interact_size.y;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), Sense::click());
     if ui.is_rect_visible(rect) {
-        if response.hovered() || response.has_focus() {
+        let hot = response.hovered();
+        if hot {
             ui.painter()
-                .rect_filled(rect, CornerRadius::same(6), BG_HOVER);
+                .rect_filled(rect, CornerRadius::same(theme::R_MD), BG_HOVER);
         }
+        let color = if hot { TEXT } else { TEXT_MUTED };
         let cy = rect.center().y;
-        let mut x = rect.left() + 10.0;
+        let mut x = rect.left() + ROW_PAD.x;
+        let caret = if open {
+            ph::CARET_DOWN
+        } else {
+            ph::CARET_RIGHT
+        };
+        icons::paint_rotated_glyph(
+            ui.painter(),
+            egui::pos2(x + 6.0, cy),
+            caret,
+            12.0,
+            color,
+            0.0,
+        );
+        x += 12.0 + 6.0;
         icons::paint_rotated_glyph(
             ui.painter(),
             egui::pos2(x + 7.0, cy),
             ph::TRASH,
             14.0,
-            TEXT_MUTED,
+            color,
             0.0,
         );
         x += 14.0 + 8.0;
         let text_width = galley.size().x;
-        ui.painter().galley(
-            egui::pos2(x, cy - galley.size().y / 2.0),
-            galley,
-            TEXT_MUTED,
-        );
+        ui.painter()
+            .galley(egui::pos2(x, cy - galley.size().y / 2.0), galley, color);
         x += text_width + 8.0;
-        ui.painter().text(
-            egui::pos2(x, cy),
-            egui::Align2::LEFT_CENTER,
-            if open { "▾" } else { "▸" },
-            font,
-            TEXT_MUTED,
+        ui.painter().galley(
+            egui::pos2(x, cy - count_galley.size().y / 2.0),
+            count_galley,
+            TEXT_FAINT,
         );
-        if response.has_focus() {
-            paint_focus_ring(ui, rect, 6);
+        if response.has_focus() && widgets::focus_visible(ui.ctx()) {
+            paint_row_focus(ui, rect);
         }
     }
+    let name = format!("{text} ({count})");
     response.widget_info(|| {
-        let mut info = WidgetInfo::labeled(WidgetType::Button, true, &text);
+        let mut info = WidgetInfo::labeled(WidgetType::Button, true, &name);
         info.selected = Some(open); // aria-expanded
         info
     });
     response.on_hover_cursor(CursorIcon::PointingHand)
 }
 
-/// One recycle-bin row: the meeting-row box at 0.75 opacity with a
-/// non-clickable main block (the meta wraps), Restore and Delete forever.
-fn bin_row(ui: &mut egui::Ui, slot: f32, d: &DeletedMeeting, actions: &mut Vec<RowAction>) {
+/// One recycle-bin row: a flat row (hover fill) with the title and meta
+/// elided, then Restore and Delete forever. Not clickable itself.
+fn bin_row(
+    ui: &mut egui::Ui,
+    slot: f32,
+    d: &DeletedMeeting,
+    today: NaiveDate,
+    actions: &mut Vec<RowAction>,
+) {
     let m = &d.meeting;
-    ui.scope(|ui| {
-        ui.set_opacity(0.75);
-        let background = ui.painter().add(egui::Shape::Noop);
-        let width = ui.available_width();
-        let main_width = (width - 2.0 * ROW_PAD.x - 2.0 * (slot + COL_GAP)).max(40.0);
-        let row = ui
-            .scope_builder(
-                UiBuilder::new().layout(Layout::left_to_right(Align::Center)),
-                |ui| {
-                    ui.set_width(width);
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.add_space(ROW_PAD.x);
-                    ui.vertical(|ui| {
-                        ui.set_width(main_width);
-                        ui.spacing_mut().item_spacing.y = TITLE_META_GAP;
-                        ui.add_space(ROW_PAD.y);
-                        let title =
-                            truncated(ui, &m.title, theme::semibold(14.0), TEXT, main_width);
-                        let (rect, _) = ui.allocate_exact_size(title.size(), Sense::hover());
-                        ui.painter().galley(rect.min, title, TEXT);
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(bin_meta_line(d))
-                                    .size(12.0)
-                                    .color(TEXT_MUTED),
-                            )
-                            .wrap(),
-                        );
-                        ui.add_space(ROW_PAD.y);
+    let background = ui.painter().add(egui::Shape::Noop);
+    let row = egui::Frame::new()
+        .inner_margin(Margin::symmetric(ROW_PAD.x as i8, ROW_PAD.y as i8))
+        .show(ui, |ui| {
+            let width = ui.available_width();
+            ui.set_width(width);
+            let main_width = (width - 2.0 * slot - COL_GAP - MAIN_GAP).max(40.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.vertical(|ui| {
+                    ui.set_width(main_width);
+                    ui.spacing_mut().item_spacing.y = TITLE_META_GAP;
+                    widgets::elide(ui, &m.title, theme::semibold(14.0), TEXT);
+                    widgets::elide(
+                        ui,
+                        &bin_meta_line(d, today),
+                        theme::regular(12.0),
+                        TEXT_MUTED,
+                    );
+                });
+                ui.add_space(MAIN_GAP);
+                let restore = widgets::icon_btn(ui, ph::ARROW_COUNTER_CLOCKWISE, ICON, "Restore");
+                let name = format!("Restore {}", m.title);
+                restore.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
+                follow_focus(&restore);
+                if restore.clicked() {
+                    actions.push(RowAction::Restore(m.id));
+                }
+                ui.add_space(COL_GAP);
+                let purge = widgets::icon_btn_danger(ui, ph::TRASH, ICON, "Delete forever");
+                let name = format!("Permanently delete {}", m.title);
+                purge.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
+                follow_focus(&purge);
+                if purge.clicked() {
+                    actions.push(RowAction::Purge {
+                        id: m.id,
+                        title: m.title.clone(),
+                        skip: ui.input(|i| i.modifiers.shift),
                     });
-                    ui.add_space(COL_GAP);
-                    let restore =
-                        widgets::icon_btn(ui, ph::ARROW_COUNTER_CLOCKWISE, ICON, "Restore");
-                    let name = format!("Restore {}", m.title);
-                    restore.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
-                    follow_focus(&restore);
-                    if restore.clicked() {
-                        actions.push(RowAction::Restore(m.id));
-                    }
-                    ui.add_space(COL_GAP);
-                    let purge = widgets::icon_btn_danger(ui, ph::TRASH, ICON, "Delete forever");
-                    let name = format!("Permanently delete {}", m.title);
-                    purge.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
-                    follow_focus(&purge);
-                    if purge.clicked() {
-                        actions.push(RowAction::Purge {
-                            id: m.id,
-                            title: m.title.clone(),
-                            skip: ui.input(|i| i.modifiers.shift),
-                        });
-                    }
-                },
-            )
-            .response;
-        let rect = row.rect;
-        let hovered = ui.rect_contains_pointer(rect);
+                }
+            });
+        })
+        .response;
+    if ui.rect_contains_pointer(row.rect) {
         ui.painter().set(
             background,
-            egui::epaint::RectShape::new(
-                rect,
-                CornerRadius::same(8),
-                if hovered { BG_HOVER } else { BG_RAISED },
-                Stroke::new(1.0, BORDER),
-                StrokeKind::Inside,
-            ),
+            egui::epaint::RectShape::filled(row.rect, CornerRadius::same(theme::R_MD), BG_HOVER),
         );
-    });
+    }
 }
 
 #[cfg(test)]
@@ -1493,15 +1690,64 @@ mod tests {
         let auto = meeting(1, "transcribed", "auto", Some(65 * 60 * 1000));
         let line = meta_line(&auto);
         assert!(line.ends_with(" · 1 h 5 min · auto"), "{line}");
+        // The time only: the date is the day header's.
+        let time = fmt_time(&auto.started_at);
+        assert!(line.starts_with(&format!("{time} · ")), "{line}");
+        assert_eq!(time.len(), 5, "{time}");
         let manual = meeting(2, "recording", "manual", None);
         assert!(meta_line(&manual).ends_with(" · —"));
+        assert_eq!(fmt_time("garbage"), "garbage");
+
         let binned = DeletedMeeting {
             meeting: manual,
             deleted_at: "2026-10-06T10:00:00+01:00".into(),
         };
-        let line = bin_meta_line(&binned);
+        let today = local_day("2026-10-07T12:00:00+01:00").unwrap();
+        let line = bin_meta_line(&binned, today);
         assert!(line.contains(" · — · deleted "), "{line}");
-        assert!(line.ends_with(" · auto-removed after 30 days"));
+        assert!(line.ends_with(" · deleted yesterday"), "{line}");
+        assert!(line.starts_with("Mon 5 Oct, "), "{line}");
+        let last_year = NaiveDate::from_ymd_opt(2027, 1, 2).unwrap();
+        assert!(bin_meta_line(&binned, last_year).starts_with("Mon 5 Oct 2026, "));
+    }
+
+    #[test]
+    fn day_labels() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
+        let day = |m, d| NaiveDate::from_ymd_opt(2026, m, d);
+        assert_eq!(day_label(Some(today), today), "Today");
+        assert_eq!(day_label(day(10, 6), today), "Yesterday");
+        assert_eq!(day_label(day(7, 23), today), "Thu 23 Jul");
+        assert_eq!(day_label(day(10, 8), today), "Thu 8 Oct", "future");
+        let new_year = NaiveDate::from_ymd_opt(2027, 1, 1).unwrap();
+        assert_eq!(day_label(day(12, 31), new_year), "Yesterday");
+        assert_eq!(day_label(day(12, 30), new_year), "Wed 30 Dec 2026");
+        assert_eq!(day_label(None, today), "Unknown date");
+        assert_eq!(in_sentence("Yesterday".into()), "yesterday");
+        assert_eq!(in_sentence("Thu 23 Jul".into()), "Thu 23 Jul");
+    }
+
+    #[test]
+    fn rows_are_grouped_under_day_headers() {
+        let d = |n| NaiveDate::from_ymd_opt(2026, 7, n);
+        let days = [d(24), d(24), d(23), None, None, d(22)];
+        let layout = list_layout(&days, 50.0, 30.0, 42.0);
+        let items: Vec<Item> = layout.items.iter().map(|&(item, ..)| item).collect();
+        use Item::{Header as H, Row as R};
+        assert_eq!(
+            items,
+            [H(0), R(0), R(1), H(2), R(2), H(3), R(3), R(4), H(5), R(5)]
+        );
+        // Offsets: a 30 pt first header, rows ROW_GAP apart within a group,
+        // later headers 42 pt; the items tile the list exactly.
+        let tops: Vec<f32> = layout.items.iter().map(|&(_, top, _)| top).collect();
+        assert_eq!(tops[1], 30.0);
+        assert_eq!(tops[2], 30.0 + 50.0 + ROW_GAP);
+        assert_eq!(tops[3], tops[2] + 50.0);
+        assert_eq!(tops[4], tops[3] + 42.0);
+        let (_, last_top, last_h) = *layout.items.last().unwrap();
+        assert_eq!(layout.height, last_top + last_h);
+        assert!(list_layout(&[], 50.0, 30.0, 42.0).items.is_empty());
     }
 
     /// A fake `list_meetings` over `total` rows that clamps like the backend.
@@ -1552,17 +1798,34 @@ mod tests {
             assert_eq!(m.line, m.title, "rows are sized for the title line");
             assert!(m.height >= m.slot + 2.0 * ROW_PAD.y);
             assert!(m.height >= m.line + TITLE_META_GAP + m.meta + 2.0 * ROW_PAD.y);
-            // `.meeting-row` in 0.2.x: 11 + title + 2 + meta + 11 ≈ 58-59 pt.
-            assert!(m.height < 61.0, "row height {}", m.height);
+            // A compact flat row: 8 + title + 2 + meta + 8, at least the
+            // 44 pt minimum row height of the design.
+            assert!((44.0..56.0).contains(&m.height), "row height {}", m.height);
             // The row being renamed keeps its height and fits its editor
             // inside the border.
             let e = m.editing();
             assert_eq!(e.height, m.height);
             assert!(e.line >= m.edit);
             let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(420.0, m.height));
-            let main = RowRects::new(rect, e).main;
+            let main = RowRects::new(rect, e, false, true).main;
             assert!(main.top() >= 1.0 && main.bottom() <= m.height - 1.0);
             assert_eq!(main.height(), e.line + TITLE_META_GAP + e.meta);
+
+            // Idle rows give the title the whole width; revealed actions
+            // (and a status) take theirs from the right, never overlapping.
+            let idle = RowRects::new(rect, m, false, false);
+            assert_eq!(idle.main.width(), 420.0 - 2.0 * ROW_PAD.x);
+            assert!(idle.status.is_none());
+            let busy = RowRects::new(rect, m, true, true);
+            let status = busy.status.unwrap();
+            assert!(busy.main.right() < busy.pencil.left());
+            assert!(busy.pencil.right() <= busy.delete.left());
+            assert!(busy.delete.right() <= status.left());
+            assert!(status.right() <= rect.right() - ROW_PAD.x + 0.01);
+            // The buttons don't move when they are revealed.
+            let hidden = RowRects::new(rect, m, true, false);
+            assert_eq!(hidden.pencil, busy.pencil);
+            assert!(hidden.main.width() > busy.main.width());
         });
     }
 
@@ -1583,7 +1846,7 @@ mod tests {
             .enumerate()
             {
                 let m = meeting(10 + id as i64, status, "auto", Some(1000));
-                meeting_row(ui, rect, metrics, &m, None, &mut actions);
+                meeting_row(ui, rect, metrics, &m, None, false, &mut actions);
             }
             let m = meeting(4, "transcribed", "manual", None);
             let mut editing = Editing {
@@ -1593,13 +1856,22 @@ mod tests {
                 focus_pending: true,
                 escaped: false,
             };
-            meeting_row(ui, rect, metrics, &m, Some(&mut editing), &mut actions);
+            meeting_row(
+                ui,
+                rect,
+                metrics,
+                &m,
+                Some(&mut editing),
+                true,
+                &mut actions,
+            );
             assert!(!editing.focus_pending, "focus is requested once");
             let binned = DeletedMeeting {
                 meeting: m,
                 deleted_at: "2026-10-06T10:00:00+01:00".into(),
             };
-            bin_row(ui, metrics.slot, &binned, &mut actions);
+            let today = Local::now().date_naive();
+            bin_row(ui, metrics.slot, &binned, today, &mut actions);
             bin_head(ui, 300.0, 3, true);
             assert!(actions.is_empty(), "no input, no actions");
         });
@@ -1616,22 +1888,29 @@ mod tests {
         view
     }
 
-    /// Where the list starts and how its rows are measured, as last drawn.
-    #[derive(Clone, Copy)]
+    /// Where the list starts and how its items are laid out, as last drawn.
     struct ListGeometry {
         origin: egui::Pos2,
         width: f32,
         metrics: RowMetrics,
+        layout: ListLayout,
     }
 
     impl ListGeometry {
+        /// Row `index`'s parts (the button positions don't depend on
+        /// whether the actions are revealed).
         fn row(&self, index: usize) -> RowRects {
-            let pitch = self.metrics.height + ROW_GAP;
+            let &(_, top, height) = self
+                .layout
+                .items
+                .iter()
+                .find(|(item, ..)| *item == Item::Row(index))
+                .expect("row laid out");
             let rect = Rect::from_min_size(
-                self.origin + egui::vec2(0.0, index as f32 * pitch),
-                egui::vec2(self.width, self.metrics.height),
+                self.origin + egui::vec2(0.0, top),
+                egui::vec2(self.width, height),
             );
-            RowRects::new(rect, self.metrics)
+            RowRects::new(rect, self.metrics, false, true)
         }
     }
 
@@ -1662,11 +1941,12 @@ mod tests {
                 area = area.vertical_scroll_offset(offset);
             }
             area.show(ui, |ui| {
-                let width = ui.available_width();
+                let metrics = RowMetrics::measure(ui);
                 geometry = Some(ListGeometry {
                     origin: ui.cursor().min,
-                    width,
-                    metrics: view.list_metrics(ui, width),
+                    width: ui.available_width(),
+                    metrics,
+                    layout: view.layout(ui, metrics),
                 });
                 view.draw(ui, &mut actions);
             });
@@ -1846,22 +2126,47 @@ mod tests {
     }
 
     #[test]
-    fn narrow_rows_grow_to_fit_wrapped_meta_lines() {
-        run(|ui| {
-            let mut view = list_view(3);
-            view.meetings[1].trigger = "auto".into();
-            let one_line = RowMetrics::measure(ui);
-            let wide = view.list_metrics(ui, 900.0);
-            assert_eq!(wide.height, one_line.height);
-            let narrow = view.list_metrics(ui, 200.0);
-            assert!(narrow.meta > one_line.meta, "{narrow:?}");
-            assert!(narrow.height > one_line.height);
-            // The widest line is the auto one, and fits its block wrapped.
-            let widest = view.widest_meta.clone().unwrap();
-            assert!(widest.ends_with(" · auto"), "{widest}");
-            let galley = meta_galley(ui, &widest, narrow.main_width(200.0));
-            assert!(galley.size().y <= narrow.meta);
-            assert!(galley.size().x <= narrow.main_width(200.0) + 0.5);
-        });
+    fn narrow_rows_elide_instead_of_overflowing() {
+        // A 200 pt list: long titles and meta lines are cut with "…", rows
+        // keep their one height, and no text runs past the list's edge.
+        let ctx = theme::test_context();
+        let mut view = list_view(3);
+        view.meetings[1].title = "A very long meeting title that cannot fit ".repeat(4);
+        view.meetings[2].trigger = "auto".into();
+        view.meetings[2].status = "failed".into();
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(200.0, 400.0),
+            )),
+            ..Default::default()
+        };
+        let mut right = 0.0;
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(input(), |ui| {
+                right = ui.max_rect().right();
+                let mut actions = Vec::new();
+                view.draw(ui, &mut actions);
+            });
+            output.textures_delta.clear();
+            texts = output
+                .shapes
+                .into_iter()
+                .filter_map(|clipped| match clipped.shape {
+                    egui::Shape::Text(text) => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+        }
+        assert!(
+            texts.iter().any(|t| t.galley.elided),
+            "the long title elides"
+        );
+        for text in &texts {
+            assert_eq!(text.galley.rows.len(), 1, "{:?}", text.galley.text());
+            let end = text.pos.x + text.galley.size().x;
+            assert!(end <= right + 0.5, "{:?} ends at {end}", text.galley.text());
+        }
     }
 }
