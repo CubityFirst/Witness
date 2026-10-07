@@ -21,7 +21,8 @@
 //! operations that must not wait for a pass (hiding on close, re-showing
 //! a not-yet-destroyed window) use Win32 directly on the overlay's HWND.
 
-use super::theme::{self, ACCENT, CAPTION_BG, CAPTION_ERR, CAPTION_TEXT, OK_LIGHT, REC_LIGHT};
+use super::icons;
+use super::theme::{self, ACCENT, CAPTION_BG, CAPTION_ERR, CAPTION_TEXT, OK_LIGHT};
 use super::topbar::edge_resize;
 use super::widgets::{self, Politeness};
 use crate::bridge::wake_root;
@@ -54,9 +55,7 @@ const ZOOM_STEP: f32 = 1.1;
 const PLACE_ATTEMPTS: u8 = 3;
 /// Slack when comparing the actual window rect with the target.
 const PLACE_TOLERANCE: i32 = 2;
-/// `rgba(229,72,77,α)` tints: border .4, grip .12, error .15.
-const BORDER_RED: Color32 = Color32::from_rgba_unmultiplied_const(0xe5, 0x48, 0x4d, 102);
-const GRIP_BG: Color32 = Color32::from_rgba_unmultiplied_const(0xe5, 0x48, 0x4d, 31);
+/// The error band: red @ 0.15.
 const ERROR_BG: Color32 = Color32::from_rgba_unmultiplied_const(0xe5, 0x48, 0x4d, 38);
 
 /// The overlay's viewport id.
@@ -719,39 +718,43 @@ fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
     surface
         .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "Live captions"));
 
-    // Grip: "● Witness — live captions (drag to move)" and ×.
+    // Grip: a raised strip with "● Live captions · drag to move" (red dot,
+    // muted title, faint hint, elided) and ×, over a hairline.
     let pad_x = 10.0 * k;
-    let close_galley =
-        painter.layout_no_wrap("×".to_owned(), theme::regular(18.0 * k), CAPTION_TEXT);
-    let close_size = close_galley.size() + egui::vec2(8.0 * k, 2.0 * k);
-    let title_width = (rect.width() - close_size.x - 2.0 * pad_x - 8.0 * k).max(10.0);
-    let mut title_job = egui::text::LayoutJob::simple_singleline(
-        "● Witness — live captions (drag to move)".to_owned(),
-        theme::regular(11.0 * k),
-        REC_LIGHT,
-    );
+    let close_size = egui::vec2(24.0 * k, 22.0 * k);
+    let dot_r = 3.5 * k;
+    let title_left = pad_x + dot_r * 2.0 + 7.0 * k;
+    let title_width = (rect.width() - title_left - close_size.x - pad_x - 8.0 * k).max(10.0);
+    let mut title_job = egui::text::LayoutJob::default();
+    let section = |color| egui::TextFormat {
+        font_id: theme::regular(11.5 * k),
+        color,
+        ..Default::default()
+    };
+    title_job.append("Live captions", 0.0, section(theme::TEXT_MUTED));
+    title_job.append("  ·  drag to move", 0.0, section(theme::TEXT_FAINT));
     title_job.wrap = egui::text::TextWrapping::truncate_at_width(title_width);
     let title_galley = painter.layout_job(title_job);
     let grip_height = title_galley.size().y.max(close_size.y) + 8.0 * k;
     let grip = Rect::from_min_size(rect.min, egui::vec2(rect.width(), grip_height));
-    let radius = (8.0 * k).round().clamp(0.0, 255.0) as u8;
-    painter.rect_filled(
-        grip,
-        CornerRadius {
-            nw: radius,
-            ne: radius,
-            sw: 0,
-            se: 0,
-        },
-        GRIP_BG,
+    painter.rect_filled(grip, CornerRadius::ZERO, theme::BG_RAISED);
+    painter.hline(
+        grip.x_range(),
+        grip.bottom() - 0.5,
+        Stroke::new(1.0, theme::BORDER),
+    );
+    painter.circle_filled(
+        egui::pos2(grip.left() + pad_x + dot_r, grip.center().y),
+        dot_r,
+        theme::REC,
     );
     painter.galley(
         egui::pos2(
-            grip.left() + pad_x,
+            grip.left() + title_left,
             grip.center().y - title_galley.size().y / 2.0,
         ),
         title_galley,
-        REC_LIGHT,
+        theme::TEXT_MUTED,
     );
     let close_rect = Rect::from_center_size(
         egui::pos2(grip.right() - pad_x - close_size.x / 2.0, grip.center().y),
@@ -764,10 +767,25 @@ fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
     close.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Close live captions")
     });
+    let close_color = if close.hovered() {
+        painter.rect_filled(
+            close_rect,
+            CornerRadius::same((6.0 * k).round().clamp(0.0, 255.0) as u8),
+            theme::BG_HOVER,
+        );
+        CAPTION_TEXT
+    } else {
+        theme::TEXT_MUTED
+    };
+    let close_galley = painter.layout_no_wrap(
+        icons::ph::X.to_owned(),
+        egui::FontId::proportional(14.0 * k),
+        close_color,
+    );
     painter.galley(
         close_rect.center() - close_galley.size() / 2.0,
         close_galley,
-        CAPTION_TEXT,
+        close_color,
     );
 
     // Error banner (sticky).
@@ -858,11 +876,11 @@ fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
         );
     }
 
-    // 1 px rounded border inside the square, opaque window.
+    // A 1 px hairline just inside the square, opaque window.
     painter.rect_stroke(
         rect.shrink(0.5),
-        CornerRadius::same(radius),
-        Stroke::new(1.0, BORDER_RED),
+        CornerRadius::ZERO,
+        Stroke::new(1.0, theme::BORDER_STRONG),
         egui::StrokeKind::Inside,
     );
 

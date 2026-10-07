@@ -6,10 +6,13 @@
 //! choosing; on later frames poll [`Confirm::answer`] with the same id.
 //! A new request cancels a pending one, which then answers `false`.
 
-use super::theme::{self, BACKDROP, BG_RAISED, BORDER, TEXT, TEXT_MUTED};
+use super::theme::{self, BACKDROP, BG_RAISED, BORDER_STRONG, TEXT, TEXT_FAINT};
 use super::widgets;
 use eframe::egui::{self, CornerRadius, Margin, Stroke};
 use std::collections::HashMap;
+
+/// The modal's maximum width.
+const MAX_WIDTH: f32 = 400.0;
 
 struct Pending {
     id: egui::Id,
@@ -67,21 +70,26 @@ impl Confirm {
         }
     }
 
-    /// Draw the modal (call once per pass, after the views).
+    /// Draw the modal (call once per pass, after the views): a 12 pt
+    /// rounded surface at most 400 pt wide (16 pt clear of the window
+    /// edges), the message, a faint Shift hint, then Cancel and the danger
+    /// button at the bottom right.
     pub fn show(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.pending.as_mut() else {
             return;
         };
-        let width = (ctx.content_rect().width() - 48.0).clamp(0.0, 380.0);
+        let width = (ctx.content_rect().width() - 2.0 * theme::S4).clamp(0.0, MAX_WIDTH);
+        // Generous padding, a little tighter on the narrowest windows.
+        let pad: i8 = if width < 360.0 { 20 } else { 24 };
         let frame = egui::Frame::new()
             .fill(BG_RAISED)
-            .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(CornerRadius::same(10))
+            .stroke(Stroke::new(1.0, BORDER_STRONG))
+            .corner_radius(CornerRadius::same(theme::R_LG))
             .inner_margin(Margin {
-                left: 20,
-                right: 20,
-                top: 18,
-                bottom: 14,
+                left: pad,
+                right: pad,
+                top: pad - 2,
+                bottom: pad - 4,
             })
             .shadow(ctx.global_style().visuals.window_shadow);
         let mut decision = None;
@@ -89,7 +97,9 @@ impl Confirm {
             .frame(frame)
             .backdrop_color(BACKDROP)
             .show(ctx, |ui| {
-                ui.set_width(width - 40.0);
+                // The frame adds its padding and the 1 pt stroke on each side.
+                ui.set_width((width - 2.0 * (f32::from(pad) + 1.0)).max(0.0));
+                ui.spacing_mut().item_spacing.y = 0.0;
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(&pending.message)
@@ -98,16 +108,26 @@ impl Confirm {
                     )
                     .wrap(),
                 );
-                ui.add_space(8.0);
+                ui.add_space(theme::S1 + 2.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("Tip: hold Shift to skip this confirmation")
+                            .font(theme::regular(12.0))
+                            .color(TEXT_FAINT),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(theme::S5 - 4.0);
                 // `horizontal` bounds the row's height; a bare right-to-left
                 // layout here would claim all the remaining (screen) height,
                 // stretching the modal and pushing the message off the top.
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = theme::S2;
                         if widgets::btn_danger(ui, pending.ok_label.as_str()).clicked() {
                             decision = Some(true);
                         }
-                        let cancel = widgets::btn_ghost(ui, "Cancel");
+                        let cancel = widgets::btn(ui, "Cancel");
                         if pending.focus_cancel {
                             cancel.request_focus();
                             pending.focus_cancel = false;
@@ -117,11 +137,6 @@ impl Confirm {
                         }
                     });
                 });
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new("Tip: hold Shift to skip this confirmation")
-                        .color(TEXT_MUTED),
-                );
             });
         // Escape or a backdrop click cancels.
         if decision.is_none() && modal.should_close() {
@@ -165,31 +180,36 @@ mod tests {
 
     #[test]
     fn modal_renders() {
-        let ctx = theme::test_context();
-        let mut confirm = Confirm::new();
-        confirm.ask(
-            egui::Id::new("x"),
-            "Delete?\nThis cannot be undone.",
-            "Delete",
-        );
-        for _ in 0..3 {
-            let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(460.0, 620.0),
-                )),
-                ..Default::default()
-            };
-            let mut output = ctx.run_ui(input, |ui| confirm.show(ui.ctx()));
-            output.textures_delta.clear(); // no renderer to upload the font atlas
+        for width in [380.0, 460.0, 1000.0] {
+            let ctx = theme::test_context();
+            let mut confirm = Confirm::new();
+            confirm.ask(
+                egui::Id::new("x"),
+                "Delete?\nThis cannot be undone.",
+                "Delete",
+            );
+            for _ in 0..3 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 620.0),
+                    )),
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(input, |ui| confirm.show(ui.ctx()));
+                output.textures_delta.clear(); // no renderer to upload the font atlas
+            }
+            assert!(confirm.is_open());
+            // A compact card, not a screen-tall panel (the message stays on
+            // screen above the buttons), clear of the window edges.
+            let card = ctx
+                .memory(|m| m.area_rect(egui::Id::new("witness-confirm")))
+                .expect("modal area");
+            assert!(card.height() < 260.0, "{card:?}");
+            assert!(card.top() > 0.0, "{card:?}");
+            assert!(card.width() <= MAX_WIDTH + 0.5, "{card:?}");
+            assert!(card.left() >= theme::S4 - 0.5, "{width}: {card:?}");
+            assert!(card.right() <= width - theme::S4 + 0.5, "{width}: {card:?}");
         }
-        assert!(confirm.is_open());
-        // A compact card, not a screen-tall panel (the message stays on
-        // screen above the buttons).
-        let card = ctx
-            .memory(|m| m.area_rect(egui::Id::new("witness-confirm")))
-            .expect("modal area");
-        assert!(card.height() < 260.0, "{card:?}");
-        assert!(card.top() > 0.0, "{card:?}");
     }
 }
