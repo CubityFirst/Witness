@@ -1,8 +1,17 @@
 //! The transcript view (map-ui-transcript §1–§9): header (Back, title with
-//! rename, meta line, Export and Retranscribe menus), the speaker stats
-//! bar, the provisional live-caption feed while a meeting records, the
-//! collapsible notes, segments interleaved with bookmarks, the "Jump to
-//! current" pill, and the player bar pinned at the bottom.
+//! rename, meta line, Export and Retranscribe menus), the speaker summary
+//! (one stacked proportion bar + a wrapping legend), the provisional
+//! live-caption feed while a meeting records, the collapsible notes,
+//! segments interleaved with bookmarks, the "Jump to current" pill, and the
+//! player bar docked at the bottom.
+//!
+//! Layout (design/ui-rework.md): the scroller spans the window (its bar at
+//! the edge) with the content in the page's padded, centred column; the
+//! player bar uses the same column. Segments are grouped by speaker turn:
+//! a turn's first row carries a header (the speaker's name in its colour,
+//! which opens the rename, and the time, which seeks); the rows after it
+//! are just text — click to play, the time is in the tooltip, and a
+//! focusable seek target sits in the row's left padding for the keyboard.
 //!
 //! Threading (design §3.4): the meeting, its audio path, the people list
 //! and the clipboard text are view-owned `Task`s, so a remount drops stale
@@ -33,8 +42,8 @@ use crate::ui::format::{
 };
 use crate::ui::icons::{self, ph};
 use crate::ui::theme::{
-    self, chip_color, ACCENT, ACTIVE_SEG_BG, ACTIVE_SEG_STROKE, BG, BG_HOVER, BG_RAISED,
-    BOOKMARK_GLYPH, BOOKMARK_ROW_BG, BORDER, FOCUS, MARK_BG, MARK_TEXT, REC, REC_LIGHT, TEXT,
+    self, speaker_text, ACCENT, ACTIVE_SEG_BG, ACTIVE_SEG_STROKE, BG, BG_HOVER, BG_RAISED,
+    BOOKMARK_ROW_BG, BORDER, FOCUS, MARK_BG, MARK_TEXT, REC, REC_LIGHT, TEXT, TEXT_FAINT,
     TEXT_MUTED, THEM_CHIP, WARN,
 };
 use crate::ui::toasts::Notice;
@@ -56,8 +65,6 @@ use witness_core::settings::Engine;
 use witness_core::transcript_export::ExportFormat;
 use witness_core::CoreResult;
 
-/// `.transcript-view { max-width: 900px }`.
-const MAX_WIDTH: f32 = 900.0;
 /// Notes autosave debounce.
 const NOTES_DEBOUNCE: Duration = Duration::from_millis(800);
 /// How long the Export button shows the check mark after a copy.
@@ -66,14 +73,40 @@ const COPIED_FOR: Duration = Duration::from_millis(1500);
 const PLAY_FRAME: Duration = Duration::from_millis(33);
 /// ←/→ while nothing has focus.
 const KEY_SKIP_MS: i64 = 5_000;
-/// `.segments { gap: 2px }`.
-const ROW_GAP: f32 = 2.0;
-/// `.segment { padding: 6px 10px }`.
+/// Space under every list row.
+const ROW_GAP: f32 = 1.0;
+/// A row's padding: its hover / active fill reaches this far past the text.
 const ROW_PAD_X: f32 = 10.0;
-const ROW_PAD_Y: f32 = 6.0;
-/// Transcript text: 14 px at `line-height: 1.45`.
+const ROW_PAD_Y: f32 = 4.0;
+/// Extra space above a speaker turn (outside its first row's fill), and
+/// above a bookmark row. The list's first row has none.
+const TURN_GAP: f32 = 12.0;
+const BOOKMARK_GAP: f32 = 6.0;
+/// A turn header's line (name + time) and the gap under it.
+const HEADER_H: f32 = 20.0;
+const HEADER_GAP: f32 = 2.0;
+/// The speaker's name in a turn header.
+const NAME_SIZE: f32 = 13.0;
+/// A bookmark row's line: as tall as its trash button.
+const BOOKMARK_LINE: f32 = 28.0;
+/// Transcript text: 14 pt at `line-height: 1.45`.
 const TEXT_SIZE: f32 = 14.0;
 const LINE_HEIGHT: f32 = TEXT_SIZE * 1.45;
+/// Estimating an unmeasured row's text height (calibrated on measured rows
+/// at 380–800 pt, unbiased to within a point): a 14 pt character's average
+/// advance, the characters word wrapping leaves unused per line, and the
+/// line as rendered (the 20.3 pt line lands on whole pixels).
+const EST_CHAR_W: f32 = 6.3;
+const EST_WRAP_LOSS: f32 = 3.0;
+const EST_LINE: f32 = 20.0;
+/// A row measured at a width this far from the current one is estimated
+/// instead (see `RowList::heights`).
+const STALE_WIDTH: f32 = 8.0;
+/// The speaker summary's proportion bar: thickness, the gap between two
+/// speakers' segments, and the narrowest a (tiny) share is drawn.
+const SUMMARY_BAR_H: f32 = 8.0;
+const SUMMARY_GAP: f32 = 2.0;
+const SUMMARY_MIN_SEG: f32 = 3.0;
 /// Rows laid out beyond the visible area (smooth wheel scrolling).
 const OVERSCAN: f32 = 600.0;
 /// A deep link re-aims until the row sits this close to the centre, for
@@ -132,6 +165,36 @@ fn build_rows(detail: &MeetingDetail) -> Vec<Row> {
     );
     rows.sort_by_key(|(at, _)| *at);
     rows.into_iter().map(|(_, row)| row).collect()
+}
+
+/// Who a segment belongs to for turn grouping: its speaker, or — while
+/// unassigned — its track (shown as `me` / `S?`).
+fn turn_key(seg: &Segment) -> (Option<i64>, &str) {
+    match seg.speaker_id {
+        Some(id) => (Some(id), ""),
+        None => (None, seg.track.as_str()),
+    }
+}
+
+/// Which rows start a speaker turn (and so carry the header): a segment
+/// whose speaker differs from the previous row's, or whose previous row is
+/// a bookmark (it interrupts the turn). Bookmark rows are never one.
+fn turn_starts(detail: &MeetingDetail, rows: &[Row]) -> Vec<bool> {
+    let mut previous = None;
+    rows.iter()
+        .map(|row| match *row {
+            Row::Seg(i) => {
+                let key = turn_key(&detail.segments[i]);
+                let head = previous != Some(key);
+                previous = Some(key);
+                head
+            }
+            Row::Bm(_) => {
+                previous = None;
+                false
+            }
+        })
+        .collect()
 }
 
 /// How a segment's speaker is shown.
@@ -211,7 +274,8 @@ fn speaker_stats(detail: &MeetingDetail, index: &HashMap<i64, usize>) -> Vec<Spe
     stats
 }
 
-/// `{fmtDuration(talk)} · {words} words · {share}%`.
+/// `{fmtDuration(talk)} · {words} words · {share}%` (the full figures, in
+/// the summary's tooltips).
 fn stat_text(stat: &SpeakerStat) -> String {
     format!(
         "{} · {} words · {}%",
@@ -221,23 +285,38 @@ fn stat_text(stat: &SpeakerStat) -> String {
     )
 }
 
-/// `.stat-chip` gap between the speaker chip and its numbers.
-const STAT_GAP: f32 = 6.0;
-/// The stats chips' `max-width` in em.
-const STAT_CHIP_MAX_EM: f32 = 16.0;
+/// The legend's short figures: `{fmtDuration(talk)} · {share}%`.
+fn legend_text(stat: &SpeakerStat) -> String {
+    format!(
+        "{} · {}%",
+        fmt_duration(Some(stat.talk_ms)),
+        stat.share.round()
+    )
+}
 
-/// The size `widgets::chip(ui, name, _, STAT_CHIP_MAX_EM)` will take, so a
-/// stat can claim its whole width before it is drawn. Mirrors the kit's
-/// chip metrics (11 pt semibold, truncated to the em cap, 8/2 px padding).
-fn stat_chip_size(ui: &egui::Ui, name: &str) -> egui::Vec2 {
-    let max_text = (STAT_CHIP_MAX_EM * 11.0 - 16.0).max(11.0);
-    let mut job = egui::text::LayoutJob::simple_singleline(
-        name.to_owned(),
-        crate::ui::theme::semibold(11.0),
-        egui::Color32::WHITE,
-    );
-    job.wrap = egui::text::TextWrapping::truncate_at_width(max_text);
-    ui.painter().layout_job(job).size() + egui::vec2(16.0, 4.0)
+/// The proportion bar's segment widths for `shares` (percent) in `width`:
+/// every speaker gets at least `SUMMARY_MIN_SEG` (a 0 % voice still shows),
+/// `SUMMARY_GAP` separates neighbours, and the widths always fill `width`
+/// exactly.
+fn summary_widths(shares: &[f64], width: f32) -> Vec<f32> {
+    let n = shares.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let total: f64 = shares.iter().sum();
+    let fixed = SUMMARY_GAP * (n - 1) as f32 + SUMMARY_MIN_SEG * n as f32;
+    let spread = (width - fixed).max(0.0);
+    shares
+        .iter()
+        .map(|share| {
+            let t = if total > 0.0 {
+                (share / total) as f32
+            } else {
+                1.0 / n as f32
+            };
+            SUMMARY_MIN_SEG + t * spread
+        })
+        .collect()
 }
 
 /// The status text under an empty transcript (map §4.6).
@@ -280,17 +359,41 @@ fn empty_message(
     }
 }
 
-/// A rough row height before the row has been measured: chip, timestamp
-/// and gaps take a fixed share of the width, the text wraps in the rest.
-fn estimate_height(detail: &MeetingDetail, row: Row, width: f32) -> f32 {
-    let (chars, reserved) = match row {
-        Row::Seg(i) => (detail.segments[i].text.chars().count(), 140.0),
-        Row::Bm(i) => (detail.bookmarks[i].note.chars().count().max(30), 150.0),
+/// How a row is drawn, beyond its data: whether it starts a speaker turn
+/// (header line + turn gap) and whether it is the list's first row (no gap
+/// above). A measured height is only reused for the same shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowShape {
+    head: bool,
+    first: bool,
+}
+
+/// A rough row height before the row has been measured: the text wraps in
+/// the row's width (a bookmark's note beside its time and trash button);
+/// a turn's first row adds its header line and the turn gap.
+fn estimate_height(detail: &MeetingDetail, row: Row, shape: RowShape, width: f32) -> f32 {
+    let above = |gap: f32| if shape.first { 0.0 } else { gap };
+    let lines = |chars: usize, reserved: f32| {
+        let text_width = (width - 2.0 * ROW_PAD_X - reserved).max(80.0);
+        let per_line = (text_width / EST_CHAR_W - EST_WRAP_LOSS).max(8.0);
+        (chars as f32 / per_line).ceil().max(1.0)
     };
-    let text_width = (width - 2.0 * ROW_PAD_X - reserved).max(80.0);
-    let per_line = (text_width / 6.8).max(8.0);
-    let lines = (chars as f32 / per_line).ceil().max(1.0);
-    lines * LINE_HEIGHT + 2.0 * ROW_PAD_Y + ROW_GAP
+    match row {
+        Row::Seg(i) => {
+            let text = lines(detail.segments[i].text.chars().count(), 0.0) * EST_LINE;
+            let header = if shape.head {
+                above(TURN_GAP) + HEADER_H + HEADER_GAP
+            } else {
+                0.0
+            };
+            header + text + 2.0 * ROW_PAD_Y + ROW_GAP
+        }
+        Row::Bm(i) => {
+            let note = lines(detail.bookmarks[i].note.chars().count().max(30), 110.0);
+            let line = (note * EST_LINE).max(BOOKMARK_LINE);
+            above(BOOKMARK_GAP) + line + 2.0 * ROW_PAD_Y + ROW_GAP
+        }
+    }
 }
 
 /// Names offered while renaming a speaker: case-insensitive substring
@@ -538,10 +641,11 @@ struct BookmarkEdit {
     edit: LineEdit,
 }
 
-/// `.rename-input`: BG fill, 1 px accent border, radius 4, 3/6 padding.
-/// Takes focus once when opened; reports Enter / focus loss as Commit and
-/// Escape as Cancel. A focus loss into the field's own right-click menu is
-/// neither. `label` is the field's accessible name (the 0.2.x aria-label).
+/// An inline rename field: BG fill, 1 px accent border, radius 6, 3/8
+/// padding (`INLINE_EDIT_MARGIN`). Takes focus once when opened; reports
+/// Enter / focus loss as Commit and Escape as Cancel. A focus loss into the
+/// field's own right-click menu is neither. `label` is the field's
+/// accessible name (the 0.2.x aria-label).
 fn inline_editor(
     ui: &mut egui::Ui,
     id: Id,
@@ -554,8 +658,8 @@ fn inline_editor(
     let response = Frame::new()
         .fill(BG)
         .stroke(Stroke::new(1.0, ACCENT))
-        .corner_radius(CornerRadius::same(4))
-        .inner_margin(Margin::symmetric(6, 3))
+        .corner_radius(CornerRadius::same(theme::R_SM))
+        .inner_margin(INLINE_EDIT_MARGIN)
         .show(ui, |ui| {
             let mut field = egui::TextEdit::singleline(&mut edit.text)
                 .id(id)
@@ -587,6 +691,9 @@ fn inline_editor(
     }
     (response, outcome)
 }
+
+/// [`inline_editor`]'s padding inside its 1 pt border.
+const INLINE_EDIT_MARGIN: Margin = Margin::symmetric(8, 3);
 
 /// Name a widget for screen readers (egui's TextEdit only exposes its hint
 /// as a placeholder).
@@ -755,10 +862,15 @@ struct ListPass {
 struct RowList {
     rows: Vec<Row>,
     keys: Vec<RowKey>,
+    /// Whether each row starts a speaker turn ([`turn_starts`]).
+    heads: Vec<bool>,
     /// Row index of each segment.
     seg_row: Vec<usize>,
-    /// Measured outer height (incl. the gap) and the width it was measured
-    /// at. A stale width still beats an estimate until the row is redrawn.
+    /// The width each row was measured at and its outer height (incl. the
+    /// gaps). Within `STALE_WIDTH` of the current width (the scroll bar
+    /// fading in) a measurement beats the estimate; past it the text has
+    /// reflowed and the estimate at the new width is the better guess,
+    /// until the row is redrawn.
     heights: Vec<Option<(f32, f32)>>,
     /// The first row visible at the viewport top and how far its top sat
     /// above it, so a width change (rows reflow, estimates change) keeps
@@ -769,15 +881,16 @@ struct RowList {
 }
 
 impl RowList {
-    /// Rebuild the rows for new data, keeping measured heights by key.
+    /// Rebuild the rows for new data, keeping measured heights by key —
+    /// but only for rows whose shape is unchanged: a bookmark added or
+    /// removed before a row can make it start (or stop starting) a turn,
+    /// which adds or drops its header line.
     fn rebuild(&mut self, detail: &MeetingDetail) {
-        let old: HashMap<RowKey, (f32, f32)> = self
-            .keys
-            .iter()
-            .zip(&self.heights)
-            .filter_map(|(key, h)| h.map(|h| (*key, h)))
+        let old: HashMap<RowKey, (RowShape, (f32, f32))> = (0..self.keys.len())
+            .filter_map(|r| self.heights[r].map(|h| (self.keys[r], (self.shape(r), h))))
             .collect();
         self.rows = build_rows(detail);
+        self.heads = turn_starts(detail, &self.rows);
         self.keys = self
             .rows
             .iter()
@@ -792,13 +905,26 @@ impl RowList {
                 self.seg_row[*i] = r;
             }
         }
-        self.heights = self.keys.iter().map(|key| old.get(key).copied()).collect();
+        self.heights = (0..self.keys.len())
+            .map(|r| {
+                old.get(&self.keys[r])
+                    .filter(|(shape, _)| *shape == self.shape(r))
+                    .map(|(_, h)| *h)
+            })
+            .collect();
+    }
+
+    fn shape(&self, row: usize) -> RowShape {
+        RowShape {
+            head: self.heads[row],
+            first: row == 0,
+        }
     }
 
     fn height(&self, detail: &MeetingDetail, row: usize, width: f32) -> f32 {
         match self.heights[row] {
-            Some((_, h)) => h,
-            None => estimate_height(detail, self.rows[row], width),
+            Some((measured_at, h)) if (measured_at - width).abs() <= STALE_WIDTH => h,
+            _ => estimate_height(detail, self.rows[row], self.shape(row), width),
         }
     }
 
@@ -833,9 +959,20 @@ impl RowList {
         let row_top = ui.cursor().top();
         let key = self.keys[r];
         let row = self.rows[r];
+        let shape = self.shape(r);
         ui.push_id(key, |ui| match row {
-            Row::Seg(i) => segment_row(ui, rc, i, actions),
-            Row::Bm(i) => bookmark_row(ui, rc, i, actions),
+            Row::Seg(i) => {
+                if shape.head && !shape.first {
+                    ui.add_space(TURN_GAP);
+                }
+                segment_row(ui, rc, i, shape.head, actions);
+            }
+            Row::Bm(i) => {
+                if !shape.first {
+                    ui.add_space(BOOKMARK_GAP);
+                }
+                bookmark_row(ui, rc, i, actions);
+            }
         });
         ui.add_space(ROW_GAP);
         let h = ui.cursor().top() - row_top;
@@ -889,20 +1026,18 @@ impl RowList {
 
         // Width changed: shift the scroll so the anchor row stays put (the
         // shift applies next pass; a scroll request repositions anyway).
+        // Computed after drawing: the rows drawn this pass are re-measured
+        // (reflowed), which the pass-start heights do not know yet.
         let resized = self.last_width.is_some_and(|w| (w - width).abs() > 0.5);
         self.last_width = Some(width);
-        if let (true, None, Some((key, above))) = (resized, req, self.anchor) {
-            if let Some(row) = self.keys.iter().position(|k| *k == key) {
-                let y_now = top + heights[..row].iter().sum::<f32>();
-                let shift = y_now - (clip.top() - above);
-                if shift.abs() > 0.5 {
-                    ui.scroll_with_delta_animation(
-                        egui::vec2(0.0, -shift),
-                        egui::style::ScrollAnimation::none(),
-                    );
-                }
-            }
-        }
+        let resize_anchor = match (resized, req, self.anchor) {
+            (true, None, Some((key, above))) => self
+                .keys
+                .iter()
+                .position(|k| *k == key)
+                .map(|row| (row, above)),
+            _ => None,
+        };
 
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -946,9 +1081,28 @@ impl RowList {
                 ));
             }
             self.space_or_editors(ui, rc, next..n, &pass, &mut out);
+            if let Some((row, above)) = resize_anchor {
+                // Where the anchor row lands next pass: the rows drawn this
+                // pass count at their reflowed heights now.
+                let y_now = top
+                    + (0..row)
+                        .map(|r| self.height(rc.detail, r, width))
+                        .sum::<f32>();
+                let shift = y_now - (clip.top() - above);
+                if shift.abs() > 0.5 {
+                    ui.scroll_with_delta_animation(
+                        egui::vec2(0.0, -shift),
+                        egui::style::ScrollAnimation::none(),
+                    );
+                }
+            }
             // No anchor while the list starts below the viewport top (the
-            // header is in view and reflows with the rest).
-            self.anchor = anchor;
+            // header is in view and reflows with the rest). A resize pass
+            // keeps the one it restores: what it saw at the top was laid
+            // out before the shift (a window drag resizes every pass).
+            if resize_anchor.is_none() {
+                self.anchor = anchor;
+            }
             if let (Some(req), Some(rect)) = (req, target_rect) {
                 let animation = if req.animate && icons::animations_enabled() {
                     ui.style().scroll_animation
@@ -968,33 +1122,33 @@ fn row_height(ui: &egui::Ui, font: &FontId) -> f32 {
     ui.fonts_mut(|f| f.row_height(font))
 }
 
-/// A chip placed on the first text line (CSS `align-items: baseline`).
-fn chip_on_line(ui: &mut egui::Ui, text: &str, color: Color32) -> Response {
-    let chip_height = row_height(ui, &theme::semibold(11.0)) + 4.0;
-    let offset = ((LINE_HEIGHT - chip_height) / 2.0).max(0.0);
-    ui.vertical(|ui| {
-        ui.add_space(offset);
-        widgets::chip(ui, text, color, 16.0)
-    })
-    .inner
+/// `text` on one line, truncated with `…` at `max_width`.
+fn elided_galley(
+    ui: &egui::Ui,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    max_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(max_width.max(10.0));
+    ui.painter().layout_job(job)
 }
 
-/// The `[m:ss]` seek button (`.segment-seek` / `.ts`): 12 px muted,
-/// sitting on the first text line.
+/// A turn header's time (`m:ss`, 12 pt muted, brighter on hover): the
+/// row's seek button, as tall as the header line.
 fn ts_button(ui: &mut egui::Ui, ms: i64, label: &str) -> Response {
-    let galley = ui.painter().layout_no_wrap(
-        format!("[{}]", fmt_ts(ms)),
-        theme::regular(12.0),
-        TEXT_MUTED,
-    );
+    let galley = ui
+        .painter()
+        .layout_no_wrap(fmt_ts(ms), theme::regular(12.0), TEXT_MUTED);
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(galley.size().x, LINE_HEIGHT), Sense::click());
+        ui.allocate_exact_size(egui::vec2(galley.size().x, HEADER_H), Sense::click());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
     if ui.is_rect_visible(rect) {
-        // Bottom-align with the 14 px text's baseline.
-        let y = rect.bottom() - galley.size().y - 1.0;
+        let color = if response.hovered() { TEXT } else { TEXT_MUTED };
+        let pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
         ui.painter()
-            .galley(egui::pos2(rect.left(), y), galley, TEXT_MUTED);
+            .galley_with_override_text_color(pos, galley, color);
         if response.has_focus() && widgets::focus_visible(ui.ctx()) {
             focus_ring(ui, rect, 4);
         }
@@ -1011,15 +1165,16 @@ fn focus_ring(ui: &egui::Ui, rect: Rect, radius: u8) {
     );
 }
 
-/// Start a `.segment` row frame; the fill is decided after the content.
+/// Start a list row's frame (padding, radius 6); the fill is decided after
+/// the content, once the row's rect is known.
 fn begin_row(ui: &mut egui::Ui) -> egui::containers::frame::Prepared {
     let mut prepared = Frame::new()
         .inner_margin(Margin::symmetric(ROW_PAD_X as i8, ROW_PAD_Y as i8))
-        .corner_radius(CornerRadius::same(6))
+        .corner_radius(CornerRadius::same(theme::R_SM))
         .begin(ui);
     let content = &mut prepared.content_ui;
     content.set_min_width(content.available_width());
-    content.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+    content.spacing_mut().item_spacing = egui::vec2(8.0, HEADER_GAP);
     prepared
 }
 
@@ -1031,79 +1186,47 @@ fn row_rect(prepared: &egui::containers::frame::Prepared) -> Rect {
         .expand2(egui::vec2(ROW_PAD_X, ROW_PAD_Y))
 }
 
-fn segment_row(ui: &mut egui::Ui, rc: &mut RowCtx, idx: usize, actions: &mut Vec<RowAction>) {
+/// A segment: the turn header when `head`, then the text (selectable; a
+/// click that is not a drag selection plays from here), then the speaker
+/// rename field while it is open on this row. Active = the accent tint.
+fn segment_row(
+    ui: &mut egui::Ui,
+    rc: &mut RowCtx,
+    idx: usize,
+    head: bool,
+    actions: &mut Vec<RowAction>,
+) {
     let detail = rc.detail;
     let seg = &detail.segments[idx];
-    let who = who(detail, rc.speakers, seg);
     let active = rc.active == Some(idx);
+    let seek_label = format!("Play at {}", fmt_ts(seg.start_ms));
     let mut prepared = begin_row(ui);
+    let mut seek = None;
     {
         let ui = &mut prepared.content_ui;
-        ui.horizontal_top(|ui| {
-            let chip_text = if who.auto {
-                format!("≈ {}", who.name)
-            } else {
-                who.name.to_string()
-            };
-            let chip = chip_on_line(ui, &chip_text, chip_color(who.label));
-            let tooltip = if who.auto {
-                format!(
-                    "{} — auto-matched by voice, click to rename/confirm",
-                    who.name
-                )
-            } else {
-                format!("{} — click to rename", who.name)
-            };
-            match seg.speaker_id {
-                Some(speaker_id) => {
-                    let click = ui.interact(chip.rect, ui.id().with("chip"), Sense::click());
-                    click.widget_info(|| {
-                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &chip_text)
-                    });
-                    if click.has_focus() && widgets::focus_visible(ui.ctx()) {
-                        focus_ring(ui, chip.rect, 255);
-                    }
-                    let click = click
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_text(tooltip);
-                    if click.clicked() {
-                        actions.push(RowAction::OpenSpeaker {
-                            speaker_id,
-                            seg_id: seg.id,
-                        });
-                    }
-                }
-                // Disabled (no speaker to rename) but at full opacity.
-                None => {
-                    chip.on_hover_text(tooltip);
-                }
-            }
-            let label = format!("Play at {}", fmt_ts(seg.start_ms));
-            let ts = ts_button(ui, seg.start_ms, &label);
-            if *rc.focus_seg == Some(seg.id) {
-                // 0.2.x focused the hit's seek button: Tab continues from
-                // the hit and Space/Enter plays from it.
-                ts.request_focus();
-                *rc.focus_seg = None;
-            }
-            if ts.clicked() {
-                actions.push(RowAction::SeekPlay(idx));
-            }
-            // Selectable text; a click that is not a drag selection seeks.
-            let text = ui.add(
-                egui::Label::new(text_job(&seg.text, rc.tokens))
-                    .wrap()
-                    .selectable(true),
-            );
-            if text.clicked() {
-                actions.push(RowAction::SeekPlay(idx));
-            }
-        });
+        if head {
+            seek = Some(turn_header(ui, rc, seg, &seek_label, actions));
+        }
+        let text = ui.add(
+            egui::Label::new(text_job(&seg.text, rc.tokens))
+                .wrap()
+                .selectable(true),
+        );
+        // No header, so no visible time: the tooltip has it.
+        let text = if head {
+            text
+        } else {
+            text.on_hover_text(format!("{} · click to play", fmt_ts(seg.start_ms)))
+        };
+        if text.clicked() {
+            actions.push(RowAction::SeekPlay(idx));
+        }
         let editing = rc
             .speaker_edit
             .as_ref()
             .is_some_and(|edit| edit.seg_id == seg.id);
         if editing {
+            ui.add_space(4.0);
             speaker_editor(ui, rc, actions);
         }
     }
@@ -1115,28 +1238,163 @@ fn segment_row(ui: &mut egui::Ui, rc: &mut RowCtx, idx: usize, actions: &mut Vec
     }
     let response = prepared.end(ui);
     if active {
-        // `outline: 1px`: painted over the row, never part of its layout (a
-        // frame stroke would grow the active row and shift every row below).
+        // The theme's outline for the active row: painted over the row,
+        // never part of its layout (a frame stroke would grow the active
+        // row and shift every row below).
         ui.painter().rect_stroke(
             response.rect,
-            CornerRadius::same(6),
+            CornerRadius::same(theme::R_SM),
             Stroke::new(1.0, ACTIVE_SEG_STROKE),
             egui::StrokeKind::Inside,
         );
     }
+
+    // A row without a header still needs a seek button for the keyboard
+    // (Tab, a deep link's focus): a strip in the row's left padding,
+    // beside the text and never over it (that would take the text's drag
+    // selection). Its focus ring outlines the whole row.
+    let seek = seek.unwrap_or_else(|| {
+        let row = response.rect;
+        let strip = Rect::from_min_max(
+            row.left_top(),
+            egui::pos2(row.left() + ROW_PAD_X - 2.0, row.bottom()),
+        );
+        let seek = ui.interact(strip, ui.id().with("seek"), Sense::click());
+        seek.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &seek_label));
+        if seek.has_focus() && widgets::focus_visible(ui.ctx()) {
+            focus_ring(ui, row, theme::R_SM);
+        }
+        seek.on_hover_cursor(egui::CursorIcon::PointingHand)
+    });
+    if *rc.focus_seg == Some(seg.id) {
+        // 0.2.x focused the hit's seek button: Tab continues from the hit
+        // and Space/Enter plays from it.
+        seek.request_focus();
+        *rc.focus_seg = None;
+    }
+    if seek.clicked() {
+        actions.push(RowAction::SeekPlay(idx));
+    }
 }
 
-/// The rename field under a speaker's row, its hint and the people
+/// A turn's header line: the speaker's name in its colour — a button that
+/// opens the rename when the segment has a speaker, `≈` marking an
+/// auto-matched voice — and the time. Returns the time's response (the
+/// row's seek button).
+fn turn_header(
+    ui: &mut egui::Ui,
+    rc: &RowCtx,
+    seg: &Segment,
+    seek_label: &str,
+    actions: &mut Vec<RowAction>,
+) -> Response {
+    let who = who(rc.detail, rc.speakers, seg);
+    let name = if who.auto {
+        format!("≈ {}", who.name)
+    } else {
+        who.name.to_string()
+    };
+    let tooltip = if who.auto {
+        format!(
+            "{} — auto-matched by voice, click to rename/confirm",
+            who.name
+        )
+    } else {
+        format!("{} — click to rename", who.name)
+    };
+    let width = ui.available_width();
+    let ts_width = ui
+        .painter()
+        .layout_no_wrap(fmt_ts(seg.start_ms), theme::regular(12.0), TEXT_MUTED)
+        .size()
+        .x;
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, HEADER_H),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let color = speaker_text(who.label);
+            let max = width - ts_width - 8.0;
+            match seg.speaker_id {
+                Some(speaker_id) => {
+                    let click = name_button(ui, &name, color, max, true);
+                    click.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name)
+                    });
+                    let click = click
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(tooltip);
+                    if click.clicked() {
+                        actions.push(RowAction::OpenSpeaker {
+                            speaker_id,
+                            seg_id: seg.id,
+                        });
+                    }
+                }
+                // No speaker to rename: the name only.
+                None => {
+                    let label = name_button(ui, &name, color, max, false);
+                    label.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &name)
+                    });
+                    label.on_hover_text(tooltip);
+                }
+            }
+            ts_button(ui, seg.start_ms, seek_label)
+        },
+    )
+    .inner
+}
+
+/// A speaker's name (13 pt semibold, `color`), elided at `max_width`; when
+/// `clickable`, a button with a soft tint of its colour on hover / focus.
+fn name_button(
+    ui: &mut egui::Ui,
+    name: &str,
+    color: Color32,
+    max_width: f32,
+    clickable: bool,
+) -> Response {
+    let galley = elided_galley(ui, name, theme::semibold(NAME_SIZE), color, max_width);
+    let sense = if clickable {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(galley.size().x, HEADER_H), sense);
+    if ui.is_rect_visible(rect) {
+        let ring = clickable && response.has_focus() && widgets::focus_visible(ui.ctx());
+        // The tint reaches into the row padding, not into the time.
+        let tint = rect.expand2(egui::vec2(4.0, -1.0));
+        if clickable && (response.hovered() || ring) {
+            ui.painter().rect_filled(
+                tint,
+                CornerRadius::same(theme::R_SM),
+                theme::alpha(color, 0.14),
+            );
+        }
+        let pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
+        ui.painter().galley(pos, galley, color);
+        if ring {
+            focus_ring(ui, tint, theme::R_SM);
+        }
+    }
+    response
+}
+
+/// The rename field under a speaker's turn header, its hint and the people
 /// suggestions ("a typo would fork a new person").
 fn speaker_editor(ui: &mut egui::Ui, rc: &mut RowCtx, actions: &mut Vec<RowAction>) {
     let Some(state) = rc.speaker_edit.as_mut() else {
         return;
     };
     let seg_id = state.seg_id;
-    ui.horizontal_wrapped(|ui| {
+    // The field, then its hint on a line of its own (beside the field it
+    // wrapped into a ragged column at narrow widths).
+    ui.vertical(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
         let id = Id::new(("speaker-rename", seg_id));
-        // `Rename ${display_name ?? label}`, as the chip shows it.
+        // `Rename ${display_name ?? label}`, as the header shows it.
         let name = speaker_of(rc.detail, rc.speakers, Some(state.speaker_id))
             .map(|s| {
                 if s.display_name.is_empty() {
@@ -1146,12 +1404,14 @@ fn speaker_editor(ui: &mut egui::Ui, rc: &mut RowCtx, actions: &mut Vec<RowActio
                 }
             })
             .unwrap_or("speaker");
+        let width = (ui.available_width() - 2.0 * f32::from(INLINE_EDIT_MARGIN.left) - 2.0)
+            .clamp(80.0, 280.0);
         let (field, outcome) = inline_editor(
             ui,
             id,
             &mut state.edit,
             theme::regular(TEXT_SIZE),
-            180.0,
+            width,
             "",
             &format!("Rename {name}"),
         );
@@ -1160,7 +1420,7 @@ fn speaker_editor(ui: &mut egui::Ui, rc: &mut RowCtx, actions: &mut Vec<RowActio
             "Saves this voice as {} for future meetings",
             if shown.is_empty() { "this name" } else { shown }
         );
-        ui.add(egui::Label::new(egui::RichText::new(hint).size(11.0).color(TEXT_MUTED)).wrap());
+        ui.add(egui::Label::new(egui::RichText::new(hint).size(12.0).color(TEXT_MUTED)).wrap());
 
         // A press on the suggestion list blurs the field first; that blur
         // must not commit the half-typed text. It is remembered instead:
@@ -1188,10 +1448,10 @@ fn speaker_editor(ui: &mut egui::Ui, rc: &mut RowCtx, actions: &mut Vec<RowActio
         if !names.is_empty() && on_screen && (field.has_focus() || into_suggestions) {
             let area = egui::Area::new(id.with("suggestions"))
                 .order(Order::Foreground)
-                .fixed_pos(field.rect.left_bottom() + egui::vec2(-6.0, 6.0))
+                .fixed_pos(field.rect.left_bottom() + egui::vec2(0.0, 4.0))
                 .show(ui.ctx(), |ui| {
                     menu_frame(ui).show(ui, |ui| {
-                        ui.set_min_width(field.rect.width() + 12.0);
+                        ui.set_min_width(field.rect.width());
                         ui.spacing_mut().item_spacing.y = 0.0;
                         for name in names {
                             if menu_item(ui, name).clicked() {
@@ -1220,24 +1480,29 @@ fn speaker_editor(ui: &mut egui::Ui, rc: &mut RowCtx, actions: &mut Vec<RowActio
     });
 }
 
+/// A bookmark: its seek button (warn glyph + time), the note (a button
+/// that edits it, or the open editor) and the remove button, on a faint
+/// warn tint.
 fn bookmark_row(ui: &mut egui::Ui, rc: &mut RowCtx, idx: usize, actions: &mut Vec<RowAction>) {
-    let bookmark = &rc.detail.bookmarks[idx];
+    let detail = rc.detail;
+    let bookmark = &detail.bookmarks[idx];
     let mut prepared = begin_row(ui);
     {
         let ui = &mut prepared.content_ui;
         ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
             let ts = fmt_ts(bookmark.at_ms);
             if bookmark_seek(ui, &ts).clicked() {
                 actions.push(RowAction::BookmarkSeek(bookmark.at_ms));
             }
-            let trash_width = 22.0;
+            let trash_width = BOOKMARK_LINE;
             let note_width = (ui.available_width() - trash_width - 8.0).max(60.0);
             let editing = rc
                 .bookmark_edit
                 .as_ref()
                 .is_some_and(|edit| edit.id == bookmark.id);
             ui.allocate_ui_with_layout(
-                egui::vec2(note_width, LINE_HEIGHT),
+                egui::vec2(note_width, BOOKMARK_LINE),
                 Layout::top_down(Align::Min),
                 |ui| {
                     ui.set_min_width(note_width);
@@ -1248,7 +1513,7 @@ fn bookmark_row(ui: &mut egui::Ui, rc: &mut RowCtx, idx: usize, actions: &mut Ve
                                 Id::new(("bookmark-note", bookmark.id)),
                                 &mut state.edit,
                                 theme::regular(TEXT_SIZE),
-                                (note_width - 14.0).max(60.0),
+                                (note_width - 18.0).max(60.0),
                                 "what happened here?",
                                 "Bookmark note",
                             );
@@ -1260,6 +1525,8 @@ fn bookmark_row(ui: &mut egui::Ui, rc: &mut RowCtx, idx: usize, actions: &mut Ve
                             }
                         }
                     } else {
+                        // The note's first line centred on the 28 pt line.
+                        ui.add_space((BOOKMARK_LINE - LINE_HEIGHT) / 2.0);
                         bookmark_note(ui, bookmark, actions);
                     }
                 },
@@ -1283,36 +1550,34 @@ fn bookmark_row(ui: &mut egui::Ui, rc: &mut RowCtx, idx: usize, actions: &mut Ve
     } else {
         BOOKMARK_ROW_BG
     };
-    let response = prepared.end(ui);
-    // `border-left: 2px solid var(--warn)`, following the rounded corners.
-    widgets::paint_left_edge(ui, response.rect, 2.0, 6, WARN);
+    prepared.end(ui);
 }
 
-/// `.bookmark-seek`: the warn chip with the bookmark glyph plus `[ts]`.
+/// A bookmark's seek button: the warn bookmark glyph and the time (12 pt
+/// muted, brighter on hover), on the row's 28 pt line.
 fn bookmark_seek(ui: &mut egui::Ui, ts: &str) -> Response {
-    let glyph = ui.painter().layout_no_wrap(
-        ph::BOOKMARK_SIMPLE.to_owned(),
-        theme::regular(11.0),
-        BOOKMARK_GLYPH,
-    );
+    let glyph =
+        ui.painter()
+            .layout_no_wrap(ph::BOOKMARK_SIMPLE.to_owned(), theme::regular(15.0), WARN);
     let time = ui
         .painter()
-        .layout_no_wrap(format!("[{ts}]"), theme::regular(12.0), TEXT_MUTED);
-    let chip_size = egui::vec2(glyph.size().x + 14.0, glyph.size().y + 6.0);
-    let size = egui::vec2(chip_size.x + 8.0 + time.size().x, LINE_HEIGHT);
+        .layout_no_wrap(ts.to_owned(), theme::regular(12.0), TEXT_MUTED);
+    let size = egui::vec2(glyph.size().x + 6.0 + time.size().x, BOOKMARK_LINE);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let label = format!("Play recording at bookmark {ts}");
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        let chip = Rect::from_min_size(
-            egui::pos2(rect.left(), rect.center().y - chip_size.y / 2.0),
-            chip_size,
+        let cy = rect.center().y;
+        let time_x = rect.left() + glyph.size().x + 6.0;
+        let time_y = cy - time.size().y / 2.0;
+        painter.galley(
+            egui::pos2(rect.left(), cy - glyph.size().y / 2.0),
+            glyph,
+            WARN,
         );
-        painter.rect_filled(chip, CornerRadius::same(255), WARN);
-        painter.galley(chip.center() - glyph.size() / 2.0, glyph, BOOKMARK_GLYPH);
-        let y = rect.bottom() - time.size().y - 1.0;
-        painter.galley(egui::pos2(chip.right() + 8.0, y), time, TEXT_MUTED);
+        let color = if response.hovered() { TEXT } else { TEXT_MUTED };
+        painter.galley_with_override_text_color(egui::pos2(time_x, time_y), time, color);
         if response.has_focus() && widgets::focus_visible(ui.ctx()) {
             focus_ring(ui, rect, 4);
         }
@@ -1320,10 +1585,10 @@ fn bookmark_seek(ui: &mut egui::Ui, ts: &str) -> Response {
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// The note as a button (muted placeholder when empty); a click edits it.
+/// The note as a button (a faint placeholder when empty); a click edits it.
 fn bookmark_note(ui: &mut egui::Ui, bookmark: &Bookmark, actions: &mut Vec<RowAction>) {
     let (text, color) = if bookmark.note.is_empty() {
-        ("bookmark — click to add a note", TEXT_MUTED)
+        ("bookmark — click to add a note", TEXT_FAINT)
     } else {
         (bookmark.note.as_str(), TEXT)
     };
@@ -1346,7 +1611,7 @@ fn bookmark_note(ui: &mut egui::Ui, bookmark: &Bookmark, actions: &mut Vec<RowAc
     );
     let click = ui.interact(full, ui.id().with("note"), Sense::click());
     click.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, text));
-    if click.has_focus() {
+    if click.has_focus() && widgets::focus_visible(ui.ctx()) {
         focus_ring(ui, full, 4);
     }
     let click = click
@@ -1360,31 +1625,42 @@ fn bookmark_note(ui: &mut egui::Ui, bookmark: &Bookmark, actions: &mut Vec<RowAc
 // ---------------------------------------------------------------------------
 // Menus, pill
 
-/// `.menu`: raised fill, 1 px border, radius 8, popup shadow, no padding.
+/// The header's icon buttons: an 18 pt glyph in a 30 pt ghost square.
+const HEADER_ICON: f32 = 18.0;
+
+/// TODO(rework): the transcript header was `widgets::btn_ghost_icon`'s only
+/// caller and now uses `widgets::icon_btn`; this keeps the kit function
+/// warning-free until the kit drops it (kit request).
+const _: fn(&mut egui::Ui, egui::RichText, f32) -> Response =
+    |ui, glyph, size| widgets::btn_ghost_icon(ui, glyph, size);
+
+/// A popup menu: raised fill, 1 pt border, radius 8, popup shadow, 4 pt
+/// inset around its rounded items.
 fn menu_frame(ui: &egui::Ui) -> Frame {
     Frame::popup(ui.style())
-        .inner_margin(Margin::ZERO)
+        .inner_margin(Margin::same(4))
         .fill(BG_RAISED)
         .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(CornerRadius::same(8))
+        .corner_radius(CornerRadius::same(theme::R_MD))
 }
 
-/// `.menu button`: 13 px, 9/14 padding, full width, hover / focus fill.
+/// A menu item: 13 pt, 8/10 padding, full width, rounded hover fill.
 fn menu_item(ui: &mut egui::Ui, text: &str) -> Response {
     let galley = ui
         .painter()
         .layout_no_wrap(text.to_owned(), theme::regular(13.0), TEXT);
-    let width = ui.available_width().max(galley.size().x + 28.0);
+    let width = ui.available_width().max(galley.size().x + 20.0);
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, galley.size().y + 18.0), Sense::click());
+        ui.allocate_exact_size(egui::vec2(width, galley.size().y + 16.0), Sense::click());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, text));
     if ui.is_rect_visible(rect) {
-        // `.menu button:hover` only: the first item's programmatic focus on
-        // open must not leave a second highlighted row after a mouse open.
+        // Hover only: the first item's programmatic focus on open must not
+        // leave a second highlighted row after a mouse open.
         if response.hovered() {
-            ui.painter().rect_filled(rect, CornerRadius::ZERO, BG_HOVER);
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(theme::R_SM), BG_HOVER);
         }
-        let pos = egui::pos2(rect.left() + 14.0, rect.center().y - galley.size().y / 2.0);
+        let pos = egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y / 2.0);
         ui.painter().galley(pos, galley, TEXT);
         if response.has_focus() && widgets::focus_visible(ui.ctx()) {
             // The global `:focus-visible` outline, kept inside the popup.
@@ -1399,10 +1675,11 @@ fn menu_item(ui: &mut egui::Ui, text: &str) -> Response {
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// A header menu: a ghost icon button toggling a right-aligned popup whose
+/// A header menu: an icon button toggling a right-aligned popup whose
 /// first item takes focus on open; Escape closes it and refocuses the
 /// trigger. Opening one menu closes the other (egui keeps one popup open).
-/// Returns the index of the chosen item.
+/// `open` opens it this pass (debug snapshots). Returns the index of the
+/// chosen item.
 fn header_menu(
     ui: &mut egui::Ui,
     glyph: &str,
@@ -1410,22 +1687,31 @@ fn header_menu(
     label: &str,
     enabled: bool,
     items: &[&str],
+    open: bool,
 ) -> Option<usize> {
+    // A fixed id: the popup is keyed by the trigger's, and auto ids in the
+    // scroller shift when the player bar appears, which closed an open menu.
+    let scope = egui::UiBuilder::new().id(Id::new(("transcript-menu", label)));
     let trigger = ui
-        .add_enabled_ui(enabled, |ui| {
-            widgets::btn_ghost_icon(ui, icons::icon(glyph, 16.0), 16.0)
+        .scope_builder(scope, |ui| {
+            ui.add_enabled_ui(enabled, |ui| {
+                widgets::icon_btn(ui, glyph, HEADER_ICON, tooltip)
+            })
+            .inner
         })
         .inner;
     trigger.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
-    let trigger = trigger.on_hover_text(tooltip);
     let ctx = ui.ctx().clone();
     let popup_id = Popup::default_response_id(&trigger);
     let was_open = Popup::is_id_open(&ctx, popup_id);
+    if open && enabled {
+        Popup::open_id(&ctx, popup_id);
+    }
     let mut chosen = None;
     Popup::menu(&trigger)
         .align(RectAlign::BOTTOM_END)
         .gap(4.0)
-        .width(160.0)
+        .width(180.0)
         .frame(menu_frame(ui))
         .show(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -1693,18 +1979,21 @@ struct TranscriptState {
     play_origin: PlayOrigin,
     /// The live-caption feed's stick-to-bottom tracking.
     live_feed: LiveFeedState,
+    /// Debug builds: snapshot states asked for by environment variables.
+    debug: DebugHooks,
 }
 
 impl TranscriptState {
     fn new(meeting_id: i64, focus_segment_id: Option<i64>, highlight: Option<String>) -> Self {
         let (bookmark_tx, bookmark_rx) = crossbeam_channel::unbounded();
+        let debug = debug_hooks();
+        // Tokens only: `highlight` must keep matching the view's, or
+        // `sync_view_args` would reset them.
+        let tokens_from = highlight.as_deref().or(debug.highlight.as_deref());
         TranscriptState {
             meeting_id,
             focus_segment_id,
-            tokens: highlight
-                .as_deref()
-                .map(highlight_tokens)
-                .unwrap_or_default(),
+            tokens: tokens_from.map(highlight_tokens).unwrap_or_default(),
             highlight,
             synthetic: synthetic_enabled(),
             detail: None,
@@ -1739,9 +2028,10 @@ impl TranscriptState {
             scroll_outer: None,
             scroll_bar: None,
             first_frame: true,
-            player_bar: PlayerBarState::default(),
+            player_bar: PlayerBarState::with_volume_open(debug.volume),
             play_origin: PlayOrigin::Bar,
             live_feed: LiveFeedState::default(),
+            debug,
         }
     }
 
@@ -1752,7 +2042,10 @@ impl TranscriptState {
 
         if let Some(error) = self.load_error.clone() {
             let message = format!("Could not load meeting: {error}");
-            match widgets::view_error(ui, &message, &["Back", "Try again"]) {
+            let choice = widgets::padded_column(ui, |ui| {
+                widgets::view_error(ui, &message, &["Back", "Try again"])
+            });
+            match choice {
                 Some(0) => self.back(cx),
                 Some(_) => self.reload(cx, true),
                 None => {}
@@ -1760,7 +2053,7 @@ impl TranscriptState {
             return;
         }
         if self.detail.is_none() {
-            widgets::empty_state(ui, "Loading…", None);
+            widgets::padded_column(ui, |ui| widgets::empty_state(ui, "Loading…", None));
             return;
         }
 
@@ -1773,19 +2066,22 @@ impl TranscriptState {
         }
         self.detect_user_scroll(&ctx);
 
-        // The player bar, pinned under the scrolling content.
+        // The player bar, docked under the scrolling content. It lines up
+        // with the text column, which last pass's scroll bar narrowed.
         if playable {
             let mut bar_out = player_bar::PlayerBarOutput::default();
             let detail = self.detail.as_ref().expect("checked above");
             let bar_state = &mut self.player_bar;
+            let right = ui.max_rect().right();
+            let gutter = self
+                .scroll_inner
+                .map_or(0.0, |inner| (right - inner.right()).clamp(0.0, 20.0));
             egui::Panel::bottom(Id::new(("transcript-player", self.meeting_id)))
                 .frame(player_bar::bar_frame())
                 .resizable(false)
                 .show_separator_line(false)
                 .show(ui, |ui| {
-                    widgets::centered_column(ui, MAX_WIDTH, |ui| {
-                        bar_out = player_bar::show(ui, cx, detail, bar_state);
-                    });
+                    bar_out = player_bar::show(ui, cx, detail, bar_state, gutter);
                 });
             if bar_out.toggled {
                 self.play_origin = PlayOrigin::Bar;
@@ -1802,11 +2098,14 @@ impl TranscriptState {
             scroll = scroll.vertical_scroll_offset(0.0);
         }
         let mut list_out = ListOutput::default();
+        // Like `widgets::scroll_column`, but `show_viewport` (the list
+        // virtualises against the clip rect itself).
         let output = scroll.show_viewport(ui, |ui, _viewport| {
-            widgets::centered_column(ui, MAX_WIDTH, |ui| {
-                widgets::keyboard_scroll(ui, KeyScroll { space: false });
+            widgets::keyboard_scroll(ui, KeyScroll { space: false });
+            widgets::padded_column(ui, |ui| {
                 list_out = self.content(ui, cx, &playback);
             });
+            ui.add_space(theme::S4);
         });
         self.record_scroll_rects(ui, &output);
         self.settle_scroll(&ctx, &list_out);
@@ -2047,6 +2346,47 @@ impl TranscriptState {
         }
         self.detail = Some(detail);
         self.deep_link();
+        self.apply_debug_hooks();
+    }
+
+    /// The first load's share of the [`DebugHooks`] (each applies once).
+    fn apply_debug_hooks(&mut self) {
+        let Some(detail) = self.detail.as_ref() else {
+            return;
+        };
+        if std::mem::take(&mut self.debug.notes_open) {
+            self.notes.open = true;
+        }
+        if let Some(idx) = self.debug.segment.take() {
+            // A deep link by index, without `focus_segment_id` (which
+            // `sync_view_args` keeps equal to the view's).
+            if let Some(seg) = detail.segments.get(idx) {
+                self.active = Some(idx);
+                self.pending_seek_ms = Some(u64::try_from(seg.start_ms).unwrap_or(0));
+                self.scroll_req = Some(ScrollReq::new(idx, true, false));
+            }
+        }
+        if std::mem::take(&mut self.debug.rename) {
+            // The first turn header with a speaker to rename.
+            let first = self
+                .list
+                .rows
+                .iter()
+                .zip(&self.list.heads)
+                .find_map(|(row, head)| {
+                    let Row::Seg(i) = *row else { return None };
+                    let seg = &detail.segments[i];
+                    (*head)
+                        .then_some(seg)
+                        .and_then(|s| Some((s.speaker_id?, s.id)))
+                });
+            if let Some((speaker_id, seg_id)) = first {
+                let name = speaker_of(detail, &self.speakers, Some(speaker_id))
+                    .map(|s| s.display_name.clone())
+                    .unwrap_or_default();
+                self.speaker_edit = Some(SpeakerEdit::new(speaker_id, seg_id, &name));
+            }
+        }
     }
 
     /// Search deep link: once the segments are there, mark the row active,
@@ -2246,7 +2586,7 @@ impl TranscriptState {
     /// Everything inside the scroll area; returns the list's output.
     fn content(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx, playback: &Playback) -> ListOutput {
         self.header(ui, cx);
-        self.stats_bar(ui);
+        self.speaker_summary(ui);
 
         let status = self
             .detail
@@ -2287,7 +2627,7 @@ impl TranscriptState {
             .is_some_and(|d| d.meeting.audio_path.is_some());
         if let (Playback::Failed(error), true) = (playback, has_audio_path) {
             widgets::inline_warning(ui, &format!("Audio playback is unavailable: {error}"));
-            ui.add_space(8.0);
+            widgets::gap(ui, theme::S2);
         }
 
         let Some(detail) = self.detail.as_ref() else {
@@ -2297,7 +2637,7 @@ impl TranscriptState {
             let progress = transcription_progress(cx, self.meeting_id);
             let (lines, retry) =
                 empty_message(detail, progress.as_ref().map(|(s, p)| (s.as_str(), *p)));
-            ui.add_space(60.0);
+            ui.add_space(48.0);
             ui.vertical_centered(|ui| {
                 for line in &lines {
                     ui.add(egui::Label::new(egui::RichText::new(line).color(TEXT_MUTED)).wrap());
@@ -2306,7 +2646,7 @@ impl TranscriptState {
                     self.retranscribe(cx, None);
                 }
             });
-            ui.add_space(60.0);
+            ui.add_space(48.0);
             return ListOutput::default();
         }
 
@@ -2330,6 +2670,9 @@ impl TranscriptState {
         self.list.show(ui, &mut rc, self.scroll_req)
     }
 
+    /// Back, the title (elided; double-click or the pencil renames) over
+    /// its meta line, and the Export / Retranscribe menus top-right. One
+    /// row at every width: the title block takes what the buttons leave.
     fn header(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
         let Some(detail) = self.detail.as_ref() else {
             return;
@@ -2346,33 +2689,34 @@ impl TranscriptState {
         }
         let has_segments = !detail.segments.is_empty();
         let copied = self.copied_until.is_some_and(|t| Instant::now() < t);
+        let open_menu = self.debug.menu.take();
 
         let mut back = false;
         let mut export_choice = None;
         let mut engine_choice = None;
         let mut start_edit = false;
         let mut title_done = None;
-        // `.transcript-header { align-items: center }`: the row is as tall as
-        // the title block, and the 30 pt buttons centre on it.
-        let title_font = theme::semibold(17.0);
-        let mut title_h = row_height(ui, &title_font);
-        if self.title_edit.is_some() {
-            // `.rename-input`: 3+3 padding and the 1 px border.
-            title_h += 8.0;
-        }
-        let block_h = title_h + 2.0 + row_height(ui, &theme::regular(12.0));
+        // The row is as tall as the title block, and the buttons centre on
+        // it: the title line is the pencil's 28 pt (the rename field's
+        // height while editing), then the 12 pt meta line.
+        let title_font = theme::semibold(TITLE_SIZE);
+        let title_h = if self.title_edit.is_some() {
+            // The field's 3 + 3 padding and 1 + 1 border.
+            row_height(ui, &title_font) + 8.0
+        } else {
+            row_height(ui, &title_font).max(PENCIL_SIZE)
+        };
+        let meta_font = theme::regular(12.0);
+        let block_h = title_h + 2.0 + row_height(ui, &meta_font);
         let width = ui.available_width();
         ui.allocate_ui_with_layout(
-            egui::vec2(width, block_h.max(30.0)),
+            egui::vec2(width, block_h),
             Layout::left_to_right(Align::Center),
             |ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(12.0, 8.0);
-                let response = widgets::btn_ghost_icon(ui, icons::icon(ph::ARROW_LEFT, 16.0), 16.0);
-                response.widget_info(|| {
-                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Back")
-                });
-                back = response.on_hover_text("Back").clicked();
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 2.0);
+                back = widgets::icon_btn(ui, ph::ARROW_LEFT, HEADER_ICON, "Back").clicked();
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
                     engine_choice = header_menu(
                         ui,
                         ph::ARROWS_CLOCKWISE,
@@ -2380,6 +2724,7 @@ impl TranscriptState {
                         "Retranscribe",
                         true,
                         &["with Parakeet", "with Whisper"],
+                        open_menu.as_deref() == Some("retranscribe"),
                     );
                     let (glyph, tip) = if copied {
                         (ph::CHECK_CIRCLE, "Copied to clipboard")
@@ -2399,13 +2744,16 @@ impl TranscriptState {
                             "Subtitles (SRT)…",
                             "Subtitles (WebVTT)…",
                         ],
+                        open_menu.as_deref() == Some("export"),
                     );
+                    ui.add_space(6.0);
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                         let block = egui::vec2(ui.available_width(), block_h);
                         ui.allocate_ui_with_layout(block, Layout::top_down(Align::Min), |ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
                             if let Some(edit) = self.title_edit.as_mut() {
-                                let width = (ui.available_width() - 14.0).max(80.0);
+                                let margins = 2.0 * f32::from(INLINE_EDIT_MARGIN.left) + 2.0;
+                                let width = (ui.available_width() - margins).max(80.0);
                                 let (_, outcome) = inline_editor(
                                     ui,
                                     Id::new(("title-edit", self.meeting_id)),
@@ -2421,13 +2769,13 @@ impl TranscriptState {
                             } else {
                                 start_edit = title_row(ui, &title);
                             }
-                            ui.label(egui::RichText::new(&meta).size(12.0).color(TEXT_MUTED));
+                            widgets::elide(ui, &meta, meta_font.clone(), TEXT_MUTED);
                         });
                     });
                 });
             },
         );
-        widgets::gap(ui, 8.0);
+        widgets::gap(ui, theme::S4);
 
         if back {
             self.back(cx);
@@ -2455,92 +2803,129 @@ impl TranscriptState {
         }
     }
 
-    fn stats_bar(&mut self, ui: &mut egui::Ui) {
+    /// The speaker summary: one stacked proportion bar (each speaker's
+    /// share of the talk time, in their colour) over a wrapping legend
+    /// ("● Name 16 min · 57%"). Hovering either shows the full figures.
+    fn speaker_summary(&self, ui: &mut egui::Ui) {
         if self.stats.is_empty() {
             return;
         }
-        Frame::new()
-            .fill(BG_RAISED)
-            .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(10.0, 6.0);
-                    for stat in &self.stats {
-                        // `.stat-chip` is `nowrap`: measure chip + text and
-                        // claim that size as ONE item, so the wrapped row
-                        // breaks between stats, never inside one (a plain
-                        // label wraps into the leftover width, splitting
-                        // "30 s · 35 words" mid-word).
-                        let text = egui::WidgetText::from(
-                            egui::RichText::new(stat_text(stat))
-                                .size(12.0)
-                                .color(TEXT_MUTED),
-                        )
-                        .into_galley(
-                            ui,
-                            Some(egui::TextWrapMode::Extend),
-                            f32::INFINITY,
-                            egui::TextStyle::Body,
-                        );
-                        let chip = stat_chip_size(ui, &stat.name);
-                        let size = egui::vec2(
-                            chip.x + STAT_GAP + text.size().x,
-                            chip.y.max(text.size().y),
-                        );
-                        ui.allocate_ui_with_layout(
-                            size,
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.spacing_mut().item_spacing.x = STAT_GAP;
-                                widgets::chip(
-                                    ui,
-                                    &stat.name,
-                                    chip_color(&stat.label),
-                                    STAT_CHIP_MAX_EM,
-                                )
-                                .on_hover_text(&stat.name);
-                                ui.label(text);
-                            },
-                        );
-                    }
-                });
+        let width = ui.available_width();
+        let (bar, _) = ui.allocate_exact_size(egui::vec2(width, SUMMARY_BAR_H), Sense::hover());
+        let shares: Vec<f64> = self.stats.iter().map(|s| s.share).collect();
+        let widths = summary_widths(&shares, width);
+        let last = widths.len() - 1;
+        let round = (SUMMARY_BAR_H / 2.0) as u8;
+        let mut x = bar.left();
+        for (i, (stat, w)) in self.stats.iter().zip(&widths).enumerate() {
+            let rect = Rect::from_min_size(egui::pos2(x, bar.top()), egui::vec2(*w, bar.height()));
+            x += w + SUMMARY_GAP;
+            // Only the bar's two ends are round; inner joins stay crisp.
+            let (left, right) = (
+                if i == 0 { round } else { 1 },
+                if i == last { round } else { 1 },
+            );
+            let radius = CornerRadius {
+                nw: left,
+                sw: left,
+                ne: right,
+                se: right,
+            };
+            let hover = ui.interact(rect, ui.id().with(("summary-bar", i)), Sense::hover());
+            let color = speaker_text(&stat.label);
+            let fill = if hover.hovered() {
+                theme::lighten(color, 0.25)
+            } else {
+                color
+            };
+            ui.painter().rect_filled(rect, radius, fill);
+            hover.on_hover_text(format!("{} — {}", stat.name, stat_text(stat)));
+        }
+        widgets::gap(ui, 10.0);
+        ui.scope(|ui| {
+            // Rows as tall as the items, not the 32 pt interact height.
+            ui.spacing_mut().interact_size.y = 0.0;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(16.0, 6.0);
+                for stat in &self.stats {
+                    legend_item(ui, stat, width);
+                }
             });
-        // `.stats-bar { margin-bottom: 8px }`
-        widgets::gap(ui, 8.0);
+        });
+        widgets::gap(ui, theme::S3);
     }
 
+    /// The notes disclosure: a full-width row (caret, "Notes", the save
+    /// state, and a faint first line while closed) over the notes field.
     fn notes_panel(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
         let indicator = self.notes.indicator();
-        let summary = ui
-            .scope_builder(egui::UiBuilder::new().sense(Sense::click()), |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    let caret = if self.notes.open {
-                        ph::CARET_DOWN
-                    } else {
-                        ph::CARET_RIGHT
-                    };
-                    ui.label(egui::RichText::new(caret).size(12.0).color(TEXT_MUTED));
-                    ui.label(egui::RichText::new("Notes").size(13.0).color(TEXT_MUTED));
-                    if let Some(text) = indicator {
-                        ui.label(
-                            egui::RichText::new(format!("· {text}"))
-                                .size(13.0)
-                                .color(TEXT_MUTED),
-                        );
-                    }
-                });
-            })
-            .response;
         let open = self.notes.open;
+        let preview = if open {
+            None
+        } else {
+            self.notes
+                .draft
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(str::to_owned)
+        };
+        let (rect, summary) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), NOTES_ROW_H),
+            Sense::click(),
+        );
         summary.widget_info(|| {
             egui::WidgetInfo::selected(egui::WidgetType::CollapsingHeader, true, open, "Notes")
         });
-        if summary.has_focus() {
-            focus_ring(ui, summary.rect, 4);
+        if ui.is_rect_visible(rect) {
+            let ring = summary.has_focus() && widgets::focus_visible(ui.ctx());
+            let hot = summary.hovered() || ring;
+            let painter = ui.painter();
+            if hot {
+                painter.rect_filled(rect, CornerRadius::same(theme::R_MD), BG_HOVER);
+            }
+            let cy = rect.center().y;
+            let mut x = rect.left() + ROW_PAD_X;
+            let caret = if open {
+                ph::CARET_DOWN
+            } else {
+                ph::CARET_RIGHT
+            };
+            let mut place = |galley: std::sync::Arc<egui::Galley>, gap: f32| {
+                painter.galley(
+                    egui::pos2(x, cy - galley.size().y / 2.0),
+                    galley.clone(),
+                    TEXT,
+                );
+                x += galley.size().x + gap;
+            };
+            place(
+                painter.layout_no_wrap(caret.into(), theme::regular(12.0), TEXT_MUTED),
+                6.0,
+            );
+            let label_color = if hot { TEXT } else { TEXT_MUTED };
+            place(
+                painter.layout_no_wrap("Notes".into(), theme::semibold(13.0), label_color),
+                8.0,
+            );
+            if let Some(text) = indicator {
+                place(
+                    painter.layout_no_wrap(text.into(), theme::regular(12.0), TEXT_FAINT),
+                    12.0,
+                );
+            }
+            let room = rect.right() - ROW_PAD_X - x;
+            if let Some(line) = preview.filter(|_| room > 40.0) {
+                let galley = elided_galley(ui, &line, theme::regular(12.5), TEXT_FAINT, room);
+                painter.galley(
+                    egui::pos2(x, cy - galley.size().y / 2.0),
+                    galley,
+                    TEXT_FAINT,
+                );
+            }
+            if ring {
+                focus_ring(ui, rect, theme::R_MD);
+            }
         }
         if summary
             .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -2556,11 +2941,10 @@ impl TranscriptState {
         );
 
         if self.notes.open {
-            widgets::gap(ui, 6.0);
-            // `.notes-input`: raised fill, 1 px border (accent while
-            // focused), radius 8, 8/10 padding.
+            widgets::gap(ui, theme::S1);
+            // Raised fill, 1 pt border (accent while focused), radius 8.
             let field = egui::TextEdit::multiline(&mut self.notes.draft)
-                .font(theme::regular(13.0))
+                .font(theme::regular(13.5))
                 .desired_width(f32::INFINITY)
                 .desired_rows(3)
                 .hint_text("Meeting notes… (searchable)");
@@ -2569,8 +2953,8 @@ impl TranscriptState {
                 Id::new(("notes", self.meeting_id)),
                 field,
                 BG_RAISED,
-                8,
-                Margin::symmetric(10, 8),
+                theme::R_MD,
+                Margin::symmetric(12, 10),
             ));
             set_accessible_label(ui.ctx(), response.id, "Meeting notes");
             widgets::text_edit_menu(&response);
@@ -2581,9 +2965,10 @@ impl TranscriptState {
             if response.lost_focus() {
                 self.flush(cx);
             }
+            widgets::gap(ui, theme::S3);
+        } else {
+            widgets::gap(ui, theme::S1);
         }
-        // `.notes-panel { padding-bottom: 10px }`
-        widgets::gap(ui, 10.0);
     }
 
     // ------------------------------------------------------------------
@@ -2926,36 +3311,38 @@ fn transcription_progress(cx: &UiCtx, meeting_id: i64) -> Option<(String, f32)> 
         })
 }
 
-/// The title (17 px semibold, one line with an ellipsis) and the inline
-/// pencil. Returns true when a rename should start (double-click or pencil).
+/// The meeting title (18 pt semibold).
+const TITLE_SIZE: f32 = 18.0;
+/// The rename pencil's square (a 14 pt glyph): the title line's height.
+const PENCIL_SIZE: f32 = 28.0;
+/// The notes disclosure row.
+const NOTES_ROW_H: f32 = 32.0;
+
+/// The title (one line, elided with the full title in its tooltip) and the
+/// inline pencil. Returns true when a rename should start (double-click or
+/// pencil).
 fn title_row(ui: &mut egui::Ui, title: &str) -> bool {
     let mut start = false;
-    // As tall as the title line: `horizontal` would reserve the 30 pt
+    // As tall as the title line: `horizontal` would reserve the 32 pt
     // interact height, padding the title down and away from its meta line.
     let interact = ui.spacing().interact_size.y;
     ui.spacing_mut().interact_size.y = 0.0;
     ui.horizontal(|ui| {
         ui.spacing_mut().interact_size.y = interact;
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let max = (ui.available_width() - 30.0).max(40.0);
-        let label = ui
-            .scope(|ui| {
-                ui.set_max_width(max);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(title)
-                            .font(theme::semibold(17.0))
-                            .color(TEXT),
-                    )
-                    .truncate()
-                    .sense(Sense::click()),
-                )
-            })
-            .inner;
-        if label
-            .on_hover_text("Double-click to rename")
-            .double_clicked()
-        {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let max = (ui.available_width() - PENCIL_SIZE - 2.0).max(40.0);
+        let galley = elided_galley(ui, title, theme::semibold(TITLE_SIZE), TEXT, max);
+        let tooltip = if galley.elided {
+            format!("{title}\nDouble-click to rename")
+        } else {
+            "Double-click to rename".to_owned()
+        };
+        let label = ui.add(
+            egui::Label::new(galley)
+                .selectable(false)
+                .sense(Sense::click()),
+        );
+        if label.on_hover_text(tooltip).double_clicked() {
             start = true;
         }
         if widgets::icon_btn(ui, ph::PENCIL_SIMPLE, 14.0, "Rename meeting").clicked() {
@@ -2964,6 +3351,43 @@ fn title_row(ui: &mut egui::Ui, title: &str) -> bool {
     });
     ui.spacing_mut().interact_size.y = interact;
     start
+}
+
+/// One speaker in the summary's legend: a dot in their colour, the name
+/// (elided so the item never outgrows `max_width`) and the short figures;
+/// claimed as one item, so the wrapping legend breaks between speakers,
+/// never inside one.
+fn legend_item(ui: &mut egui::Ui, stat: &SpeakerStat, max_width: f32) -> Response {
+    const DOT: f32 = 8.0;
+    const GAP: f32 = 6.0;
+    let figures = ui
+        .painter()
+        .layout_no_wrap(legend_text(stat), theme::regular(12.0), TEXT_MUTED);
+    let name_max = (max_width - DOT - 2.0 * GAP - figures.size().x).max(40.0);
+    let name = elided_galley(ui, &stat.name, theme::regular(13.0), TEXT, name_max);
+    let height = name.size().y.max(figures.size().y);
+    let size = egui::vec2(DOT + GAP + name.size().x + GAP + figures.size().x, height);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    let full = format!("{} — {}", stat.name, stat_text(stat));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &full));
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let cy = rect.center().y;
+        painter.circle_filled(
+            egui::pos2(rect.left() + DOT / 2.0, cy),
+            DOT / 2.0,
+            speaker_text(&stat.label),
+        );
+        let name_x = rect.left() + DOT + GAP;
+        let figures_x = name_x + name.size().x + GAP;
+        painter.galley(egui::pos2(name_x, cy - name.size().y / 2.0), name, TEXT);
+        painter.galley(
+            egui::pos2(figures_x, cy - figures.size().y / 2.0),
+            figures,
+            TEXT_MUTED,
+        );
+    }
+    response.on_hover_text(full)
 }
 
 /// A new caption scrolls the feed to the bottom only if the reader was
@@ -3004,8 +3428,10 @@ impl LiveFeedState {
     }
 }
 
-/// The provisional caption feed (map §5): own scroll area that follows new
-/// captions while the reader is within 40 px of its bottom.
+/// The provisional caption feed (map §5): a raised surface with a faint
+/// red outline, its own scroll area that follows new captions while the
+/// reader is within 40 pt of its bottom. Lines are grouped into Me / Them
+/// turns like the transcript.
 fn live_feed(
     ui: &mut egui::Ui,
     state: &mut LiveFeedState,
@@ -3019,13 +3445,15 @@ fn live_feed(
     let max_height = ui.ctx().content_rect().height() * 0.6;
     let stick = state.stick(lines.back().map(|line| (line.track, line.start_ms)));
     Frame::new()
+        .fill(BG_RAISED)
         .stroke(Stroke::new(1.0, LIVE_BORDER))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(12, 10))
+        .corner_radius(CornerRadius::same(theme::R_LG))
+        .inner_margin(Margin::symmetric(8, 10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
+                ui.add_space(ROW_PAD_X - 8.0);
                 if recording {
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), Sense::hover());
                     let alpha = icons::pulse_alpha(ui.ctx());
@@ -3034,16 +3462,16 @@ fn live_feed(
                 }
                 ui.label(
                     egui::RichText::new("Live captions")
-                        .size(13.0)
+                        .font(theme::semibold(13.0))
                         .color(REC_LIGHT),
                 );
                 ui.label(
-                    egui::RichText::new("· provisional")
-                        .size(13.0)
-                        .color(TEXT_MUTED),
+                    egui::RichText::new("provisional")
+                        .size(12.0)
+                        .color(TEXT_FAINT),
                 );
             });
-            widgets::gap(ui, 6.0);
+            widgets::gap(ui, 4.0);
             let output = egui::ScrollArea::vertical()
                 .id_salt(("live-feed", meeting_id))
                 .max_height((max_height - 40.0).max(80.0))
@@ -3057,14 +3485,21 @@ fn live_feed(
                              transcription models. The full transcript is produced after the \
                              recording."
                         };
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(text).color(TEXT_MUTED)).wrap(),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.add_space(ROW_PAD_X - ui.spacing().item_spacing.x);
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(text).color(TEXT_MUTED))
+                                    .wrap(),
+                            );
+                        });
                         return;
                     }
-                    ui.spacing_mut().item_spacing.y = ROW_GAP;
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let mut previous = None;
                     for line in &sorted {
-                        ui.push_id((line.track, line.start_ms), |ui| live_line(ui, line));
+                        let head = previous != Some(line.track);
+                        previous = Some(line.track);
+                        ui.push_id((line.track, line.start_ms), |ui| live_line(ui, line, head));
                     }
                     if stick {
                         ui.scroll_to_cursor(Some(Align::Max));
@@ -3082,41 +3517,94 @@ fn live_feed(
             Politeness::Polite,
         );
     }
-    // `.live-feed { margin-bottom: 10px }`
-    widgets::gap(ui, 10.0);
+    widgets::gap(ui, theme::S3);
 }
 
-/// A caption line: "Me" / "Them" chip (not clickable), `[ts]`, text.
-fn live_line(ui: &mut egui::Ui, line: &LiveTranscript) {
+/// A caption line: a "Me" / "Them" header with the time when the track
+/// changes (not clickable), then the text.
+fn live_line(ui: &mut egui::Ui, line: &LiveTranscript, head: bool) {
+    // Text colours, lifted from the chips like `theme::speaker_text`.
     let (name, color) = if line.track == "mic" {
-        ("Me", chip_color("me"))
+        ("Me", speaker_text("me"))
     } else {
-        ("Them", THEM_CHIP)
+        ("Them", theme::lighten(THEM_CHIP, 0.35))
     };
-    let prepared = begin_row(ui);
-    let mut prepared = prepared;
+    if head {
+        ui.add_space(6.0);
+    }
+    let mut prepared = begin_row(ui);
     {
         let ui = &mut prepared.content_ui;
-        ui.horizontal_top(|ui| {
-            chip_on_line(ui, name, color);
-            let galley = ui.painter().layout_no_wrap(
-                format!("[{}]", fmt_ts(i64::try_from(line.start_ms).unwrap_or(0))),
-                theme::regular(12.0),
-                TEXT_MUTED,
+        if head {
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), HEADER_H),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(
+                        egui::RichText::new(name)
+                            .font(theme::semibold(NAME_SIZE))
+                            .color(color),
+                    );
+                    ui.label(
+                        egui::RichText::new(fmt_ts(i64::try_from(line.start_ms).unwrap_or(0)))
+                            .size(12.0)
+                            .color(TEXT_MUTED),
+                    );
+                },
             );
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(galley.size().x, LINE_HEIGHT), Sense::hover());
-            let y = rect.bottom() - galley.size().y - 1.0;
-            ui.painter()
-                .galley(egui::pos2(rect.left(), y), galley, TEXT_MUTED);
-            ui.add(egui::Label::new(text_job(&line.text, &[])).wrap());
-        });
+        }
+        ui.add(egui::Label::new(text_job(&line.text, &[])).wrap());
     }
     let rect = row_rect(&prepared);
     if ui.rect_contains_pointer(rect) {
         prepared.frame.fill = BG_HOVER;
     }
     prepared.end(ui);
+    ui.add_space(ROW_GAP);
+}
+
+/// Debug builds: states for passive snapshots (`snap.ps1`), each from an
+/// environment variable and applied once; all off in release builds.
+#[derive(Debug, Default, Clone)]
+struct DebugHooks {
+    /// `WITNESS_DEBUG_TRANSCRIPT_NOTES=1`: the notes open on load.
+    notes_open: bool,
+    /// `WITNESS_DEBUG_TRANSCRIPT_SEGMENT=<index>`: deep link to the n-th
+    /// segment (active, centred, the audio positioned there).
+    segment: Option<usize>,
+    /// `WITNESS_DEBUG_TRANSCRIPT_HIGHLIGHT=<terms>`: search highlighting.
+    highlight: Option<String>,
+    /// `WITNESS_DEBUG_TRANSCRIPT_MENU=export|retranscribe`: that menu open.
+    menu: Option<String>,
+    /// `WITNESS_DEBUG_TRANSCRIPT_VOLUME=1`: the compact volume popover open.
+    volume: bool,
+    /// `WITNESS_DEBUG_TRANSCRIPT_RENAME=1`: the speaker rename open on the
+    /// first turn with a speaker.
+    rename: bool,
+}
+
+#[cfg(debug_assertions)]
+fn debug_hooks() -> DebugHooks {
+    let var = |name: &str| {
+        std::env::var(format!("WITNESS_DEBUG_TRANSCRIPT_{name}"))
+            .ok()
+            .filter(|v| !v.is_empty())
+    };
+    let on = |name: &str| var(name).is_some_and(|v| v == "1");
+    DebugHooks {
+        notes_open: on("NOTES"),
+        segment: var("SEGMENT").and_then(|v| v.trim().parse().ok()),
+        highlight: var("HIGHLIGHT"),
+        menu: var("MENU"),
+        volume: on("VOLUME"),
+        rename: on("RENAME"),
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_hooks() -> DebugHooks {
+    DebugHooks::default()
 }
 
 // ---------------------------------------------------------------------------
@@ -3132,8 +3620,8 @@ fn synthetic_enabled() -> bool {
     false
 }
 
-/// A generated meeting with `count` segments of varied length across four
-/// speakers (one auto-matched) and a bookmark every 150 segments, for
+/// A generated meeting with `count` segments of varied length in turns of
+/// four speakers (one auto-matched) and a bookmark every 150 segments, for
 /// checking that long transcripts scroll smoothly.
 fn synthetic_detail(meeting_id: i64, count: usize) -> MeetingDetail {
     const WORDS: &[&str] = &[
@@ -3185,13 +3673,18 @@ fn synthetic_detail(meeting_id: i64, count: usize) -> MeetingDetail {
     let mut segments = Vec::with_capacity(count);
     let mut bookmarks = Vec::new();
     let mut at = 0i64;
+    let mut speaker = 0;
     for i in 0..count {
         let words = 3 + (i * 7919) % 57;
         let text = (0..words)
             .map(|w| WORDS[(i * 31 + w * 17) % WORDS.len()])
             .collect::<Vec<_>>()
             .join(" ");
-        let speaker = i % speakers.len();
+        // Turns of one to a few lines: the speaker changes on ~40 % of
+        // lines, to one of the other three.
+        if i > 0 && (i * 37 + 11) % 5 < 2 {
+            speaker = (speaker + 1 + i % 3) % speakers.len();
+        }
         let length = 1_500 + (words as i64) * 350;
         segments.push(Segment {
             id: i as i64 + 1,
@@ -3340,6 +3833,7 @@ mod tests {
         assert_eq!(stats[1].label, "me");
         assert_eq!(stats[2].label, "S?");
         assert_eq!(stat_text(&stats[0]), "3 s · 3 words · 60%");
+        assert_eq!(legend_text(&stats[0]), "3 s · 60%");
         assert!(speaker_stats(&synthetic_detail(1, 0), &index).is_empty());
     }
 
@@ -3564,7 +4058,10 @@ mod tests {
         let mut list = RowList::default();
         list.rebuild(&detail);
         let req = ScrollReq::new(2_400, true, false);
-        let out = run_list(&mut list, &detail, Some(req), 8);
+        // The view re-aims for up to `SCROLL_SETTLE_FRAMES` passes (the scroll
+        // bar animating in narrows the rows, and egui applies some scrolls a
+        // pass late).
+        let out = run_list(&mut list, &detail, Some(req), SCROLL_SETTLE_FRAMES.into());
         let error = out.target_error.expect("target row laid out");
         assert!(
             error.abs() <= SCROLL_SETTLED_PX * 2.0,
@@ -3579,13 +4076,32 @@ mod tests {
         list.rebuild(&detail);
         let req = ScrollReq::new(1_500, true, false);
         run_list_sized(&mut list, &detail, Some(req), 12, 800.0);
-        let (key, _) = list.anchor.expect("anchored after the jump");
+        let (key, above) = list.anchor.expect("anchored after the jump");
         // Narrower: every row above reflows taller.
         run_list_sized(&mut list, &detail, None, 6, 420.0);
-        let (after, _) = list.anchor.expect("still anchored");
+        let (after, above_after) = list.anchor.expect("still anchored");
         let index = |k: RowKey| list.keys.iter().position(|x| *x == k).unwrap();
-        let drift = index(after).abs_diff(index(key));
-        assert!(drift <= 3, "drifted {drift} rows");
+        // The same row stays at the top, at the same offset: rows drawn in
+        // the resize pass count at their reflowed heights, and rows
+        // measured at the old width are estimated at the new one.
+        assert_eq!(index(after), index(key), "drifted");
+        assert!(
+            (above_after - above).abs() <= 2.0,
+            "{above} -> {above_after}"
+        );
+    }
+
+    #[test]
+    fn a_measurement_at_another_width_yields_to_the_estimate() {
+        let detail = synthetic_detail(1, 10);
+        let mut list = RowList::default();
+        list.rebuild(&detail);
+        list.heights[4] = Some((800.0, 999.0));
+        // The scroll bar fading in: still the measurement.
+        assert_eq!(list.height(&detail, 4, 795.0), 999.0);
+        // Reflowed: the estimate at the new width.
+        let estimate = estimate_height(&detail, list.rows[4], list.shape(4), 420.0);
+        assert_eq!(list.height(&detail, 4, 420.0), estimate);
     }
 
     #[test]
@@ -3620,7 +4136,8 @@ mod tests {
     #[test]
     fn a_click_on_a_row_above_commits_the_open_rename_first() {
         let mut state = TranscriptState::new(1, None, None);
-        // Segment id 6 is Alice's (speaker 2), id 3 Bob's (speaker 3, ≈).
+        // Speaker 2 is Alice, speaker 3 Bob (≈); the seg ids name the rows
+        // whose names were clicked.
         state.detail = Some(synthetic_detail(1, 10));
         let mut open = SpeakerEdit::new(2, 6, "Alice");
         open.edit.text = "Alicia".into();
@@ -3882,7 +4399,6 @@ mod tests {
 
     #[test]
     fn deep_link_focuses_the_hits_seek_button() {
-        let ctx = theme::test_context();
         let detail = synthetic_detail(1, 6);
         let speakers: HashMap<i64, usize> = detail
             .speakers
@@ -3892,36 +4408,187 @@ mod tests {
             .collect();
         let mut list = RowList::default();
         list.rebuild(&detail);
-        let target = detail.segments[3].id;
-        let mut focus_seg = Some(target);
-        let mut update = None;
-        for _ in 0..2 {
-            update = Some(accesskit_pass(&ctx, |ui| {
-                let (mut speaker_edit, mut bookmark_edit) = (None, None);
-                let mut rc = RowCtx {
-                    detail: &detail,
-                    speakers: &speakers,
-                    tokens: &[],
-                    active: Some(3),
-                    speaker_edit: &mut speaker_edit,
-                    bookmark_edit: &mut bookmark_edit,
-                    people: &[],
-                    focus_seg: &mut focus_seg,
-                };
-                egui::ScrollArea::vertical().show_viewport(ui, |ui, _| {
-                    list.show(ui, &mut rc, None);
-                });
-            }));
+        // Both seek buttons: a turn header's time and the left-padding
+        // target of a row without a header.
+        let (head, plain) = (2, 3);
+        assert!(list.heads[list.seg_row[head]] && !list.heads[list.seg_row[plain]]);
+        for idx in [head, plain] {
+            let ctx = theme::test_context();
+            let mut focus_seg = Some(detail.segments[idx].id);
+            let mut update = None;
+            for _ in 0..2 {
+                update = Some(accesskit_pass(&ctx, |ui| {
+                    let (mut speaker_edit, mut bookmark_edit) = (None, None);
+                    let mut rc = RowCtx {
+                        detail: &detail,
+                        speakers: &speakers,
+                        tokens: &[],
+                        active: Some(idx),
+                        speaker_edit: &mut speaker_edit,
+                        bookmark_edit: &mut bookmark_edit,
+                        people: &[],
+                        focus_seg: &mut focus_seg,
+                    };
+                    egui::ScrollArea::vertical().show_viewport(ui, |ui, _| {
+                        list.show(ui, &mut rc, None);
+                    });
+                }));
+            }
+            assert_eq!(focus_seg, None, "{idx}: the focus request was not taken");
+            let update = update.unwrap();
+            let focused = update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == update.focus)
+                .and_then(|(_, node)| node.label().map(str::to_owned));
+            let expected = format!("Play at {}", fmt_ts(detail.segments[idx].start_ms));
+            assert_eq!(focused.as_deref(), Some(expected.as_str()), "{idx}");
         }
-        assert_eq!(focus_seg, None, "the focus request was not taken");
-        let update = update.unwrap();
-        let focused = update
-            .nodes
+    }
+
+    #[test]
+    fn turns_start_on_a_new_speaker_or_after_a_bookmark() {
+        let mut detail = synthetic_detail(1, 0);
+        let on = |id, speaker: Option<i64>, track: &str, start| Segment {
+            speaker_id: speaker,
+            track: track.into(),
+            ..seg(id, start, "text")
+        };
+        detail.segments = vec![
+            on(1, Some(2), "loopback", 0),
+            on(2, Some(2), "loopback", 1_000),
+            on(3, Some(3), "loopback", 2_000),
+            on(4, None, "mic", 3_000),
+            on(5, None, "mic", 4_000),
+            on(6, None, "loopback", 5_000),
+            on(7, None, "loopback", 7_000),
+        ];
+        detail.bookmarks = vec![Bookmark {
+            id: 1,
+            meeting_id: 1,
+            at_ms: 6_000,
+            note: String::new(),
+        }];
+        let rows = build_rows(&detail);
+        assert_eq!(rows[6], Row::Bm(0));
+        assert_eq!(
+            turn_starts(&detail, &rows),
+            // An unassigned segment groups by its track; a bookmark breaks
+            // the turn and never starts one itself.
+            [true, false, true, true, false, true, false, true]
+        );
+    }
+
+    #[test]
+    fn a_cached_height_is_dropped_when_the_row_gains_a_header() {
+        let mut detail = synthetic_detail(1, 20);
+        let mut list = RowList::default();
+        list.rebuild(&detail);
+        // A row in the middle of a turn, measured.
+        let r = (1..list.rows.len())
+            .find(|&r| !list.heads[r])
+            .expect("a row without a header");
+        let Row::Seg(i) = list.rows[r] else {
+            panic!("segment expected")
+        };
+        list.heights[r] = Some((700.0, 42.0));
+        let other = list.keys[r + 1];
+        list.heights[r + 1] = Some((700.0, 43.0));
+        // A bookmark lands just before it: it now starts a turn.
+        detail.bookmarks.push(Bookmark {
+            id: 99,
+            meeting_id: 1,
+            at_ms: detail.segments[i].start_ms - 1,
+            note: String::new(),
+        });
+        list.rebuild(&detail);
+        let row = list.seg_row[i];
+        assert!(list.heads[row]);
+        assert_eq!(list.heights[row], None, "measured without its header");
+        // Rows whose shape did not change keep theirs.
+        let kept = list.keys.iter().position(|k| *k == other).unwrap();
+        assert_eq!(list.heights[kept], Some((700.0, 43.0)));
+    }
+
+    #[test]
+    fn a_turns_first_row_is_taller_by_its_header() {
+        let mut detail = synthetic_detail(1, 0);
+        detail.segments = (0..4)
+            .map(|i| Segment {
+                speaker_id: Some(if i < 2 { 2 } else { 3 }),
+                track: "loopback".into(),
+                ..seg(i + 1, i * 1_000, "same short line")
+            })
+            .collect();
+        let mut list = RowList::default();
+        list.rebuild(&detail);
+        run_list(&mut list, &detail, None, 2);
+        let h = |r: usize| list.heights[r].expect("measured").1;
+        // Row 0: header, no turn gap (first row); row 1: text only; row 2:
+        // a new turn, so the gap too.
+        assert!(
+            (h(0) - h(1) - (HEADER_H + HEADER_GAP)).abs() < 1.0,
+            "{} {}",
+            h(0),
+            h(1)
+        );
+        assert!((h(2) - h(0) - TURN_GAP).abs() < 1.0, "{} {}", h(2), h(0));
+        // The estimates have the same shape.
+        let est = |r| estimate_height(&detail, list.rows[r], list.shape(r), 800.0);
+        assert!((est(0) - h(0)).abs() < 3.0, "{} vs {}", est(0), h(0));
+        assert!((est(1) - h(1)).abs() < 3.0, "{} vs {}", est(1), h(1));
+        assert!((est(2) - h(2)).abs() < 3.0, "{} vs {}", est(2), h(2));
+    }
+
+    #[test]
+    fn summary_segments_fill_the_bar() {
+        let widths = summary_widths(&[57.0, 33.0, 9.0, 1.0, 0.0], 338.0);
+        let total: f32 = widths.iter().sum::<f32>() + SUMMARY_GAP * 4.0;
+        assert!((total - 338.0).abs() < 0.01, "{total}");
+        // Ordered like the shares, and a 0 % voice still shows.
+        assert!(widths.windows(2).all(|w| w[0] >= w[1]), "{widths:?}");
+        assert!((widths[4] - SUMMARY_MIN_SEG).abs() < 0.01);
+        assert_eq!(summary_widths(&[], 100.0), Vec::<f32>::new());
+        assert_eq!(summary_widths(&[0.0, 0.0], 100.0), vec![49.0, 49.0]);
+    }
+
+    #[test]
+    fn the_summary_fits_at_the_narrowest_width() {
+        // The 380 pt window's column: 380 − 2 × 16 padding − the scroll bar.
+        let width = 338.0;
+        let ctx = theme::test_context();
+        let detail = synthetic_detail(1, 4);
+        let mut state = TranscriptState::new(1, None, None);
+        state.speakers = detail
+            .speakers
             .iter()
-            .find(|(id, _)| *id == update.focus)
-            .and_then(|(_, node)| node.label().map(str::to_owned));
-        let expected = format!("Play at {}", fmt_ts(detail.segments[3].start_ms));
-        assert_eq!(focused.as_deref(), Some(expected.as_str()));
+            .enumerate()
+            .map(|(i, s)| (s.id, i))
+            .collect();
+        state.stats = speaker_stats(&detail, &state.speakers);
+        state.stats[0].name = "Somebody With An Extremely Long Display Name".into();
+        state.detail = Some(detail);
+        let mut column = Rect::NOTHING;
+        let mut content = Rect::NOTHING;
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, 600.0),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_width(width);
+                        column = ui.max_rect();
+                        state.speaker_summary(ui);
+                        content = ui.min_rect();
+                    },
+                );
+            });
+            output.textures_delta.clear();
+        }
+        assert!(
+            content.right() <= column.right() + 0.5,
+            "{content:?} in {column:?}"
+        );
     }
 
     #[test]

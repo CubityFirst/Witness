@@ -1,7 +1,10 @@
-//! The transcript's player bar (map-ui-transcript §10.4): row 1 is the
-//! current time, the scrubber with bookmark markers and the total time;
-//! row 2 is ±10 s, play/pause, add bookmark, the speed menu, volume and
-//! "Save a copy…".
+//! The transcript's player bar (map-ui-transcript §10.4): a raised surface
+//! docked at the bottom of the view, in the page's padded column. Row 1 is
+//! the scrubber (with bookmark markers) between the current and the total
+//! time; row 2 is the transport on the left (±10 s around a round
+//! play/pause, add bookmark) and speed, volume and "Save a copy…" on the
+//! right. When the bar is too narrow for the volume slider it collapses to
+//! an icon button with a popover slider, so nothing ever wraps.
 //!
 //! The bar only drives `witness_core::player::Player` (every call is cheap
 //! and non-blocking); it never touches the database. Scrubbing previews the
@@ -15,13 +18,15 @@ use crate::platform::dialogs::{self, SaveFileRequest};
 use crate::ui::format::fmt_ts;
 use crate::ui::icons::ph;
 use crate::ui::theme::{
-    self, ACCENT, BG, BG_HOVER, BG_RAISED, BORDER, FOCUS, TEXT, TEXT_MUTED, WARN,
+    self, ACCENT, ACCENT_HOVER, BG, BG_HOVER, BG_RAISED, BORDER, BORDER_STRONG, FOCUS, TEXT,
+    TEXT_MUTED, WARN, WHITE,
 };
 use crate::ui::toasts::Notice;
 use crate::ui::widgets;
 use crate::ui::UiCtx;
 use eframe::egui::{
-    self, Align, CornerRadius, Frame, Key, Layout, Margin, Response, Sense, Stroke,
+    self, Align, CornerRadius, Frame, Key, Layout, Margin, Popup, PopupCloseBehavior, Rect,
+    RectAlign, Response, Sense, Stroke,
 };
 use std::time::{Duration, Instant};
 use witness_core::player::PlayerSnapshot;
@@ -36,14 +41,27 @@ const SCRUB_SEEK_INTERVAL: Duration = Duration::from_millis(100);
 const SKIP_BUTTON_MS: i64 = 10_000;
 /// ←/→ on the focused scrubber (same step as the view's global keys).
 const SKIP_KEY_MS: i64 = 5_000;
-/// Scrubber row height: the 24 px marker hit targets fit inside it.
+/// Scrubber row height: the 24 pt marker hit targets fit inside it.
 const SCRUB_HEIGHT: f32 = 24.0;
-/// Seek-track thickness and thumb radius (Chromium's range input).
+/// Seek-track thickness and thumb radius (resting / hovered or held).
 const TRACK_HEIGHT: f32 = 4.0;
 const THUMB_RADIUS: f32 = 7.0;
-/// Bookmark marker hit target (centred on the point) and dot size.
+const THUMB_RADIUS_REST: f32 = 6.0;
+/// Bookmark marker hit target (centred on the point) and dot radius; the
+/// dot sits in a ring of the surface colour so it reads on the track.
 const MARKER_HIT: f32 = 24.0;
-const MARKER_DOT: f32 = 4.0;
+const MARKER_RADIUS: f32 = 3.0;
+/// Transport buttons (ghost squares) and the round play/pause.
+const BTN_SIZE: f32 = 32.0;
+const PLAY_SIZE: f32 = 36.0;
+/// Gap between the controls of one cluster.
+const CONTROL_GAP: f32 = 4.0;
+/// Narrower than this (the bar's content width) the volume slider
+/// collapses into a popover: both clusters with the slider need ~330 pt.
+const FULL_CONTROLS_MIN: f32 = 360.0;
+/// The inline volume slider and the popover's.
+const VOLUME_WIDTH: f32 = 80.0;
+const VOLUME_POPOVER_WIDTH: f32 = 140.0;
 
 /// Per-transcript player bar state (scrub preview, throttling).
 #[derive(Debug, Default)]
@@ -52,6 +70,19 @@ pub struct PlayerBarState {
     scrub_ms: Option<u64>,
     /// When the last throttled scrub seek went out.
     last_scrub_seek: Option<Instant>,
+    /// Open the compact volume popover on the next pass (debug snapshots).
+    open_volume_once: bool,
+}
+
+impl PlayerBarState {
+    /// A fresh state; `open_volume` opens the compact volume popover on the
+    /// first pass (debug snapshots).
+    pub fn with_volume_open(open_volume: bool) -> Self {
+        PlayerBarState {
+            open_volume_once: open_volume,
+            ..PlayerBarState::default()
+        }
+    }
 }
 
 /// What the bar asks the transcript view to do.
@@ -92,43 +123,72 @@ fn clock(ms: u64) -> String {
     fmt_ts(i64::try_from(ms).unwrap_or(i64::MAX))
 }
 
-/// The bar's container: `.player-bar` (BG fill, 10/6 vertical padding).
+/// The docked panel around the bar: the page background, so rows never
+/// show through, with breathing room above and below the surface.
 pub fn bar_frame() -> Frame {
     Frame::new().fill(BG).inner_margin(Margin {
         left: 0,
         right: 0,
-        top: 10,
-        bottom: 6,
+        top: 8,
+        bottom: 12,
     })
 }
 
-/// Draw the bar (the `.player` card) for `detail`'s archived audio.
+/// The page's padded, centred column, less `gutter` on the right: the
+/// transcript's scroll bar takes that much width from its content, and the
+/// bar lines up with the text above it rather than with the window edge.
+pub fn bar_column<R>(ui: &mut egui::Ui, gutter: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let width = (ui.available_width() - gutter).max(0.0);
+    let pad = widgets::pad_x(width);
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.add_space(pad);
+        ui.vertical(|ui| {
+            ui.set_width((width - 2.0 * pad).max(0.0));
+            widgets::content_column(ui, add)
+        })
+        .inner
+    })
+    .inner
+}
+
+/// Draw the bar for `detail`'s archived audio. `gutter`: see
+/// [`bar_column`].
 pub fn show(
     ui: &mut egui::Ui,
     cx: &mut UiCtx,
     detail: &MeetingDetail,
     st: &mut PlayerBarState,
+    gutter: f32,
 ) -> PlayerBarOutput {
     let mut out = PlayerBarOutput::default();
     let snap = cx.player.snapshot();
     sync_preferences(cx, &snap);
 
-    Frame::new()
-        .fill(BG_RAISED)
-        .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin {
-            left: 12,
-            right: 12,
-            top: 10,
-            bottom: 8,
-        })
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing = egui::vec2(10.0, 6.0);
-            time_row(ui, cx, detail, st, &snap);
-            controls_row(ui, cx, detail, &snap, &mut out);
-        });
+    bar_column(ui, gutter, |ui| {
+        Frame::new()
+            .fill(BG_RAISED)
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(CornerRadius::same(theme::R_LG))
+            .inner_margin(Margin {
+                left: 12,
+                right: 12,
+                top: 6,
+                bottom: 8,
+            })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing = egui::vec2(10.0, 2.0);
+                time_row(ui, cx, detail, st, &snap);
+
+                let mut volume = cx.prefs.volume.clamp(0.0, 1.0);
+                let mut speed = snap_speed(cx.prefs.speed);
+                let open_volume = std::mem::take(&mut st.open_volume_once);
+                let (controls, _) =
+                    controls_row(ui, snap.playing, &mut volume, &mut speed, open_volume);
+                apply_controls(cx, detail, &snap, controls, volume, speed, &mut out);
+            });
+    });
     out
 }
 
@@ -163,7 +223,8 @@ fn time_label(ui: &mut egui::Ui, text: String, min_width: f32, right_align: bool
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &text));
 }
 
-/// Row 1: current time, scrubber + markers, total time.
+/// Row 1: current time, scrubber + markers, total time. The current time
+/// is as wide as the total, so the scrubber never shifts while it counts.
 fn time_row(
     ui: &mut egui::Ui,
     cx: &mut UiCtx,
@@ -182,10 +243,9 @@ fn time_row(
         .size()
         .x;
     ui.horizontal(|ui| {
-        // `.player-time`: min-width 40, right-aligned.
-        time_label(ui, clock(current), 40.0, true);
+        time_label(ui, clock(current), total_width, true);
         let scrub_width =
-            (ui.available_width() - total_width - ui.spacing().item_spacing.x).max(120.0);
+            (ui.available_width() - total_width - ui.spacing().item_spacing.x).max(60.0);
         scrubber(ui, cx, detail, st, snap, scrub_width);
         time_label(ui, total, 0.0, false);
     });
@@ -193,7 +253,7 @@ fn time_row(
 
 /// The seek slider (`<input type=range step=0.1>`) plus the bookmark
 /// markers on top of it. Markers are registered after the track, so they
-/// win the click where they overlap it.
+/// win the click where they overlap it; the thumb is painted last.
 fn scrubber(
     ui: &mut egui::Ui,
     cx: &mut UiCtx,
@@ -299,25 +359,33 @@ fn scrubber(
     let value = st.scrub_ms.unwrap_or(snap.position_ms).min(duration);
     response.widget_info(|| egui::WidgetInfo::slider(true, value as f64 / 1000.0, "Seek"));
 
-    if ui.is_rect_visible(rect) {
+    let visible = ui.is_rect_visible(rect);
+    let cy = rect.center().y;
+    if visible {
         let painter = ui.painter();
-        let cy = rect.center().y;
         let bar = egui::Rect::from_x_y_ranges(
             track.min..=track.max,
             (cy - TRACK_HEIGHT / 2.0)..=(cy + TRACK_HEIGHT / 2.0),
         );
-        painter.rect_filled(bar, CornerRadius::same(2), BORDER);
-        let x = to_x(value);
-        let filled = egui::Rect::from_x_y_ranges(bar.left()..=x, bar.y_range());
+        painter.rect_filled(bar, CornerRadius::same(2), BORDER_STRONG);
+        let filled = egui::Rect::from_x_y_ranges(bar.left()..=to_x(value), bar.y_range());
         painter.rect_filled(filled, CornerRadius::same(2), ACCENT);
+    }
+
+    // Bookmark markers (only once the duration is known): 24×24
+    // transparent targets around a warn dot.
+    if duration > 0 {
+        for bookmark in &detail.bookmarks {
+            bookmark_marker(ui, cx, bookmark, egui::pos2(to_x(at_ms(bookmark)), cy));
+        }
+    }
+
+    if visible {
         let hot = response.hovered() || held;
-        let radius = if hot {
-            THUMB_RADIUS
-        } else {
-            THUMB_RADIUS - 1.0
-        };
-        painter.circle_filled(egui::pos2(x, cy), radius, ACCENT);
-        if response.has_focus() {
+        let radius = if hot { THUMB_RADIUS } else { THUMB_RADIUS_REST };
+        let painter = ui.painter();
+        painter.circle_filled(egui::pos2(to_x(value), cy), radius, ACCENT);
+        if response.has_focus() && widgets::focus_visible(ui.ctx()) {
             painter.rect_stroke(
                 rect.expand(2.0),
                 CornerRadius::same(6),
@@ -329,207 +397,313 @@ fn scrubber(
     if duration > 0 {
         response.on_hover_cursor(egui::CursorIcon::PointingHand);
     }
+}
 
-    // Bookmark markers (only once the duration is known): 24×24
-    // transparent targets around a 4 px warn dot.
-    if duration == 0 {
-        return;
-    }
-    for bookmark in &detail.bookmarks {
-        let at = u64::try_from(bookmark.at_ms).unwrap_or(0);
-        let center = egui::pos2(to_x(at), rect.center().y);
-        let hit = egui::Rect::from_center_size(center, egui::vec2(MARKER_HIT, MARKER_HIT));
-        let marker = ui.interact(
+fn at_ms(bookmark: &witness_core::db::Bookmark) -> u64 {
+    u64::try_from(bookmark.at_ms).unwrap_or(0)
+}
+
+/// One bookmark marker on the scrubber: seeks (without playing) on click.
+fn bookmark_marker(
+    ui: &mut egui::Ui,
+    cx: &mut UiCtx,
+    bookmark: &witness_core::db::Bookmark,
+    center: egui::Pos2,
+) {
+    let at = at_ms(bookmark);
+    let hit = egui::Rect::from_center_size(center, egui::vec2(MARKER_HIT, MARKER_HIT));
+    let marker = ui.interact(
+        hit,
+        ui.id().with(("seek-marker", bookmark.id)),
+        Sense::click(),
+    );
+    let time = clock(at);
+    let (tooltip, label) = if bookmark.note.is_empty() {
+        (time.clone(), format!("Go to bookmark at {time}"))
+    } else {
+        (
+            format!("{time} — {}", bookmark.note),
+            format!("Go to bookmark at {time}: {}", bookmark.note),
+        )
+    };
+    marker.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
+    let painter = ui.painter();
+    let radius = if marker.hovered() {
+        MARKER_RADIUS + 1.0
+    } else {
+        MARKER_RADIUS
+    };
+    painter.circle_filled(center, radius + 1.5, BG_RAISED);
+    painter.circle_filled(center, radius, WARN);
+    if marker.has_focus() && widgets::focus_visible(ui.ctx()) {
+        painter.rect_stroke(
             hit,
-            ui.id().with(("seek-marker", bookmark.id)),
-            Sense::click(),
+            CornerRadius::same(6),
+            Stroke::new(2.0, FOCUS),
+            egui::StrokeKind::Outside,
         );
-        let time = clock(at);
-        let (tooltip, label) = if bookmark.note.is_empty() {
-            (time.clone(), format!("Go to bookmark at {time}"))
-        } else {
-            (
-                format!("{time} — {}", bookmark.note),
-                format!("Go to bookmark at {time}: {}", bookmark.note),
-            )
-        };
-        marker.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
-        ui.painter().circle_filled(center, MARKER_DOT / 2.0, WARN);
-        if marker.has_focus() {
-            ui.painter().rect_stroke(
-                hit,
-                CornerRadius::same(4),
-                Stroke::new(2.0, FOCUS),
-                egui::StrokeKind::Outside,
-            );
-        }
-        let marker = marker
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text(tooltip);
-        if marker.clicked() {
-            // Markers seek without playing.
-            cx.player.seek_ms(at);
-        }
+    }
+    let marker = marker
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(tooltip);
+    if marker.clicked() {
+        // Markers seek without playing.
+        cx.player.seek_ms(at);
     }
 }
 
-/// Row 2: transport on the left; speed, volume and "Save a copy…" on the
-/// right (`justify-content: space-between`). When both clusters do not fit
-/// on one line, the right one wraps below, still right-aligned.
+/// What row 2's controls were asked to do this pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Controls {
+    back: bool,
+    toggle: bool,
+    forward: bool,
+    bookmark: bool,
+    save: bool,
+    volume_changed: bool,
+    speed_changed: bool,
+}
+
+/// Where row 2's two clusters were laid out (for the layout tests).
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct ControlsLayout {
+    left: Rect,
+    right: Rect,
+}
+
+/// Row 2: the transport on the left, speed / volume / "Save a copy…" on
+/// the right, one line at every width (the volume slider collapses into a
+/// popover when the bar is narrow). Pure layout: the caller applies the
+/// returned intents.
 fn controls_row(
     ui: &mut egui::Ui,
-    cx: &mut UiCtx,
-    detail: &MeetingDetail,
-    snap: &PlayerSnapshot,
-    out: &mut PlayerBarOutput,
-) {
-    // Both clusters' widths from last pass (first pass: estimates).
-    let width_id = ui.id().with("player-cluster-widths");
-    let (left_width, right_width): (f32, f32) = ui
-        .ctx()
-        .data(|d| d.get_temp(width_id))
-        .unwrap_or((150.0, 240.0));
-    let one_line = ui.available_width() >= left_width + right_width + 10.0;
-
-    let mut widths = (left_width, right_width);
-    let row = ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        widths.0 = left_cluster(ui, cx, snap, out);
-        if one_line {
-            widths.1 = right_cluster(ui, cx, detail);
-        }
-    });
-    if !one_line {
-        ui.allocate_ui_with_layout(
-            egui::vec2(row.response.rect.width().max(ui.available_width()), 0.0),
-            Layout::right_to_left(Align::Center),
-            |ui| widths.1 = right_cluster(ui, cx, detail),
-        );
-    }
-    ui.ctx().data_mut(|d| d.insert_temp(width_id, widths));
+    playing: bool,
+    volume: &mut f32,
+    speed: &mut f32,
+    open_volume: bool,
+) -> (Controls, ControlsLayout) {
+    let compact = ui.available_width() < FULL_CONTROLS_MIN;
+    let mut c = Controls::default();
+    // Both clusters in a row exactly as tall as the play button, so the
+    // shorter speed select and slider centre on the same line as it.
+    let cluster = |ui: &egui::Ui| egui::vec2(ui.available_width(), PLAY_SIZE);
+    let (left, right) = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = CONTROL_GAP;
+            let left = ui
+                .allocate_ui_with_layout(cluster(ui), Layout::left_to_right(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = CONTROL_GAP;
+                    transport(ui, playing, &mut c);
+                })
+                .response
+                .rect;
+            let right = ui
+                .allocate_ui_with_layout(cluster(ui), Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = CONTROL_GAP;
+                    c.save =
+                        player_btn(ui, ph::DOWNLOAD_SIMPLE, 17.0, "Save a copy", "Save a copy…")
+                            .clicked();
+                    c.volume_changed = volume_control(ui, volume, compact, open_volume);
+                    ui.add_space(CONTROL_GAP);
+                    c.speed_changed = speed_select_centred(ui, speed);
+                })
+                .response
+                .rect;
+            (left, right)
+        })
+        .inner;
+    (c, ControlsLayout { left, right })
 }
 
-/// ±10 s, play/pause, add bookmark. Returns the cluster's width.
-fn left_cluster(
-    ui: &mut egui::Ui,
-    cx: &mut UiCtx,
-    snap: &PlayerSnapshot,
-    out: &mut PlayerBarOutput,
-) -> f32 {
-    let start = ui.cursor().left();
-    if player_btn(
+/// Skip back, play/pause, skip forward, add bookmark.
+fn transport(ui: &mut egui::Ui, playing: bool, c: &mut Controls) {
+    c.back = player_btn(
         ui,
         ph::REWIND,
-        15.0,
+        16.0,
         "Back 10 seconds",
         "Back 10 s (←: 5 s)",
-        false,
     )
-    .clicked()
-    {
-        cx.player.skip_ms(-SKIP_BUTTON_MS);
-    }
-    let (glyph, label, tip) = if snap.playing {
-        (ph::PAUSE, "Pause", "Pause (space)")
+    .clicked();
+    let (label, tip) = if playing {
+        ("Pause", "Pause (space)")
     } else {
-        (ph::PLAY, "Play", "Play (space)")
+        ("Play", "Play (space)")
     };
-    if player_btn(ui, glyph, 18.0, label, tip, true).clicked() {
-        cx.player.toggle();
-        out.toggled = true;
-    }
-    if player_btn(
+    c.toggle = play_btn(ui, playing, label, tip).clicked();
+    c.forward = player_btn(
         ui,
         ph::FAST_FORWARD,
-        15.0,
+        16.0,
         "Forward 10 seconds",
         "Forward 10 s (→: 5 s)",
-        false,
     )
-    .clicked()
-    {
-        cx.player.skip_ms(SKIP_BUTTON_MS);
-    }
-    if player_btn(
+    .clicked();
+    ui.add_space(CONTROL_GAP);
+    c.bookmark = player_btn(
         ui,
         ph::BOOKMARK_SIMPLE,
-        15.0,
+        16.0,
         "Add bookmark at the current position",
         "Add bookmark here",
-        false,
     )
-    .clicked()
-    {
-        out.add_bookmark_at_ms = Some(i64::try_from(snap.position_ms).unwrap_or(i64::MAX));
-    }
-    ui.cursor().left() - start
+    .clicked();
 }
 
-/// Speed, volume and "Save a copy…", laid out right to left from the row's
-/// right edge (so the widgets are added in reverse). Returns its width.
-fn right_cluster(ui: &mut egui::Ui, cx: &mut UiCtx, detail: &MeetingDetail) -> f32 {
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        if player_btn(
-            ui,
-            ph::DOWNLOAD_SIMPLE,
-            18.0,
-            "Save a copy",
-            "Save a copy…",
-            false,
-        )
-        .clicked()
-        {
-            save_copy(cx, detail.meeting.id);
-        }
+/// The speaker glyph for a volume level.
+fn volume_glyph(volume: f32) -> &'static str {
+    if volume <= 0.0 {
+        ph::SPEAKER_X
+    } else if volume < 0.5 {
+        ph::SPEAKER_LOW
+    } else {
+        ph::SPEAKER_HIGH
+    }
+}
 
-        // Volume: muted speaker glyph + an 80 px slider, step 0.05.
+/// The volume slider (step 0.05): inline after a speaker glyph, or — when
+/// `compact` — in a popover above a speaker button. Returns whether the
+/// value changed. In a right-to-left layout (the slider sits right).
+fn volume_control(ui: &mut egui::Ui, volume: &mut f32, compact: bool, open: bool) -> bool {
+    // A slider is as tall as a line of body text.
+    let slider = |ui: &mut egui::Ui, volume: &mut f32, width: f32| {
+        let height = ui.text_style_height(&egui::TextStyle::Body);
+        let response = centred(ui, height, |ui| {
+            widgets::slider(ui, volume, 0.0..=1.0, 0.05, Some(width))
+        })
+        .on_hover_text("Volume");
+        let value = *volume;
+        response.widget_info(|| egui::WidgetInfo::slider(true, f64::from(value) * 100.0, "Volume"));
+        response.changed()
+    };
+    if !compact {
+        let mut changed = false;
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            let mut volume = cx.prefs.volume.clamp(0.0, 1.0);
-            let response = widgets::slider(ui, &mut volume, 0.0..=1.0, 0.05, Some(80.0))
-                .on_hover_text("Volume");
-            response.widget_info(|| {
-                egui::WidgetInfo::slider(true, f64::from(volume) * 100.0, "Volume")
-            });
-            if response.changed() {
-                cx.prefs.volume = volume;
-                cx.player.set_volume(volume);
-            }
+            changed = slider(ui, volume, VOLUME_WIDTH);
             ui.label(
-                egui::RichText::new(ph::SPEAKER_HIGH)
-                    .size(18.0)
+                egui::RichText::new(volume_glyph(*volume))
+                    .size(17.0)
                     .color(TEXT_MUTED),
             )
             .on_hover_text("Volume");
         });
-
-        // Speed (`.player-speed` select).
-        let before = snap_speed(cx.prefs.speed);
-        let mut speed = before;
-        widgets::select(ui, widgets::SelectKind::Compact, |ui| {
-            egui::ComboBox::from_id_salt("player-speed")
-                .selected_text(egui::RichText::new(speed_label(speed)).size(12.0))
-                .width(56.0)
-                .show_ui(ui, |ui| {
-                    for option in SPEEDS {
-                        ui.selectable_value(
-                            &mut speed,
-                            option,
-                            egui::RichText::new(speed_label(option)).size(12.0),
-                        );
-                    }
-                })
-                .response
-                .on_hover_text("Playback speed")
+        return changed;
+    }
+    let button = player_btn(ui, volume_glyph(*volume), 17.0, "Volume", "Volume");
+    let popup_id = Popup::default_response_id(&button);
+    if open {
+        Popup::open_id(ui.ctx(), popup_id);
+    }
+    let mut changed = false;
+    Popup::from_toggle_button_response(&button)
+        .align(RectAlign::TOP)
+        .gap(6.0)
+        .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
+        .frame(
+            Frame::popup(ui.style())
+                .fill(BG_RAISED)
+                .stroke(Stroke::new(1.0, BORDER))
+                .corner_radius(CornerRadius::same(theme::R_MD))
+                .inner_margin(Margin::symmetric(12, 10)),
+        )
+        .show(|ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                changed = slider(ui, volume, VOLUME_POPOVER_WIDTH);
+                let percent = format!("{}%", (*volume * 100.0).round());
+                ui.add_sized(
+                    [30.0, 16.0],
+                    egui::Label::new(egui::RichText::new(percent).size(12.0).color(TEXT_MUTED)),
+                );
+            });
         });
-        if (speed - before).abs() > f32::EPSILON {
-            cx.prefs.speed = speed;
-            cx.player.set_speed(speed);
-        }
-        ui.min_rect().width()
-    })
-    .inner
+    changed
+}
+
+/// The speed select (`.player-speed`). Returns whether it changed.
+fn speed_select(ui: &mut egui::Ui, speed: &mut f32) -> bool {
+    let before = *speed;
+    widgets::select(ui, widgets::SelectKind::Compact, |ui| {
+        egui::ComboBox::from_id_salt("player-speed")
+            .selected_text(egui::RichText::new(speed_label(*speed)).size(12.0))
+            .width(52.0)
+            .show_ui(ui, |ui| {
+                for option in SPEEDS {
+                    ui.selectable_value(
+                        speed,
+                        option,
+                        egui::RichText::new(speed_label(option)).size(12.0),
+                    );
+                }
+            })
+            .response
+            .on_hover_text("Playback speed")
+    });
+    (*speed - before).abs() > f32::EPSILON
+}
+
+/// [`speed_select`] centred on the row's line (the compact select: a
+/// 12 pt line + 4 pt padding above and below).
+fn speed_select_centred(ui: &mut egui::Ui, speed: &mut f32) -> bool {
+    let height = ui.fonts_mut(|f| f.row_height(&theme::regular(12.0))) + 8.0;
+    centred(ui, height, |ui| speed_select(ui, speed))
+}
+
+/// Run `add` in a box exactly `height` tall, centred on the row's line, in
+/// the row's direction. egui's ComboBox and Slider lay out inside a nested
+/// `horizontal` from the top of the space they get, so in a centred row
+/// their top would sit on the centre line, the control hanging below it.
+fn centred<R>(ui: &mut egui::Ui, height: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let free = ui.available_rect_before_wrap();
+    let cy = free.center().y;
+    let rect = Rect::from_x_y_ranges(free.x_range(), (cy - height / 2.0)..=(cy + height / 2.0));
+    let layout = if ui.layout().main_dir() == egui::Direction::RightToLeft {
+        Layout::right_to_left(Align::Min)
+    } else {
+        Layout::left_to_right(Align::Min)
+    };
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
+    let inner = add(&mut child);
+    ui.advance_cursor_after_rect(child.min_rect());
+    inner
+}
+
+/// Run row 2's intents against the player, the prefs and the view.
+fn apply_controls(
+    cx: &mut UiCtx,
+    detail: &MeetingDetail,
+    snap: &PlayerSnapshot,
+    c: Controls,
+    volume: f32,
+    speed: f32,
+    out: &mut PlayerBarOutput,
+) {
+    if c.back {
+        cx.player.skip_ms(-SKIP_BUTTON_MS);
+    }
+    if c.toggle {
+        cx.player.toggle();
+        out.toggled = true;
+    }
+    if c.forward {
+        cx.player.skip_ms(SKIP_BUTTON_MS);
+    }
+    if c.bookmark {
+        out.add_bookmark_at_ms = Some(i64::try_from(snap.position_ms).unwrap_or(i64::MAX));
+    }
+    if c.volume_changed {
+        cx.prefs.volume = volume;
+        cx.player.set_volume(volume);
+    }
+    if c.speed_changed {
+        cx.prefs.speed = speed;
+        cx.player.set_speed(speed);
+    }
+    if c.save {
+        save_copy(cx, detail.meeting.id);
+    }
 }
 
 /// "Save a copy…": check the archive exists BEFORE any dialog (the old
@@ -561,38 +735,66 @@ fn save_copy(cx: &mut UiCtx, meeting_id: i64) {
     });
 }
 
-/// `.player-btn`: a transparent glyph button (6 px padding, radius 6) whose
-/// glyph turns accent on hover; `accent` = `.player-play`. `label` is the
-/// accessible name, `tooltip` the CSS `title`.
-fn player_btn(
-    ui: &mut egui::Ui,
-    glyph: &str,
-    size: f32,
-    label: &str,
-    tooltip: &str,
-    accent: bool,
-) -> Response {
+/// A transport button: a 32×32 ghost square (radius 8) whose muted glyph
+/// brightens on hover. `label` is the accessible name, `tooltip` the CSS
+/// `title`.
+fn player_btn(ui: &mut egui::Ui, glyph: &str, size: f32, label: &str, tooltip: &str) -> Response {
     let galley = ui
         .painter()
         .layout_no_wrap(glyph.to_owned(), theme::regular(size), TEXT);
-    let side = galley.size().x.max(size) + 12.0;
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(BTN_SIZE, BTN_SIZE), Sense::click());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
     if ui.is_rect_visible(rect) {
-        let hot = response.hovered() || response.has_focus();
+        let ring = response.has_focus() && widgets::focus_visible(ui.ctx());
+        let hot = response.hovered() || ring;
         let painter = ui.painter();
         if hot {
-            painter.rect_filled(rect, CornerRadius::same(6), BG_HOVER);
+            painter.rect_filled(rect, CornerRadius::same(theme::R_MD), BG_HOVER);
         }
-        let color = if hot || accent { ACCENT } else { TEXT };
+        let color = if hot { TEXT } else { TEXT_MUTED };
         painter.galley(rect.center() - galley.size() / 2.0, galley, color);
-        if response.has_focus() {
+        if ring {
             painter.rect_stroke(
                 rect.expand(2.0),
-                CornerRadius::same(8),
+                CornerRadius::same(theme::R_MD + 2),
                 Stroke::new(2.0, FOCUS),
                 egui::StrokeKind::Outside,
             );
+        }
+    }
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(tooltip)
+}
+
+/// The primary play/pause: an accent disc with a solid white triangle or
+/// pause bars (Phosphor's regular set has outline glyphs only).
+fn play_btn(ui: &mut egui::Ui, playing: bool, label: &str, tooltip: &str) -> Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(PLAY_SIZE, PLAY_SIZE), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    if ui.is_rect_visible(rect) {
+        let ring = response.has_focus() && widgets::focus_visible(ui.ctx());
+        let hot = response.hovered() || ring;
+        let painter = ui.painter();
+        let c = rect.center();
+        let radius = PLAY_SIZE / 2.0;
+        painter.circle_filled(c, radius, if hot { ACCENT_HOVER } else { ACCENT });
+        if playing {
+            for dx in [-3.5, 3.5] {
+                let bar = Rect::from_center_size(c + egui::vec2(dx, 0.0), egui::vec2(3.5, 13.0));
+                painter.rect_filled(bar, CornerRadius::same(1), WHITE);
+            }
+        } else {
+            // Optically centred: the triangle's mass sits right of its box.
+            let points = vec![
+                c + egui::vec2(-4.0, -7.0),
+                c + egui::vec2(8.0, 0.0),
+                c + egui::vec2(-4.0, 7.0),
+            ];
+            painter.add(egui::Shape::convex_polygon(points, WHITE, Stroke::NONE));
+        }
+        if ring {
+            painter.circle_stroke(c, radius + 3.0, Stroke::new(2.0, FOCUS));
         }
     }
     response
@@ -624,5 +826,106 @@ mod tests {
         assert_eq!(clock(0), "0:00");
         assert_eq!(clock(61_999), "1:01");
         assert_eq!(clock(3_600_000), "1:00:00");
+    }
+
+    #[test]
+    fn volume_glyph_follows_the_level() {
+        assert_eq!(volume_glyph(0.0), ph::SPEAKER_X);
+        assert_eq!(volume_glyph(0.3), ph::SPEAKER_LOW);
+        assert_eq!(volume_glyph(1.0), ph::SPEAKER_HIGH);
+    }
+
+    /// Lay out row 2 in a `width`-wide column (two passes, so the combo box
+    /// knows its size); returns the clusters and the column's rect.
+    fn controls_at(width: f32) -> (ControlsLayout, Rect) {
+        let ctx = theme::test_context();
+        let mut layout = None;
+        let mut column = Rect::NOTHING;
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, 100.0),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_width(width);
+                        column = ui.max_rect();
+                        let (mut volume, mut speed) = (0.8, 1.25);
+                        layout = Some(controls_row(ui, false, &mut volume, &mut speed, false).1);
+                    },
+                );
+            });
+            output.textures_delta.clear();
+        }
+        (layout.unwrap(), column)
+    }
+
+    /// The bar's content width at a window width (16 pt page padding, a
+    /// 10 pt scroll gutter, 12 pt surface padding).
+    fn content_width(window: f32) -> f32 {
+        window - 10.0 - 2.0 * 16.0 - 2.0 * 12.0
+    }
+
+    #[test]
+    fn controls_stay_on_one_line_down_to_the_minimum_width() {
+        for window in [380.0, 460.0, 640.0] {
+            let width = content_width(window);
+            let (layout, column) = controls_at(width);
+            assert!(
+                layout.left.right() + CONTROL_GAP <= layout.right.left() + 0.5,
+                "{window}: clusters overlap: {layout:?}"
+            );
+            assert!(
+                layout.right.right() <= column.right() + 0.5,
+                "{window}: right cluster overflows: {layout:?} in {column:?}"
+            );
+            assert!(
+                (layout.left.center().y - layout.right.center().y).abs() < 1.0,
+                "{window}: clusters on different lines: {layout:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_volume_slider_collapses_only_when_narrow() {
+        let (narrow, _) = controls_at(content_width(380.0));
+        let (wide, _) = controls_at(content_width(460.0));
+        // The inline slider adds its 80 pt (+ gap) to the right cluster.
+        assert!(
+            wide.right.width() - narrow.right.width() > VOLUME_WIDTH - BTN_SIZE,
+            "{narrow:?} vs {wide:?}"
+        );
+    }
+
+    #[test]
+    fn the_bar_column_lines_up_with_the_padded_column_beside_a_scroll_bar() {
+        let ctx = theme::test_context();
+        let (mut bar, mut page) = (Rect::NOTHING, Rect::NOTHING);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(1000.0, 100.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ui.set_width(1000.0);
+                    bar = bar_column(ui, 10.0, |ui| ui.max_rect());
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(990.0, 50.0),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.set_width(990.0);
+                            page = widgets::padded_column(ui, |ui| ui.max_rect());
+                        },
+                    );
+                },
+            );
+        });
+        output.textures_delta.clear();
+        assert!(
+            (bar.left() - page.left()).abs() < 0.5,
+            "{bar:?} vs {page:?}"
+        );
+        assert!(
+            (bar.right() - page.right()).abs() < 0.5,
+            "{bar:?} vs {page:?}"
+        );
     }
 }
