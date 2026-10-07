@@ -8,27 +8,42 @@
 
 use crate::bridge::{OpDone, Task};
 use crate::ui::format::{fmt_date, fmt_date_short, fmt_duration, fmt_thousands};
-use crate::ui::theme::{self, ACCENT, BG_HOVER, BG_RAISED, BORDER, TEXT, TEXT_MUTED};
+use crate::ui::icons;
+use crate::ui::theme::{
+    self, ACCENT, ACCENT_HOVER, BORDER, BORDER_STRONG, REC_LIGHT, S1, S2, S3, S4, TEXT, TEXT_FAINT,
+    TEXT_MUTED,
+};
 use crate::ui::toasts::Notice;
-use crate::ui::views::meetings::{follow_focus, open_transcript, paint_focus_ring, truncated};
+use crate::ui::views::meetings::{follow_focus, open_transcript};
 use crate::ui::widgets::{self, KeyScroll};
 use crate::ui::{UiCtx, View};
 use chrono::{DateTime, Datelike, Days, Local, NaiveDate};
 use eframe::egui::{
-    self, Align, CornerRadius, CursorIcon, Layout, Rect, Response, Sense, Stroke, UiBuilder,
-    WidgetInfo, WidgetType,
+    self, Align, Color32, CornerRadius, FontId, Layout, Rect, Response, Sense, Stroke, WidgetInfo,
+    WidgetType,
 };
+use std::sync::Arc;
 use witness_core::db::{Meeting, PersonMeetingStat};
 use witness_core::service::PersonInfo;
 use witness_core::CoreResult;
 
 /// Buckets in the trend: the current week and the 11 before it.
 const WEEKS: usize = 12;
-/// The chart's rendered height (the SVG's 100×34 box at 68 px).
-const CHART_HEIGHT: f32 = 68.0;
+/// The bar area's height inside the trend surface (axis labels below).
+const CHART_HEIGHT: f32 = 56.0;
+/// The widest a bar gets: past this, wider windows add air, not fat bars.
+const BAR_MAX_WIDTH: f32 = 28.0;
+/// Person avatars in the list.
+const AVATAR: f32 = 32.0;
+/// The expand chevron's box.
+const CHEVRON: f32 = 16.0;
 /// The one confirmation this view can have open.
 const CONFIRM_ID: &str = "people-confirm";
 const HINT: &str = "\"Speaking\" totals come from transcribed segments; word counts are approximate. Unnamed speakers (Speaker 1…) aren't tracked across meetings — rename them to a person to include them here. Enrolled voices can also be managed in Settings.";
+
+// TODO(rework): this view was `widgets::chip_size`'s last caller. Keep the
+// build warning-free until the kit drops it (or another view uses it).
+const _: fn(&egui::Ui, &str, f32) -> egui::Vec2 = widgets::chip_size;
 
 // ----------------------------------------------------------------------
 // Weekly trend (pure)
@@ -83,13 +98,14 @@ fn bucket_weeks(today: NaiveDate, meetings: &[Meeting]) -> Vec<Week> {
     weeks
 }
 
-/// Bar height in the chart's 34-unit box: total meeting time scaled to
-/// 30 units (at least 2), or a 0.8-unit stub for an empty week.
-fn bar_height(ms: i64, max_ms: i64) -> f32 {
+/// A bar's height as a fraction of the chart: total meeting time over the
+/// busiest week's, at least 6 % so a short week stays visible; 0 for an
+/// empty week (drawn as a stub on the baseline).
+fn bar_fraction(ms: i64, max_ms: i64) -> f32 {
     if ms > 0 {
-        (ms as f32 / max_ms.max(1) as f32 * 30.0).max(2.0)
+        (ms as f32 / max_ms.max(1) as f32).clamp(0.06, 1.0)
     } else {
-        0.8
+        0.0
     }
 }
 
@@ -219,6 +235,50 @@ fn meeting_meta(m: &PersonMeetingStat) -> String {
     text
 }
 
+/// The row's one-line summary: `{n} meeting(s) · {duration} speaking`.
+fn summary_text(p: &PersonAgg) -> String {
+    let s = if p.meeting_count == 1 { "" } else { "s" };
+    format!(
+        "{} meeting{s} · {} speaking",
+        p.meeting_count,
+        fmt_duration(Some(p.talk_ms))
+    )
+}
+
+/// The expanded detail's key/value pairs: the same facts as
+/// [`stats_text`], under the same conditions.
+fn stat_pairs(p: &PersonAgg, sample_seconds: Option<f64>) -> Vec<(&'static str, String)> {
+    let mut pairs = vec![("Meetings", p.meeting_count.to_string())];
+    if !p.is_me {
+        pairs.push(("Time together", fmt_duration(Some(p.together_ms))));
+    }
+    pairs.push(("Speaking time", fmt_duration(Some(p.talk_ms))));
+    pairs.push(("Words", fmt_thousands(p.words)));
+    if p.together_ms > 0 {
+        pairs.push((
+            "Share of meeting time",
+            format!("{}%", percent(p.talk_ms, p.together_ms)),
+        ));
+    }
+    if let Some(seconds) = sample_seconds {
+        pairs.push((
+            "Speech learned",
+            format!("{} min", (seconds / 60.0).round() as i64),
+        ));
+    }
+    pairs
+}
+
+/// A person's avatar colour: Me's speaker colour, everyone else one of the
+/// eight speaker colours by person id — stable across reloads and renames,
+/// and distinct for up to eight consecutive enrolments.
+fn person_color(p: &PersonAgg) -> Color32 {
+    match p.person_id {
+        None => theme::chip_color("me"),
+        Some(id) => theme::chip_color(&format!("S{}", id.rem_euclid(8) + 1)),
+    }
+}
+
 // ----------------------------------------------------------------------
 // The view
 
@@ -283,13 +343,9 @@ impl PeopleView {
         self.take_confirm_answer(cx);
 
         let mut actions = Vec::new();
-        egui::ScrollArea::vertical()
-            .id_salt("people-scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                widgets::keyboard_scroll(ui, KeyScroll { space: true });
-                widgets::centered_column(ui, 900.0, |ui| self.draw(ui, &mut actions));
-            });
+        widgets::scroll_column(ui, "people-scroll", KeyScroll { space: true }, |ui| {
+            self.draw(ui, &mut actions)
+        });
         for action in actions {
             match action {
                 Action::Toggle(key) => {
@@ -384,11 +440,28 @@ impl PeopleView {
                 self.weeks = bucket_weeks(today, &meetings);
                 self.prints = prints;
                 self.load_error = None;
+                #[cfg(debug_assertions)]
+                self.debug_expand();
             }
             (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
                 cx.toasts.error("Could not load people statistics", &error);
                 self.load_error = Some(error);
             }
+        }
+    }
+
+    /// Debug builds only: `WITNESS_DEBUG_EXPAND_PERSON=<index>` opens that
+    /// person's detail after the first load, for passive snapshots.
+    #[cfg(debug_assertions)]
+    fn debug_expand(&mut self) {
+        if self.expanded.is_some() {
+            return;
+        }
+        let index = std::env::var("WITNESS_DEBUG_EXPAND_PERSON")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        if let Some(person) = index.and_then(|i| self.people.get(i)) {
+            self.expanded = Some(person.key.clone());
         }
     }
 
@@ -429,16 +502,26 @@ impl PeopleView {
             return;
         }
 
-        ui.spacing_mut().item_spacing.y = 8.0;
+        ui.add_space(S4);
         trend_card(ui, &self.weeks);
+        widgets::section_header(ui, "People");
+        ui.spacing_mut().item_spacing.y = 2.0;
         for person in &self.people {
             let print = person
                 .person_id
                 .and_then(|id| self.prints.iter().find(|p| p.id == id));
             let open = self.expanded.as_deref() == Some(person.key.as_str());
-            person_card(ui, person, print, open, actions);
+            person_entry(ui, person, print, open, actions);
         }
-        ui.add(egui::Label::new(egui::RichText::new(HINT).size(12.0).color(TEXT_MUTED)).wrap());
+        ui.add_space(S4);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(HINT)
+                    .font(theme::regular(12.0))
+                    .color(TEXT_FAINT),
+            )
+            .wrap(),
+        );
     }
 }
 
@@ -460,257 +543,329 @@ fn forget(cx: &mut UiCtx, id: i64, name: String) {
 // ----------------------------------------------------------------------
 // Widgets
 
-/// `.person-card` frame (raised, 1 px border, radius 8, no padding).
-fn card_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(BG_RAISED)
-        .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(CornerRadius::same(8))
-}
-
-/// The trend card: title plus 12 bars of total meeting time per week.
+/// The trend surface: the caption, then 12 bars of total meeting time per
+/// week over a faint baseline, with the range's ends labelled below.
 fn trend_card(ui: &mut egui::Ui, weeks: &[Week]) {
-    card_frame()
-        .inner_margin(egui::Margin::symmetric(14, 10))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 6.0;
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(trend_title(weeks))
-                        .size(12.0)
-                        .color(TEXT_MUTED),
-                )
-                .wrap(),
+    widgets::group(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = S2;
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(trend_title(weeks))
+                    .font(theme::regular(12.5))
+                    .color(TEXT_MUTED),
+            )
+            .wrap(),
+        );
+        ui.add_space(S1);
+        trend_chart(ui, weeks);
+        if let Some(first) = weeks.first() {
+            // Axis ends: the oldest week's Monday and the current week.
+            let height = ui.fonts_mut(|f| f.row_height(&axis_font()));
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
+            let painter = ui.painter();
+            painter.text(
+                rect.left_center(),
+                egui::Align2::LEFT_CENTER,
+                first.from.format("%-d %b").to_string(),
+                axis_font(),
+                TEXT_FAINT,
             );
-            trend_chart(ui, weeks);
-        });
+            painter.text(
+                rect.right_center(),
+                egui::Align2::RIGHT_CENTER,
+                "This week",
+                axis_font(),
+                TEXT_FAINT,
+            );
+        }
+    });
 }
 
-/// The bars, drawn in the SVG's 100×34 logical box stretched to the
-/// available width × 68 pt; each slot's tooltip is its week's summary.
+/// The chart's axis labels.
+fn axis_font() -> FontId {
+    theme::regular(11.5)
+}
+
+/// The bars: one slot per week across the available width (bars capped at
+/// [`BAR_MAX_WIDTH`], centred in their slot), the current week and the
+/// hovered one in full accent; each slot's tooltip is its week's summary.
 fn trend_chart(ui: &mut egui::Ui, weeks: &[Week]) -> Response {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), CHART_HEIGHT),
         Sense::hover(),
     );
     let slot = rect.width() / WEEKS as f32;
-    let unit_y = rect.height() / 34.0;
-    let max_ms = weeks.iter().map(|w| w.ms).max().unwrap_or(0).max(1);
+    let hovered = match response.hover_pos() {
+        Some(pos) if !weeks.is_empty() => {
+            Some((((pos.x - rect.left()) / slot).floor().max(0.0) as usize).min(weeks.len() - 1))
+        }
+        _ => None,
+    };
     if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        // The baseline the bars stand on.
+        painter.hline(
+            rect.x_range(),
+            rect.bottom() - 0.5,
+            Stroke::new(1.0, BORDER),
+        );
+        let max_ms = weeks.iter().map(|w| w.ms).max().unwrap_or(0).max(1);
+        let bar_w = (slot * 0.6).clamp(3.0, BAR_MAX_WIDTH);
+        let current = weeks.len().saturating_sub(1);
         for (i, week) in weeks.iter().enumerate() {
-            let h = bar_height(week.ms, max_ms);
-            let bar = Rect::from_min_size(
-                egui::pos2(
-                    rect.left() + i as f32 * slot + 0.15 * slot,
-                    rect.top() + (32.0 - h) * unit_y,
-                ),
-                egui::vec2(0.7 * slot, h * unit_y),
+            let center_x = rect.left() + (i as f32 + 0.5) * slot;
+            let emphasised = i == current || hovered == Some(i);
+            let fraction = bar_fraction(week.ms, max_ms);
+            if fraction == 0.0 {
+                // An empty week: a short stub on the baseline keeps the slot.
+                let stub = Rect::from_center_size(
+                    egui::pos2(center_x, rect.bottom() - 2.0),
+                    egui::vec2(bar_w, 3.0),
+                );
+                let color = if emphasised {
+                    TEXT_FAINT
+                } else {
+                    BORDER_STRONG
+                };
+                painter.rect_filled(stub, CornerRadius::same(1), color);
+                continue;
+            }
+            let h = fraction * (rect.height() - S1);
+            let bar = Rect::from_min_max(
+                egui::pos2(center_x - bar_w / 2.0, rect.bottom() - h),
+                egui::pos2(center_x + bar_w / 2.0, rect.bottom()),
             );
-            let color = if week.ms > 0 { ACCENT } else { BORDER };
-            let radius = if week.ms > 0 { 2 } else { 1 };
-            ui.painter()
-                .rect_filled(bar, CornerRadius::same(radius), color.gamma_multiply(0.85));
+            let color = if hovered == Some(i) {
+                ACCENT_HOVER
+            } else if emphasised {
+                ACCENT
+            } else {
+                theme::alpha(ACCENT, 0.7)
+            };
+            let radius = CornerRadius {
+                nw: 3,
+                ne: 3,
+                sw: 0,
+                se: 0,
+            };
+            painter.rect_filled(bar, radius, color);
         }
     }
     let summary = weeks.iter().map(week_text).collect::<Vec<_>>().join("; ");
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, &summary));
-    match response.hover_pos() {
-        Some(pos) if !weeks.is_empty() => {
-            let index =
-                (((pos.x - rect.left()) / slot).floor().max(0.0) as usize).min(weeks.len() - 1);
-            response.on_hover_text_at_pointer(week_text(&weeks[index]))
-        }
-        _ => response,
+    match hovered {
+        Some(index) => response.on_hover_text_at_pointer(week_text(&weeks[index])),
+        None => response,
     }
 }
 
-/// A clickable full-width area with a hover background behind `add`'s
-/// content (the background corners follow `radius`).
-fn hover_area(
-    ui: &mut egui::Ui,
-    id_salt: impl std::hash::Hash + std::fmt::Debug,
-    margin: egui::Margin,
-    radius: CornerRadius,
-    add: impl FnOnce(&mut egui::Ui),
-) -> Response {
-    let background = ui.painter().add(egui::Shape::Noop);
-    let response = ui
-        .scope_builder(
-            UiBuilder::new().id_salt(id_salt).sense(Sense::click()),
+/// A single-line galley elided with `…` at `width` (`galley.elided` says
+/// whether it had to).
+fn elided(
+    ui: &egui::Ui,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    width: f32,
+) -> Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(1.0));
+    ui.painter().layout_job(job)
+}
+
+/// The expand chevron: a caret pointing right, turned down by `t` (0..1).
+fn paint_chevron(ui: &egui::Ui, rect: Rect, t: f32, color: Color32) {
+    let angle = t * std::f32::consts::FRAC_PI_2;
+    let (sin, cos) = angle.sin_cos();
+    let c = rect.center();
+    let points = [(-2.0, -4.5), (2.5, 0.0), (-2.0, 4.5)]
+        .map(|(x, y): (f32, f32)| egui::pos2(c.x + x * cos - y * sin, c.y + x * sin + y * cos));
+    ui.painter()
+        .add(egui::Shape::line(points.to_vec(), Stroke::new(1.5, color)));
+}
+
+/// A person's list row: avatar, name and the one-line summary, and the
+/// chevron that turns when the detail is open. Returns the row's response
+/// (click = toggle) and the content's rect.
+fn person_row(ui: &mut egui::Ui, p: &PersonAgg, open: bool) -> (Response, Rect) {
+    let summary = summary_text(p);
+    let (row, content) = widgets::list_row(ui, ("person-row", &p.key), false, |ui, hovered| {
+        let name_font = theme::semibold(14.0);
+        let meta_font = theme::regular(12.0);
+        let text_h = ui.fonts_mut(|f| f.row_height(&name_font) + f.row_height(&meta_font)) + 1.0;
+        let height = text_h.max(AVATAR);
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), height),
+            Layout::left_to_right(Align::Center),
             |ui| {
-                egui::Frame::new().inner_margin(margin).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    add(ui);
-                });
+                ui.spacing_mut().item_spacing.x = S3;
+                widgets::avatar(ui, &p.name, person_color(p), AVATAR);
+                let text_w = (ui.available_width() - CHEVRON - S3).max(0.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(text_w, text_h),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_width(text_w);
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        widgets::elide(ui, &p.name, name_font, TEXT);
+                        widgets::elide(ui, &summary, meta_font, TEXT_MUTED);
+                    },
+                );
+                let (mark, _) =
+                    ui.allocate_exact_size(egui::vec2(CHEVRON, CHEVRON), Sense::hover());
+                let t = if icons::animations_enabled() {
+                    let id = egui::Id::new(("person-chevron", &p.key));
+                    ui.ctx().animate_bool_responsive(id, open)
+                } else if open {
+                    1.0
+                } else {
+                    0.0
+                };
+                let color = if hovered || open { TEXT } else { TEXT_MUTED };
+                paint_chevron(ui, mark, t, color);
             },
         )
-        .response;
-    if response.hovered() || response.has_focus() {
-        ui.painter().set(
-            background,
-            egui::Shape::rect_filled(response.rect, radius, BG_HOVER),
-        );
-    }
-    if response.has_focus() {
-        paint_focus_ring(ui, response.rect.shrink(2.0), 6);
-    }
-    follow_focus(&response);
-    response.on_hover_cursor(CursorIcon::PointingHand)
+        .response
+        .rect
+    });
+    follow_focus(&row);
+    (row, content)
 }
 
-/// `.person-head` (`align-items: center`): chip, wrapping stats and the
-/// chevron share one centre line. The stats are laid out first so the row
-/// gets its final height before anything is placed; a zero-height cell in
-/// a centred row would start the stats half a row down.
-fn person_head(ui: &mut egui::Ui, p: &PersonAgg, stats: &str, open: bool) -> egui::Rect {
-    const GAP: f32 = 10.0;
-    const CHEVRON_WIDTH: f32 = 12.0;
-    let chip = widgets::chip_size(ui, &p.name, 16.0);
-    let available = ui.available_width();
-    let stats_width = (available - chip.x - CHEVRON_WIDTH - 2.0 * GAP).max(40.0);
-    let stats = ui.painter().layout(
-        stats.to_owned(),
-        theme::regular(13.0),
-        TEXT_MUTED,
-        stats_width,
-    );
-    let chevron = ui.painter().layout_no_wrap(
-        if open { "▾" } else { "▸" }.to_owned(),
-        theme::regular(theme::BASE_SIZE),
-        TEXT_MUTED,
-    );
-    let height = stats.size().y.max(chip.y).max(chevron.size().y);
-    ui.allocate_ui_with_layout(
-        egui::vec2(available, height),
-        Layout::left_to_right(Align::Center),
-        |ui| {
-            ui.spacing_mut().item_spacing.x = GAP;
-            let color = theme::chip_color(if p.is_me { "me" } else { "S1" });
-            let chip = widgets::chip(ui, &p.name, color, 16.0).on_hover_text(&p.name);
-            let (cell, _) =
-                ui.allocate_exact_size(egui::vec2(stats_width, stats.size().y), Sense::hover());
-            ui.painter().galley(cell.min, stats, TEXT_MUTED);
-            let (mark, _) = ui.allocate_exact_size(
-                egui::vec2(CHEVRON_WIDTH.max(chevron.size().x), chevron.size().y),
-                Sense::hover(),
+/// The detail's key/value grid: two columns when there is room, one
+/// otherwise; keys elide (full key as tooltip), values never do.
+fn stats_grid(ui: &mut egui::Ui, pairs: &[(&'static str, String)]) {
+    const GAP_X: f32 = 24.0;
+    let key_font = theme::regular(12.5);
+    let value_font = theme::semibold(13.0);
+    let width = ui.available_width();
+    let cols = if width >= 400.0 { 2 } else { 1 };
+    let cell_w = (width - GAP_X * (cols - 1) as f32) / cols as f32;
+    let row_h = ui.fonts_mut(|f| f.row_height(&value_font).max(f.row_height(&key_font)));
+    ui.spacing_mut().item_spacing.y = 10.0;
+    for chunk in pairs.chunks(cols) {
+        // One exact-height line per grid row (`ui.horizontal` would pad it
+        // to the 32 pt control height); cells are placed inside it.
+        let (line, _) = ui.allocate_exact_size(egui::vec2(width, row_h), Sense::hover());
+        for (col, (key, value)) in chunk.iter().enumerate() {
+            let cell = Rect::from_min_size(
+                line.min + egui::vec2(col as f32 * (cell_w + GAP_X), 0.0),
+                egui::vec2(cell_w, row_h),
             );
-            ui.painter().galley(mark.min, chevron, TEXT_MUTED);
-            chip.rect.union(cell).union(mark)
-        },
-    )
-    .inner
+            let response = ui.interact(cell, ui.id().with(("stat", *key)), Sense::hover());
+            let value_g = ui
+                .painter()
+                .layout_no_wrap(value.clone(), value_font.clone(), TEXT);
+            let key_w = cell_w - value_g.size().x - S2;
+            let key_g = elided(ui, key, key_font.clone(), TEXT_MUTED, key_w);
+            let key_elided = key_g.elided;
+            let painter = ui.painter();
+            painter.galley(
+                egui::pos2(cell.left(), cell.center().y - key_g.size().y / 2.0),
+                key_g,
+                TEXT_MUTED,
+            );
+            painter.galley(
+                egui::pos2(
+                    cell.right() - value_g.size().x,
+                    cell.center().y - value_g.size().y / 2.0,
+                ),
+                value_g,
+                TEXT,
+            );
+            let name = format!("{key}: {value}");
+            response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, &name));
+            if key_elided {
+                response.on_hover_text(*key);
+            }
+        }
+    }
 }
 
-/// One person card: the header (chip, stats, chevron) toggles the
-/// accordion; the open card lists their meetings and "Forget voice…".
-fn person_card(
+/// One meeting shared with the person: title and meta line, both elided
+/// (the tooltip and accessible name carry the whole text). Click opens it.
+fn meeting_row(ui: &mut egui::Ui, p: &PersonAgg, m: &PersonMeetingStat) -> Response {
+    let meta = meeting_meta(m);
+    let (row, ()) = widgets::list_row(
+        ui,
+        ("person-meeting", &p.key, m.meeting_id),
+        false,
+        |ui, _| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            widgets::elide(ui, &m.meeting_title, theme::regular(14.0), TEXT);
+            widgets::elide(ui, &meta, theme::regular(12.0), TEXT_MUTED);
+        },
+    );
+    let name = format!("{}, {meta}", m.meeting_title);
+    row.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
+    follow_focus(&row);
+    row
+}
+
+/// One person: the row, and when open the detail under it: the stats
+/// grid, their meetings and "Forget voice…" (named people only).
+fn person_entry(
     ui: &mut egui::Ui,
     p: &PersonAgg,
     print: Option<&PersonInfo>,
     open: bool,
     actions: &mut Vec<Action>,
 ) {
-    let stats = stats_text(p, print.map(|x| x.sample_seconds));
-    card_frame().show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.spacing_mut().item_spacing.y = 0.0;
-        let header_radius = if open {
-            CornerRadius {
-                nw: 8,
-                ne: 8,
-                sw: 0,
-                se: 0,
-            }
-        } else {
-            CornerRadius::same(8)
-        };
-        let header = hover_area(
-            ui,
-            ("person-head", &p.key),
-            egui::Margin::symmetric(14, 10),
-            header_radius,
-            |ui| {
-                person_head(ui, p, &stats, open);
-            },
-        );
-        let name = format!("{}: {stats}", p.name);
-        header.widget_info(|| {
-            let mut info = WidgetInfo::labeled(WidgetType::Button, true, &name);
-            info.selected = Some(open); // aria-expanded
-            info
-        });
-        if header.clicked() {
-            actions.push(Action::Toggle(p.key.clone()));
-        }
-        if !open {
-            return;
-        }
+    let sample_seconds = print.map(|x| x.sample_seconds);
+    let (header, _) = person_row(ui, p, open);
+    let name = format!("{}: {}", p.name, stats_text(p, sample_seconds));
+    header.widget_info(|| {
+        let mut info = WidgetInfo::labeled(WidgetType::Button, true, &name);
+        info.selected = Some(open); // aria-expanded
+        info
+    });
+    if header.clicked() {
+        actions.push(Action::Toggle(p.key.clone()));
+    }
+    if !open {
+        return;
+    }
 
-        // `.person-meetings`: 1 px top border, one row per meeting.
-        let (_, line) = ui.allocate_space(egui::vec2(ui.available_width(), 1.0));
-        ui.painter().line_segment(
-            [line.left_center(), line.right_center()],
-            Stroke::new(1.0, BORDER),
-        );
-        let forget = !p.is_me && p.person_id.is_some();
-        let count = p.meetings.len();
-        for (index, m) in p.meetings.iter().enumerate() {
-            let last = !forget && index + 1 == count;
-            let radius = if last {
-                CornerRadius {
-                    nw: 0,
-                    ne: 0,
-                    sw: 8,
-                    se: 8,
+    // The detail hangs under the name (flush left when compact).
+    let indent = if widgets::is_compact(ui) {
+        0.0
+    } else {
+        AVATAR + S3
+    };
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.add_space(indent);
+        let width = ui.available_width();
+        ui.vertical(|ui| {
+            ui.set_width(width);
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.add_space(S1);
+            widgets::group(ui, |ui| stats_grid(ui, &stat_pairs(p, sample_seconds)));
+            ui.add_space(S2);
+            for m in &p.meetings {
+                if meeting_row(ui, p, m).clicked() {
+                    actions.push(Action::Open(m.meeting_id));
                 }
-            } else {
-                CornerRadius::ZERO
-            };
-            let row = hover_area(
-                ui,
-                ("person-meeting", &p.key, m.meeting_id),
-                egui::Margin {
-                    left: 24,
-                    right: 14,
-                    top: 8,
-                    bottom: 8,
-                },
-                radius,
-                |ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    let width = ui.available_width();
-                    let title = truncated(ui, &m.meeting_title, theme::semibold(14.0), TEXT, width);
-                    let (rect, _) = ui.allocate_exact_size(title.size(), Sense::hover());
-                    ui.painter().galley(rect.min, title, TEXT);
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(meeting_meta(m))
-                                .size(12.0)
-                                .color(TEXT_MUTED),
-                        )
-                        .wrap(),
-                    );
-                },
-            );
-            let name = format!("{}, {}", m.meeting_title, meeting_meta(m));
-            row.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
-            if row.clicked() {
-                actions.push(Action::Open(m.meeting_id));
             }
-        }
-        if let (true, Some(id)) = (forget, p.person_id) {
-            let button = widgets::btn_ghost(ui, "Forget voice…")
-                .on_hover_text("Forget this voice — Shift-click to skip confirmation");
-            follow_focus(&button);
-            if button.clicked() {
-                actions.push(Action::Forget {
-                    id,
-                    name: p.name.clone(),
-                    skip: ui.input(|i| i.modifiers.shift),
-                });
+            if let (false, Some(id)) = (p.is_me, p.person_id) {
+                // Destructive but secondary: a ghost button in light red, its
+                // text roughly in line with the meeting titles above.
+                ui.add_space(S1);
+                let button =
+                    widgets::btn_ghost(ui, egui::RichText::new("Forget voice…").color(REC_LIGHT))
+                        .on_hover_text("Forget this voice — Shift-click to skip confirmation");
+                follow_focus(&button);
+                if button.clicked() {
+                    actions.push(Action::Forget {
+                        id,
+                        name: p.name.clone(),
+                        skip: ui.input(|i| i.modifiers.shift),
+                    });
+                }
             }
-        }
+            ui.add_space(S3);
+        });
     });
 }
 
@@ -798,11 +953,49 @@ mod tests {
 
     #[test]
     fn bars_scale_to_total_time() {
-        assert_eq!(bar_height(0, 100), 0.8);
-        assert_eq!(bar_height(100, 100), 30.0);
-        assert_eq!(bar_height(1, 1_000_000), 2.0);
-        assert_eq!(bar_height(50, 100), 15.0);
-        assert_eq!(bar_height(5, 0), 30.0 * 5.0); // max clamps to 1
+        assert_eq!(bar_fraction(0, 100), 0.0);
+        assert_eq!(bar_fraction(100, 100), 1.0);
+        assert_eq!(bar_fraction(1, 1_000_000), 0.06);
+        assert_eq!(bar_fraction(50, 100), 0.5);
+        assert_eq!(bar_fraction(5, 0), 1.0); // never taller than the chart
+    }
+
+    #[test]
+    fn summary_and_detail_pairs() {
+        let stats = vec![
+            stat(None, "Me", 1, 600_000, 300_000),
+            stat(Some(2), "Bob", 1, 600_000, 150_000),
+            stat(Some(2), "Bob", 2, 0, 0),
+        ];
+        let people = aggregate(&stats);
+        assert_eq!(summary_text(&people[0]), "1 meeting · 5 min speaking");
+        assert_eq!(summary_text(&people[1]), "2 meetings · 2 min speaking");
+        let keys = |pairs: Vec<(&'static str, String)>| -> Vec<&'static str> {
+            pairs.into_iter().map(|(k, _)| k).collect()
+        };
+        assert_eq!(
+            keys(stat_pairs(&people[0], None)),
+            [
+                "Meetings",
+                "Speaking time",
+                "Words",
+                "Share of meeting time"
+            ]
+        );
+        assert_eq!(
+            stat_pairs(&people[1], Some(89.0)),
+            [
+                ("Meetings", "2".to_string()),
+                ("Time together", "10 min".to_string()),
+                ("Speaking time", "2 min".to_string()),
+                ("Words", "2,468".to_string()),
+                ("Share of meeting time", "25%".to_string()),
+                ("Speech learned", "1 min".to_string()),
+            ]
+        );
+        // Avatar colours: Me's speaker colour; others stable by id.
+        assert_eq!(person_color(&people[0]), theme::chip_color("me"));
+        assert_eq!(person_color(&people[1]), theme::chip_color("S3"));
     }
 
     #[test]
@@ -859,41 +1052,54 @@ mod tests {
     }
 
     #[test]
-    fn cards_and_chart_lay_out() {
+    fn rows_detail_and_chart_lay_out() {
         let ctx = theme::test_context();
-        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let stats = vec![
-                stat(None, "Me", 1, 600_000, 300_000),
-                stat(Some(2), "Bob", 1, 600_000, 150_000),
-            ];
-            let people = aggregate(&stats);
-            let weeks = bucket_weeks(day(2026, 10, 7), &[]);
-            trend_card(ui, &weeks);
-            let mut actions = Vec::new();
-            person_card(ui, &people[0], None, true, &mut actions);
-            person_card(ui, &people[1], None, true, &mut actions);
-            person_card(ui, &people[1], None, false, &mut actions);
-            assert!(actions.is_empty());
-        });
-        output.textures_delta.clear();
+        for width in [1000.0, 380.0] {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 2000.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                let stats = vec![
+                    stat(None, "Me", 1, 600_000, 300_000),
+                    stat(Some(2), "Bob", 1, 600_000, 150_000),
+                ];
+                let people = aggregate(&stats);
+                let weeks = bucket_weeks(day(2026, 10, 7), &[]);
+                trend_card(ui, &weeks);
+                let mut actions = Vec::new();
+                person_entry(ui, &people[0], None, true, &mut actions);
+                person_entry(ui, &people[1], None, true, &mut actions);
+                person_entry(ui, &people[1], None, false, &mut actions);
+                assert!(actions.is_empty());
+                // Nothing grew past the window.
+                assert!(ui.min_rect().right() <= width + 0.5, "at {width}");
+            });
+            output.textures_delta.clear();
+        }
     }
+
+    /// The row never overflows its width (long names elide), and the
+    /// avatar and chevron centre on it.
     #[test]
-    fn person_head_centres_chip_stats_and_chevron() {
+    fn person_row_fits_and_centres_avatar_and_chevron() {
         let ctx = theme::test_context();
         let person = PersonAgg {
-            key: "me".into(),
-            person_id: None,
-            name: "Me".into(),
-            is_me: true,
+            key: "p7".into(),
+            person_id: Some(7),
+            name: "Christopher Warriner-Montgomery of the Very Long Name".into(),
+            is_me: false,
             meetings: Vec::new(),
             meeting_count: 12,
             together_ms: 3_600_000,
             talk_ms: 1_200_000,
             words: 4_321,
         };
-        let stats = stats_text(&person, Some(42.0));
         for width in [900.0, 300.0] {
-            let mut rects = Vec::new();
+            let mut rows = Vec::new();
             let mut output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(
@@ -903,19 +1109,26 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    let row = person_head(ui, &person, &stats, false);
-                    rects.push(row);
+                    let (row, content) = person_row(ui, &person, false);
+                    rows.push((row.rect, content));
                 },
             );
             output.textures_delta.clear();
-            let row = rects[0];
-            // Every shape (chip fill, stats, chevron) centres on the row.
+            let (row, content) = rows[0];
+            assert!(row.right() <= width + 0.5, "{row:?} at {width}");
             for clipped in output.shapes {
                 let rect = clipped.shape.visual_bounding_rect();
-                if rect.is_positive() && row.intersects(rect) {
+                if !rect.is_positive() || !row.intersects(rect) {
+                    continue;
+                }
+                assert!(
+                    rect.left() >= row.left() - 0.5 && rect.right() <= row.right() + 0.5,
+                    "{rect:?} overflows {row:?} at {width}"
+                );
+                if matches!(clipped.shape, egui::Shape::Circle(_) | egui::Shape::Path(_)) {
                     assert!(
-                        (rect.center().y - row.center().y).abs() < 3.0,
-                        "{rect:?} off {row:?} at {width}"
+                        (rect.center().y - content.center().y).abs() < 1.5,
+                        "{rect:?} off {content:?} at {width}"
                     );
                 }
             }
