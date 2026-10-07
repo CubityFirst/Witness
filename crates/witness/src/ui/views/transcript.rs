@@ -1628,12 +1628,6 @@ fn bookmark_note(ui: &mut egui::Ui, bookmark: &Bookmark, actions: &mut Vec<RowAc
 /// The header's icon buttons: an 18 pt glyph in a 30 pt ghost square.
 const HEADER_ICON: f32 = 18.0;
 
-/// TODO(rework): the transcript header was `widgets::btn_ghost_icon`'s only
-/// caller and now uses `widgets::icon_btn`; this keeps the kit function
-/// warning-free until the kit drops it (kit request).
-const _: fn(&mut egui::Ui, egui::RichText, f32) -> Response =
-    |ui, glyph, size| widgets::btn_ghost_icon(ui, glyph, size);
-
 /// A popup menu: raised fill, 1 pt border, radius 8, popup shadow, 4 pt
 /// inset around its rounded items.
 fn menu_frame(ui: &egui::Ui) -> Frame {

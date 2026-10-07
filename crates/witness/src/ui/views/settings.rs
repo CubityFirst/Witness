@@ -1710,16 +1710,6 @@ fn hotkey_row(ui: &mut egui::Ui, name: &str, what: &str, combo: Option<&str>) {
 // ----------------------------------------------------------------------
 // Layout helpers (shared with updates.rs)
 
-/// TODO(rework): Settings was the last user of the kit's checkbox, radio
-/// and card; until widgets.rs drops (or allows) them, this keeps them from
-/// failing `-D warnings`. Delete with them.
-#[allow(dead_code)]
-fn kit_keepalive(ui: &mut egui::Ui, on: &mut bool, engine: &mut Engine) -> egui::Frame {
-    widgets::checkbox(ui, true, on, "");
-    widgets::radio_value(ui, engine, Engine::Parakeet, "");
-    widgets::card_frame()
-}
-
 /// Below this a row's text column would be squeezed: the control stacks
 /// under the text instead.
 const TEXT_MIN_WIDTH: f32 = 200.0;

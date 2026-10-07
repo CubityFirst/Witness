@@ -9,22 +9,17 @@ pub const BG: Color32 = Color32::from_rgb(0x0f, 0x10, 0x13);
 pub const BG_RAISED: Color32 = Color32::from_rgb(0x17, 0x18, 0x1c);
 pub const BG_HOVER: Color32 = Color32::from_rgb(0x1f, 0x21, 0x26);
 /// Pressed / selected rows.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub const BG_ACTIVE: Color32 = Color32::from_rgb(0x26, 0x29, 0x30);
 pub const BORDER: Color32 = Color32::from_rgb(0x26, 0x29, 0x2f);
 /// Input and secondary-button borders.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub const BORDER_STRONG: Color32 = Color32::from_rgb(0x34, 0x38, 0x41);
 pub const TEXT: Color32 = Color32::from_rgb(0xe8, 0xea, 0xee);
 pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x96, 0x9b, 0xa5);
 /// Tertiary text: timestamps, placeholders, hints.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x6b, 0x70, 0x7a);
 pub const ACCENT: Color32 = Color32::from_rgb(0x6e, 0x8e, 0xff);
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0x8a, 0xa3, 0xff);
 /// Accent @ 16 %: selected nav, active segment, search hits.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub const ACCENT_SOFT: Color32 = Color32::from_rgba_unmultiplied_const(0x6e, 0x8e, 0xff, 41);
 pub const REC: Color32 = Color32::from_rgb(0xf0, 0x52, 0x52);
 pub const OK: Color32 = Color32::from_rgb(0x3f, 0xb9, 0x50);
@@ -38,8 +33,6 @@ pub const REC_HOVER: Color32 = Color32::from_rgb(0xd1, 0x35, 0x39);
 pub const OK_LIGHT: Color32 = Color32::from_rgb(0x6f, 0xcf, 0x82);
 /// Live-feed remote ("Them") chip.
 pub const THEM_CHIP: Color32 = Color32::from_rgb(0x2f, 0x7c, 0x3d);
-/// Glyph colour on the (warn-coloured) bookmark chip.
-pub const BOOKMARK_GLYPH: Color32 = Color32::from_rgb(0x1a, 0x1c, 0x20);
 /// Search-hit `<mark>` text.
 pub const MARK_TEXT: Color32 = Color32::from_rgb(0xdd, 0xe4, 0xff);
 pub const CAPTION_TEXT: Color32 = Color32::from_rgb(0xee, 0xf1, 0xf5);
@@ -51,9 +44,6 @@ pub const WHITE: Color32 = Color32::WHITE;
 pub const PILL_REC_BG: Color32 = Color32::from_rgb(0x3a, 0x25, 0x2b);
 /// Busy pill background: warn 15 % over `BG_RAISED`.
 pub const PILL_BUSY_BG: Color32 = Color32::from_rgb(0x38, 0x32, 0x24);
-/// Model banner (warn 10 % / 40 % over `BG`).
-pub const BANNER_BG: Color32 = Color32::from_rgb(0x27, 0x24, 0x1b);
-pub const BANNER_BORDER: Color32 = Color32::from_rgb(0x61, 0x4d, 0x1d);
 /// Inline warning (warn 8 % / 35 % over `BG`).
 pub const WARN_BG: Color32 = Color32::from_rgb(0x23, 0x21, 0x1b);
 pub const WARN_BORDER: Color32 = Color32::from_rgb(0x58, 0x46, 0x1c);
@@ -114,50 +104,34 @@ pub fn narrow(ui: &egui::Ui) -> bool {
 }
 
 /// Spacing scale (pt).
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub const S1: f32 = 4.0;
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub const S2: f32 = 8.0;
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub const S3: f32 = 12.0;
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub const S4: f32 = 16.0;
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub const S5: f32 = 24.0;
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
-pub const S6: f32 = 32.0;
-
 /// Corner radii: small chips, controls/rows, surfaces/modals.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub const R_SM: u8 = 6;
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub const R_MD: u8 = 8;
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub const R_LG: u8 = 12;
 
 /// The content column's maximum width.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub const CONTENT_MAX: f32 = 760.0;
 /// Below this width layouts switch to stacked / icon-only variants.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub const COMPACT_BELOW: f32 = 460.0;
 
 /// A speaker's colour as readable text / avatar fill on the dark
 /// background: the stable chip colour, lifted towards white.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub fn speaker_text(label: &str) -> Color32 {
     lighten(chip_color(label), 0.35)
 }
 
 /// Mix `c` towards white by `t` (0..1).
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub fn lighten(c: Color32, t: f32) -> Color32 {
     let mix = |v: u8| (v as f32 + (255.0 - v as f32) * t).round() as u8;
     Color32::from_rgb(mix(c.r()), mix(c.g()), mix(c.b()))
 }
 
 /// `c` at `alpha` (0..1) as an unmultiplied colour.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub fn alpha(c: Color32, alpha: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (alpha * 255.0).round() as u8)
 }

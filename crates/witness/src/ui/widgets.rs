@@ -169,16 +169,6 @@ pub fn btn(ui: &mut egui::Ui, text: impl Into<WidgetText>) -> Response {
     styled_button(ui, style, text.into(), None)
 }
 
-/// `.btn.btn-with-icon` holding only an `icon` pt glyph: as tall as the
-/// SVG + padding + the 1 px border (30 pt for a 16 pt icon), like CSS.
-pub fn btn_icon_only(ui: &mut egui::Ui, glyph: impl Into<WidgetText>, icon: f32) -> Response {
-    let style = ButtonStyle {
-        content_height: Some(icon + 2.0),
-        ..btn_style(ui)
-    };
-    styled_button(ui, style, glyph.into(), None)
-}
-
 /// Ghost button: text only, a hover fill, no border.
 pub fn btn_ghost(ui: &mut egui::Ui, text: impl Into<WidgetText>) -> Response {
     let style = ButtonStyle {
@@ -189,20 +179,6 @@ pub fn btn_ghost(ui: &mut egui::Ui, text: impl Into<WidgetText>) -> Response {
         ..btn_style(ui)
     };
     styled_button(ui, style, text.into(), None)
-}
-
-/// `.btn.btn-ghost.btn-with-icon` holding only an `icon` pt glyph: sized
-/// like [`btn_icon_only`] (30 pt for a 16 pt icon), not by Segoe's row.
-pub fn btn_ghost_icon(ui: &mut egui::Ui, glyph: impl Into<WidgetText>, icon: f32) -> Response {
-    let style = ButtonStyle {
-        fill: Color32::TRANSPARENT,
-        hover_fill: BG_HOVER,
-        stroke: Color32::TRANSPARENT,
-        hover_stroke: Color32::TRANSPARENT,
-        content_height: Some(icon + 2.0),
-        ..btn_style(ui)
-    };
-    styled_button(ui, style, glyph.into(), None)
 }
 
 /// Make the gap between the last widget and the next one `gap` pt: a CSS
@@ -218,34 +194,6 @@ pub fn gap(ui: &mut egui::Ui, gap: f32) {
 pub fn btn_danger(ui: &mut egui::Ui, text: impl Into<WidgetText>) -> Response {
     let style = danger_style(ui);
     styled_button(ui, style, text.into(), None)
-}
-
-/// The top bar's record button: `.btn-record` (light-red semibold glyph on
-/// the normal fill) while idle, `.btn-stop` (danger look) while recording.
-/// `content` is the glyph (`icon` pt, sized like [`btn_icon_only`]);
-/// `label` its accessible name ("Start recording" / "Stop recording").
-pub fn btn_record(
-    ui: &mut egui::Ui,
-    recording: bool,
-    content: impl Into<WidgetText>,
-    icon: f32,
-    label: &str,
-) -> Response {
-    let base = if recording {
-        danger_style(ui)
-    } else {
-        ButtonStyle {
-            text: REC_LIGHT,
-            hover_text: REC_LIGHT,
-            font: Font::Semibold(theme::BASE_SIZE),
-            ..btn_style(ui)
-        }
-    };
-    let style = ButtonStyle {
-        content_height: Some(icon + 2.0),
-        ..base
-    };
-    styled_button(ui, style, content.into(), Some(label)).on_hover_text(label)
 }
 
 fn icon_style(size: f32, hover_text: Color32) -> ButtonStyle {
@@ -288,52 +236,6 @@ pub fn icon_btn_danger(ui: &mut egui::Ui, glyph: &str, size: f32, label: &str) -
     let style = ButtonStyle {
         fixed_size: Some(icon_size(ui, glyph, size)),
         ..icon_style(size, REC)
-    };
-    styled_button(ui, style, glyph.into(), Some(label)).on_hover_text(label)
-}
-
-fn nav_style(selected: bool, padding: egui::Vec2, font: Font) -> ButtonStyle {
-    ButtonStyle {
-        fill: if selected {
-            BG_ACTIVE
-        } else {
-            Color32::TRANSPARENT
-        },
-        hover_fill: if selected { BG_ACTIVE } else { BG_HOVER },
-        stroke: Color32::TRANSPARENT,
-        hover_stroke: Color32::TRANSPARENT,
-        text: if selected { TEXT } else { TEXT_MUTED },
-        hover_text: TEXT,
-        padding,
-        radius: theme::R_MD,
-        font,
-        fixed_size: None,
-        content_height: None,
-    }
-}
-
-/// `.nav-btn` (7/12 padding); `selected` = `.active` (text colour + hover bg).
-pub fn nav_btn(ui: &mut egui::Ui, text: impl Into<WidgetText>, selected: bool) -> Response {
-    let style = nav_style(
-        selected,
-        egui::vec2(12.0, 7.0),
-        Font::Regular(theme::BASE_SIZE),
-    );
-    let response = styled_button(ui, style, text.into(), None);
-    if selected {
-        response.widget_info(|| {
-            egui::WidgetInfo::selected(egui::WidgetType::Button, true, true, "current page")
-        });
-    }
-    response
-}
-
-/// `.nav-btn.nav-btn-icon` (7/9 padding) for the Settings gear: the 18 pt
-/// SVG + padding = 32 pt tall (no border).
-pub fn nav_icon_btn(ui: &mut egui::Ui, glyph: &str, selected: bool, label: &str) -> Response {
-    let style = ButtonStyle {
-        content_height: Some(18.0),
-        ..nav_style(selected, egui::vec2(9.0, 7.0), Font::Regular(18.0))
     };
     styled_button(ui, style, glyph.into(), Some(label)).on_hover_text(label)
 }
@@ -424,39 +326,6 @@ pub fn pill(ui: &mut egui::Ui, kind: PillKind, text: impl Into<WidgetText>) -> R
     response
 }
 
-/// A chip's padding (8/2 per side).
-const CHIP_PADDING: egui::Vec2 = egui::vec2(16.0, 4.0);
-
-fn chip_galley(ui: &egui::Ui, text: &str, max_width_em: f32) -> std::sync::Arc<egui::Galley> {
-    let font = theme::semibold(11.0);
-    let max_text = (max_width_em * 11.0 - 16.0).max(11.0);
-    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, WHITE);
-    job.wrap = egui::text::TextWrapping::truncate_at_width(max_text);
-    ui.painter().layout_job(job)
-}
-
-/// The size [`chip`] will allocate, for laying out around it first.
-pub fn chip_size(ui: &egui::Ui, text: &str, max_width_em: f32) -> egui::Vec2 {
-    chip_galley(ui, text, max_width_em).size() + CHIP_PADDING
-}
-
-/// A speaker chip: fully rounded `color` fill, white semibold 11 pt text,
-/// truncated with an ellipsis at `max_width_em` em (CSS `max-width: 16em`).
-pub fn chip(ui: &mut egui::Ui, text: &str, color: Color32, max_width_em: f32) -> Response {
-    let galley = chip_galley(ui, text, max_width_em);
-    let size = galley.size() + CHIP_PADDING;
-    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
-    if ui.is_rect_visible(rect) {
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(255), color);
-        ui.painter()
-            .galley(rect.center() - galley.size() / 2.0, galley, WHITE);
-    }
-    let name = text.to_owned();
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &name));
-    response
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BadgeKind {
     /// `.badge-transcribed`: green tint, light-green text.
@@ -518,17 +387,6 @@ pub fn inline_warning(ui: &mut egui::Ui, text: &str) -> Response {
             );
         })
         .response
-}
-
-/// A raised surface (grouped controls, the player, detail panels): one
-/// elevation step, hairline border, radius 12. Not for list items — those
-/// are flat [`list_row`]s.
-pub fn card_frame() -> Frame {
-    Frame::new()
-        .fill(BG_RAISED)
-        .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(CornerRadius::same(theme::R_LG))
-        .inner_margin(Margin::symmetric(16, 14))
 }
 
 /// `.view-error`: a red-tinted box (max 720, centred) with `message` and a
@@ -594,10 +452,13 @@ pub fn centered_column<R>(
     let available = ui.available_width();
     let width = available.min(max_width);
     let inset = ((available - width) / 2.0).max(0.0);
+    let spacing_x = ui.spacing().item_spacing.x;
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         ui.add_space(inset);
         ui.vertical(|ui| {
+            // The inset needed no gap; the content gets the normal one back.
+            ui.spacing_mut().item_spacing.x = spacing_x;
             ui.set_width(width);
             add(ui)
         })
@@ -616,17 +477,6 @@ pub struct KeyScroll {
 
 fn view_viewport_id() -> egui::Id {
     egui::Id::new("witness-view-viewport-right")
-}
-
-/// How far the current view's scroll bar pulled its content in from
-/// `right` (the content panel's right edge), as of the last view drawn: 0
-/// without a scroll bar, or when no view noted its viewport. In 0.2.x the
-/// model banner and search box lived in the view's scroller, so they share
-/// this right edge with the view's cards and rows.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
-pub fn view_scroll_gutter(ctx: &egui::Context, right: f32) -> f32 {
-    ctx.data(|d| d.get_temp::<f32>(view_viewport_id()))
-        .map_or(0.0, |viewport| (right - viewport).clamp(0.0, 20.0))
 }
 
 /// Forget the noted viewport (before a view draws; it notes it again).
@@ -722,103 +572,6 @@ pub fn text_edit_menu(response: &Response) {
 
 // ---------------------------------------------------------------------------
 // Form controls
-
-/// Checkbox / radio visuals (CSS `accent-color: var(--accent)`): an empty
-/// box with a visible muted outline (accent on hover), or an accent-filled
-/// box with a white mark when checked. The label keeps the text colour.
-fn toggle_visuals(style: &mut egui::Style, checked: bool) {
-    style.visuals.override_text_color = Some(TEXT);
-    let w = &mut style.visuals.widgets;
-    for (state, hover) in [
-        (&mut w.inactive, false),
-        (&mut w.hovered, true),
-        (&mut w.active, true),
-    ] {
-        if checked {
-            state.bg_fill = theme::ACCENT;
-            state.bg_stroke = Stroke::new(1.0, theme::ACCENT);
-            state.fg_stroke = Stroke::new(2.0, WHITE);
-        } else {
-            state.bg_fill = theme::BG;
-            state.bg_stroke = Stroke::new(1.0, if hover { theme::ACCENT } else { TEXT_MUTED });
-        }
-    }
-}
-
-/// `<input type=checkbox>` with the app's accent look; disabled when
-/// `enabled` is false (the value is kept).
-pub fn checkbox(
-    ui: &mut egui::Ui,
-    enabled: bool,
-    checked: &mut bool,
-    text: impl Into<WidgetText>,
-) -> Response {
-    let on = *checked;
-    ui.scope(|ui| {
-        toggle_visuals(ui.style_mut(), on);
-        let response = ui.add_enabled(enabled, egui::Checkbox::new(checked, text));
-        toggle_focus_ring(ui, &response, false);
-        response
-    })
-    .inner
-}
-
-/// The box (or circle) of a checkbox / radio laid out in `rect`: egui puts
-/// it `icon_width` square at the left, vertically centred.
-fn toggle_box(ui: &egui::Ui, rect: egui::Rect) -> egui::Rect {
-    let side = ui.spacing().icon_width;
-    egui::Rect::from_center_size(
-        egui::pos2(rect.left() + side / 2.0, rect.center().y),
-        egui::vec2(side, side),
-    )
-}
-
-/// `:focus-visible` on a checkbox / radio: the 2 px FOCUS outline, 2 pt
-/// outside the box (or circle). egui draws focus only as the active
-/// visuals, which a checked toggle shares with its other states.
-fn toggle_focus_ring(ui: &egui::Ui, response: &Response, round: bool) {
-    if !(response.has_focus() && focus_visible(ui.ctx())) {
-        return;
-    }
-    let target = toggle_box(ui, response.rect);
-    let stroke = Stroke::new(2.0, theme::FOCUS);
-    if round {
-        // Centre of a 2 px stroke drawn 2 pt outside the circle.
-        ui.painter()
-            .circle_stroke(target.center(), target.width() / 2.0 + 3.0, stroke);
-    } else {
-        let radius = ui
-            .visuals()
-            .widgets
-            .inactive
-            .corner_radius
-            .nw
-            .saturating_add(2);
-        ui.painter().rect_stroke(
-            target.expand(2.0),
-            CornerRadius::same(radius),
-            stroke,
-            egui::StrokeKind::Outside,
-        );
-    }
-}
-
-/// `<input type=radio>` with the app's accent look: selects `alternative`.
-pub fn radio_value<T: PartialEq>(
-    ui: &mut egui::Ui,
-    current: &mut T,
-    alternative: T,
-    text: impl Into<WidgetText>,
-) -> Response {
-    let on = *current == alternative;
-    ui.scope(|ui| {
-        toggle_visuals(ui.style_mut(), on);
-        let response = ui.radio_value(current, alternative, text);
-        toggle_focus_ring(ui, &response, true);
-        response
-    })
-    .inner
-}
 
 /// Range-input visuals: a visible `--border` rail and an accent fill up to
 /// the value ([`slider`] paints the solid accent thumb itself, since egui
@@ -972,18 +725,6 @@ pub fn framed_text_edit<'t>(
     )
 }
 
-/// CSS `border-left: Npx solid` on a card with rounded corners: the band
-/// follows the card's left corner arcs instead of sticking out past them.
-pub fn paint_left_edge(ui: &egui::Ui, card: egui::Rect, width: f32, radius: u8, color: Color32) {
-    let band = egui::Rect::from_min_max(
-        card.left_top(),
-        egui::pos2(card.left() + width, card.bottom()),
-    );
-    ui.painter()
-        .with_clip_rect(band.intersect(ui.clip_rect()))
-        .rect_filled(card, CornerRadius::same(radius), color);
-}
-
 // ---------------------------------------------------------------------------
 // Focus visibility
 
@@ -1045,13 +786,11 @@ pub fn announce(ctx: &egui::Context, id: egui::Id, text: &str, politeness: Polit
 
 /// Below [`theme::COMPACT_BELOW`] of available width: stacked / icon-only
 /// variants.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub fn is_compact(ui: &egui::Ui) -> bool {
     ui.available_width() < theme::COMPACT_BELOW
 }
 
 /// Primary button: accent fill, white semibold text.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub fn btn_primary(ui: &mut egui::Ui, text: impl Into<WidgetText>) -> Response {
     let style = ButtonStyle {
         fill: theme::ACCENT,
@@ -1072,7 +811,6 @@ const SWITCH: egui::Vec2 = egui::vec2(36.0, 20.0);
 /// A Windows-11-style toggle switch (no label): accent track when on, a
 /// hairline track when off; the knob slides. Disabled when `enabled` is
 /// false (the value is kept). `label` is the accessible name.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub fn switch(ui: &mut egui::Ui, enabled: bool, on: &mut bool, label: &str) -> Response {
     let (rect, mut response) = ui.allocate_exact_size(SWITCH, Sense::click());
     if enabled && response.clicked() {
@@ -1128,88 +866,8 @@ pub fn switch(ui: &mut egui::Ui, enabled: bool, on: &mut bool, label: &str) -> R
     }
 }
 
-/// A switch with its label on the left, filling the row (clicking the text
-/// toggles too). For simple boolean rows outside a [`setting_row`].
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
-pub fn switch_row(ui: &mut egui::Ui, enabled: bool, on: &mut bool, label: &str) -> Response {
-    let mut out = None;
-    ui.horizontal(|ui| {
-        let text_w = (ui.available_width() - SWITCH.x - theme::S3).max(40.0);
-        let color = if enabled { TEXT } else { TEXT_MUTED };
-        let text = ui.add_sized(
-            [text_w, SWITCH.y],
-            egui::Label::new(egui::RichText::new(label).color(color))
-                .wrap()
-                .sense(Sense::click()),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let mut r = switch(ui, enabled, on, label);
-            if enabled && text.clicked() {
-                *on = !*on;
-                r.mark_changed();
-            }
-            out = Some(r);
-        });
-    });
-    out.expect("switch drawn")
-}
-
-/// A settings row: `title` (+ a muted `description`) on the left, the
-/// control on the right. Narrower than 440 pt the control stacks under the
-/// text, left-aligned, so nothing is squeezed or clipped.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
-pub fn setting_row<R>(
-    ui: &mut egui::Ui,
-    title: &str,
-    description: Option<&str>,
-    control: impl FnOnce(&mut egui::Ui) -> R,
-) -> R {
-    let text = |ui: &mut egui::Ui| {
-        ui.spacing_mut().item_spacing.y = 2.0;
-        ui.add(egui::Label::new(egui::RichText::new(title).color(TEXT)).wrap());
-        if let Some(d) = description.filter(|d| !d.is_empty()) {
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(d)
-                        .font(theme::regular(12.5))
-                        .color(TEXT_MUTED),
-                )
-                .wrap(),
-            );
-        }
-    };
-    if ui.available_width() < 440.0 {
-        ui.vertical(|ui| {
-            text(ui);
-            ui.add_space(theme::S2 - ui.spacing().item_spacing.y);
-            control(ui)
-        })
-        .inner
-    } else {
-        let full = ui.available_width();
-        ui.horizontal(|ui| {
-            // The text takes ~58 %; the control is laid out right to left
-            // in what is left, vertically centred on the row.
-            let text_w = (full * 0.58).max(160.0);
-            ui.allocate_ui_with_layout(
-                egui::vec2(text_w, 0.0),
-                egui::Layout::top_down(egui::Align::Min),
-                text,
-            );
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), 0.0),
-                egui::Layout::right_to_left(egui::Align::Center),
-                control,
-            )
-            .inner
-        })
-        .inner
-    }
-}
-
 /// A grouped surface whose rows are separated by [`group_divider`]: one
 /// raised, rounded block (Settings sections, detail panels).
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub fn group<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     Frame::new()
         .fill(BG_RAISED)
@@ -1225,7 +883,6 @@ pub fn group<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 }
 
 /// A hairline between two rows of a [`group`], spanning its content width.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub fn group_divider(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), Sense::hover());
     ui.painter()
@@ -1233,7 +890,6 @@ pub fn group_divider(ui: &mut egui::Ui) {
 }
 
 /// A section header above a group or list: 12.5 pt semibold muted.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub fn section_header(ui: &mut egui::Ui, text: &str) -> Response {
     ui.add_space(theme::S3);
     let r = ui.add(
@@ -1250,7 +906,6 @@ pub fn section_header(ui: &mut egui::Ui, text: &str) -> Response {
 
 /// A list group header ("Today", "Yesterday", "Thu 23 Jul"): 12 pt
 /// semibold faint, with breathing room above.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub fn day_header(ui: &mut egui::Ui, text: &str) {
     ui.add_space(theme::S2);
     ui.add(
@@ -1266,7 +921,6 @@ pub fn day_header(ui: &mut egui::Ui, text: &str) {
 /// A single-line label that elides with `…` at the available width and
 /// shows the whole text as a tooltip when it had to. Use for every title,
 /// name or path that can be long.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub fn elide(ui: &mut egui::Ui, text: &str, font: FontId, color: Color32) -> Response {
     let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
     job.wrap = egui::text::TextWrapping::truncate_at_width(ui.available_width().max(10.0));
@@ -1284,7 +938,6 @@ pub fn elide(ui: &mut egui::Ui, text: &str, font: FontId, color: Color32) -> Res
 /// keyboard focus ring, 8/12 padding. `add` lays out the row content and
 /// gets whether the row is hovered (for hover-revealed actions). Returns
 /// the row's own response (click = open) and `add`'s result.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub fn list_row<R>(
     ui: &mut egui::Ui,
     id_salt: impl egui::AsIdSalt,
@@ -1292,23 +945,24 @@ pub fn list_row<R>(
     add: impl FnOnce(&mut egui::Ui, bool) -> R,
 ) -> (Response, R) {
     let id = ui.id().with(id_salt);
-    // The previous frame's hover decides this frame's fill and revealed
-    // actions (immediate mode lays out before it knows).
-    let was_hovered: bool = ui.data(|d| d.get_temp(id).unwrap_or(false));
+    // The row senses through its scope, which egui registers *before* the
+    // content (from the previous pass's rect): buttons inside the row are
+    // on top and keep their clicks; everywhere else the row gets them.
+    let builder = egui::UiBuilder::new().id_salt(id).sense(Sense::click());
     let bg_idx = ui.painter().add(egui::Shape::Noop);
-    let inner = Frame::new()
-        .inner_margin(Margin::symmetric(12, 8))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            add(ui, was_hovered)
-        });
-    let rect = inner.response.rect;
-    let response = ui.interact(rect, id, Sense::click());
+    let scope = ui.scope_builder(builder, |ui| {
+        let hovered = ui.response().contains_pointer();
+        Frame::new()
+            .inner_margin(Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                add(ui, hovered)
+            })
+            .inner
+    });
+    let response = scope.response;
+    let rect = response.rect;
     let hovered = response.contains_pointer();
-    ui.data_mut(|d| d.insert_temp(id, hovered));
-    if hovered != was_hovered {
-        ui.ctx().request_repaint();
-    }
     let fill = if selected {
         BG_ACTIVE
     } else if hovered {
@@ -1330,12 +984,11 @@ pub fn list_row<R>(
     }
     (
         response.on_hover_cursor(egui::CursorIcon::PointingHand),
-        inner.inner,
+        scope.inner,
     )
 }
 
 /// Up to two initials of `name` ("Paul Gordon" → "PG", "me" → "ME").
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub fn initials(name: &str) -> String {
     let words: Vec<&str> = name
         .split(|c: char| c.is_whitespace() || c == '-' || c == '_')
@@ -1354,7 +1007,6 @@ pub fn initials(name: &str) -> String {
 }
 
 /// A round avatar with `name`'s initials, tinted by `color`.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub fn avatar(ui: &mut egui::Ui, name: &str, color: Color32, size: f32) -> Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
     if ui.is_rect_visible(rect) {
@@ -1372,7 +1024,6 @@ pub fn avatar(ui: &mut egui::Ui, name: &str, color: Color32, size: f32) -> Respo
 }
 
 /// Horizontal page padding: 16 pt up to 640 pt of width, 24 beyond.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub fn pad_x(width: f32) -> f32 {
     if width <= 640.0 {
         theme::S4
@@ -1383,14 +1034,15 @@ pub fn pad_x(width: f32) -> f32 {
 
 /// [`content_column`] with the responsive side padding: what the shell
 /// uses for the banner / search box and views use inside their scroller.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub fn padded_column<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let pad = pad_x(ui.available_width());
+    let spacing_x = ui.spacing().item_spacing.x;
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         ui.add_space(pad);
         let inner_w = (ui.available_width() - pad).max(0.0);
         ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.x = spacing_x;
             ui.set_width(inner_w);
             content_column(ui, add)
         })
@@ -1402,7 +1054,6 @@ pub fn padded_column<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R)
 /// A view's main scroller: full window width (its bar at the window edge),
 /// the content in a [`padded_column`], keyboard scrolling when nothing has
 /// focus. `id_salt` keeps each view's scroll offset separate.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub fn scroll_column<R>(
     ui: &mut egui::Ui,
     id_salt: impl egui::AsIdSalt,
@@ -1422,7 +1073,6 @@ pub fn scroll_column<R>(
 
 /// The content column every view lives in: at most
 /// [`theme::CONTENT_MAX`] wide, centred.
-#[allow(dead_code)] // TODO(rework): drop once every view uses the kit
 pub fn content_column<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     centered_column(ui, theme::CONTENT_MAX, add)
 }
@@ -1455,24 +1105,29 @@ mod tests {
             btn(ui, "Save");
             btn_ghost(ui, "Later");
             btn_danger(ui, "Delete");
-            btn_record(ui, false, "●", 17.0, "Start recording");
-            btn_record(ui, true, "■", 17.0, "Stop recording");
+            btn_primary(ui, "Download now");
             icon_btn(ui, "x", 16.0, "Rename");
             icon_btn_danger(ui, "x", 16.0, "Delete");
-            nav_btn(ui, "Meetings", true);
-            nav_icon_btn(ui, "x", false, "Settings");
             win_btn(ui, "x", 14.0, "Close to tray", true);
             pill(ui, PillKind::Idle, "Idle");
             pill(ui, PillKind::Recording, "0:12");
-            chip(
+            elide(
                 ui,
-                "A very long speaker name that will be truncated",
-                Color32::RED,
-                16.0,
+                "A very long meeting title that will be elided",
+                theme::semibold(14.0),
+                TEXT,
             );
+            avatar(ui, "Paul Gordon", theme::chip_color("S2"), 32.0);
+            section_header(ui, "Recording");
+            day_header(ui, "Today");
+            group(ui, |ui| {
+                ui.label("row");
+                group_divider(ui);
+                ui.label("row");
+            });
+            list_row(ui, "row", false, |ui, _| ui.label("Meeting"));
             badge(ui, BadgeKind::Ok, "Transcribed");
             inline_warning(ui, "Microphone device was lost during recording");
-            card_frame().show(ui, |ui| ui.label("card"));
             assert_eq!(view_error(ui, "Could not load", &["Try again"]), None);
             empty_state(
                 ui,
@@ -1484,16 +1139,6 @@ mod tests {
             let edit = ui.text_edit_singleline(&mut String::new());
             text_edit_menu(&edit);
             announce(ui.ctx(), egui::Id::new("a"), "Idle", Politeness::Polite);
-        });
-    }
-
-    #[test]
-    fn chip_truncates_at_its_max_width() {
-        run(|ui| {
-            let short = chip(ui, "S1", Color32::RED, 16.0);
-            let long = chip(ui, &"long ".repeat(40), Color32::RED, 16.0);
-            assert!(short.rect.width() < long.rect.width());
-            assert!(long.rect.width() <= 16.0 * 11.0 + 0.5);
         });
     }
 
@@ -1532,34 +1177,11 @@ mod tests {
     }
 
     #[test]
-    fn form_controls_are_visible_on_raised_cards() {
-        let mut style = egui::Style::default();
-        theme::style(&mut style);
-        toggle_visuals(&mut style, false);
-        let idle = style.visuals.widgets.inactive;
-        assert_eq!(idle.bg_stroke.color, TEXT_MUTED, "unchecked outline");
-        toggle_visuals(&mut style, true);
-        let on = style.visuals.widgets.inactive;
-        assert_eq!((on.bg_fill, on.fg_stroke.color), (theme::ACCENT, WHITE));
-        assert_eq!(style.visuals.override_text_color, Some(TEXT));
-
-        let mut style = egui::Style::default();
-        theme::style(&mut style);
-        slider_visuals(&mut style);
-        assert!(style.visuals.slider_trailing_fill);
-        assert_eq!(style.visuals.selection.bg_fill, theme::ACCENT);
-        assert_eq!(style.visuals.widgets.inactive.bg_fill, BORDER, "rail");
-    }
-
-    #[test]
     fn form_controls_lay_out() {
         run(|ui| {
             let mut on = true;
-            assert!(checkbox(ui, true, &mut on, "Auto-record").rect.height() > 0.0);
-            checkbox(ui, false, &mut on, "Disabled");
-            let mut pick = 1;
-            radio_value(ui, &mut pick, 1, "One");
-            radio_value(ui, &mut pick, 2, "Two");
+            assert_eq!(switch(ui, true, &mut on, "Auto-record").rect.size(), SWITCH);
+            switch(ui, false, &mut on, "Disabled");
             let mut value = 0.6_f32;
             let response = slider(ui, &mut value, 0.3..=0.9, 0.05, Some(80.0));
             assert_eq!(response.rect.width(), 80.0);
@@ -1567,8 +1189,6 @@ mod tests {
             let id = egui::Id::new("text-input");
             let edit = text_input(ui, id, egui::TextEdit::singleline(&mut text));
             ui.add(edit);
-            let card = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(100.0, 40.0));
-            paint_left_edge(ui, card, 3.0, 8, theme::ACCENT);
         });
     }
 
@@ -1640,106 +1260,68 @@ mod tests {
         assert!(heights[1] <= 26.0 && heights[1] < heights[0], "{heights:?}");
     }
 
-    #[test]
-    fn view_scroll_gutter_is_the_scroll_bars_width_only_while_it_shows() {
-        let ctx = theme::test_context();
-        for (rows, expect_bar) in [(200, true), (2, false)] {
-            let mut right = 0.0;
-            for _ in 0..3 {
-                let input = egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(460.0, 400.0),
-                    )),
-                    ..Default::default()
-                };
-                let mut output = ctx.run_ui(input, |ui| {
-                    egui::CentralPanel::default().show(ui, |ui| {
-                        right = ui.max_rect().right();
-                        clear_view_viewport(ui.ctx());
-                        egui::ScrollArea::vertical()
-                            .id_salt(("gutter", rows))
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                keyboard_scroll(ui, KeyScroll::default());
-                                for i in 0..rows {
-                                    ui.label(format!("row {i}"));
-                                }
-                            });
-                    });
-                });
-                output.textures_delta.clear();
-            }
-            let gutter = view_scroll_gutter(&ctx, right);
-            if expect_bar {
-                let s = ctx.global_style().spacing.scroll;
-                assert!(gutter >= s.bar_width, "gutter {gutter}");
-                assert!(gutter <= s.allocated_width() + 0.5, "gutter {gutter}");
-            } else {
-                assert_eq!(gutter, 0.0);
-            }
-        }
-        clear_view_viewport(&ctx);
-        assert_eq!(view_scroll_gutter(&ctx, 400.0), 0.0);
-    }
-
-    /// Paint shapes of one pass with a FOCUS-coloured stroke.
-    fn focus_strokes(shapes: &[egui::epaint::ClippedShape]) -> usize {
-        shapes
-            .iter()
-            .filter(|clipped| match &clipped.shape {
-                egui::Shape::Rect(rect) => rect.stroke.color == theme::FOCUS,
-                egui::Shape::Circle(circle) => circle.stroke.color == theme::FOCUS,
-                _ => false,
-            })
-            .count()
-    }
-
-    #[test]
-    fn checked_toggles_show_keyboard_focus() {
-        for radio in [false, true] {
-            let ctx = theme::test_context();
-            ctx.data_mut(|d| d.insert_temp(focus_visible_id(), true));
-            let mut rings = Vec::new();
-            for _ in 0..3 {
-                let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                    egui::CentralPanel::default().show(ui, |ui| {
-                        let response = if radio {
-                            let mut engine = 1;
-                            radio_value(ui, &mut engine, 1, "Parakeet")
-                        } else {
-                            let mut on = true;
-                            checkbox(ui, true, &mut on, "Auto-record")
-                        };
-                        response.request_focus();
-                    });
-                });
-                output.textures_delta.clear();
-                rings.push(focus_strokes(&output.shapes));
-            }
-            assert_eq!(rings.last(), Some(&1), "radio={radio}: {rings:?}");
-
-            // Not focused: no ring.
-            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                ui.memory_mut(|m| m.surrender_focus(m.focused().unwrap_or(egui::Id::NULL)));
-                egui::CentralPanel::default().show(ui, |ui| {
-                    let mut on = true;
-                    checkbox(ui, true, &mut on, "Other");
-                });
-            });
-            output.textures_delta.clear();
-            assert_eq!(focus_strokes(&output.shapes), 0);
-        }
-    }
-
     /// CSS margins are whole gaps: `gap` subtracts the item spacing egui
     /// adds after every widget, between siblings and after a child scope.
+    /// A button inside a `list_row` keeps its click; the row only gets
+    /// clicks that land outside its inner widgets.
+    #[test]
+    fn list_rows_leave_inner_buttons_their_clicks() {
+        let ctx = theme::test_context();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 200.0));
+        // (row clicked, button clicked, row rect, button rect)
+        let pass = |events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            let mut out = (false, false, egui::Rect::NOTHING, egui::Rect::NOTHING);
+            let mut output = ctx.run_ui(input, |ui| {
+                let (row, button) = list_row(ui, "row", false, |ui, _| {
+                    ui.horizontal(|ui| {
+                        ui.label("Meeting title");
+                        btn(ui, "Delete")
+                    })
+                    .inner
+                });
+                out = (row.clicked(), button.clicked(), row.rect, button.rect);
+            });
+            output.textures_delta.clear();
+            out
+        };
+        let click_at = |p: egui::Pos2| {
+            vec![
+                egui::Event::PointerMoved(p),
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ]
+        };
+        pass(vec![]);
+        let (_, _, row_rect, button_rect) = pass(vec![]);
+        let (row, button, ..) = pass(click_at(button_rect.center()));
+        assert_eq!((row, button), (false, true));
+        let empty = egui::pos2(row_rect.right() - 4.0, row_rect.center().y);
+        assert!(!button_rect.contains(empty));
+        let (row, button, ..) = pass(click_at(empty));
+        assert_eq!((row, button), (true, false));
+    }
+
     #[test]
     fn gaps_are_exact_css_margins() {
         run(|ui| {
-            let a = card_frame().show(ui, |ui| ui.label("a")).response.rect;
+            let a = ui.label("a").rect;
             gap(ui, 14.0);
-            let b = card_frame().show(ui, |ui| ui.label("b")).response.rect;
+            let b = ui.label("b").rect;
             assert!((b.top() - a.bottom() - 14.0).abs() < 0.01);
 
             // The shell: a scope holding the search box, then 12 pt.

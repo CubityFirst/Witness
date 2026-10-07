@@ -41,10 +41,6 @@ const CHEVRON: f32 = 16.0;
 const CONFIRM_ID: &str = "people-confirm";
 const HINT: &str = "\"Speaking\" totals come from transcribed segments; word counts are approximate. Unnamed speakers (Speaker 1…) aren't tracked across meetings — rename them to a person to include them here. Enrolled voices can also be managed in Settings.";
 
-// TODO(rework): this view was `widgets::chip_size`'s last caller. Keep the
-// build warning-free until the kit drops it (or another view uses it).
-const _: fn(&egui::Ui, &str, f32) -> egui::Vec2 = widgets::chip_size;
-
 // ----------------------------------------------------------------------
 // Weekly trend (pure)
 
