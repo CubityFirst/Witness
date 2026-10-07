@@ -17,6 +17,32 @@ pub struct UiPrefs {
     pub volume: f32,
     /// Player speed (0.75–2).
     pub speed: f32,
+    /// Light / dark, or follow Windows' app mode.
+    pub appearance: Appearance,
+    /// Windows' accent colour, or Witness blue.
+    pub accent: AccentSource,
+    /// The Windows 11 Mica backdrop behind the window (where supported;
+    /// applies on restart).
+    pub backdrop: bool,
+    /// The first-run setup was finished or skipped.
+    pub onboarded: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Appearance {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccentSource {
+    #[default]
+    Windows,
+    Witness,
 }
 
 impl Default for UiPrefs {
@@ -25,6 +51,10 @@ impl Default for UiPrefs {
             model_banner_dismissed: false,
             volume: 1.0,
             speed: 1.0,
+            appearance: Appearance::System,
+            accent: AccentSource::Windows,
+            backdrop: true,
+            onboarded: false,
         }
     }
 }
@@ -149,11 +179,31 @@ mod tests {
             model_banner_dismissed: true,
             volume: 0.4,
             speed: 1.5,
+            appearance: Appearance::Light,
+            accent: AccentSource::Witness,
+            backdrop: false,
+            onboarded: true,
         };
         prefs.save(&dir).unwrap();
         assert_eq!(UiPrefs::load(&dir), prefs);
         assert!(!dir.join("ui-state.toml.tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 0.3.0 file without the appearance keys loads them as defaults.
+    #[test]
+    fn older_files_get_appearance_defaults() {
+        let prefs: UiPrefs = toml::from_str(
+            "volume = 0.5
+",
+        )
+        .unwrap();
+        assert_eq!(prefs.appearance, Appearance::System);
+        assert_eq!(prefs.accent, AccentSource::Windows);
+        assert!(prefs.backdrop);
+        assert!(!prefs.onboarded);
+        let text = toml::to_string(&UiPrefs::default()).unwrap();
+        assert!(text.contains("appearance = \"system\""), "{text}");
     }
 
     #[test]

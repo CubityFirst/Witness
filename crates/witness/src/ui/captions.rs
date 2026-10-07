@@ -22,7 +22,7 @@
 //! a not-yet-destroyed window) use Win32 directly on the overlay's HWND.
 
 use super::icons;
-use super::theme::{self, ACCENT, CAPTION_BG, CAPTION_ERR, CAPTION_TEXT, OK_LIGHT};
+use super::theme::{self, pal};
 use super::topbar::edge_resize;
 use super::widgets::{self, Politeness};
 use crate::bridge::wake_root;
@@ -705,7 +705,7 @@ fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
     // the main window's zoom (which egui applies to every viewport).
     let k = st.scale * st.text_scale / ctx.zoom_factor().max(0.1);
     let painter = ui.painter().with_clip_rect(rect);
-    painter.rect_filled(rect, CornerRadius::ZERO, CAPTION_BG);
+    painter.rect_filled(rect, CornerRadius::ZERO, pal().caption_bg);
 
     // The surface: drags the window (registered first, so × stays on top).
     let surface = ui
@@ -731,22 +731,22 @@ fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
         color,
         ..Default::default()
     };
-    title_job.append("Live captions", 0.0, section(theme::TEXT_MUTED));
-    title_job.append("  ·  drag to move", 0.0, section(theme::TEXT_FAINT));
+    title_job.append("Live captions", 0.0, section(theme::pal().text_muted));
+    title_job.append("  ·  drag to move", 0.0, section(theme::pal().text_faint));
     title_job.wrap = egui::text::TextWrapping::truncate_at_width(title_width);
     let title_galley = painter.layout_job(title_job);
     let grip_height = title_galley.size().y.max(close_size.y) + 8.0 * k;
     let grip = Rect::from_min_size(rect.min, egui::vec2(rect.width(), grip_height));
-    painter.rect_filled(grip, CornerRadius::ZERO, theme::BG_RAISED);
+    painter.rect_filled(grip, CornerRadius::ZERO, theme::pal().bg_raised);
     painter.hline(
         grip.x_range(),
         grip.bottom() - 0.5,
-        Stroke::new(1.0, theme::BORDER),
+        Stroke::new(1.0, theme::pal().border),
     );
     painter.circle_filled(
         egui::pos2(grip.left() + pad_x + dot_r, grip.center().y),
         dot_r,
-        theme::REC,
+        theme::pal().rec,
     );
     painter.galley(
         egui::pos2(
@@ -754,7 +754,7 @@ fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
             grip.center().y - title_galley.size().y / 2.0,
         ),
         title_galley,
-        theme::TEXT_MUTED,
+        theme::pal().text_muted,
     );
     let close_rect = Rect::from_center_size(
         egui::pos2(grip.right() - pad_x - close_size.x / 2.0, grip.center().y),
@@ -771,11 +771,11 @@ fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
         painter.rect_filled(
             close_rect,
             CornerRadius::same((6.0 * k).round().clamp(0.0, 255.0) as u8),
-            theme::BG_HOVER,
+            theme::pal().bg_hover,
         );
-        CAPTION_TEXT
+        pal().caption_text
     } else {
-        theme::TEXT_MUTED
+        theme::pal().text_muted
     };
     let close_galley = painter.layout_no_wrap(
         icons::ph::X.to_owned(),
@@ -794,7 +794,7 @@ fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
         let mut job = egui::text::LayoutJob::simple(
             error.clone(),
             theme::regular(11.0 * k),
-            CAPTION_ERR,
+            pal().caption_err,
             (rect.width() - 2.0 * pad_x).max(10.0),
         );
         job.wrap.max_rows = 3;
@@ -807,7 +807,7 @@ fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
         painter.galley(
             egui::pos2(band.left() + pad_x, band.top() + 5.0 * k),
             galley,
-            CAPTION_ERR,
+            pal().caption_err,
         );
         top = band.bottom();
         // The web banner was `role="alert"`.
@@ -837,33 +837,41 @@ fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
         job.append(
             "Listening…",
             0.0,
-            format(theme::regular(size), theme::TEXT_MUTED),
+            format(theme::regular(size), theme::pal().text_muted),
         );
         job.wrap.max_width = wrap_width;
         let galley = lines_painter.layout_job(job);
         y -= galley.size().y;
-        lines_painter.galley(egui::pos2(area.left() + pad_x, y), galley, CAPTION_TEXT);
+        lines_painter.galley(
+            egui::pos2(area.left() + pad_x, y),
+            galley,
+            pal().caption_text,
+        );
     }
     for line in st.lines.iter().rev() {
         if y < area.top() {
             break;
         }
         let (who, color) = if line.track == "mic" {
-            ("Me", ACCENT)
+            ("Me", pal().accent)
         } else {
-            ("Them", OK_LIGHT)
+            ("Them", pal().ok_light)
         };
         let mut job = egui::text::LayoutJob::default();
         job.append(who, 0.0, format(theme::semibold(size), color));
         job.append(
             &format!(" {}", line.text),
             0.0,
-            format(theme::regular(size), CAPTION_TEXT),
+            format(theme::regular(size), pal().caption_text),
         );
         job.wrap.max_width = wrap_width;
         let galley = lines_painter.layout_job(job);
         y -= galley.size().y;
-        lines_painter.galley(egui::pos2(area.left() + pad_x, y), galley, CAPTION_TEXT);
+        lines_painter.galley(
+            egui::pos2(area.left() + pad_x, y),
+            galley,
+            pal().caption_text,
+        );
         y -= 4.0 * k;
     }
     if let Some(newest) = st.lines.back() {
@@ -880,7 +888,7 @@ fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
     painter.rect_stroke(
         rect.shrink(0.5),
         CornerRadius::ZERO,
-        Stroke::new(1.0, theme::BORDER_STRONG),
+        Stroke::new(1.0, theme::pal().border_strong),
         egui::StrokeKind::Inside,
     );
 

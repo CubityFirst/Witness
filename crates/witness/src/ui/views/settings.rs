@@ -30,7 +30,7 @@ use super::updates::UpdatesSection;
 use crate::bridge::{OpDone, OpHandle, Task};
 use crate::platform::{autostart, dialogs};
 use crate::ui::icons::ph;
-use crate::ui::theme::{self, BG, BORDER, OK, TEXT, TEXT_MUTED};
+use crate::ui::theme::{self, pal};
 use crate::ui::toasts::Notice;
 use crate::ui::widgets::{self, BadgeKind, KeyScroll, Politeness};
 use crate::ui::{UiCmd, UiCtx};
@@ -300,7 +300,7 @@ impl SettingsState {
             ui.painter().hline(
                 ui.max_rect().x_range(),
                 out.inner_rect.top(),
-                Stroke::new(1.0, BORDER),
+                Stroke::new(1.0, pal().border),
             );
         }
         #[cfg(debug_assertions)]
@@ -584,10 +584,10 @@ impl SettingsState {
             ui.label(
                 RichText::new("Settings")
                     .font(theme::semibold(20.0))
-                    .color(TEXT),
+                    .color(pal().text),
             );
             if let Some(at) = cx.settings.saved_flash() {
-                ui.label(RichText::new("saved ✓").size(12.5).color(OK));
+                ui.label(RichText::new("saved ✓").size(12.5).color(pal().ok));
                 widgets::announce(
                     ui.ctx(),
                     egui::Id::new("settings-saved-flash"),
@@ -1525,7 +1525,7 @@ fn threshold_row(ui: &mut egui::Ui, local: &mut Option<f32>, stored: f32) -> Opt
                 egui::Align2::LEFT_CENTER,
                 threshold_readout(local.or(commit).unwrap_or(stored)),
                 theme::regular(theme::BASE_SIZE),
-                TEXT,
+                pal().text,
             );
             commit
         },
@@ -1579,15 +1579,15 @@ fn model_row(
             ui.label(
                 RichText::new(format!("rev {short}"))
                     .font(egui::FontId::monospace(11.5))
-                    .color(TEXT_MUTED),
+                    .color(pal().text_muted),
             )
             .on_hover_text(format!("Expected revision {}", model.expected_revision));
             match &state {
                 ModelState::Failed(error) => {
-                    status_note(ui, theme::REC_LIGHT, &format!("failed: {error}"));
+                    status_note(ui, theme::pal().rec_light, &format!("failed: {error}"));
                 }
                 ModelState::Progress(text) => {
-                    status_note(ui, theme::WARN, text);
+                    status_note(ui, theme::pal().warn, text);
                     if let Some(f) = fraction {
                         progress_bar(ui, f);
                     }
@@ -1595,7 +1595,7 @@ fn model_row(
                 ModelState::Idle {
                     integrity_error: Some(error),
                 } => {
-                    status_note(ui, theme::REC_LIGHT, "integrity check failed")
+                    status_note(ui, theme::pal().rec_light, "integrity check failed")
                         .on_hover_text(error);
                 }
                 _ => {}
@@ -1649,10 +1649,10 @@ fn gpu_libs_row(
             let id = title(ui, "CUDA runtime + cuDNN (GPU)");
             match &state {
                 GpuLibsState::Failed(error) => {
-                    status_note(ui, theme::REC_LIGHT, &format!("failed: {error}"));
+                    status_note(ui, theme::pal().rec_light, &format!("failed: {error}"));
                 }
                 GpuLibsState::Progress(text) => {
-                    status_note(ui, theme::WARN, text);
+                    status_note(ui, theme::pal().warn, text);
                     if let Some(f) = fraction {
                         progress_bar(ui, f);
                     }
@@ -1662,7 +1662,7 @@ fn gpu_libs_row(
                     integrity_error: Some(error),
                     ..
                 } => {
-                    status_note(ui, theme::REC_LIGHT, "integrity check failed")
+                    status_note(ui, theme::pal().rec_light, "integrity check failed")
                         .on_hover_text(error);
                 }
                 _ => {}
@@ -1701,7 +1701,7 @@ fn hotkey_row(ui: &mut egui::Ui, name: &str, what: &str, combo: Option<&str>) {
         |ui, _| match &key {
             Some(key) => keycap(ui, key),
             None => {
-                ui.label(RichText::new("Unavailable").color(TEXT_MUTED));
+                ui.label(RichText::new("Unavailable").color(pal().text_muted));
             }
         },
     );
@@ -1909,7 +1909,7 @@ pub(super) fn toggle(
 pub(super) fn title(ui: &mut egui::Ui, text: &str) -> egui::Id {
     let font = theme::regular(theme::BASE_SIZE);
     let natural = text_width(ui, text, font.clone());
-    let id = widgets::elide(ui, text, font, TEXT).id;
+    let id = widgets::elide(ui, text, font, pal().text).id;
     ui.data_mut(|d| d.insert_temp(id.with("natural-width"), natural));
     id
 }
@@ -1926,7 +1926,7 @@ pub(super) fn note(ui: &mut egui::Ui, text: &str) {
         egui::Label::new(
             RichText::new(text)
                 .font(theme::regular(12.5))
-                .color(TEXT_MUTED),
+                .color(pal().text_muted),
         )
         .wrap(),
     );
@@ -1943,7 +1943,7 @@ pub(super) fn footnote(ui: &mut egui::Ui, text: &str) {
         egui::Label::new(
             RichText::new(text)
                 .font(theme::regular(12.5))
-                .color(TEXT_MUTED),
+                .color(pal().text_muted),
         )
         .wrap(),
     );
@@ -1956,11 +1956,12 @@ pub(super) fn progress_bar(ui: &mut egui::Ui, fraction: f32) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 4.0), egui::Sense::hover());
     let radius = CornerRadius::same(2);
-    ui.painter().rect_filled(rect, radius, theme::BORDER_STRONG);
+    ui.painter()
+        .rect_filled(rect, radius, theme::pal().border_strong);
     let mut done = rect;
     done.set_width(rect.width() * fraction.clamp(0.0, 1.0));
     if done.width() > 0.0 {
-        ui.painter().rect_filled(done, radius, theme::ACCENT);
+        ui.painter().rect_filled(done, radius, theme::pal().accent);
     }
 }
 
@@ -1975,26 +1976,26 @@ pub(super) fn button(ui: &mut egui::Ui, enabled: bool, text: &str) -> egui::Resp
 fn path_box(ui: &mut egui::Ui, text: &str) {
     ui.add_space(theme::S1);
     egui::Frame::new()
-        .fill(BG)
+        .fill(pal().bg)
         .corner_radius(CornerRadius::same(theme::R_SM))
         .inner_margin(Margin::symmetric(8, 4))
         .show(ui, |ui| {
-            widgets::elide(ui, text, egui::FontId::monospace(12.0), TEXT);
+            widgets::elide(ui, text, egui::FontId::monospace(12.0), pal().text);
         });
 }
 
 /// A key cap for a hotkey combo.
 fn keycap(ui: &mut egui::Ui, text: &str) {
     egui::Frame::new()
-        .fill(BG)
-        .stroke(Stroke::new(1.0, theme::BORDER_STRONG))
+        .fill(pal().bg)
+        .stroke(Stroke::new(1.0, theme::pal().border_strong))
         .corner_radius(CornerRadius::same(theme::R_SM))
         .inner_margin(Margin::symmetric(8, 3))
         .show(ui, |ui| {
             ui.label(
                 RichText::new(text)
                     .font(egui::FontId::monospace(12.0))
-                    .color(TEXT),
+                    .color(pal().text),
             );
         });
 }
@@ -2003,8 +2004,8 @@ fn keycap(ui: &mut egui::Ui, text: &str) {
 /// right; true when it was clicked.
 fn warning_strip(ui: &mut egui::Ui, text: &str, action: &str, enabled: bool) -> bool {
     egui::Frame::new()
-        .fill(theme::WARN_BG)
-        .stroke(Stroke::new(1.0, theme::WARN_BORDER))
+        .fill(theme::pal().warn_bg)
+        .stroke(Stroke::new(1.0, theme::pal().warn_border))
         .corner_radius(CornerRadius::same(theme::R_MD))
         .inner_margin(Margin::symmetric(12, 8))
         .show(ui, |ui| {
@@ -2014,7 +2015,7 @@ fn warning_strip(ui: &mut egui::Ui, text: &str, action: &str, enabled: bool) -> 
                 ("warning", text),
                 Slot::Fit,
                 |ui| {
-                    ui.add(egui::Label::new(RichText::new(text).color(theme::WARN)).wrap())
+                    ui.add(egui::Label::new(RichText::new(text).color(theme::pal().warn)).wrap())
                         .id
                 },
                 |ui, _| button(ui, enabled, action).clicked(),
@@ -2033,9 +2034,9 @@ fn badge_or_text(ui: &mut egui::Ui, kind: BadgeKind, text: &str) {
         widgets::badge(ui, kind, text);
     } else {
         let color = match kind {
-            BadgeKind::Ok => theme::OK_LIGHT,
-            BadgeKind::Busy => theme::WARN,
-            BadgeKind::Failed => theme::REC_LIGHT,
+            BadgeKind::Ok => theme::pal().ok_light,
+            BadgeKind::Busy => theme::pal().warn,
+            BadgeKind::Failed => theme::pal().rec_light,
         };
         status_note(ui, color, text);
     }
@@ -2044,7 +2045,7 @@ fn badge_or_text(ui: &mut egui::Ui, kind: BadgeKind, text: &str) {
 /// Single-line width of `text` in `font`.
 fn text_width(ui: &egui::Ui, text: &str, font: egui::FontId) -> f32 {
     ui.painter()
-        .layout_no_wrap(text.to_owned(), font, TEXT)
+        .layout_no_wrap(text.to_owned(), font, pal().text)
         .size()
         .x
 }
@@ -2054,7 +2055,7 @@ fn text_width(ui: &egui::Ui, text: &str, font: egui::FontId) -> f32 {
 fn kv_row(ui: &mut egui::Ui, key: &str, value: impl FnOnce(&mut egui::Ui)) {
     let full = ui.available_width();
     let key_label = |ui: &mut egui::Ui| {
-        ui.add(egui::Label::new(RichText::new(key).color(TEXT_MUTED)).wrap());
+        ui.add(egui::Label::new(RichText::new(key).color(pal().text_muted)).wrap());
     };
     if full >= KV_SIDE_BY_SIDE {
         ui.horizontal_top(|ui| {
@@ -2084,7 +2085,7 @@ fn kv_row(ui: &mut egui::Ui, key: &str, value: impl FnOnce(&mut egui::Ui)) {
                 egui::Label::new(
                     RichText::new(key)
                         .font(theme::regular(12.5))
-                        .color(TEXT_MUTED),
+                        .color(pal().text_muted),
                 )
                 .wrap(),
             );
@@ -2095,7 +2096,7 @@ fn kv_row(ui: &mut egui::Ui, key: &str, value: impl FnOnce(&mut egui::Ui)) {
 
 /// A diagnostics value: body text, wrapping.
 fn value(ui: &mut egui::Ui, text: &str) {
-    ui.add(egui::Label::new(RichText::new(text).color(TEXT)).wrap());
+    ui.add(egui::Label::new(RichText::new(text).color(pal().text)).wrap());
 }
 
 /// A diagnostics path (monospace, elided) with an optional trailing badge;
@@ -2121,7 +2122,7 @@ fn path_value(
             egui::vec2(path_width, 0.0),
             Layout::left_to_right(Align::Min),
             |ui| {
-                widgets::elide(ui, path, egui::FontId::monospace(12.0), TEXT);
+                widgets::elide(ui, path, egui::FontId::monospace(12.0), pal().text);
             },
         );
         badge.map(|(kind, text)| widgets::badge(ui, kind, text))
@@ -3115,7 +3116,7 @@ mod tests {
                     "switch",
                     Slot::Fit,
                     |ui| {
-                        let r = widgets::elide(ui, "Auto-record", theme::regular(14.0), TEXT);
+                        let r = widgets::elide(ui, "Auto-record", theme::regular(14.0), pal().text);
                         title_rect = r.rect;
                         r.id
                     },
@@ -3127,7 +3128,8 @@ mod tests {
                     "field",
                     Slot::Fill(FIELD_WIDTH),
                     |ui| {
-                        let r = widgets::elide(ui, "Watch patterns", theme::regular(14.0), TEXT);
+                        let r =
+                            widgets::elide(ui, "Watch patterns", theme::regular(14.0), pal().text);
                         label_rect = r.rect;
                         r.id
                     },

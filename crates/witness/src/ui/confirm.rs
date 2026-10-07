@@ -6,7 +6,7 @@
 //! choosing; on later frames poll [`Confirm::answer`] with the same id.
 //! A new request cancels a pending one, which then answers `false`.
 
-use super::theme::{self, BACKDROP, BG_RAISED, BORDER_STRONG, TEXT, TEXT_FAINT};
+use super::theme::{self, pal};
 use super::widgets;
 use eframe::egui::{self, CornerRadius, Margin, Stroke};
 use std::collections::HashMap;
@@ -82,8 +82,8 @@ impl Confirm {
         // Generous padding, a little tighter on the narrowest windows.
         let pad: i8 = if width < 360.0 { 20 } else { 24 };
         let frame = egui::Frame::new()
-            .fill(BG_RAISED)
-            .stroke(Stroke::new(1.0, BORDER_STRONG))
+            .fill(pal().bg_raised)
+            .stroke(Stroke::new(1.0, pal().border_strong))
             .corner_radius(CornerRadius::same(theme::R_LG))
             .inner_margin(Margin {
                 left: pad,
@@ -95,7 +95,7 @@ impl Confirm {
         let mut decision = None;
         let modal = egui::Modal::new(egui::Id::new("witness-confirm"))
             .frame(frame)
-            .backdrop_color(BACKDROP)
+            .backdrop_color(pal().backdrop)
             .show(ctx, |ui| {
                 // The frame adds its padding and the 1 pt stroke on each side.
                 ui.set_width((width - 2.0 * (f32::from(pad) + 1.0)).max(0.0));
@@ -103,7 +103,7 @@ impl Confirm {
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(&pending.message)
-                            .color(TEXT)
+                            .color(pal().text)
                             .line_height(Some(theme::BASE_SIZE * 1.5)),
                     )
                     .wrap(),
@@ -113,7 +113,7 @@ impl Confirm {
                     egui::Label::new(
                         egui::RichText::new("Tip: hold Shift to skip this confirmation")
                             .font(theme::regular(12.0))
-                            .color(TEXT_FAINT),
+                            .color(pal().text_faint),
                     )
                     .wrap(),
                 );

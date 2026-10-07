@@ -9,7 +9,7 @@
 //! wide.
 
 use super::icons::ph;
-use super::theme::{self, ACCENT, ACCENT_HOVER, BG_RAISED, BORDER_STRONG, OK, REC, TEXT};
+use super::theme::{self, pal};
 use super::widgets::{self, Politeness};
 use eframe::egui::{self, Align2, Color32, CornerRadius, Margin, Order, Stroke};
 use std::fmt::Display;
@@ -32,9 +32,9 @@ impl NoticeKind {
 
     fn accent(self) -> Color32 {
         match self {
-            NoticeKind::Error => REC,
-            NoticeKind::Info => ACCENT,
-            NoticeKind::Success => OK,
+            NoticeKind::Error => pal().rec,
+            NoticeKind::Info => pal().accent,
+            NoticeKind::Success => pal().ok,
         }
     }
 
@@ -320,7 +320,7 @@ fn toast_ui(ui: &mut egui::Ui, toast: &Toast, width: f32) -> (Option<ToastAction
     let action_w = toast.action.as_ref().map(|(label, _)| {
         let pad = if theme::narrow(ui) { 20.0 } else { 28.0 };
         ui.painter()
-            .layout_no_wrap(label.clone(), font.clone(), TEXT)
+            .layout_no_wrap(label.clone(), font.clone(), pal().text)
             .size()
             .x
             .ceil()
@@ -328,21 +328,24 @@ fn toast_ui(ui: &mut egui::Ui, toast: &Toast, width: f32) -> (Option<ToastAction
     });
     let line_height = ui
         .painter()
-        .layout_no_wrap("0".to_owned(), font.clone(), TEXT)
+        .layout_no_wrap("0".to_owned(), font.clone(), pal().text)
         .size()
         .y;
     // Measure the message at the width it gets (no action yet: the
     // message rect's width does not depend on its height).
     let (_, probe, _, _, _) = toast_layout(content_w, egui::Vec2::ZERO, line_height, action_w);
-    let galley = ui
-        .painter()
-        .layout(toast.message.clone(), font, TEXT, probe.width().max(1.0));
+    let galley = ui.painter().layout(
+        toast.message.clone(),
+        font,
+        pal().text,
+        probe.width().max(1.0),
+    );
     let (icon, text, action_rect, close, height) =
         toast_layout(content_w, galley.size(), line_height, action_w);
 
     let frame = egui::Frame::new()
-        .fill(BG_RAISED)
-        .stroke(Stroke::new(1.0, BORDER_STRONG))
+        .fill(pal().bg_raised)
+        .stroke(Stroke::new(1.0, pal().border_strong))
         .corner_radius(CornerRadius::same(theme::R_LG))
         .inner_margin(Margin {
             left: PAD_LEFT as i8,
@@ -381,7 +384,7 @@ fn toast_ui(ui: &mut egui::Ui, toast: &Toast, width: f32) -> (Option<ToastAction
                 rect,
                 egui::Layout::right_to_left(egui::Align::Center),
                 &mut |ui| {
-                    let text = egui::RichText::new(label.as_str()).color(ACCENT_HOVER);
+                    let text = egui::RichText::new(label.as_str()).color(pal().accent_hover);
                     if widgets::btn_ghost(ui, text).clicked() {
                         action = Some(toast_action.clone());
                     }

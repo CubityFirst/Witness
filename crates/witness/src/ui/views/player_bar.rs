@@ -17,10 +17,7 @@ use crate::bridge::OpDone;
 use crate::platform::dialogs::{self, SaveFileRequest};
 use crate::ui::format::fmt_ts;
 use crate::ui::icons::ph;
-use crate::ui::theme::{
-    self, ACCENT, ACCENT_HOVER, BG, BG_HOVER, BG_RAISED, BORDER, BORDER_STRONG, FOCUS, TEXT,
-    TEXT_MUTED, WARN, WHITE,
-};
+use crate::ui::theme::{self, pal};
 use crate::ui::toasts::Notice;
 use crate::ui::widgets;
 use crate::ui::UiCtx;
@@ -126,7 +123,7 @@ fn clock(ms: u64) -> String {
 /// The docked panel around the bar: the page background, so rows never
 /// show through, with breathing room above and below the surface.
 pub fn bar_frame() -> Frame {
-    Frame::new().fill(BG).inner_margin(Margin {
+    Frame::new().fill(pal().bg).inner_margin(Margin {
         left: 0,
         right: 0,
         top: 8,
@@ -167,8 +164,8 @@ pub fn show(
 
     bar_column(ui, gutter, |ui| {
         Frame::new()
-            .fill(BG_RAISED)
-            .stroke(Stroke::new(1.0, BORDER))
+            .fill(pal().bg_raised)
+            .stroke(Stroke::new(1.0, pal().border))
             .corner_radius(CornerRadius::same(theme::R_LG))
             .inner_margin(Margin {
                 left: 12,
@@ -210,7 +207,7 @@ fn sync_preferences(cx: &mut UiCtx, snap: &PlayerSnapshot) {
 fn time_label(ui: &mut egui::Ui, text: String, min_width: f32, right_align: bool) {
     let galley = ui
         .painter()
-        .layout_no_wrap(text.clone(), theme::regular(12.0), TEXT_MUTED);
+        .layout_no_wrap(text.clone(), theme::regular(12.0), pal().text_muted);
     let width = galley.size().x.max(min_width);
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, SCRUB_HEIGHT), Sense::hover());
     let x = if right_align {
@@ -219,7 +216,7 @@ fn time_label(ui: &mut egui::Ui, text: String, min_width: f32, right_align: bool
         rect.left()
     };
     let pos = egui::pos2(x, rect.center().y - galley.size().y / 2.0);
-    ui.painter().galley(pos, galley, TEXT_MUTED);
+    ui.painter().galley(pos, galley, pal().text_muted);
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &text));
 }
 
@@ -239,7 +236,7 @@ fn time_row(
     let total = clock(snap.duration_ms);
     let total_width = ui
         .painter()
-        .layout_no_wrap(total.clone(), theme::regular(12.0), TEXT_MUTED)
+        .layout_no_wrap(total.clone(), theme::regular(12.0), pal().text_muted)
         .size()
         .x;
     ui.horizontal(|ui| {
@@ -367,9 +364,9 @@ fn scrubber(
             track.min..=track.max,
             (cy - TRACK_HEIGHT / 2.0)..=(cy + TRACK_HEIGHT / 2.0),
         );
-        painter.rect_filled(bar, CornerRadius::same(2), BORDER_STRONG);
+        painter.rect_filled(bar, CornerRadius::same(2), pal().border_strong);
         let filled = egui::Rect::from_x_y_ranges(bar.left()..=to_x(value), bar.y_range());
-        painter.rect_filled(filled, CornerRadius::same(2), ACCENT);
+        painter.rect_filled(filled, CornerRadius::same(2), pal().accent);
     }
 
     // Bookmark markers (only once the duration is known): 24×24
@@ -384,12 +381,12 @@ fn scrubber(
         let hot = response.hovered() || held;
         let radius = if hot { THUMB_RADIUS } else { THUMB_RADIUS_REST };
         let painter = ui.painter();
-        painter.circle_filled(egui::pos2(to_x(value), cy), radius, ACCENT);
+        painter.circle_filled(egui::pos2(to_x(value), cy), radius, pal().accent);
         if response.has_focus() && widgets::focus_visible(ui.ctx()) {
             painter.rect_stroke(
                 rect.expand(2.0),
                 CornerRadius::same(6),
-                Stroke::new(2.0, FOCUS),
+                Stroke::new(2.0, pal().focus),
                 egui::StrokeKind::Outside,
             );
         }
@@ -433,13 +430,13 @@ fn bookmark_marker(
     } else {
         MARKER_RADIUS
     };
-    painter.circle_filled(center, radius + 1.5, BG_RAISED);
-    painter.circle_filled(center, radius, WARN);
+    painter.circle_filled(center, radius + 1.5, pal().bg_raised);
+    painter.circle_filled(center, radius, pal().warn);
     if marker.has_focus() && widgets::focus_visible(ui.ctx()) {
         painter.rect_stroke(
             hit,
             CornerRadius::same(6),
-            Stroke::new(2.0, FOCUS),
+            Stroke::new(2.0, pal().focus),
             egui::StrokeKind::Outside,
         );
     }
@@ -585,7 +582,7 @@ fn volume_control(ui: &mut egui::Ui, volume: &mut f32, compact: bool, open: bool
             ui.label(
                 egui::RichText::new(volume_glyph(*volume))
                     .size(17.0)
-                    .color(TEXT_MUTED),
+                    .color(pal().text_muted),
             )
             .on_hover_text("Volume");
         });
@@ -603,8 +600,8 @@ fn volume_control(ui: &mut egui::Ui, volume: &mut f32, compact: bool, open: bool
         .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
         .frame(
             Frame::popup(ui.style())
-                .fill(BG_RAISED)
-                .stroke(Stroke::new(1.0, BORDER))
+                .fill(pal().bg_raised)
+                .stroke(Stroke::new(1.0, pal().border))
                 .corner_radius(CornerRadius::same(theme::R_MD))
                 .inner_margin(Margin::symmetric(12, 10)),
         )
@@ -615,7 +612,11 @@ fn volume_control(ui: &mut egui::Ui, volume: &mut f32, compact: bool, open: bool
                 let percent = format!("{}%", (*volume * 100.0).round());
                 ui.add_sized(
                     [30.0, 16.0],
-                    egui::Label::new(egui::RichText::new(percent).size(12.0).color(TEXT_MUTED)),
+                    egui::Label::new(
+                        egui::RichText::new(percent)
+                            .size(12.0)
+                            .color(pal().text_muted),
+                    ),
                 );
             });
         });
@@ -741,7 +742,7 @@ fn save_copy(cx: &mut UiCtx, meeting_id: i64) {
 fn player_btn(ui: &mut egui::Ui, glyph: &str, size: f32, label: &str, tooltip: &str) -> Response {
     let galley = ui
         .painter()
-        .layout_no_wrap(glyph.to_owned(), theme::regular(size), TEXT);
+        .layout_no_wrap(glyph.to_owned(), theme::regular(size), pal().text);
     let (rect, response) = ui.allocate_exact_size(egui::vec2(BTN_SIZE, BTN_SIZE), Sense::click());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
     if ui.is_rect_visible(rect) {
@@ -749,15 +750,15 @@ fn player_btn(ui: &mut egui::Ui, glyph: &str, size: f32, label: &str, tooltip: &
         let hot = response.hovered() || ring;
         let painter = ui.painter();
         if hot {
-            painter.rect_filled(rect, CornerRadius::same(theme::R_MD), BG_HOVER);
+            painter.rect_filled(rect, CornerRadius::same(theme::R_MD), pal().bg_hover);
         }
-        let color = if hot { TEXT } else { TEXT_MUTED };
+        let color = if hot { pal().text } else { pal().text_muted };
         painter.galley(rect.center() - galley.size() / 2.0, galley, color);
         if ring {
             painter.rect_stroke(
                 rect.expand(2.0),
                 CornerRadius::same(theme::R_MD + 2),
-                Stroke::new(2.0, FOCUS),
+                Stroke::new(2.0, pal().focus),
                 egui::StrokeKind::Outside,
             );
         }
@@ -778,11 +779,19 @@ fn play_btn(ui: &mut egui::Ui, playing: bool, label: &str, tooltip: &str) -> Res
         let painter = ui.painter();
         let c = rect.center();
         let radius = PLAY_SIZE / 2.0;
-        painter.circle_filled(c, radius, if hot { ACCENT_HOVER } else { ACCENT });
+        painter.circle_filled(
+            c,
+            radius,
+            if hot {
+                pal().accent_hover
+            } else {
+                pal().accent
+            },
+        );
         if playing {
             for dx in [-3.5, 3.5] {
                 let bar = Rect::from_center_size(c + egui::vec2(dx, 0.0), egui::vec2(3.5, 13.0));
-                painter.rect_filled(bar, CornerRadius::same(1), WHITE);
+                painter.rect_filled(bar, CornerRadius::same(1), pal().white);
             }
         } else {
             // Optically centred: the triangle's mass sits right of its box.
@@ -791,10 +800,14 @@ fn play_btn(ui: &mut egui::Ui, playing: bool, label: &str, tooltip: &str) -> Res
                 c + egui::vec2(8.0, 0.0),
                 c + egui::vec2(-4.0, 7.0),
             ];
-            painter.add(egui::Shape::convex_polygon(points, WHITE, Stroke::NONE));
+            painter.add(egui::Shape::convex_polygon(
+                points,
+                pal().white,
+                Stroke::NONE,
+            ));
         }
         if ring {
-            painter.circle_stroke(c, radius + 3.0, Stroke::new(2.0, FOCUS));
+            painter.circle_stroke(c, radius + 3.0, Stroke::new(2.0, pal().focus));
         }
     }
     response

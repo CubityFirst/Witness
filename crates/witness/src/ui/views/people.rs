@@ -9,10 +9,7 @@
 use crate::bridge::{OpDone, Task};
 use crate::ui::format::{fmt_date, fmt_date_short, fmt_duration, fmt_thousands};
 use crate::ui::icons;
-use crate::ui::theme::{
-    self, ACCENT, ACCENT_HOVER, BORDER, BORDER_STRONG, REC_LIGHT, S1, S2, S3, S4, TEXT, TEXT_FAINT,
-    TEXT_MUTED,
-};
+use crate::ui::theme::{self, pal, S1, S2, S3, S4};
 use crate::ui::toasts::Notice;
 use crate::ui::views::meetings::{follow_focus, open_transcript};
 use crate::ui::widgets::{self, KeyScroll};
@@ -514,7 +511,7 @@ impl PeopleView {
             egui::Label::new(
                 egui::RichText::new(HINT)
                     .font(theme::regular(12.0))
-                    .color(TEXT_FAINT),
+                    .color(pal().text_faint),
             )
             .wrap(),
         );
@@ -548,7 +545,7 @@ fn trend_card(ui: &mut egui::Ui, weeks: &[Week]) {
             egui::Label::new(
                 egui::RichText::new(trend_title(weeks))
                     .font(theme::regular(12.5))
-                    .color(TEXT_MUTED),
+                    .color(pal().text_muted),
             )
             .wrap(),
         );
@@ -565,14 +562,14 @@ fn trend_card(ui: &mut egui::Ui, weeks: &[Week]) {
                 egui::Align2::LEFT_CENTER,
                 first.from.format("%-d %b").to_string(),
                 axis_font(),
-                TEXT_FAINT,
+                pal().text_faint,
             );
             painter.text(
                 rect.right_center(),
                 egui::Align2::RIGHT_CENTER,
                 "This week",
                 axis_font(),
-                TEXT_FAINT,
+                pal().text_faint,
             );
         }
     });
@@ -604,7 +601,7 @@ fn trend_chart(ui: &mut egui::Ui, weeks: &[Week]) -> Response {
         painter.hline(
             rect.x_range(),
             rect.bottom() - 0.5,
-            Stroke::new(1.0, BORDER),
+            Stroke::new(1.0, pal().border),
         );
         let max_ms = weeks.iter().map(|w| w.ms).max().unwrap_or(0).max(1);
         let bar_w = (slot * 0.6).clamp(3.0, BAR_MAX_WIDTH);
@@ -620,9 +617,9 @@ fn trend_chart(ui: &mut egui::Ui, weeks: &[Week]) -> Response {
                     egui::vec2(bar_w, 3.0),
                 );
                 let color = if emphasised {
-                    TEXT_FAINT
+                    pal().text_faint
                 } else {
-                    BORDER_STRONG
+                    pal().border_strong
                 };
                 painter.rect_filled(stub, CornerRadius::same(1), color);
                 continue;
@@ -633,11 +630,11 @@ fn trend_chart(ui: &mut egui::Ui, weeks: &[Week]) -> Response {
                 egui::pos2(center_x + bar_w / 2.0, rect.bottom()),
             );
             let color = if hovered == Some(i) {
-                ACCENT_HOVER
+                pal().accent_hover
             } else if emphasised {
-                ACCENT
+                pal().accent
             } else {
-                theme::alpha(ACCENT, 0.7)
+                theme::alpha(pal().accent, 0.7)
             };
             let radius = CornerRadius {
                 nw: 3,
@@ -704,8 +701,8 @@ fn person_row(ui: &mut egui::Ui, p: &PersonAgg, open: bool) -> (Response, Rect) 
                     |ui| {
                         ui.set_width(text_w);
                         ui.spacing_mut().item_spacing.y = 1.0;
-                        widgets::elide(ui, &p.name, name_font, TEXT);
-                        widgets::elide(ui, &summary, meta_font, TEXT_MUTED);
+                        widgets::elide(ui, &p.name, name_font, pal().text);
+                        widgets::elide(ui, &summary, meta_font, pal().text_muted);
                     },
                 );
                 let (mark, _) =
@@ -718,7 +715,11 @@ fn person_row(ui: &mut egui::Ui, p: &PersonAgg, open: bool) -> (Response, Rect) 
                 } else {
                     0.0
                 };
-                let color = if hovered || open { TEXT } else { TEXT_MUTED };
+                let color = if hovered || open {
+                    pal().text
+                } else {
+                    pal().text_muted
+                };
                 paint_chevron(ui, mark, t, color);
             },
         )
@@ -750,17 +751,17 @@ fn stats_grid(ui: &mut egui::Ui, pairs: &[(&'static str, String)]) {
                 egui::vec2(cell_w, row_h),
             );
             let response = ui.interact(cell, ui.id().with(("stat", *key)), Sense::hover());
-            let value_g = ui
-                .painter()
-                .layout_no_wrap(value.clone(), value_font.clone(), TEXT);
+            let value_g =
+                ui.painter()
+                    .layout_no_wrap(value.clone(), value_font.clone(), pal().text);
             let key_w = cell_w - value_g.size().x - S2;
-            let key_g = elided(ui, key, key_font.clone(), TEXT_MUTED, key_w);
+            let key_g = elided(ui, key, key_font.clone(), pal().text_muted, key_w);
             let key_elided = key_g.elided;
             let painter = ui.painter();
             painter.galley(
                 egui::pos2(cell.left(), cell.center().y - key_g.size().y / 2.0),
                 key_g,
-                TEXT_MUTED,
+                pal().text_muted,
             );
             painter.galley(
                 egui::pos2(
@@ -768,7 +769,7 @@ fn stats_grid(ui: &mut egui::Ui, pairs: &[(&'static str, String)]) {
                     cell.center().y - value_g.size().y / 2.0,
                 ),
                 value_g,
-                TEXT,
+                pal().text,
             );
             let name = format!("{key}: {value}");
             response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, &name));
@@ -789,8 +790,8 @@ fn meeting_row(ui: &mut egui::Ui, p: &PersonAgg, m: &PersonMeetingStat) -> Respo
         false,
         |ui, _| {
             ui.spacing_mut().item_spacing.y = 1.0;
-            widgets::elide(ui, &m.meeting_title, theme::regular(14.0), TEXT);
-            widgets::elide(ui, &meta, theme::regular(12.0), TEXT_MUTED);
+            widgets::elide(ui, &m.meeting_title, theme::regular(14.0), pal().text);
+            widgets::elide(ui, &meta, theme::regular(12.0), pal().text_muted);
         },
     );
     let name = format!("{}, {meta}", m.meeting_title);
@@ -848,9 +849,11 @@ fn person_entry(
                 // Destructive but secondary: a ghost button in light red, its
                 // text roughly in line with the meeting titles above.
                 ui.add_space(S1);
-                let button =
-                    widgets::btn_ghost(ui, egui::RichText::new("Forget voice…").color(REC_LIGHT))
-                        .on_hover_text("Forget this voice — Shift-click to skip confirmation");
+                let button = widgets::btn_ghost(
+                    ui,
+                    egui::RichText::new("Forget voice…").color(pal().rec_light),
+                )
+                .on_hover_text("Forget this voice — Shift-click to skip confirmation");
                 follow_focus(&button);
                 if button.clicked() {
                     actions.push(Action::Forget {

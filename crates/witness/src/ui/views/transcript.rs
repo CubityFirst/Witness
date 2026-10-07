@@ -41,11 +41,7 @@ use crate::ui::format::{
     fmt_date, fmt_duration, fmt_thousands, fmt_ts, highlight_ranges, highlight_tokens,
 };
 use crate::ui::icons::{self, ph};
-use crate::ui::theme::{
-    self, speaker_text, ACCENT, ACTIVE_SEG_BG, ACTIVE_SEG_STROKE, BG, BG_HOVER, BG_RAISED,
-    BOOKMARK_ROW_BG, BORDER, FOCUS, MARK_BG, MARK_TEXT, REC, REC_LIGHT, TEXT, TEXT_FAINT,
-    TEXT_MUTED, THEM_CHIP, WARN,
-};
+use crate::ui::theme::{self, pal, speaker_text};
 use crate::ui::toasts::Notice;
 use crate::ui::widgets::{self, KeyScroll, Politeness};
 use crate::ui::{QueuedNotes, UiCtx, View};
@@ -416,13 +412,13 @@ fn suggestions<'a>(people: &'a [PersonInfo], text: &str) -> Vec<&'a str> {
 fn text_job(text: &str, tokens: &[String]) -> egui::text::LayoutJob {
     let plain = egui::TextFormat {
         font_id: theme::regular(TEXT_SIZE),
-        color: TEXT,
+        color: pal().text,
         line_height: Some(LINE_HEIGHT),
         ..Default::default()
     };
     let mark = egui::TextFormat {
-        background: MARK_BG,
-        color: MARK_TEXT,
+        background: pal().mark_bg,
+        color: pal().mark_text,
         ..plain.clone()
     };
     let mut job = egui::text::LayoutJob::default();
@@ -659,8 +655,8 @@ fn inline_editor(
     label: &str,
 ) -> (Response, EditOutcome) {
     let response = Frame::new()
-        .fill(BG)
-        .stroke(Stroke::new(1.0, ACCENT))
+        .fill(pal().bg)
+        .stroke(Stroke::new(1.0, pal().accent))
         .corner_radius(CornerRadius::same(theme::R_SM))
         .inner_margin(INLINE_EDIT_MARGIN)
         .show(ui, |ui| {
@@ -1162,12 +1158,16 @@ fn elided_galley(
 fn ts_button(ui: &mut egui::Ui, ms: i64, label: &str) -> Response {
     let galley = ui
         .painter()
-        .layout_no_wrap(fmt_ts(ms), theme::regular(12.0), TEXT_MUTED);
+        .layout_no_wrap(fmt_ts(ms), theme::regular(12.0), pal().text_muted);
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(galley.size().x, HEADER_H), Sense::click());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
     if ui.is_rect_visible(rect) {
-        let color = if response.hovered() { TEXT } else { TEXT_MUTED };
+        let color = if response.hovered() {
+            pal().text
+        } else {
+            pal().text_muted
+        };
         let pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
         ui.painter()
             .galley_with_override_text_color(pos, galley, color);
@@ -1182,7 +1182,7 @@ fn focus_ring(ui: &egui::Ui, rect: Rect, radius: u8) {
     ui.painter().rect_stroke(
         rect.expand(2.0),
         CornerRadius::same(radius),
-        Stroke::new(2.0, FOCUS),
+        Stroke::new(2.0, pal().focus),
         egui::StrokeKind::Outside,
     );
 }
@@ -1254,9 +1254,9 @@ fn segment_row(
     }
     let rect = row_rect(&prepared);
     if active {
-        prepared.frame.fill = ACTIVE_SEG_BG;
+        prepared.frame.fill = pal().active_seg_bg;
     } else if ui.rect_contains_pointer(rect) {
-        prepared.frame.fill = BG_HOVER;
+        prepared.frame.fill = pal().bg_hover;
     }
     let response = prepared.end(ui);
     if active {
@@ -1266,7 +1266,7 @@ fn segment_row(
         ui.painter().rect_stroke(
             response.rect,
             CornerRadius::same(theme::R_SM),
-            Stroke::new(1.0, ACTIVE_SEG_STROKE),
+            Stroke::new(1.0, pal().active_seg_stroke),
             egui::StrokeKind::Inside,
         );
     }
@@ -1327,7 +1327,7 @@ fn turn_header(
     let width = ui.available_width();
     let ts_width = ui
         .painter()
-        .layout_no_wrap(fmt_ts(seg.start_ms), theme::regular(12.0), TEXT_MUTED)
+        .layout_no_wrap(fmt_ts(seg.start_ms), theme::regular(12.0), pal().text_muted)
         .size()
         .x;
     ui.allocate_ui_with_layout(
@@ -1442,7 +1442,9 @@ fn speaker_editor(ui: &mut egui::Ui, rc: &mut RowCtx, actions: &mut Vec<RowActio
             "Saves this voice as {} for future meetings",
             if shown.is_empty() { "this name" } else { shown }
         );
-        ui.add(egui::Label::new(egui::RichText::new(hint).size(12.0).color(TEXT_MUTED)).wrap());
+        ui.add(
+            egui::Label::new(egui::RichText::new(hint).size(12.0).color(pal().text_muted)).wrap(),
+        );
 
         // A press on the suggestion list blurs the field first; that blur
         // must not commit the half-typed text. It is remembered instead:
@@ -1568,9 +1570,9 @@ fn bookmark_row(ui: &mut egui::Ui, rc: &mut RowCtx, idx: usize, actions: &mut Ve
     }
     let rect = row_rect(&prepared);
     prepared.frame.fill = if ui.rect_contains_pointer(rect) {
-        BG_HOVER
+        pal().bg_hover
     } else {
-        BOOKMARK_ROW_BG
+        pal().bookmark_row_bg
     };
     prepared.end(ui);
 }
@@ -1578,12 +1580,14 @@ fn bookmark_row(ui: &mut egui::Ui, rc: &mut RowCtx, idx: usize, actions: &mut Ve
 /// A bookmark's seek button: the warn bookmark glyph and the time (12 pt
 /// muted, brighter on hover), on the row's 28 pt line.
 fn bookmark_seek(ui: &mut egui::Ui, ts: &str) -> Response {
-    let glyph =
-        ui.painter()
-            .layout_no_wrap(ph::BOOKMARK_SIMPLE.to_owned(), theme::regular(15.0), WARN);
+    let glyph = ui.painter().layout_no_wrap(
+        ph::BOOKMARK_SIMPLE.to_owned(),
+        theme::regular(15.0),
+        pal().warn,
+    );
     let time = ui
         .painter()
-        .layout_no_wrap(ts.to_owned(), theme::regular(12.0), TEXT_MUTED);
+        .layout_no_wrap(ts.to_owned(), theme::regular(12.0), pal().text_muted);
     let size = egui::vec2(glyph.size().x + 6.0 + time.size().x, BOOKMARK_LINE);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let label = format!("Play recording at bookmark {ts}");
@@ -1596,9 +1600,13 @@ fn bookmark_seek(ui: &mut egui::Ui, ts: &str) -> Response {
         painter.galley(
             egui::pos2(rect.left(), cy - glyph.size().y / 2.0),
             glyph,
-            WARN,
+            pal().warn,
         );
-        let color = if response.hovered() { TEXT } else { TEXT_MUTED };
+        let color = if response.hovered() {
+            pal().text
+        } else {
+            pal().text_muted
+        };
         painter.galley_with_override_text_color(egui::pos2(time_x, time_y), time, color);
         if response.has_focus() && widgets::focus_visible(ui.ctx()) {
             focus_ring(ui, rect, 4);
@@ -1610,9 +1618,9 @@ fn bookmark_seek(ui: &mut egui::Ui, ts: &str) -> Response {
 /// The note as a button (a faint placeholder when empty); a click edits it.
 fn bookmark_note(ui: &mut egui::Ui, bookmark: &Bookmark, actions: &mut Vec<RowAction>) {
     let (text, color) = if bookmark.note.is_empty() {
-        ("bookmark — click to add a note", TEXT_FAINT)
+        ("bookmark — click to add a note", pal().text_faint)
     } else {
-        (bookmark.note.as_str(), TEXT)
+        (bookmark.note.as_str(), pal().text)
     };
     let job = egui::text::LayoutJob::single_section(
         text.to_string(),
@@ -1655,8 +1663,8 @@ const HEADER_ICON: f32 = 18.0;
 fn menu_frame(ui: &egui::Ui) -> Frame {
     Frame::popup(ui.style())
         .inner_margin(Margin::same(4))
-        .fill(BG_RAISED)
-        .stroke(Stroke::new(1.0, BORDER))
+        .fill(pal().bg_raised)
+        .stroke(Stroke::new(1.0, pal().border))
         .corner_radius(CornerRadius::same(theme::R_MD))
 }
 
@@ -1664,7 +1672,7 @@ fn menu_frame(ui: &egui::Ui) -> Frame {
 fn menu_item(ui: &mut egui::Ui, text: &str) -> Response {
     let galley = ui
         .painter()
-        .layout_no_wrap(text.to_owned(), theme::regular(13.0), TEXT);
+        .layout_no_wrap(text.to_owned(), theme::regular(13.0), pal().text);
     let width = ui.available_width().max(galley.size().x + 20.0);
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(width, galley.size().y + 16.0), Sense::click());
@@ -1674,16 +1682,16 @@ fn menu_item(ui: &mut egui::Ui, text: &str) -> Response {
         // leave a second highlighted row after a mouse open.
         if response.hovered() {
             ui.painter()
-                .rect_filled(rect, CornerRadius::same(theme::R_SM), BG_HOVER);
+                .rect_filled(rect, CornerRadius::same(theme::R_SM), pal().bg_hover);
         }
         let pos = egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y / 2.0);
-        ui.painter().galley(pos, galley, TEXT);
+        ui.painter().galley(pos, galley, pal().text);
         if response.has_focus() && widgets::focus_visible(ui.ctx()) {
             // The global `:focus-visible` outline, kept inside the popup.
             ui.painter().rect_stroke(
                 rect.shrink(2.0),
                 CornerRadius::same(4),
-                Stroke::new(2.0, FOCUS),
+                Stroke::new(2.0, pal().focus),
                 egui::StrokeKind::Inside,
             );
         }
@@ -1817,7 +1825,7 @@ fn jump_pill(ctx: &egui::Context, id: Id, anchor: egui::Pos2) -> bool {
             let galley = ui.painter().layout_no_wrap(
                 "Jump to current".to_owned(),
                 theme::regular(12.0),
-                TEXT,
+                pal().text,
             );
             let size = galley.size() + egui::vec2(24.0, 10.0);
             let (rect, response) = ui.allocate_exact_size(size, Sense::click());
@@ -1839,11 +1847,11 @@ fn jump_pill(ctx: &egui::Context, id: Id, anchor: egui::Pos2) -> bool {
             painter.rect(
                 rect,
                 radius,
-                if hot { BG_HOVER } else { BG_RAISED },
-                Stroke::new(1.0, if hot { ACCENT } else { BORDER }),
+                if hot { pal().bg_hover } else { pal().bg_raised },
+                Stroke::new(1.0, if hot { pal().accent } else { pal().border }),
                 egui::StrokeKind::Inside,
             );
-            painter.galley(rect.center() - galley.size() / 2.0, galley, TEXT);
+            painter.galley(rect.center() - galley.size() / 2.0, galley, pal().text);
             response
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .clicked()
@@ -2656,7 +2664,9 @@ impl TranscriptState {
             ui.add_space(48.0);
             ui.vertical_centered(|ui| {
                 for line in &lines {
-                    ui.add(egui::Label::new(egui::RichText::new(line).color(TEXT_MUTED)).wrap());
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(line).color(pal().text_muted)).wrap(),
+                    );
                 }
                 if retry && widgets::btn(ui, "Retry").clicked() {
                     self.retranscribe(cx, None);
@@ -2785,7 +2795,7 @@ impl TranscriptState {
                             } else {
                                 start_edit = title_row(ui, &title);
                             }
-                            widgets::elide(ui, &meta, meta_font.clone(), TEXT_MUTED);
+                            widgets::elide(ui, &meta, meta_font.clone(), pal().text_muted);
                         });
                     });
                 });
@@ -2898,7 +2908,7 @@ impl TranscriptState {
             let hot = summary.hovered() || ring;
             let painter = ui.painter();
             if hot {
-                painter.rect_filled(rect, CornerRadius::same(theme::R_MD), BG_HOVER);
+                painter.rect_filled(rect, CornerRadius::same(theme::R_MD), pal().bg_hover);
             }
             let cy = rect.center().y;
             let mut x = rect.left() + ROW_PAD_X;
@@ -2911,32 +2921,32 @@ impl TranscriptState {
                 painter.galley(
                     egui::pos2(x, cy - galley.size().y / 2.0),
                     galley.clone(),
-                    TEXT,
+                    pal().text,
                 );
                 x += galley.size().x + gap;
             };
             place(
-                painter.layout_no_wrap(caret.into(), theme::regular(12.0), TEXT_MUTED),
+                painter.layout_no_wrap(caret.into(), theme::regular(12.0), pal().text_muted),
                 6.0,
             );
-            let label_color = if hot { TEXT } else { TEXT_MUTED };
+            let label_color = if hot { pal().text } else { pal().text_muted };
             place(
                 painter.layout_no_wrap("Notes".into(), theme::semibold(13.0), label_color),
                 8.0,
             );
             if let Some(text) = indicator {
                 place(
-                    painter.layout_no_wrap(text.into(), theme::regular(12.0), TEXT_FAINT),
+                    painter.layout_no_wrap(text.into(), theme::regular(12.0), pal().text_faint),
                     12.0,
                 );
             }
             let room = rect.right() - ROW_PAD_X - x;
             if let Some(line) = preview.filter(|_| room > 40.0) {
-                let galley = elided_galley(ui, &line, theme::regular(12.5), TEXT_FAINT, room);
+                let galley = elided_galley(ui, &line, theme::regular(12.5), pal().text_faint, room);
                 painter.galley(
                     egui::pos2(x, cy - galley.size().y / 2.0),
                     galley,
-                    TEXT_FAINT,
+                    pal().text_faint,
                 );
             }
             if ring {
@@ -2968,7 +2978,7 @@ impl TranscriptState {
                 ui,
                 Id::new(("notes", self.meeting_id)),
                 field,
-                BG_RAISED,
+                pal().bg_raised,
                 theme::R_MD,
                 Margin::symmetric(12, 10),
             ));
@@ -3347,7 +3357,7 @@ fn title_row(ui: &mut egui::Ui, title: &str) -> bool {
         ui.spacing_mut().interact_size.y = interact;
         ui.spacing_mut().item_spacing.x = 2.0;
         let max = (ui.available_width() - PENCIL_SIZE - 2.0).max(40.0);
-        let galley = elided_galley(ui, title, theme::semibold(TITLE_SIZE), TEXT, max);
+        let galley = elided_galley(ui, title, theme::semibold(TITLE_SIZE), pal().text, max);
         let tooltip = if galley.elided {
             format!("{title}\nDouble-click to rename")
         } else {
@@ -3376,11 +3386,11 @@ fn title_row(ui: &mut egui::Ui, title: &str) -> bool {
 fn legend_item(ui: &mut egui::Ui, stat: &SpeakerStat, max_width: f32) -> Response {
     const DOT: f32 = 8.0;
     const GAP: f32 = 6.0;
-    let figures = ui
-        .painter()
-        .layout_no_wrap(legend_text(stat), theme::regular(12.0), TEXT_MUTED);
+    let figures =
+        ui.painter()
+            .layout_no_wrap(legend_text(stat), theme::regular(12.0), pal().text_muted);
     let name_max = (max_width - DOT - 2.0 * GAP - figures.size().x).max(40.0);
-    let name = elided_galley(ui, &stat.name, theme::regular(13.0), TEXT, name_max);
+    let name = elided_galley(ui, &stat.name, theme::regular(13.0), pal().text, name_max);
     let height = name.size().y.max(figures.size().y);
     let size = egui::vec2(DOT + GAP + name.size().x + GAP + figures.size().x, height);
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
@@ -3396,11 +3406,15 @@ fn legend_item(ui: &mut egui::Ui, stat: &SpeakerStat, max_width: f32) -> Respons
         );
         let name_x = rect.left() + DOT + GAP;
         let figures_x = name_x + name.size().x + GAP;
-        painter.galley(egui::pos2(name_x, cy - name.size().y / 2.0), name, TEXT);
+        painter.galley(
+            egui::pos2(name_x, cy - name.size().y / 2.0),
+            name,
+            pal().text,
+        );
         painter.galley(
             egui::pos2(figures_x, cy - figures.size().y / 2.0),
             figures,
-            TEXT_MUTED,
+            pal().text_muted,
         );
     }
     response.on_hover_text(full)
@@ -3461,7 +3475,7 @@ fn live_feed(
     let max_height = ui.ctx().content_rect().height() * 0.6;
     let stick = state.stick(lines.back().map(|line| (line.track, line.start_ms)));
     Frame::new()
-        .fill(BG_RAISED)
+        .fill(pal().bg_raised)
         .stroke(Stroke::new(1.0, LIVE_BORDER))
         .corner_radius(CornerRadius::same(theme::R_LG))
         .inner_margin(Margin::symmetric(8, 10))
@@ -3474,17 +3488,17 @@ fn live_feed(
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), Sense::hover());
                     let alpha = icons::pulse_alpha(ui.ctx());
                     ui.painter()
-                        .circle_filled(rect.center(), 4.0, REC.gamma_multiply(alpha));
+                        .circle_filled(rect.center(), 4.0, pal().rec.gamma_multiply(alpha));
                 }
                 ui.label(
                     egui::RichText::new("Live captions")
                         .font(theme::semibold(13.0))
-                        .color(REC_LIGHT),
+                        .color(pal().rec_light),
                 );
                 ui.label(
                     egui::RichText::new("provisional")
                         .size(12.0)
-                        .color(TEXT_FAINT),
+                        .color(pal().text_faint),
                 );
             });
             widgets::gap(ui, 4.0);
@@ -3504,7 +3518,7 @@ fn live_feed(
                         ui.horizontal(|ui| {
                             ui.add_space(ROW_PAD_X - ui.spacing().item_spacing.x);
                             ui.add(
-                                egui::Label::new(egui::RichText::new(text).color(TEXT_MUTED))
+                                egui::Label::new(egui::RichText::new(text).color(pal().text_muted))
                                     .wrap(),
                             );
                         });
@@ -3543,7 +3557,7 @@ fn live_line(ui: &mut egui::Ui, line: &LiveTranscript, head: bool) {
     let (name, color) = if line.track == "mic" {
         ("Me", speaker_text("me"))
     } else {
-        ("Them", theme::lighten(THEM_CHIP, 0.35))
+        ("Them", theme::lighten(pal().them_chip, 0.35))
     };
     if head {
         ui.add_space(6.0);
@@ -3565,7 +3579,7 @@ fn live_line(ui: &mut egui::Ui, line: &LiveTranscript, head: bool) {
                     ui.label(
                         egui::RichText::new(fmt_ts(i64::try_from(line.start_ms).unwrap_or(0)))
                             .size(12.0)
-                            .color(TEXT_MUTED),
+                            .color(pal().text_muted),
                     );
                 },
             );
@@ -3574,7 +3588,7 @@ fn live_line(ui: &mut egui::Ui, line: &LiveTranscript, head: bool) {
     }
     let rect = row_rect(&prepared);
     if ui.rect_contains_pointer(rect) {
-        prepared.frame.fill = BG_HOVER;
+        prepared.frame.fill = pal().bg_hover;
     }
     prepared.end(ui);
     ui.add_space(ROW_GAP);
@@ -3899,7 +3913,7 @@ mod tests {
         let marks = job
             .sections
             .iter()
-            .filter(|s| s.format.background == MARK_BG)
+            .filter(|s| s.format.background == pal().mark_bg)
             .count();
         assert_eq!(marks, 2);
     }
@@ -4627,7 +4641,7 @@ mod tests {
                     .shapes
                     .iter()
                     .filter(|clipped| match &clipped.shape {
-                        egui::Shape::Rect(rect) => rect.fill == BG_HOVER,
+                        egui::Shape::Rect(rect) => rect.fill == pal().bg_hover,
                         _ => false,
                     })
                     .count();

@@ -5,11 +5,7 @@
 //! regions. Views use these rather than fighting the global `Visuals`
 //! (map-ui-shell §9) — and do not fork them.
 
-use super::theme::{
-    self, narrow, BADGE_OK_BG, BADGE_REC_BG, BADGE_WARN_BG, BG_ACTIVE, BG_HOVER, BG_RAISED, BORDER,
-    BORDER_STRONG, OK_LIGHT, PILL_BUSY_BG, PILL_REC_BG, REC, REC_HOVER, REC_LIGHT, TEXT,
-    TEXT_FAINT, TEXT_MUTED, VIEW_ERROR_BG, VIEW_ERROR_BORDER, WARN, WARN_BG, WARN_BORDER, WHITE,
-};
+use super::theme::{self, narrow, pal};
 use eframe::egui::{
     self, Color32, CornerRadius, FontId, Frame, Margin, Response, Sense, Stroke, TextWrapMode,
     WidgetText,
@@ -64,12 +60,12 @@ fn btn_padding(ui: &egui::Ui) -> egui::Vec2 {
 
 fn btn_style(ui: &egui::Ui) -> ButtonStyle {
     ButtonStyle {
-        fill: BG_HOVER,
-        hover_fill: BG_ACTIVE,
-        stroke: BORDER_STRONG,
-        hover_stroke: BORDER_STRONG,
-        text: TEXT,
-        hover_text: TEXT,
+        fill: pal().bg_hover,
+        hover_fill: pal().bg_active,
+        stroke: pal().border_strong,
+        hover_stroke: pal().border_strong,
+        text: pal().text,
+        hover_text: pal().text,
         padding: btn_padding(ui),
         radius: theme::R_MD,
         font: Font::Regular(theme::BASE_SIZE),
@@ -80,12 +76,12 @@ fn btn_style(ui: &egui::Ui) -> ButtonStyle {
 
 fn danger_style(ui: &egui::Ui) -> ButtonStyle {
     ButtonStyle {
-        fill: REC,
-        hover_fill: REC_HOVER,
-        stroke: REC,
-        hover_stroke: REC_LIGHT,
-        text: WHITE,
-        hover_text: WHITE,
+        fill: pal().rec,
+        hover_fill: pal().rec_hover,
+        stroke: pal().rec,
+        hover_stroke: pal().rec_light,
+        text: pal().white,
+        hover_text: pal().white,
         font: Font::Semibold(theme::BASE_SIZE),
         ..btn_style(ui)
     }
@@ -151,7 +147,7 @@ fn styled_button(
             painter.rect_stroke(
                 rect.expand(2.0),
                 CornerRadius::same(style.radius + 2),
-                Stroke::new(2.0, theme::FOCUS),
+                Stroke::new(2.0, theme::pal().focus),
                 egui::StrokeKind::Outside,
             );
         }
@@ -173,7 +169,7 @@ pub fn btn(ui: &mut egui::Ui, text: impl Into<WidgetText>) -> Response {
 pub fn btn_ghost(ui: &mut egui::Ui, text: impl Into<WidgetText>) -> Response {
     let style = ButtonStyle {
         fill: Color32::TRANSPARENT,
-        hover_fill: BG_HOVER,
+        hover_fill: pal().bg_hover,
         stroke: Color32::TRANSPARENT,
         hover_stroke: Color32::TRANSPARENT,
         ..btn_style(ui)
@@ -199,10 +195,10 @@ pub fn btn_danger(ui: &mut egui::Ui, text: impl Into<WidgetText>) -> Response {
 fn icon_style(size: f32, hover_text: Color32) -> ButtonStyle {
     ButtonStyle {
         fill: Color32::TRANSPARENT,
-        hover_fill: BG_HOVER,
+        hover_fill: pal().bg_hover,
         stroke: Color32::TRANSPARENT,
         hover_stroke: Color32::TRANSPARENT,
-        text: TEXT_MUTED,
+        text: pal().text_muted,
         hover_text,
         padding: egui::vec2(4.0, 4.0),
         radius: theme::R_MD,
@@ -216,7 +212,7 @@ fn icon_style(size: f32, hover_text: Color32) -> ButtonStyle {
 fn icon_size(ui: &egui::Ui, glyph: &str, size: f32) -> egui::Vec2 {
     let galley = ui
         .painter()
-        .layout_no_wrap(glyph.to_owned(), theme::regular(size), TEXT);
+        .layout_no_wrap(glyph.to_owned(), theme::regular(size), pal().text);
     let side = (galley.size().x.max(size) + 12.0).max(28.0);
     egui::vec2(side, side)
 }
@@ -226,7 +222,7 @@ fn icon_size(ui: &egui::Ui, glyph: &str, size: f32) -> egui::Vec2 {
 pub fn icon_btn(ui: &mut egui::Ui, glyph: &str, size: f32, label: &str) -> Response {
     let style = ButtonStyle {
         fixed_size: Some(icon_size(ui, glyph, size)),
-        ..icon_style(size, TEXT)
+        ..icon_style(size, pal().text)
     };
     styled_button(ui, style, glyph.into(), Some(label)).on_hover_text(label)
 }
@@ -235,7 +231,7 @@ pub fn icon_btn(ui: &mut egui::Ui, glyph: &str, size: f32, label: &str) -> Respo
 pub fn icon_btn_danger(ui: &mut egui::Ui, glyph: &str, size: f32, label: &str) -> Response {
     let style = ButtonStyle {
         fixed_size: Some(icon_size(ui, glyph, size)),
-        ..icon_style(size, REC)
+        ..icon_style(size, pal().rec)
     };
     styled_button(ui, style, glyph.into(), Some(label)).on_hover_text(label)
 }
@@ -245,11 +241,11 @@ pub fn icon_btn_danger(ui: &mut egui::Ui, glyph: &str, size: f32, label: &str) -
 pub fn win_btn(ui: &mut egui::Ui, glyph: &str, size: f32, label: &str, close: bool) -> Response {
     let style = ButtonStyle {
         fill: Color32::TRANSPARENT,
-        hover_fill: if close { REC } else { BG_HOVER },
+        hover_fill: if close { pal().rec } else { pal().bg_hover },
         stroke: Color32::TRANSPARENT,
         hover_stroke: Color32::TRANSPARENT,
-        text: TEXT_MUTED,
-        hover_text: if close { WHITE } else { TEXT },
+        text: pal().text_muted,
+        hover_text: if close { pal().white } else { pal().text },
         padding: egui::Vec2::ZERO,
         radius: 6,
         font: Font::Regular(size),
@@ -275,9 +271,9 @@ pub enum PillKind {
 impl PillKind {
     pub fn colors(self) -> (Color32, Color32) {
         match self {
-            PillKind::Idle => (BG_HOVER, TEXT_MUTED),
-            PillKind::Busy => (PILL_BUSY_BG, WARN),
-            PillKind::Recording => (PILL_REC_BG, REC_LIGHT),
+            PillKind::Idle => (pal().bg_hover, pal().text_muted),
+            PillKind::Busy => (pal().pill_busy_bg, pal().warn),
+            PillKind::Recording => (pal().pill_rec_bg, pal().rec_light),
         }
     }
 }
@@ -339,9 +335,9 @@ pub enum BadgeKind {
 /// An uppercase 11 pt badge (3/8 padding, 0.4 px letter spacing).
 pub fn badge(ui: &mut egui::Ui, kind: BadgeKind, text: &str) -> Response {
     let (fill, color) = match kind {
-        BadgeKind::Ok => (BADGE_OK_BG, OK_LIGHT),
-        BadgeKind::Busy => (BADGE_WARN_BG, WARN),
-        BadgeKind::Failed => (BADGE_REC_BG, REC_LIGHT),
+        BadgeKind::Ok => (pal().badge_ok_bg, pal().ok_light),
+        BadgeKind::Busy => (pal().badge_warn_bg, pal().warn),
+        BadgeKind::Failed => (pal().badge_rec_bg, pal().rec_light),
     };
     let mut job = egui::text::LayoutJob::default();
     job.append(
@@ -374,14 +370,14 @@ pub fn badge(ui: &mut egui::Ui, kind: BadgeKind, text: &str) -> Response {
 /// `.inline-warning`: warn text on a warn tint, selectable (role=alert).
 pub fn inline_warning(ui: &mut egui::Ui, text: &str) -> Response {
     Frame::new()
-        .fill(WARN_BG)
-        .stroke(Stroke::new(1.0, WARN_BORDER))
+        .fill(pal().warn_bg)
+        .stroke(Stroke::new(1.0, pal().warn_border))
         .corner_radius(CornerRadius::same(theme::R_MD))
         .inner_margin(Margin::symmetric(12, 10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.add(
-                egui::Label::new(egui::RichText::new(text).color(WARN))
+                egui::Label::new(egui::RichText::new(text).color(pal().warn))
                     .wrap()
                     .selectable(true),
             );
@@ -396,8 +392,8 @@ pub fn view_error(ui: &mut egui::Ui, message: &str, buttons: &[&str]) -> Option<
     ui.add_space(24.0);
     centered_column(ui, 720.0, |ui| {
         Frame::new()
-            .fill(VIEW_ERROR_BG)
-            .stroke(Stroke::new(1.0, VIEW_ERROR_BORDER))
+            .fill(pal().view_error_bg)
+            .stroke(Stroke::new(1.0, pal().view_error_border))
             .corner_radius(CornerRadius::same(8))
             .inner_margin(Margin::same(18))
             .show(ui, |ui| {
@@ -430,13 +426,13 @@ pub fn empty_state(ui: &mut egui::Ui, title: &str, muted: Option<&str>) {
                 egui::Label::new(
                     egui::RichText::new(title)
                         .font(theme::semibold(15.0))
-                        .color(TEXT),
+                        .color(pal().text),
                 )
                 .wrap(),
             );
         }
         if let Some(muted) = muted {
-            ui.add(egui::Label::new(egui::RichText::new(muted).color(TEXT_MUTED)).wrap());
+            ui.add(egui::Label::new(egui::RichText::new(muted).color(pal().text_muted)).wrap());
         }
     });
     ui.add_space(56.0);
@@ -578,13 +574,13 @@ pub fn text_edit_menu(response: &Response) {
 /// paints the resting handle in the rail colour).
 fn slider_visuals(style: &mut egui::Style) {
     style.visuals.slider_trailing_fill = true;
-    style.visuals.selection.bg_fill = theme::ACCENT;
+    style.visuals.selection.bg_fill = theme::pal().accent;
     let w = &mut style.visuals.widgets;
-    w.inactive.bg_fill = BORDER;
-    w.inactive.fg_stroke = Stroke::new(2.0, theme::ACCENT);
+    w.inactive.bg_fill = pal().border;
+    w.inactive.fg_stroke = Stroke::new(2.0, theme::pal().accent);
     for state in [&mut w.hovered, &mut w.active] {
-        state.bg_fill = theme::ACCENT;
-        state.fg_stroke = Stroke::new(2.0, theme::FOCUS);
+        state.bg_fill = theme::pal().accent;
+        state.fg_stroke = Stroke::new(2.0, theme::pal().focus);
     }
 }
 
@@ -618,9 +614,9 @@ pub fn slider(
         if ui.is_rect_visible(response.rect) {
             let (center, radius) = slider_thumb(response.rect, *value, lo, hi);
             let painter = ui.painter();
-            painter.circle_filled(center, radius, theme::ACCENT);
+            painter.circle_filled(center, radius, theme::pal().accent);
             if response.hovered() || response.dragged() {
-                painter.circle_stroke(center, radius, Stroke::new(2.0, theme::FOCUS));
+                painter.circle_stroke(center, radius, Stroke::new(2.0, theme::pal().focus));
             }
         }
         response
@@ -663,12 +659,12 @@ pub enum SelectKind {
 pub fn select_style(style: &mut egui::Style, kind: SelectKind) {
     let w = &mut style.visuals.widgets;
     for (state, border) in [
-        (&mut w.inactive, BORDER_STRONG),
-        (&mut w.hovered, BORDER_STRONG),
-        (&mut w.active, theme::ACCENT),
-        (&mut w.open, theme::ACCENT),
+        (&mut w.inactive, pal().border_strong),
+        (&mut w.hovered, pal().border_strong),
+        (&mut w.active, theme::pal().accent),
+        (&mut w.open, theme::pal().accent),
     ] {
-        state.weak_bg_fill = BG_RAISED;
+        state.weak_bg_fill = pal().bg_raised;
         state.bg_stroke = Stroke::new(1.0, border);
         state.corner_radius = CornerRadius::same(theme::R_MD);
     }
@@ -696,7 +692,14 @@ pub const TEXT_INPUT_MARGIN: Margin = Margin::symmetric(10, 6);
 /// `.text-input`: `--bg` fill, 1 px `--border` that turns accent on focus,
 /// radius 6, 6/10 padding. Gives `edit` its `id` (needed to know focus).
 pub fn text_input<'t>(ui: &egui::Ui, id: egui::Id, edit: egui::TextEdit<'t>) -> egui::TextEdit<'t> {
-    framed_text_edit(ui, id, edit, BG_RAISED, theme::R_MD, TEXT_INPUT_MARGIN)
+    framed_text_edit(
+        ui,
+        id,
+        edit,
+        pal().bg_raised,
+        theme::R_MD,
+        TEXT_INPUT_MARGIN,
+    )
 }
 
 /// A text field with its own frame: `fill`, a 1 px `--border` that turns
@@ -712,9 +715,9 @@ pub fn framed_text_edit<'t>(
 ) -> egui::TextEdit<'t> {
     let focused = ui.memory(|m| m.has_focus(id));
     let border = if focused {
-        theme::ACCENT
+        theme::pal().accent
     } else {
-        BORDER_STRONG
+        pal().border_strong
     };
     edit.id(id).margin(margin).frame(
         Frame::new()
@@ -793,12 +796,12 @@ pub fn is_compact(ui: &egui::Ui) -> bool {
 /// Primary button: accent fill, white semibold text.
 pub fn btn_primary(ui: &mut egui::Ui, text: impl Into<WidgetText>) -> Response {
     let style = ButtonStyle {
-        fill: theme::ACCENT,
-        hover_fill: theme::ACCENT_HOVER,
+        fill: theme::pal().accent,
+        hover_fill: theme::pal().accent_hover,
         stroke: Color32::TRANSPARENT,
         hover_stroke: Color32::TRANSPARENT,
-        text: WHITE,
-        hover_text: WHITE,
+        text: pal().white,
+        hover_text: pal().white,
         font: Font::Semibold(theme::BASE_SIZE),
         ..btn_style(ui)
     };
@@ -828,33 +831,40 @@ pub fn switch(ui: &mut egui::Ui, enabled: bool, on: &mut bool, label: &str) -> R
         let radius = CornerRadius::same(255);
         let track = if value {
             if hovered {
-                theme::ACCENT_HOVER
+                theme::pal().accent_hover
             } else {
-                theme::ACCENT
+                theme::pal().accent
             }
         } else if hovered {
-            BG_ACTIVE
+            pal().bg_active
         } else {
-            BG_HOVER
+            pal().bg_hover
         };
         let stroke = if value {
             Stroke::NONE
         } else {
-            Stroke::new(1.0, if hovered { TEXT_MUTED } else { BORDER_STRONG })
+            Stroke::new(
+                1.0,
+                if hovered {
+                    pal().text_muted
+                } else {
+                    pal().border_strong
+                },
+            )
         };
         painter.rect(rect, radius, track, stroke, egui::StrokeKind::Inside);
         let knob_r = if value { 7.0 } else { 6.0 };
         let x = egui::lerp((rect.left() + 10.0)..=(rect.right() - 10.0), t);
-        let knob = if value { WHITE } else { TEXT_MUTED };
+        let knob = if value { pal().white } else { pal().text_muted };
         painter.circle_filled(egui::pos2(x, rect.center().y), knob_r, knob);
         if !enabled {
-            painter.rect_filled(rect, radius, theme::alpha(theme::BG, 0.45));
+            painter.rect_filled(rect, radius, theme::alpha(theme::pal().bg, 0.45));
         }
         if response.has_focus() && focus_visible(ui.ctx()) {
             painter.rect_stroke(
                 rect.expand(2.0),
                 radius,
-                Stroke::new(2.0, theme::FOCUS),
+                Stroke::new(2.0, theme::pal().focus),
                 egui::StrokeKind::Outside,
             );
         }
@@ -870,8 +880,8 @@ pub fn switch(ui: &mut egui::Ui, enabled: bool, on: &mut bool, label: &str) -> R
 /// raised, rounded block (Settings sections, detail panels).
 pub fn group<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     Frame::new()
-        .fill(BG_RAISED)
-        .stroke(Stroke::new(1.0, BORDER))
+        .fill(pal().bg_raised)
+        .stroke(Stroke::new(1.0, pal().border))
         .corner_radius(CornerRadius::same(theme::R_LG))
         .inner_margin(Margin::symmetric(16, 12))
         .show(ui, |ui| {
@@ -885,8 +895,11 @@ pub fn group<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 /// A hairline between two rows of a [`group`], spanning its content width.
 pub fn group_divider(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), Sense::hover());
-    ui.painter()
-        .hline(rect.x_range(), rect.center().y, Stroke::new(1.0, BORDER));
+    ui.painter().hline(
+        rect.x_range(),
+        rect.center().y,
+        Stroke::new(1.0, pal().border),
+    );
 }
 
 /// A section header above a group or list: 12.5 pt semibold muted.
@@ -896,7 +909,7 @@ pub fn section_header(ui: &mut egui::Ui, text: &str) -> Response {
         egui::Label::new(
             egui::RichText::new(text)
                 .font(theme::semibold(12.5))
-                .color(TEXT_MUTED),
+                .color(pal().text_muted),
         )
         .truncate(),
     );
@@ -912,7 +925,7 @@ pub fn day_header(ui: &mut egui::Ui, text: &str) {
         egui::Label::new(
             egui::RichText::new(text)
                 .font(theme::semibold(12.0))
-                .color(TEXT_FAINT),
+                .color(pal().text_faint),
         )
         .truncate(),
     );
@@ -964,9 +977,9 @@ pub fn list_row<R>(
     let rect = response.rect;
     let hovered = response.contains_pointer();
     let fill = if selected {
-        BG_ACTIVE
+        pal().bg_active
     } else if hovered {
-        BG_HOVER
+        pal().bg_hover
     } else {
         Color32::TRANSPARENT
     };
@@ -978,7 +991,7 @@ pub fn list_row<R>(
         ui.painter().rect_stroke(
             rect,
             CornerRadius::same(theme::R_MD),
-            Stroke::new(2.0, theme::FOCUS),
+            Stroke::new(2.0, theme::pal().focus),
             egui::StrokeKind::Inside,
         );
     }
@@ -1071,6 +1084,57 @@ pub fn scroll_column<R>(
         })
 }
 
+#[allow(dead_code)] // TODO(v2): views adopt it
+/// A loading placeholder block: a rounded `bg_hover` bar with a soft
+/// shimmer sweeping across it (static when Windows animations are off).
+pub fn skeleton(ui: &mut egui::Ui, size: egui::Vec2) -> Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let p = pal();
+        let radius = CornerRadius::same((size.y / 2.0).min(6.0) as u8);
+        ui.painter().rect_filled(rect, radius, p.bg_hover);
+        if super::icons::animations_enabled() {
+            // A band 40 % of the screen wide travelling every 1.4 s, the
+            // same phase for every block so a list shimmers as one.
+            let t = ui.input(|i| i.time) as f32 % 1.4 / 1.4;
+            let screen = ui.ctx().content_rect();
+            let band = screen.width() * 0.4;
+            let x = screen.left() - band + (screen.width() + band * 2.0) * t;
+            let glow = egui::Rect::from_x_y_ranges(x..=x + band, rect.y_range()).intersect(rect);
+            if glow.width() > 0.0 {
+                let shine = if p.dark {
+                    Color32::from_white_alpha(10)
+                } else {
+                    Color32::from_white_alpha(140)
+                };
+                ui.painter()
+                    .with_clip_rect(rect)
+                    .rect_filled(glow, radius, shine);
+            }
+            super::icons::request_animation_frame(ui.ctx());
+        }
+    }
+    response
+}
+
+#[allow(dead_code)] // TODO(v2): views adopt it
+/// `rows` list-row placeholders (a title bar and a shorter meta bar each),
+/// widths varied so it reads as content, for a view's first load.
+pub fn skeleton_rows(ui: &mut egui::Ui, rows: usize) {
+    let width = ui.available_width();
+    for row in 0..rows {
+        let title = width * [0.62, 0.48, 0.71, 0.55, 0.66, 0.44][row % 6];
+        let meta = width * [0.28, 0.22, 0.31, 0.25][row % 4];
+        Frame::new()
+            .inner_margin(Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 8.0;
+                skeleton(ui, egui::vec2(title.max(60.0), 12.0));
+                skeleton(ui, egui::vec2(meta.max(40.0), 9.0));
+            });
+    }
+}
+
 /// The content column every view lives in: at most
 /// [`theme::CONTENT_MAX`] wide, centred.
 pub fn content_column<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -1115,7 +1179,7 @@ mod tests {
                 ui,
                 "A very long meeting title that will be elided",
                 theme::semibold(14.0),
-                TEXT,
+                pal().text,
             );
             avatar(ui, "Paul Gordon", theme::chip_color("S2"), 32.0);
             section_header(ui, "Recording");
@@ -1215,7 +1279,7 @@ mod tests {
         assert!((6.5..=8.5).contains(&radius), "radius {radius}");
         let disc = shapes.iter().any(|shape| {
             matches!(shape, egui::Shape::Circle(c)
-                if c.fill == theme::ACCENT && c.center == center && c.radius == radius)
+                if c.fill == theme::pal().accent && c.center == center && c.radius == radius)
         });
         assert!(disc, "no solid accent thumb: {shapes:?}");
         // The rail: 4 pt tall, no 18x24 rectangular handle anywhere.
@@ -1250,12 +1314,12 @@ mod tests {
         let buttons: Vec<_> = shapes
             .iter()
             .filter_map(|shape| match shape {
-                egui::Shape::Rect(r) if r.stroke.color == BORDER_STRONG => Some(r),
+                egui::Shape::Rect(r) if r.stroke.color == pal().border_strong => Some(r),
                 _ => None,
             })
             .collect();
         assert_eq!(buttons.len(), 2, "{shapes:?}");
-        assert!(buttons.iter().all(|r| r.fill == BG_RAISED));
+        assert!(buttons.iter().all(|r| r.fill == pal().bg_raised));
         // `.player-speed` (12 px, 4/6 padding) is shorter than a text input.
         assert!(heights[1] <= 26.0 && heights[1] < heights[0], "{heights:?}");
     }

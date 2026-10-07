@@ -11,9 +11,7 @@
 use crate::bridge::Task;
 use crate::ui::format::{fmt_ts, parse_snippet, SnippetPart};
 use crate::ui::icons::{self, ph};
-use crate::ui::theme::{
-    self, ACCENT, BG_HOVER, BG_RAISED, MARK_BG, MARK_TEXT, REC, TEXT, TEXT_FAINT, TEXT_MUTED,
-};
+use crate::ui::theme::{self, pal};
 use crate::ui::views::meetings::{follow_focus, load_more_button, paint_focus_ring};
 use crate::ui::widgets::{self, KeyScroll, Politeness};
 use crate::ui::{SearchFilters, UiCtx, View, Who};
@@ -70,7 +68,7 @@ pub fn search_box(ui: &mut egui::Ui, cx: &mut UiCtx, current: &View) {
         // `<input type=search>` keeps focus on Enter.
         .return_key(None::<egui::KeyboardShortcut>)
         .desired_width(f32::INFINITY);
-    let edit = widgets::framed_text_edit(ui, id, edit, BG_RAISED, theme::R_MD, margin);
+    let edit = widgets::framed_text_edit(ui, id, edit, pal().bg_raised, theme::R_MD, margin);
     let response = ui.add(edit);
     icons::paint_rotated_glyph(
         ui.painter(),
@@ -80,7 +78,11 @@ pub fn search_box(ui: &mut egui::Ui, cx: &mut UiCtx, current: &View) {
         ),
         ph::MAGNIFYING_GLASS,
         15.0,
-        if focused { TEXT_MUTED } else { TEXT_FAINT },
+        if focused {
+            pal().text_muted
+        } else {
+            pal().text_faint
+        },
         0.0,
     );
     widgets::text_edit_menu(&response);
@@ -141,14 +143,14 @@ fn clear_button(ui: &mut egui::Ui, field: Rect) -> bool {
     let hot = response.hovered() || response.has_focus();
     if hot {
         ui.painter()
-            .rect_filled(rect, CornerRadius::same(theme::R_SM), BG_HOVER);
+            .rect_filled(rect, CornerRadius::same(theme::R_SM), pal().bg_hover);
     }
     crate::ui::icons::paint_rotated_glyph(
         ui.painter(),
         rect.center(),
         ph::X,
         14.0,
-        if hot { TEXT } else { TEXT_MUTED },
+        if hot { pal().text } else { pal().text_muted },
         0.0,
     );
     if response.has_focus() {
@@ -279,7 +281,11 @@ fn hit_job(hit: &SearchHit, wrap_width: f32) -> (LayoutJob, Vec<Range<usize>>) {
             marks.push(chars..chars + n);
         }
         chars += n;
-        job.append(&text, 0.0, format(if mark { MARK_TEXT } else { TEXT }));
+        job.append(
+            &text,
+            0.0,
+            format(if mark { pal().mark_text } else { pal().text }),
+        );
     }
     (job, marks)
 }
@@ -296,20 +302,20 @@ fn hit_meta_job(hit: &SearchHit, width: f32) -> LayoutJob {
         job.append(
             "Meeting notes",
             0.0,
-            TextFormat::simple(theme::semibold(12.0), TEXT_MUTED),
+            TextFormat::simple(theme::semibold(12.0), pal().text_muted),
         );
         return job;
     }
     job.append(
         &fmt_ts(hit.start_ms),
         0.0,
-        TextFormat::simple(theme::regular(12.0), TEXT_FAINT),
+        TextFormat::simple(theme::regular(12.0), pal().text_faint),
     );
     if let Some(speaker) = hit.speaker_name.as_deref().filter(|s| !s.is_empty()) {
         job.append(
             speaker,
             8.0,
-            TextFormat::simple(theme::semibold(12.0), TEXT_MUTED),
+            TextFormat::simple(theme::semibold(12.0), pal().text_muted),
         );
     }
     job
@@ -386,10 +392,10 @@ fn hit_row(ui: &mut egui::Ui, index: usize, hit: &SearchHit) -> bool {
                     mark.translate(rect.min.to_vec2())
                         .expand2(egui::vec2(2.0, 0.0)),
                     CornerRadius::same(3),
-                    MARK_BG,
+                    pal().mark_bg,
                 );
             }
-            ui.painter().galley(rect.min, galley, TEXT);
+            ui.painter().galley(rect.min, galley, pal().text);
         }
     });
     let label = hit_label(hit);
@@ -407,7 +413,7 @@ fn group_title(ui: &mut egui::Ui, hit: &SearchHit, today: NaiveDate) -> bool {
     let date = ui.painter().layout_no_wrap(
         group_date(&hit.started_at, today),
         theme::regular(12.0),
-        TEXT_MUTED,
+        pal().text_muted,
     );
     // The date gives way first on very narrow columns.
     let show_date = date.size().x + theme::S3 <= inner * 0.45;
@@ -417,7 +423,7 @@ fn group_title(ui: &mut egui::Ui, hit: &SearchHit, today: NaiveDate) -> bool {
         inner
     };
     let font = theme::semibold(14.0);
-    let mut job = LayoutJob::simple_singleline(hit.meeting_title.clone(), font, TEXT);
+    let mut job = LayoutJob::simple_singleline(hit.meeting_title.clone(), font, pal().text);
     job.wrap = TextWrapping::truncate_at_width(title_width.max(1.0));
     let title = ui.painter().layout_job(job);
     let height = title.size().y.max(date.size().y) + 8.0;
@@ -432,14 +438,14 @@ fn group_title(ui: &mut egui::Ui, hit: &SearchHit, today: NaiveDate) -> bool {
     let id = ui.id().with(("search-group", hit.meeting_id));
     let response = ui.interact(title_rect, id, Sense::click());
     let hot = response.hovered();
-    let color = if hot { ACCENT } else { TEXT };
+    let color = if hot { pal().accent } else { pal().text };
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         let elided = title.elided;
         painter.galley(title_rect.min, title, color);
         if hot {
             let y = title_rect.bottom() - 1.0;
-            painter.hline(title_rect.x_range(), y, Stroke::new(1.0, ACCENT));
+            painter.hline(title_rect.x_range(), y, Stroke::new(1.0, pal().accent));
         }
         if show_date {
             painter.galley(
@@ -448,7 +454,7 @@ fn group_title(ui: &mut egui::Ui, hit: &SearchHit, today: NaiveDate) -> bool {
                     rect.center().y - date.size().y / 2.0,
                 ),
                 date,
-                TEXT_MUTED,
+                pal().text_muted,
             );
         }
         if response.has_focus() && widgets::focus_visible(ui.ctx()) {
@@ -493,11 +499,15 @@ fn heading_galley(
     let layout = |query: &str| {
         let (main, suffix) = heading(query, count, has_more);
         let mut job = LayoutJob::default();
-        job.append(&main, 0.0, TextFormat::simple(theme::semibold(17.0), TEXT));
+        job.append(
+            &main,
+            0.0,
+            TextFormat::simple(theme::semibold(17.0), pal().text),
+        );
         job.append(
             &suffix,
             0.0,
-            TextFormat::simple(theme::semibold(17.0), TEXT_MUTED),
+            TextFormat::simple(theme::semibold(17.0), pal().text_muted),
         );
         job.wrap = TextWrapping {
             max_width: width.max(40.0),
@@ -861,7 +871,7 @@ impl SearchView {
             ] {
                 let label_width = ui
                     .painter()
-                    .layout_no_wrap(label.into(), theme::regular(13.0), TEXT_MUTED)
+                    .layout_no_wrap(label.into(), theme::regular(13.0), pal().text_muted)
                     .size()
                     .x;
                 let width = label_width + theme::S2 + DATE_WIDTH;
@@ -871,7 +881,7 @@ impl SearchView {
                         ui.label(
                             egui::RichText::new(label)
                                 .font(theme::regular(13.0))
-                                .color(TEXT_MUTED),
+                                .color(pal().text_muted),
                         );
                         date_field(ui, name, id, text, Some(DATE_WIDTH));
                     });
@@ -916,7 +926,11 @@ fn filters_toggle(ui: &mut egui::Ui, open: bool, active: usize) -> egui::Respons
     };
     let text = egui::RichText::new(format!("{}  Filters{count}  {caret}", ph::FUNNEL))
         .size(13.0)
-        .color(if active > 0 { ACCENT } else { TEXT_MUTED });
+        .color(if active > 0 {
+            pal().accent
+        } else {
+            pal().text_muted
+        });
     let response = widgets::btn_ghost(ui, text);
     let name = if active > 0 {
         format!("Filters ({active} active)")
@@ -943,7 +957,7 @@ fn stacked(ui: &mut egui::Ui, label: &str, height: f32, control: impl FnOnce(&mu
                 ui.label(
                     egui::RichText::new(label)
                         .font(theme::regular(13.0))
-                        .color(TEXT_MUTED),
+                        .color(pal().text_muted),
                 );
             },
         );
@@ -1012,7 +1026,7 @@ fn date_field(ui: &mut egui::Ui, name: &str, id: &str, text: &mut String, width:
         ui,
         id,
         edit,
-        BG_RAISED,
+        pal().bg_raised,
         theme::R_MD,
         widgets::TEXT_INPUT_MARGIN,
     );
@@ -1022,7 +1036,7 @@ fn date_field(ui: &mut egui::Ui, name: &str, id: &str, text: &mut String, width:
         ui.painter().rect_stroke(
             response.rect,
             CornerRadius::same(theme::R_MD),
-            Stroke::new(1.0, REC),
+            Stroke::new(1.0, pal().rec),
             StrokeKind::Inside,
         );
     }

@@ -20,9 +20,7 @@
 use crate::bridge::{OpDone, Task};
 use crate::ui::format::fmt_duration;
 use crate::ui::icons::{self, ph};
-use crate::ui::theme::{
-    self, ACCENT, BG, BG_HOVER, FOCUS, REC, TEXT, TEXT_FAINT, TEXT_MUTED, WARN,
-};
+use crate::ui::theme::{self, pal};
 use crate::ui::toasts::{Notice, ToastAction};
 use crate::ui::widgets::{self, KeyScroll};
 use crate::ui::{UiCtx, View};
@@ -86,11 +84,11 @@ pub(crate) fn status_label(status: &str) -> &str {
 /// Glyph and colour of the `StatusIcon` for `status`.
 fn status_glyph(status: &str) -> (&'static str, Color32) {
     match status {
-        "recording" => (ph::RECORD, REC),
-        "recorded" => (ph::WAVEFORM, WARN),
-        "processing" => (ph::CIRCLE_NOTCH, WARN),
-        "failed" => (ph::WARNING_CIRCLE, REC),
-        _ => (ph::CHECK_CIRCLE, theme::OK),
+        "recording" => (ph::RECORD, pal().rec),
+        "recorded" => (ph::WAVEFORM, pal().warn),
+        "processing" => (ph::CIRCLE_NOTCH, pal().warn),
+        "failed" => (ph::WARNING_CIRCLE, pal().rec),
+        _ => (ph::CHECK_CIRCLE, theme::pal().ok),
     }
 }
 
@@ -204,7 +202,7 @@ pub(crate) fn paint_focus_ring(ui: &egui::Ui, rect: Rect, radius: u8) {
     ui.painter().rect_stroke(
         rect.expand(2.0),
         CornerRadius::same(radius + 2),
-        Stroke::new(2.0, FOCUS),
+        Stroke::new(2.0, pal().focus),
         StrokeKind::Outside,
     );
 }
@@ -214,7 +212,7 @@ fn paint_row_focus(ui: &egui::Ui, rect: Rect) {
     ui.painter().rect_stroke(
         rect,
         CornerRadius::same(theme::R_MD),
-        Stroke::new(2.0, FOCUS),
+        Stroke::new(2.0, pal().focus),
         StrokeKind::Inside,
     );
 }
@@ -259,9 +257,9 @@ fn paint_glyph(ui: &egui::Ui, rect: Rect, glyph: &str, color: Color32) {
 /// Side of the square `widgets::icon_btn` box for a 16 pt glyph (the
 /// kit's formula, so status icons and buttons line up).
 fn icon_slot(ui: &egui::Ui) -> f32 {
-    let galley = ui
-        .painter()
-        .layout_no_wrap(ph::TRASH.to_owned(), theme::regular(ICON), TEXT);
+    let galley =
+        ui.painter()
+            .layout_no_wrap(ph::TRASH.to_owned(), theme::regular(ICON), pal().text);
     (galley.size().x.max(ICON) + 12.0).max(28.0)
 }
 
@@ -975,7 +973,7 @@ impl MeetingsView {
             if open {
                 let label = egui::RichText::new("Empty bin")
                     .size(13.0)
-                    .color(TEXT_MUTED);
+                    .color(pal().text_muted);
                 let button = widgets::btn_ghost(ui, label);
                 follow_focus(&button);
                 if button.clicked() {
@@ -1000,7 +998,7 @@ impl MeetingsView {
                     egui::Label::new(
                         egui::RichText::new("Meetings here are deleted for good after 30 days.")
                             .font(theme::regular(12.0))
-                            .color(TEXT_FAINT),
+                            .color(pal().text_faint),
                     )
                     .wrap(),
                 );
@@ -1183,7 +1181,7 @@ fn meeting_row(
     let revealed = hovered || is_editing || (focus_kept && ring);
     if hovered {
         row.painter()
-            .rect_filled(rect, CornerRadius::same(theme::R_MD), BG_HOVER);
+            .rect_filled(rect, CornerRadius::same(theme::R_MD), pal().bg_hover);
     }
 
     let metrics = if is_editing {
@@ -1310,24 +1308,27 @@ fn open_row(
             row,
             &m.title,
             theme::semibold(14.0),
-            TEXT,
+            pal().text,
             main_rect.width(),
         );
         elided = title.elided;
         let title_top = main_rect.top() + (metrics.line - metrics.title) / 2.0;
         title_rect = Rect::from_min_size(egui::pos2(main_rect.left(), title_top), title.size());
-        row.painter().galley(title_rect.min, title, TEXT);
+        row.painter().galley(title_rect.min, title, pal().text);
     }
     let meta = truncated(
         row,
         &meta_line(m),
         theme::regular(12.0),
-        TEXT_MUTED,
+        pal().text_muted,
         main_rect.width(),
     );
     let meta_top = main_rect.top() + metrics.line + TITLE_META_GAP;
-    row.painter()
-        .galley(egui::pos2(main_rect.left(), meta_top), meta, TEXT_MUTED);
+    row.painter().galley(
+        egui::pos2(main_rect.left(), meta_top),
+        meta,
+        pal().text_muted,
+    );
 
     let name = format!("Open {}, {}", m.title, status_label(&m.status));
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &name));
@@ -1388,8 +1389,8 @@ fn rename_editor(
             .layout(Layout::left_to_right(Align::Center)),
     );
     let frame = egui::Frame::new()
-        .fill(BG)
-        .stroke(Stroke::new(1.0, ACCENT))
+        .fill(pal().bg)
+        .stroke(Stroke::new(1.0, pal().accent))
         .corner_radius(CornerRadius::same(theme::R_SM))
         .inner_margin(EDIT_MARGIN);
     if row.input(|i| i.key_pressed(Key::Escape)) {
@@ -1461,10 +1462,13 @@ fn status_button(
     let (glyph, color) = status_glyph(status);
     let hot = response.hovered() || response.has_focus();
     if hot {
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(theme::R_MD), theme::BG_ACTIVE);
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::same(theme::R_MD),
+            theme::pal().bg_active,
+        );
     }
-    paint_glyph(ui, rect, glyph, if hot { TEXT } else { color });
+    paint_glyph(ui, rect, glyph, if hot { pal().text } else { color });
     if response.has_focus() && widgets::focus_visible(ui.ctx()) {
         paint_focus_ring(ui, rect, theme::R_MD);
     }
@@ -1478,7 +1482,11 @@ fn status_button(
 /// A full-width, flat "Load more" (accent text, hover fill), as wide as
 /// the rows above it; disabled while a load runs. Shared with Search.
 pub(crate) fn load_more_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> Response {
-    let color = if enabled { ACCENT } else { TEXT_MUTED };
+    let color = if enabled {
+        pal().accent
+    } else {
+        pal().text_muted
+    };
     let galley = ui
         .painter()
         .layout_no_wrap(label.to_owned(), theme::semibold(13.0), color);
@@ -1494,7 +1502,7 @@ pub(crate) fn load_more_button(ui: &mut egui::Ui, label: &str, enabled: bool) ->
         let hot = enabled && response.hovered();
         if hot {
             ui.painter()
-                .rect_filled(rect, CornerRadius::same(theme::R_MD), BG_HOVER);
+                .rect_filled(rect, CornerRadius::same(theme::R_MD), pal().bg_hover);
         }
         ui.painter()
             .galley(rect.center() - galley.size() / 2.0, galley, color);
@@ -1514,7 +1522,7 @@ pub(crate) fn load_more_button(ui: &mut egui::Ui, label: &str, enabled: bool) ->
 fn empty_bin_width(ui: &egui::Ui) -> f32 {
     let galley = ui
         .painter()
-        .layout_no_wrap("Empty bin".into(), theme::regular(13.0), TEXT);
+        .layout_no_wrap("Empty bin".into(), theme::regular(13.0), pal().text);
     galley.size().x + 2.0 * ui.spacing().button_padding.x
 }
 
@@ -1525,19 +1533,19 @@ fn bin_head(ui: &mut egui::Ui, width: f32, count: usize, open: bool) -> Response
     let font = theme::semibold(12.5);
     let galley = ui
         .painter()
-        .layout_no_wrap(text.to_owned(), font.clone(), TEXT_MUTED);
+        .layout_no_wrap(text.to_owned(), font.clone(), pal().text_muted);
     let count_galley =
         ui.painter()
-            .layout_no_wrap(count.to_string(), theme::regular(12.0), TEXT_FAINT);
+            .layout_no_wrap(count.to_string(), theme::regular(12.0), pal().text_faint);
     let height = ui.spacing().interact_size.y;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), Sense::click());
     if ui.is_rect_visible(rect) {
         let hot = response.hovered();
         if hot {
             ui.painter()
-                .rect_filled(rect, CornerRadius::same(theme::R_MD), BG_HOVER);
+                .rect_filled(rect, CornerRadius::same(theme::R_MD), pal().bg_hover);
         }
-        let color = if hot { TEXT } else { TEXT_MUTED };
+        let color = if hot { pal().text } else { pal().text_muted };
         let cy = rect.center().y;
         let mut x = rect.left() + ROW_PAD.x;
         let caret = if open {
@@ -1570,7 +1578,7 @@ fn bin_head(ui: &mut egui::Ui, width: f32, count: usize, open: bool) -> Response
         ui.painter().galley(
             egui::pos2(x, cy - count_galley.size().y / 2.0),
             count_galley,
-            TEXT_FAINT,
+            pal().text_faint,
         );
         if response.has_focus() && widgets::focus_visible(ui.ctx()) {
             paint_row_focus(ui, rect);
@@ -1607,12 +1615,12 @@ fn bin_row(
                 ui.vertical(|ui| {
                     ui.set_width(main_width);
                     ui.spacing_mut().item_spacing.y = TITLE_META_GAP;
-                    widgets::elide(ui, &m.title, theme::semibold(14.0), TEXT);
+                    widgets::elide(ui, &m.title, theme::semibold(14.0), pal().text);
                     widgets::elide(
                         ui,
                         &bin_meta_line(d, today),
                         theme::regular(12.0),
-                        TEXT_MUTED,
+                        pal().text_muted,
                     );
                 });
                 ui.add_space(MAIN_GAP);
@@ -1641,7 +1649,11 @@ fn bin_row(
     if ui.rect_contains_pointer(row.rect) {
         ui.painter().set(
             background,
-            egui::epaint::RectShape::filled(row.rect, CornerRadius::same(theme::R_MD), BG_HOVER),
+            egui::epaint::RectShape::filled(
+                row.rect,
+                CornerRadius::same(theme::R_MD),
+                pal().bg_hover,
+            ),
         );
     }
 }
@@ -1682,7 +1694,7 @@ mod tests {
         assert_eq!(status_label("failed"), "Transcription failed");
         assert_eq!(status_label("weird"), "weird");
         assert_eq!(status_glyph("weird").0, ph::CHECK_CIRCLE);
-        assert_eq!(status_glyph("recording"), (ph::RECORD, REC));
+        assert_eq!(status_glyph("recording"), (ph::RECORD, pal().rec));
     }
 
     #[test]

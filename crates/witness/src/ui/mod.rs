@@ -9,6 +9,8 @@ pub mod confirm;
 pub mod fonts;
 pub mod format;
 pub mod icons;
+pub mod onboarding;
+pub mod palette;
 pub mod theme;
 pub mod toasts;
 pub mod topbar;
@@ -240,6 +242,24 @@ pub struct UiCtx<'a> {
     pub flyout: &'a mut FlyoutState,
     pub cmds: &'a mut Vec<UiCmd>,
     pub fonts: &'a FontLoader,
+    #[allow(dead_code)] // TODO(v2): the split shell and views read it
+    /// Where the view being drawn sits (wide windows split the meeting
+    /// list and the open transcript side by side).
+    pub pane: PaneRole,
+}
+
+/// The role of the view being drawn in the shell's layout.
+#[allow(dead_code)] // TODO(v2): the split shell constructs List / Detail
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaneRole {
+    /// The whole content area (narrow windows, and every non-split view).
+    #[default]
+    Full,
+    /// The list column of a split: `selected` is the meeting open on the
+    /// right (highlight it; opening another replaces it).
+    List { selected: Option<i64> },
+    /// The detail column of a split (no Back button: the list is beside it).
+    Detail,
 }
 
 impl UiCtx<'_> {

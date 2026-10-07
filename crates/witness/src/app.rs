@@ -23,10 +23,12 @@ use crate::settings_store::SettingsStore;
 use crate::ui::captions::{CaptionsOverlay, OpenReason};
 use crate::ui::confirm::Confirm;
 use crate::ui::fonts::FontLoader;
+use crate::ui::onboarding::Onboarding;
+use crate::ui::palette::CommandPalette;
 use crate::ui::toasts::{Notice, ToastAction, Toasts};
 use crate::ui::{
-    icons, submit_recording, theme, topbar, views, widgets, ActiveView, Nav, UiCmd, UiCtx, View,
-    ViewMemory,
+    icons, submit_recording, theme, topbar, views, widgets, ActiveView, Nav, PaneRole, UiCmd,
+    UiCtx, View, ViewMemory,
 };
 use crate::ui_state::{PrefsWriter, UiPrefs};
 use crossbeam_channel::Receiver;
@@ -72,6 +74,8 @@ pub struct StartParts {
     pub minimized: bool,
     /// Debug builds: an off-screen snapshot run (`crate::snapshot`).
     pub snapshot: Option<crate::snapshot::Config>,
+    /// The window was created transparent for the Mica backdrop.
+    pub backdrop: bool,
 }
 
 /// The OS-shell objects released at the point of no return of an exit path.
@@ -146,6 +150,63 @@ pub struct WitnessApp {
     debug_panic_hotkey: bool,
     /// Debug builds: an off-screen snapshot run (`crate::snapshot`).
     snapshot: Option<crate::snapshot::Snapshot>,
+    /// Windows' app mode and accent, re-read every few seconds.
+    system_theme: SystemTheme,
+    /// The Ctrl+K command palette.
+    palette: CommandPalette,
+    /// First-run setup (shown instead of the views while active).
+    onboarding: Onboarding,
+    /// The Mica backdrop is showing (window background transparent).
+    backdrop_on: bool,
+}
+
+/// Windows' theme inputs, cached (registry reads are not per-frame work).
+struct SystemTheme {
+    light: Option<bool>,
+    accent: Option<[egui::Color32; 7]>,
+    read_at: Instant,
+}
+
+/// How often Windows' app mode / accent are re-read while shown.
+const SYSTEM_THEME_POLL: Duration = Duration::from_secs(2);
+
+impl SystemTheme {
+    fn read() -> SystemTheme {
+        SystemTheme {
+            light: system::apps_use_light_theme(),
+            accent: system::accent_palette()
+                .map(|shades| shades.map(|[r, g, b]| egui::Color32::from_rgb(r, g, b))),
+            read_at: Instant::now(),
+        }
+    }
+}
+
+/// The palette for `prefs` (Appearance, accent source) given Windows'
+/// settings. Debug builds honour `WITNESS_DEBUG_THEME=light|dark`.
+fn resolve_palette(prefs: &UiPrefs, system: &SystemTheme, backdrop: bool) -> theme::Palette {
+    use crate::ui_state::{AccentSource, Appearance};
+    let mut dark = match prefs.appearance {
+        Appearance::System => !system.light.unwrap_or(false),
+        Appearance::Light => false,
+        Appearance::Dark => true,
+    };
+    if cfg!(debug_assertions) {
+        match std::env::var("WITNESS_DEBUG_THEME").ok().as_deref() {
+            Some("light") => dark = false,
+            Some("dark") => dark = true,
+            _ => {}
+        }
+    }
+    let accent = match prefs.accent {
+        AccentSource::Windows => system.accent.as_ref(),
+        AccentSource::Witness => None,
+    };
+    let palette = theme::Palette::resolve(dark, accent);
+    if backdrop {
+        palette.with_backdrop()
+    } else {
+        palette
+    }
 }
 
 impl WitnessApp {
@@ -159,6 +220,7 @@ impl WitnessApp {
             instance_guard,
             minimized,
             snapshot,
+            backdrop,
         } = parts;
         let ctx = cc.egui_ctx.clone();
 
@@ -197,6 +259,12 @@ impl WitnessApp {
 
         let data_dir = core.runtime_data_dir();
         let prefs = UiPrefs::load(&data_dir);
+        // Mica needs the transparent window `main.rs` created; without it
+        // (or if DWM refuses) the window paints its opaque background.
+        let backdrop_on = backdrop && window.set_backdrop(true);
+        let system_theme = SystemTheme::read();
+        let onboarding = Onboarding::new(&prefs);
+        theme::apply(&ctx, resolve_palette(&prefs, &system_theme, backdrop_on));
         let repaint_ctx = ctx.clone();
         let player = Player::spawn(Arc::new(move || wake_root(&repaint_ctx)));
 
@@ -254,6 +322,10 @@ impl WitnessApp {
             debug_panic_hotkey: cfg!(debug_assertions)
                 && std::env::var_os("WITNESS_DEBUG_PANIC_HOTKEY").is_some_and(|v| v == "1"),
             snapshot: snapshot.map(crate::snapshot::Snapshot::new),
+            system_theme,
+            backdrop_on,
+            palette: CommandPalette::new(),
+            onboarding,
         };
         app.apply_zoom(&ctx);
         app.debug_surfaces();
@@ -284,6 +356,7 @@ impl WitnessApp {
             flyout: &mut self.flyout,
             cmds: &mut self.cmds,
             fonts: &self.fonts,
+            pane: PaneRole::Full,
         };
         f(&mut self.active, &mut cx)
     }
@@ -804,8 +877,18 @@ impl WitnessApp {
             return;
         }
         let typing = ctx.egui_wants_keyboard_input();
+        if ctx.input_mut(|i| consume_key_exact(i, Key::K, |m| m.command && !m.alt))
+            && !self.onboarding.is_active()
+        {
+            self.palette.toggle();
+        }
+        if self.palette.is_open() {
+            return;
+        }
+        // In a transcript Ctrl+F is find-in-transcript (the view's).
+        let in_transcript = matches!(self.view, View::Transcript { .. });
         let jump = ctx.input_mut(|i| {
-            let ctrl_f = consume_key_exact(i, Key::F, |m| m.command && !m.alt);
+            let ctrl_f = !in_transcript && consume_key_exact(i, Key::F, |m| m.command && !m.alt);
             let slash = !typing && consume_key_exact(i, Key::Slash, |m| !m.command && !m.alt);
             ctrl_f || slash
         });
@@ -996,6 +1079,21 @@ impl eframe::App for WitnessApp {
 
         self.persist_prefs(ctx);
 
+        // Follow Windows' app mode / accent and the Appearance setting.
+        if (focused && !self.was_focused)
+            || self.system_theme.read_at.elapsed() >= SYSTEM_THEME_POLL
+        {
+            self.system_theme = SystemTheme::read();
+        }
+        let palette = resolve_palette(&self.prefs, &self.system_theme, self.backdrop_on);
+        theme::apply(ctx, palette);
+        if self.backdrop_on {
+            self.window.set_dark_frame(palette.dark);
+        }
+        if self.window.is_shown() && !minimized {
+            ctx.request_repaint_after(SYSTEM_THEME_POLL);
+        }
+
         // Re-read the Windows text size whenever the window gains focus.
         if focused && !self.was_focused {
             let scale = system::text_scale_factor();
@@ -1024,6 +1122,9 @@ impl eframe::App for WitnessApp {
         }
 
         let mut topbar_out = topbar::TopBarOutput::default();
+        // Drawn with the views' `UiCtx`; moved out for the closure's borrow.
+        let mut palette = std::mem::take(&mut self.palette);
+        let mut onboarding = std::mem::take(&mut self.onboarding);
         // F0 → U7/U4 contract: besides the documented `show`, `resize_edges`
         // and the banners, this calls `topbar::frame()` and
         // `topbar::paint_bottom_border(ui, rect)` (U7 keeps both), and it
@@ -1044,12 +1145,14 @@ impl eframe::App for WitnessApp {
             // Views own their full-width scroller (bar at the window edge)
             // and centre their content in `widgets::scroll_column`; the shell
             // only pads the banner and the search box the same way.
-            let content = egui::Frame::new().fill(theme::BG).inner_margin(Margin {
-                left: 0,
-                right: 0,
-                top: 12,
-                bottom: 0,
-            });
+            let content = egui::Frame::new()
+                .fill(theme::pal().window_bg)
+                .inner_margin(Margin {
+                    left: 0,
+                    right: 0,
+                    top: 12,
+                    bottom: 0,
+                });
             egui::CentralPanel::default().frame(content).show(ui, |ui| {
                 widgets::clear_view_viewport(ui.ctx());
                 let banner = topbar::has_model_banner(cx);
@@ -1067,9 +1170,18 @@ impl eframe::App for WitnessApp {
                     });
                     widgets::gap(ui, theme::S2);
                 }
-                view.show(ui, cx);
+                if onboarding.is_active() {
+                    onboarding.show(ui, cx);
+                } else {
+                    view.show(ui, cx);
+                }
             });
+            if palette.is_open() {
+                palette.show(ui.ctx(), cx);
+            }
         });
+        self.palette = palette;
+        self.onboarding = onboarding;
 
         self.confirm.show(&ctx);
         if let Some(action) = self.toasts.show(&ctx) {

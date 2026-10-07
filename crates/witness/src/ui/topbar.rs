@@ -13,10 +13,7 @@
 
 use super::format::{capture_warning, fmt_elapsed};
 use super::icons::{self, ph};
-use super::theme::{
-    self, ACCENT, ACCENT_HOVER, ACCENT_SOFT, BG, BG_HOVER, BG_RAISED, BORDER, OK, REC, REC_HOVER,
-    REC_LIGHT, TEXT, TEXT_MUTED, WARN, WHITE,
-};
+use super::theme::{self, pal};
 use super::widgets::{self, PillKind, Politeness};
 use super::{UiCtx, View};
 use crate::bridge::OpDone;
@@ -496,7 +493,7 @@ fn stable_width(ui: &egui::Ui, text: &str, font: FontId) -> f32 {
         .map(|c| if c.is_ascii_digit() { '0' } else { c })
         .collect();
     ui.painter()
-        .layout_no_wrap(template, font, TEXT)
+        .layout_no_wrap(template, font, pal().text)
         .size()
         .x
         .ceil()
@@ -516,7 +513,7 @@ fn measure_row(ui: &egui::Ui, model: &BarModel) -> RowWidths {
     ];
     let labels = [NavItem::Meetings, NavItem::People].map(|item| {
         ui.painter()
-            .layout_no_wrap(item.label().to_owned(), nav_font(), TEXT)
+            .layout_no_wrap(item.label().to_owned(), nav_font(), pal().text)
             .size()
             .x
             .ceil()
@@ -667,12 +664,15 @@ struct Look {
 }
 
 /// Bookmark, CC and an unselected gear: no fill until hovered.
-const GHOST: Look = Look {
-    fill: Color32::TRANSPARENT,
-    hover_fill: BG_HOVER,
-    glyph: TEXT_MUTED,
-    hover_glyph: TEXT,
-};
+fn ghost() -> Look {
+    let p = pal();
+    Look {
+        fill: Color32::TRANSPARENT,
+        hover_fill: p.bg_hover,
+        glyph: p.text_muted,
+        hover_glyph: p.text,
+    }
+}
 
 /// A 32 pt square bar button with `glyph` (`size` pt) centred, radius 8,
 /// the keyboard focus ring and `label` as its accessible name. Dimmed and
@@ -724,7 +724,7 @@ fn focus_ring(ui: &egui::Ui, rect: Rect, radius: u8) {
     ui.painter().rect_stroke(
         rect.expand(2.0),
         CornerRadius::same(radius.saturating_add(2)),
-        Stroke::new(2.0, theme::FOCUS),
+        Stroke::new(2.0, theme::pal().focus),
         egui::StrokeKind::Outside,
     );
 }
@@ -743,17 +743,17 @@ fn record_button(ui: &mut egui::Ui, model: &BarModel) -> egui::Response {
     };
     let look = if recording {
         Look {
-            fill: REC,
-            hover_fill: REC_HOVER,
-            glyph: WHITE,
-            hover_glyph: WHITE,
+            fill: pal().rec,
+            hover_fill: pal().rec_hover,
+            glyph: pal().white,
+            hover_glyph: pal().white,
         }
     } else {
         Look {
-            fill: theme::alpha(REC, 0.16),
-            hover_fill: theme::alpha(REC, 0.28),
-            glyph: REC,
-            hover_glyph: REC_LIGHT,
+            fill: theme::alpha(pal().rec, 0.16),
+            hover_fill: theme::alpha(pal().rec, 0.28),
+            glyph: pal().rec,
+            hover_glyph: pal().rec_light,
         }
     };
     ui.add_enabled_ui(!model.busy, |ui| {
@@ -761,14 +761,14 @@ fn record_button(ui: &mut egui::Ui, model: &BarModel) -> egui::Response {
         let rect = response.rect;
         let enabled = ui.is_enabled();
         let color = match (recording, enabled) {
-            (true, _) => WHITE,
-            (false, true) if response.hovered() => REC_LIGHT,
-            (false, true) => REC,
-            (false, false) => REC.gamma_multiply(0.55),
+            (true, _) => pal().white,
+            (false, true) if response.hovered() => pal().rec_light,
+            (false, true) => pal().rec,
+            (false, false) => pal().rec.gamma_multiply(0.55),
         };
         let painter = ui.painter();
         if recording && model.busy {
-            icons::paint_spinner(ui, rect, 16.0, WHITE);
+            icons::paint_spinner(ui, rect, 16.0, pal().white);
         } else if recording {
             painter.rect_filled(
                 Rect::from_center_size(rect.center(), egui::vec2(11.0, 11.0)),
@@ -789,7 +789,7 @@ fn bookmark_button(ui: &mut egui::Ui, tooltip: &str) -> egui::Response {
         ui,
         Some((ph::BOOKMARK_SIMPLE, 17.0)),
         "Bookmark this moment",
-        GHOST,
+        ghost(),
         None,
     )
     .on_hover_text(tooltip)
@@ -805,20 +805,27 @@ fn bookmark_tooltip(hotkey: Option<&str>) -> String {
 /// Re-open (or focus) the captions overlay.
 fn captions_button(ui: &mut egui::Ui) -> egui::Response {
     let label = "Show the caption overlay";
-    bar_button(ui, Some((ph::CLOSED_CAPTIONING, 18.0)), label, GHOST, None).on_hover_text(label)
+    bar_button(
+        ui,
+        Some((ph::CLOSED_CAPTIONING, 18.0)),
+        label,
+        ghost(),
+        None,
+    )
+    .on_hover_text(label)
 }
 
 /// The settings gear; accent-tinted while Settings is open.
 fn settings_button(ui: &mut egui::Ui, selected: bool) -> egui::Response {
     let look = if selected {
         Look {
-            fill: ACCENT_SOFT,
-            hover_fill: ACCENT_SOFT,
-            glyph: ACCENT_HOVER,
-            hover_glyph: ACCENT_HOVER,
+            fill: pal().accent_soft,
+            hover_fill: pal().accent_soft,
+            glyph: pal().accent_hover,
+            hover_glyph: pal().accent_hover,
         }
     } else {
-        GHOST
+        ghost()
     };
     let item = NavItem::Settings;
     bar_button(
@@ -844,8 +851,8 @@ fn nav_control(
     ui.painter().rect(
         track,
         CornerRadius::same(theme::R_MD),
-        BG_RAISED,
-        Stroke::new(1.0, BORDER),
+        pal().bg_raised,
+        Stroke::new(1.0, pal().border),
         egui::StrokeKind::Inside,
     );
     ui.add_space(NAV_INSET);
@@ -866,7 +873,7 @@ fn nav_segment(
     let label = item.label();
     let galley = ui
         .painter()
-        .layout_no_wrap(label.to_owned(), nav_font(), TEXT);
+        .layout_no_wrap(label.to_owned(), nav_font(), pal().text);
     let width = segment_width(icons_only, galley.size().x.ceil());
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, SEG_HEIGHT), Sense::click());
     response.widget_info(|| {
@@ -876,16 +883,16 @@ fn nav_segment(
         let ring = response.has_focus() && widgets::focus_visible(ui.ctx());
         let hot = response.hovered() || ring;
         let fill = if selected {
-            ACCENT_SOFT
+            pal().accent_soft
         } else if hot {
-            BG_HOVER
+            pal().bg_hover
         } else {
             Color32::TRANSPARENT
         };
         let (icon_color, text_color) = match (selected, hot) {
-            (true, _) => (ACCENT_HOVER, TEXT),
-            (false, true) => (TEXT, TEXT),
-            (false, false) => (TEXT_MUTED, TEXT_MUTED),
+            (true, _) => (pal().accent_hover, pal().text),
+            (false, true) => (pal().text, pal().text),
+            (false, false) => (pal().text_muted, pal().text_muted),
         };
         let painter = ui.painter();
         painter.rect_filled(rect, CornerRadius::same(theme::R_SM), fill);
@@ -940,7 +947,7 @@ fn window_controls(ui: &mut egui::Ui, actions: &mut Vec<BarAction>) {
 /// pads itself inside its drag area). `app.rs` paints the hairline bottom
 /// border with [`paint_bottom_border`].
 pub fn frame() -> egui::Frame {
-    egui::Frame::new().fill(BG)
+    egui::Frame::new().fill(pal().window_bg)
 }
 
 /// The bar's 1 px bottom border.
@@ -948,7 +955,7 @@ pub fn paint_bottom_border(ui: &egui::Ui, rect: egui::Rect) {
     ui.painter().hline(
         rect.x_range(),
         rect.bottom() - 0.5,
-        Stroke::new(1.0, BORDER),
+        Stroke::new(1.0, pal().border),
     );
 }
 
@@ -1067,7 +1074,7 @@ impl PillGeom {
         let pad = widgets::pill_padding(ui);
         let text = ui
             .painter()
-            .layout_no_wrap("0".to_owned(), pill_font(), TEXT)
+            .layout_no_wrap("0".to_owned(), pill_font(), pal().text)
             .size()
             .y;
         PillGeom {
@@ -1272,19 +1279,19 @@ fn status_pill(
             let glyph = painter.layout_no_wrap(
                 ph::WARNING.to_owned(),
                 FontId::proportional(PILL_WARN),
-                WARN,
+                pal().warn,
             );
-            painter.galley(center - glyph.size() / 2.0, glyph, WARN);
+            painter.galley(center - glyph.size() / 2.0, glyph, pal().warn);
         };
         match piece {
             Piece::Lead => match parts.lead {
                 Lead::RecDot => {
                     let alpha = icons::pulse_alpha(ui.ctx());
-                    painter.circle_filled(center, 4.0, REC.gamma_multiply(alpha));
+                    painter.circle_filled(center, 4.0, pal().rec.gamma_multiply(alpha));
                 }
                 Lead::Spinner => {
                     let lead = Rect::from_center_size(center, egui::vec2(w, w));
-                    icons::paint_spinner(ui, lead, 13.0, WARN);
+                    icons::paint_spinner(ui, lead, 13.0, pal().warn);
                 }
                 Lead::Warning => warning_glyph(),
                 Lead::None => {}
@@ -1368,7 +1375,10 @@ fn level_meter(ui: &mut egui::Ui, rect: Rect, model: &BarModel) {
     let response = ui.interact(rect, ui.id().with("level-meter"), Sense::hover());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, METER_LABEL));
     let (mic, loopback) = model.levels;
-    for (row, (rms, color)) in [(mic, ACCENT), (loopback, OK)].into_iter().enumerate() {
+    for (row, (rms, color)) in [(mic, pal().accent), (loopback, pal().ok)]
+        .into_iter()
+        .enumerate()
+    {
         let target = meter_width(rms);
         let width = if model.animate_meter {
             ui.ctx().animate_value_with_time(
@@ -1385,7 +1395,7 @@ fn level_meter(ui: &mut egui::Ui, rect: Rect, model: &BarModel) {
             egui::vec2(METER_WIDTH, METER_BAR),
         );
         ui.painter()
-            .rect_filled(track, CornerRadius::same(2), theme::alpha(TEXT, 0.08));
+            .rect_filled(track, CornerRadius::same(2), theme::alpha(pal().text, 0.08));
         let bar = Rect::from_min_size(egui::pos2(rect.left(), top), egui::vec2(width, METER_BAR));
         ui.painter().rect_filled(bar, CornerRadius::same(2), color);
     }
@@ -1496,7 +1506,7 @@ pub fn health_banner(ui: &mut egui::Ui, cx: &mut UiCtx) {
         return;
     };
     egui::Panel::top("health-banner")
-        .frame(Frame::new().fill(BG).inner_margin(Margin {
+        .frame(Frame::new().fill(pal().bg).inner_margin(Margin {
             left: 0,
             right: 0,
             top: 12,
@@ -1564,8 +1574,8 @@ pub fn model_banner(ui: &mut egui::Ui, cx: &mut UiCtx) {
         Politeness::Polite,
     );
     Frame::new()
-        .fill(BG_RAISED)
-        .stroke(Stroke::new(1.0, BORDER))
+        .fill(pal().bg_raised)
+        .stroke(Stroke::new(1.0, pal().border))
         .corner_radius(CornerRadius::same(theme::R_LG))
         .inner_margin(Margin::symmetric(16, 14))
         .show(ui, |ui| {
@@ -1579,7 +1589,7 @@ pub fn model_banner(ui: &mut egui::Ui, cx: &mut UiCtx) {
 fn banner_actions_width(ui: &egui::Ui, progress: Option<&str>) -> f32 {
     let width = |text: &str, font: FontId| {
         ui.painter()
-            .layout_no_wrap(text.to_owned(), font, TEXT)
+            .layout_no_wrap(text.to_owned(), font, pal().text)
             .size()
             .x
     };
@@ -1602,7 +1612,7 @@ fn banner_contents(ui: &mut egui::Ui, cx: &mut UiCtx, progress: Option<&str>) {
             ui.spacing_mut().item_spacing.x = theme::S3;
             ui.add_sized(
                 [BANNER_ICON, 20.0],
-                egui::Label::new(icons::icon(ph::DOWNLOAD_SIMPLE, 18.0).color(ACCENT)),
+                egui::Label::new(icons::icon(ph::DOWNLOAD_SIMPLE, 18.0).color(pal().accent)),
             );
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
@@ -1610,7 +1620,7 @@ fn banner_contents(ui: &mut egui::Ui, cx: &mut UiCtx, progress: Option<&str>) {
                     egui::Label::new(
                         RichText::new(BANNER_TITLE)
                             .font(theme::semibold(theme::BASE_SIZE))
-                            .color(TEXT),
+                            .color(pal().text),
                     )
                     .wrap(),
                 );
@@ -1618,7 +1628,7 @@ fn banner_contents(ui: &mut egui::Ui, cx: &mut UiCtx, progress: Option<&str>) {
                     egui::Label::new(
                         RichText::new(BANNER_BODY)
                             .font(theme::regular(13.0))
-                            .color(TEXT_MUTED),
+                            .color(pal().text_muted),
                     )
                     .wrap(),
                 );
@@ -1633,7 +1643,7 @@ fn banner_contents(ui: &mut egui::Ui, cx: &mut UiCtx, progress: Option<&str>) {
                 ui.label(
                     RichText::new(text)
                         .font(theme::regular(13.0))
-                        .color(TEXT_MUTED),
+                        .color(pal().text_muted),
                 );
                 widgets::announce(
                     ui.ctx(),

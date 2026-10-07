@@ -53,7 +53,17 @@ fn eager_definitions() -> (FontDefinitions, Vec<&'static str>) {
     let mut fonts = FontDefinitions::default();
     let mut eager_loaded = Vec::new();
 
-    if let Some(bytes) = read_font("segoeui.ttf") {
+    // Windows 11's Segoe UI Variable (one variable file: regular and
+    // semibold are weight instances of it); classic Segoe UI otherwise.
+    let variable = read_font("SegUIVar.ttf");
+    if let Some(bytes) = &variable {
+        fonts.font_data.insert(
+            SEGOE.into(),
+            Arc::new(variable_instance(bytes.clone(), 400.0)),
+        );
+        proportional(&mut fonts).insert(0, SEGOE.into());
+        eager_loaded.push("seguivar");
+    } else if let Some(bytes) = read_font("segoeui.ttf") {
         fonts
             .font_data
             .insert(SEGOE.into(), Arc::new(FontData::from_owned(bytes)));
@@ -73,7 +83,14 @@ fn eager_definitions() -> (FontDefinitions, Vec<&'static str>) {
 
     // Semibold: its own face first, then everything Proportional has.
     let mut semibold = proportional(&mut fonts).clone();
-    if let Some(bytes) = read_font("seguisb.ttf") {
+    if let Some(bytes) = variable {
+        fonts.font_data.insert(
+            SEGOE_SEMIBOLD.into(),
+            Arc::new(variable_instance(bytes, 600.0)),
+        );
+        semibold.retain(|name| name != SEGOE);
+        semibold.insert(0, SEGOE_SEMIBOLD.into());
+    } else if let Some(bytes) = read_font("seguisb.ttf") {
         fonts
             .font_data
             .insert(SEGOE_SEMIBOLD.into(), Arc::new(FontData::from_owned(bytes)));
@@ -104,6 +121,14 @@ fn eager_definitions() -> (FontDefinitions, Vec<&'static str>) {
     }
 
     (fonts, eager_loaded)
+}
+
+/// Segoe UI Variable at `weight`, "Text" optical size (the UI sizes).
+fn variable_instance(bytes: Vec<u8>, weight: f32) -> FontData {
+    let mut data = FontData::from_owned(bytes);
+    data.tweak.coords =
+        egui::epaint::text::VariationCoords::new([(b"wght", weight), (b"opsz", 10.5)]);
+    data
 }
 
 fn proportional(fonts: &mut FontDefinitions) -> &mut Vec<String> {

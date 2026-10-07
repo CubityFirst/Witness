@@ -294,6 +294,81 @@ fn text_scale_from_percent(percent: u32) -> f32 {
     percent.clamp(100, 225) as f32 / 100.0
 }
 
+/// Windows' "Choose your app mode": `Some(true)` for Light, `Some(false)`
+/// for Dark (`Personalize\AppsUseLightTheme`), `None` when unknown.
+pub fn apps_use_light_theme() -> Option<bool> {
+    #[cfg(windows)]
+    {
+        use winreg::enums::HKEY_CURRENT_USER;
+        let key = winreg::RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+            .ok()?;
+        let value: u32 = key.get_value("AppsUseLightTheme").ok()?;
+        Some(value != 0)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Windows' accent colour ramp from `Explorer\Accent\AccentPalette`: seven
+/// RGB shades, light3, light2, light1, base, dark1, dark2, dark3 (the
+/// value holds eight RGBA entries; the last is unused).
+pub fn accent_palette() -> Option<[[u8; 3]; 7]> {
+    #[cfg(windows)]
+    {
+        use winreg::enums::HKEY_CURRENT_USER;
+        let key = winreg::RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent")
+            .ok()?;
+        let raw = key.get_raw_value("AccentPalette").ok()?;
+        accent_palette_from_bytes(&raw.bytes)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+fn accent_palette_from_bytes(bytes: &[u8]) -> Option<[[u8; 3]; 7]> {
+    if bytes.len() < 28 {
+        return None;
+    }
+    let mut out = [[0u8; 3]; 7];
+    for (i, shade) in out.iter_mut().enumerate() {
+        shade.copy_from_slice(&bytes[i * 4..i * 4 + 3]);
+    }
+    Some(out)
+}
+
+/// Windows 11 22H2+ (build 22621), where `DWMWA_SYSTEMBACKDROP_TYPE`
+/// (Mica) exists, and not a remote session (RDP draws no backdrop).
+pub fn backdrop_supported() -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_REMOTESESSION};
+        // SAFETY: GetSystemMetrics has no preconditions.
+        let remote = unsafe { GetSystemMetrics(SM_REMOTESESSION) } != 0;
+        !remote && windows_build().is_some_and(|b| b >= 22621)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// The Windows build number (`CurrentBuildNumber`).
+#[cfg(windows)]
+fn windows_build() -> Option<u32> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    let key = winreg::RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(r"Software\Microsoft\Windows NT\CurrentVersion")
+        .ok()?;
+    let build: String = key.get_value("CurrentBuildNumber").ok()?;
+    build.trim().parse().ok()
+}
+
 /// Whether a Windows high-contrast theme is active (`SPI_GETHIGHCONTRAST`).
 pub fn high_contrast_on() -> bool {
     imp::high_contrast_on()
@@ -318,6 +393,18 @@ pub fn error_box(text: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn accent_palette_bytes_are_rgba_entries() {
+        let mut raw = Vec::new();
+        for i in 0..8u8 {
+            raw.extend_from_slice(&[i, i + 10, i + 20, 0xff]);
+        }
+        let shades = super::accent_palette_from_bytes(&raw).unwrap();
+        assert_eq!(shades[0], [0, 10, 20]);
+        assert_eq!(shades[6], [6, 16, 26]);
+        assert!(super::accent_palette_from_bytes(&raw[..20]).is_none());
+    }
+
     use super::*;
 
     #[test]
