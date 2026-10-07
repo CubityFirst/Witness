@@ -71,9 +71,12 @@ UI (`crates/witness`): eframe 0.36 (glow renderer), no router — a `View` enum
 in `ui/mod.rs` (`ActiveView` owns the live view). Views in `ui/views/`:
 Meetings (+ recycle bin), People (stats + weekly trend), Transcript (+
 `player_bar.rs`: player, live captions, bookmarks, notes), Search (filters),
-Settings (+ `updates.rs`). The look follows **docs/UI.md** (flat rows,
-grouped surfaces, elide-don't-overflow, nothing wraps or clips at ≥ 380 pt,
-the 380 pt minimum width). Shared kit (use it, don't fork it): `ui/theme.rs`
+Settings (+ `updates.rs`), plus `ui/palette.rs` (Ctrl+K command palette)
+and `ui/onboarding.rs` (first-run setup). The look follows **docs/UI.md**
+(flat rows, grouped surfaces, elide-don't-overflow, nothing wraps or clips
+at ≥ 380 pt, light + dark themes, the split layout from 900 pt). Colours
+are a runtime `theme::Palette` read with `pal()` at paint time — never put
+a colour in a const/static. Shared kit (use it, don't fork it): `ui/theme.rs`
 (tokens: palette, spacing `S1..S5`, radii, `CONTENT_MAX`, `COMPACT_BELOW`,
 speaker colours; fonts; Visuals with floating scroll bars), `icons.rs`
 (egui-phosphor regular), `widgets.rs` (buttons, pills, `list_row`, `group`,

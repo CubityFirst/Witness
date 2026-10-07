@@ -20,6 +20,20 @@ still evolve quickly.
   with toggle switches. Nothing overflows or clips down to the new 380 pt
   minimum window width; long titles and paths are shortened with "…" and a
   tooltip.
+- Light and dark themes (Settings → Appearance: follow Windows, light or
+  dark) with Windows' accent colour, Segoe UI Variable, and the Windows 11
+  Mica backdrop (22H2 and later; applies after a restart).
+- Wide windows split into the meeting list and the open transcript side
+  by side; the divider can be dragged and is remembered.
+- Ctrl+K command palette: jump to any meeting or person, or run an action
+  (record, bookmark, settings, theme, search transcripts).
+- Transcript: who-spoke-when timeline on the scrubber, Ctrl+F find with
+  next/previous, and click a speaker in the legend to show only their
+  lines.
+- Keyboard navigation in lists (↑/↓, j/k, Enter, F2, Delete), loading
+  placeholders, and helpful empty states.
+- First-run setup assistant (devices with a live level check, models,
+  preferences); Settings → Startup → Run setup again.
 - Updates continue through the same feed and signing key: 0.2.x installs
   update into this release through their built-in updater, into the same
   per-user install location, keeping shortcuts, the autostart entry and all

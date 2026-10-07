@@ -1001,13 +1001,19 @@ pub fn avatar(ui: &mut egui::Ui, name: &str, color: Color32, size: f32) -> Respo
     let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        painter.circle_filled(rect.center(), size / 2.0, theme::alpha(color, 0.22));
+        let dark = pal().dark;
+        let (fill, ink) = if dark {
+            (theme::alpha(color, 0.22), theme::lighten(color, 0.45))
+        } else {
+            (theme::alpha(color, 0.16), theme::darken(color, 0.25))
+        };
+        painter.circle_filled(rect.center(), size / 2.0, fill);
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
             initials(name),
             theme::semibold((size * 0.38).max(10.0)),
-            theme::lighten(color, 0.45),
+            ink,
         );
     }
     response
