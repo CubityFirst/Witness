@@ -33,8 +33,17 @@
 //! Selection limitation (accepted, R12): drag-selecting text only spans
 //! rows that are laid out; "Copy to clipboard" and the exports cover the
 //! whole transcript.
+//!
+//! Find (Ctrl+F) searches the data, not the drawn rows: every shown
+//! segment's text, case- and (Latin) accent-insensitively; the current hit
+//! scrolls into view through the same scroll requests as a deep link. The
+//! speaker filter (a click in the legend or on the proportion bar; Ctrl
+//! adds speakers) rebuilds the row list with each run of hidden lines
+//! collapsed into one faint "n lines from others" row, which stands in for
+//! them when playback follows along — and find searches only the shown
+//! lines.
 
-use super::player_bar::{self, PlayerBarState};
+use super::player_bar::{self, PlayerBarState, Timeline, TimelineSpan, TimelineSpeaker};
 use crate::bridge::{OpDone, Task};
 use crate::platform::dialogs::{self, SaveFileRequest};
 use crate::ui::format::{
@@ -44,13 +53,14 @@ use crate::ui::icons::{self, ph};
 use crate::ui::theme::{self, pal, speaker_text};
 use crate::ui::toasts::Notice;
 use crate::ui::widgets::{self, KeyScroll, Politeness};
-use crate::ui::{QueuedNotes, UiCtx, View};
+use crate::ui::{PaneRole, QueuedNotes, UiCtx, View};
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Frame, Id, Key, Layout, Margin, Modifiers,
     Order, Popup, Rect, RectAlign, Response, Sense, Stroke,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use witness_core::db::{Bookmark, Meeting, Segment, Speaker};
@@ -114,8 +124,16 @@ const SCROLL_SETTLED_PX: f32 = 24.0;
 const SCROLL_SETTLE_FRAMES: u8 = 20;
 /// Speaker-rename suggestions shown at once.
 const MAX_SUGGESTIONS: usize = 8;
-/// `.live-feed` border: rec @ 0.35.
-const LIVE_BORDER: Color32 = Color32::from_rgba_unmultiplied_const(0xe5, 0x48, 0x4d, 89);
+/// `.live-feed` border: the record red at this strength.
+const LIVE_BORDER_ALPHA: f32 = 0.35;
+/// The "n lines from others" row standing in for filtered-out lines: its
+/// line, and the space above it (none as the list's first row).
+const HIDDEN_LINE: f32 = 22.0;
+const HIDDEN_GAP: f32 = 6.0;
+/// Legend items and proportion-bar segments of speakers outside the filter.
+const FILTERED_OUT_ALPHA: f32 = 0.4;
+/// The find bar's height.
+const FIND_BAR_H: f32 = 36.0;
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -129,41 +147,60 @@ pub(crate) fn segment_at(segments: &[Segment], t_ms: i64) -> Option<usize> {
         .checked_sub(1)
 }
 
-/// One list row: a segment (index into `segments`) or a bookmark.
+/// One list row: a segment (index into `segments`), a bookmark, or a run
+/// of `count` consecutive segments from `first` that the speaker filter
+/// hides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
     Seg(usize),
     Bm(usize),
+    Hidden { first: usize, count: usize },
 }
 
-/// A row's identity across reloads (height cache, widget ids).
+/// A row's identity across reloads (height cache, widget ids). A hidden
+/// run is known by its first segment's id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RowKey {
     Seg(i64),
     Bm(i64),
+    Hidden(i64),
 }
 
 /// Segments and bookmarks interleaved by time; a stable sort, so on equal
-/// times the segment comes before the bookmark.
-fn build_rows(detail: &MeetingDetail) -> Vec<Row> {
-    let mut rows: Vec<(i64, Row)> =
+/// times the segment comes before the bookmark. Segments `shown` rejects
+/// collapse into [`Row::Hidden`] runs (a shown row or a bookmark ends a
+/// run).
+fn build_rows(detail: &MeetingDetail, shown: impl Fn(usize) -> bool) -> Vec<Row> {
+    let mut timed: Vec<(i64, Row)> =
         Vec::with_capacity(detail.segments.len() + detail.bookmarks.len());
-    rows.extend(
+    timed.extend(
         detail
             .segments
             .iter()
             .enumerate()
             .map(|(i, segment)| (segment.start_ms, Row::Seg(i))),
     );
-    rows.extend(
+    timed.extend(
         detail
             .bookmarks
             .iter()
             .enumerate()
             .map(|(i, bookmark)| (bookmark.at_ms, Row::Bm(i))),
     );
-    rows.sort_by_key(|(at, _)| *at);
-    rows.into_iter().map(|(_, row)| row).collect()
+    timed.sort_by_key(|(at, _)| *at);
+    let mut rows: Vec<Row> = Vec::with_capacity(timed.len());
+    for (_, row) in timed {
+        match (row, rows.last_mut()) {
+            (Row::Seg(i), Some(Row::Hidden { first, count }))
+                if !shown(i) && *first + *count == i =>
+            {
+                *count += 1;
+            }
+            (Row::Seg(i), _) if !shown(i) => rows.push(Row::Hidden { first: i, count: 1 }),
+            (row, _) => rows.push(row),
+        }
+    }
+    rows
 }
 
 /// Who a segment belongs to for turn grouping: its speaker, or — while
@@ -177,7 +214,8 @@ fn turn_key(seg: &Segment) -> (Option<i64>, &str) {
 
 /// Which rows start a speaker turn (and so carry the header): a segment
 /// whose speaker differs from the previous row's, or whose previous row is
-/// a bookmark (it interrupts the turn). Bookmark rows are never one.
+/// a bookmark or hidden lines (they interrupt the turn). Those rows are
+/// never one.
 fn turn_starts(detail: &MeetingDetail, rows: &[Row]) -> Vec<bool> {
     let mut previous = None;
     rows.iter()
@@ -188,12 +226,50 @@ fn turn_starts(detail: &MeetingDetail, rows: &[Row]) -> Vec<bool> {
                 previous = Some(key);
                 head
             }
-            Row::Bm(_) => {
+            Row::Bm(_) | Row::Hidden { .. } => {
                 previous = None;
                 false
             }
         })
         .collect()
+}
+
+/// Who a segment belongs to for the speaker filter and the summary: its
+/// speaker, or — while unassigned — its track (mic = `me`, else `S?`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum SpeakerKey {
+    Speaker(i64),
+    Unassigned { mic: bool },
+}
+
+fn speaker_key(seg: &Segment) -> SpeakerKey {
+    match seg.speaker_id {
+        Some(id) => SpeakerKey::Speaker(id),
+        None => SpeakerKey::Unassigned {
+            mic: seg.track == "mic",
+        },
+    }
+}
+
+/// The speakers whose lines show: everyone when `filter` is empty.
+fn is_shown(filter: &BTreeSet<SpeakerKey>, seg: &Segment) -> bool {
+    filter.is_empty() || filter.contains(&speaker_key(seg))
+}
+
+/// A click on a speaker in the legend / proportion bar: alone, show only
+/// them — or everyone again when they were the only one shown; with Ctrl,
+/// add or remove them (removing the last one shows everyone).
+fn toggle_filter(filter: &mut BTreeSet<SpeakerKey>, key: SpeakerKey, add: bool) {
+    if add {
+        if !filter.remove(&key) {
+            filter.insert(key);
+        }
+    } else if filter.len() == 1 && filter.contains(&key) {
+        filter.clear();
+    } else {
+        filter.clear();
+        filter.insert(key);
+    }
 }
 
 /// How a segment's speaker is shown.
@@ -233,6 +309,7 @@ fn who<'a>(detail: &'a MeetingDetail, index: &HashMap<i64, usize>, seg: &'a Segm
 /// One entry of the speaker stats bar.
 #[derive(Debug, Clone, PartialEq)]
 struct SpeakerStat {
+    key: SpeakerKey,
     name: String,
     label: String,
     talk_ms: i64,
@@ -242,17 +319,16 @@ struct SpeakerStat {
 }
 
 /// Per-speaker talk time, words and share, by talk time descending. Keyed
-/// by speaker id, or by label for unassigned segments.
+/// by speaker id, or by track for unassigned segments ([`SpeakerKey`]).
 fn speaker_stats(detail: &MeetingDetail, index: &HashMap<i64, usize>) -> Vec<SpeakerStat> {
     let mut stats: Vec<SpeakerStat> = Vec::new();
-    let mut by_key: HashMap<String, usize> = HashMap::new();
+    let mut by_key: HashMap<SpeakerKey, usize> = HashMap::new();
     for seg in &detail.segments {
         let who = who(detail, index, seg);
-        let key = seg
-            .speaker_id
-            .map_or_else(|| who.label.to_string(), |id| id.to_string());
+        let key = speaker_key(seg);
         let slot = *by_key.entry(key).or_insert_with(|| {
             stats.push(SpeakerStat {
+                key,
                 name: who.name.to_string(),
                 label: who.label.to_string(),
                 talk_ms: 0,
@@ -316,6 +392,218 @@ fn summary_widths(shares: &[f64], width: f32) -> Vec<f32> {
             SUMMARY_MIN_SEG + t * spread
         })
         .collect()
+}
+
+/// The scrubber's speaker timeline: one timeline speaker per summary entry
+/// (dimmed when the filter hides them), one span per segment.
+fn build_timeline(
+    detail: &MeetingDetail,
+    stats: &[SpeakerStat],
+    filter: &BTreeSet<SpeakerKey>,
+    version: u64,
+) -> Timeline {
+    let slot: HashMap<SpeakerKey, u16> = stats
+        .iter()
+        .enumerate()
+        .filter_map(|(i, stat)| Some((stat.key, u16::try_from(i).ok()?)))
+        .collect();
+    Timeline {
+        version,
+        speakers: stats
+            .iter()
+            .map(|stat| TimelineSpeaker {
+                name: stat.name.clone(),
+                label: stat.label.clone(),
+                dimmed: !filter.is_empty() && !filter.contains(&stat.key),
+            })
+            .collect(),
+        spans: detail
+            .segments
+            .iter()
+            .filter_map(|seg| {
+                Some(TimelineSpan {
+                    start_ms: seg.start_ms,
+                    end_ms: seg.end_ms,
+                    speaker: *slot.get(&speaker_key(seg))?,
+                })
+            })
+            .collect(),
+    }
+}
+
+/// "Paul Gordon", "Paul Gordon and Bob", "3 speakers": who the filter
+/// shows, in summary order.
+fn filter_names(stats: &[SpeakerStat], filter: &BTreeSet<SpeakerKey>) -> String {
+    let names: Vec<&str> = stats
+        .iter()
+        .filter(|stat| filter.contains(&stat.key))
+        .map(|stat| stat.name.as_str())
+        .collect();
+    match names.as_slice() {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [a, b] => format!("{a} and {b}"),
+        many => format!("{} speakers", many.len()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Find
+
+/// A Latin letter without its accent (Latin-1 Supplement and Latin
+/// Extended-A, lowercase in); anything else unchanged. Cheap, and covers
+/// the names and loanwords a transcript meets ("Zoë", "café", "Łukasz").
+fn fold_char(c: char) -> char {
+    // U+0100–U+017F in order; `_` keeps the character (ligatures).
+    const EXTENDED_A: &str = "aaaaaaccccccccddddeeeeeeeeeegggggggghhhhiiiiiiiiii__jjkkklllllllllln\
+                              nnnnnnnnoooooo__rrrrrrssssssssttttttuuuuuuuuuuuuwwyyyzzzzzzs";
+    match c {
+        'à'..='å' => 'a',
+        'ç' => 'c',
+        'è'..='ë' => 'e',
+        'ì'..='ï' => 'i',
+        'ñ' => 'n',
+        'ò'..='ö' | 'ø' => 'o',
+        'ù'..='ü' => 'u',
+        'ý' | 'ÿ' => 'y',
+        '\u{100}'..='\u{17f}' => match EXTENDED_A.chars().nth(c as usize - 0x100) {
+            Some('_') | None => c,
+            Some(base) => base,
+        },
+        _ => c,
+    }
+}
+
+/// Combining accents (U+0300–U+036F): dropped, so decomposed text matches.
+fn is_combining(c: char) -> bool {
+    ('\u{300}'..='\u{36f}').contains(&c)
+}
+
+/// `text` lowercased and accent-folded for find, with each folded byte's
+/// source character as a byte range of `text`.
+fn fold_with_origin(text: &str) -> (String, Vec<(usize, usize)>) {
+    let mut folded = String::with_capacity(text.len());
+    let mut origin = Vec::with_capacity(text.len());
+    for (start, c) in text.char_indices() {
+        let end = start + c.len_utf8();
+        for lower in c.to_lowercase() {
+            if is_combining(lower) {
+                continue;
+            }
+            let before = folded.len();
+            folded.push(fold_char(lower));
+            origin.extend(std::iter::repeat_n((start, end), folded.len() - before));
+        }
+    }
+    (folded, origin)
+}
+
+/// The query as find compares it (trimmed, folded); empty finds nothing.
+fn find_needle(query: &str) -> String {
+    fold_with_origin(query.trim()).0
+}
+
+/// Byte ranges of `text` where `needle` (already [`find_needle`]d) occurs,
+/// left to right, not overlapping.
+fn find_in(text: &str, needle: &str) -> Vec<Range<usize>> {
+    if needle.is_empty() || text.is_empty() {
+        return Vec::new();
+    }
+    let (folded, origin) = fold_with_origin(text);
+    folded
+        .match_indices(needle)
+        .map(|(at, hit)| {
+            // The hit takes the accents that follow its last letter.
+            let mut end = origin[at + hit.len() - 1].1;
+            while let Some(c) = text[end..].chars().next().filter(|c| is_combining(*c)) {
+                end += c.len_utf8();
+            }
+            origin[at].0..end
+        })
+        .collect()
+}
+
+/// One find hit: a segment and the hit's byte range in its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FindHit {
+    seg: usize,
+    range: Range<usize>,
+}
+
+/// Every hit of `query` in the shown segments, in transcript order.
+fn find_hits(detail: &MeetingDetail, shown: impl Fn(usize) -> bool, query: &str) -> Vec<FindHit> {
+    let needle = find_needle(query);
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    detail
+        .segments
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| shown(*i))
+        .flat_map(|(seg, s)| {
+            find_in(&s.text, &needle)
+                .into_iter()
+                .map(move |range| FindHit { seg, range })
+        })
+        .collect()
+}
+
+/// The hit to start from: the first at or after segment `from` (the row at
+/// the top of the view), wrapping to the first.
+fn first_hit_from(hits: &[FindHit], from: usize) -> Option<usize> {
+    if hits.is_empty() {
+        return None;
+    }
+    Some(hits.partition_point(|h| h.seg < from) % hits.len())
+}
+
+/// The next (or previous) hit after `current`, wrapping around.
+fn step_hit(len: usize, current: Option<usize>, back: bool) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(match (current, back) {
+        (None, false) => 0,
+        (None, true) => len - 1,
+        (Some(at), false) => (at + 1) % len,
+        (Some(at), true) => (at + len - 1) % len,
+    })
+}
+
+/// "3 of 17", "No matches", or nothing for an empty query.
+fn find_count_text(query: &str, hits: usize, current: Option<usize>) -> String {
+    if find_needle(query).is_empty() {
+        String::new()
+    } else if hits == 0 {
+        "No matches".to_owned()
+    } else {
+        format!("{} of {}", current.map_or(0, |c| c + 1), hits)
+    }
+}
+
+/// Ctrl+F's find bar and its hits.
+#[derive(Debug, Default)]
+struct FindState {
+    query: String,
+    hits: Vec<FindHit>,
+    current: Option<usize>,
+    /// (query, data generation) the hits were computed for.
+    computed: Option<(String, u64)>,
+    /// Focus the field (and select its text) on the next draw.
+    focus: bool,
+    /// The widget that had focus when find opened: it gets it back on Esc.
+    return_focus: Option<Id>,
+}
+
+impl FindState {
+    /// The hits for segment `seg` (a slice of `hits`) and the index of the
+    /// first of them in `hits`.
+    fn hits_in(&self, seg: usize) -> (usize, &[FindHit]) {
+        let lo = self.hits.partition_point(|h| h.seg < seg);
+        let hi = lo + self.hits[lo..].partition_point(|h| h.seg == seg);
+        (lo, &self.hits[lo..hi])
+    }
 }
 
 /// The status text under an empty transcript (map §4.6).
@@ -392,6 +680,8 @@ fn estimate_height(detail: &MeetingDetail, row: Row, shape: RowShape, width: f32
             let line = (note * EST_LINE).max(BOOKMARK_LINE);
             above(BOOKMARK_GAP) + line + 2.0 * ROW_PAD_Y + ROW_GAP
         }
+        // Fixed: one line, whatever the width.
+        Row::Hidden { .. } => above(HIDDEN_GAP) + HIDDEN_LINE + ROW_GAP,
     }
 }
 
@@ -408,8 +698,10 @@ fn suggestions<'a>(people: &'a [PersonInfo], text: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// Search-term highlighting for a segment's text (`<mark>` runs).
-fn text_job(text: &str, tokens: &[String]) -> egui::text::LayoutJob {
+/// A segment's text with `marks` highlighted (`<mark>` runs: search terms
+/// or find hits); the mark at index `current` is the current find hit, in
+/// the accent itself. `marks` are sorted and do not overlap.
+fn text_job(text: &str, marks: &[Range<usize>], current: Option<usize>) -> egui::text::LayoutJob {
     let plain = egui::TextFormat {
         font_id: theme::regular(TEXT_SIZE),
         color: pal().text,
@@ -421,13 +713,22 @@ fn text_job(text: &str, tokens: &[String]) -> egui::text::LayoutJob {
         color: pal().mark_text,
         ..plain.clone()
     };
+    let strong = egui::TextFormat {
+        background: pal().accent,
+        color: pal().on_accent,
+        ..plain.clone()
+    };
     let mut job = egui::text::LayoutJob::default();
     let mut at = 0;
-    for range in highlight_ranges(text, tokens) {
+    for (i, range) in marks.iter().enumerate() {
+        if range.start < at || range.end > text.len() {
+            continue;
+        }
         if range.start > at {
             job.append(&text[at..range.start], 0.0, plain.clone());
         }
-        job.append(&text[range.clone()], 0.0, mark.clone());
+        let format = if current == Some(i) { &strong } else { &mark };
+        job.append(&text[range.clone()], 0.0, format.clone());
         at = range.end;
     }
     if at < text.len() || text.is_empty() {
@@ -794,6 +1095,30 @@ struct RowCtx<'a> {
     /// A deep link's segment whose seek button takes keyboard focus when
     /// its row is laid out (cleared once taken).
     focus_seg: &'a mut Option<i64>,
+    /// Find's hits while it has a query (they replace the search terms'
+    /// highlighting).
+    find: Option<&'a FindState>,
+}
+
+impl RowCtx<'_> {
+    /// The highlighted ranges in segment `seg`'s text and which of them is
+    /// the current find hit.
+    fn marks(&self, seg: usize) -> (Vec<Range<usize>>, Option<usize>) {
+        match self.find {
+            Some(find) => {
+                let (first, hits) = find.hits_in(seg);
+                let current = find
+                    .current
+                    .and_then(|c| c.checked_sub(first))
+                    .filter(|c| *c < hits.len());
+                (hits.iter().map(|h| h.range.clone()).collect(), current)
+            }
+            None => (
+                highlight_ranges(&self.detail.segments[seg].text, self.tokens),
+                None,
+            ),
+        }
+    }
 }
 
 /// A scroll the list should perform: to a segment's row, "nearest"
@@ -863,8 +1188,11 @@ struct RowList {
     keys: Vec<RowKey>,
     /// Whether each row starts a speaker turn ([`turn_starts`]).
     heads: Vec<bool>,
-    /// Row index of each segment.
+    /// Row index of each segment: its own row, or the hidden run standing
+    /// in for it.
     seg_row: Vec<usize>,
+    /// The rows wholly inside the viewport last pass (empty when none).
+    visible: Range<usize>,
     /// The width each row was measured at and its outer height (incl. the
     /// gaps). Within `STALE_WIDTH` of the current width (the scroll bar
     /// fading in) a measurement beats the estimate; past it the text has
@@ -886,15 +1214,17 @@ struct RowList {
 }
 
 impl RowList {
-    /// Rebuild the rows for new data, keeping measured heights by key —
-    /// but only for rows whose shape is unchanged: a bookmark added or
-    /// removed before a row can make it start (or stop starting) a turn,
-    /// which adds or drops its header line.
-    fn rebuild(&mut self, detail: &MeetingDetail) {
+    /// Rebuild the rows for new data (or a new speaker filter: `shown`),
+    /// keeping measured heights by key — but only for rows whose shape is
+    /// unchanged: a bookmark added or removed before a row can make it
+    /// start (or stop starting) a turn, which adds or drops its header
+    /// line. A reading anchor whose row went (its line was hidden, or its
+    /// hidden run was shown) moves to the row that holds that line now.
+    fn rebuild(&mut self, detail: &MeetingDetail, shown: impl Fn(usize) -> bool) {
         let old: HashMap<RowKey, (RowShape, (f32, f32))> = (0..self.keys.len())
             .filter_map(|r| self.heights[r].map(|h| (self.keys[r], (self.shape(r), h))))
             .collect();
-        self.rows = build_rows(detail);
+        self.rows = build_rows(detail, shown);
         self.heads = turn_starts(detail, &self.rows);
         self.keys = self
             .rows
@@ -902,12 +1232,15 @@ impl RowList {
             .map(|row| match *row {
                 Row::Seg(i) => RowKey::Seg(detail.segments[i].id),
                 Row::Bm(i) => RowKey::Bm(detail.bookmarks[i].id),
+                Row::Hidden { first, .. } => RowKey::Hidden(detail.segments[first].id),
             })
             .collect();
         self.seg_row = vec![0; detail.segments.len()];
         for (r, row) in self.rows.iter().enumerate() {
-            if let Row::Seg(i) = row {
-                self.seg_row[*i] = r;
+            match *row {
+                Row::Seg(i) => self.seg_row[i] = r,
+                Row::Hidden { first, count } => self.seg_row[first..first + count].fill(r),
+                Row::Bm(_) => {}
             }
         }
         self.heights = (0..self.keys.len())
@@ -917,6 +1250,50 @@ impl RowList {
                     .map(|(_, h)| *h)
             })
             .collect();
+        self.visible = 0..0;
+        if let Some((key, _)) = self.anchor.filter(|(key, _)| !self.keys.contains(key)) {
+            let seg_id = match key {
+                RowKey::Seg(id) | RowKey::Hidden(id) => Some(id),
+                RowKey::Bm(_) => None,
+            };
+            self.anchor = seg_id
+                .and_then(|id| detail.segments.iter().position(|s| s.id == id))
+                .map(|i| (self.keys[self.seg_row[i]], 0.0));
+        }
+    }
+
+    /// The rows changed under the reader (the speaker filter): keep the
+    /// row at the top of the view in place over the next passes, as after
+    /// a resize.
+    fn keep_reading_position(&mut self) {
+        if self.anchor.is_some() {
+            self.resize_settle = RESIZE_SETTLE_PASSES;
+        }
+    }
+
+    /// The segment the reader is at: the first one in or after the row at
+    /// the top of the view (0 while the list starts below the top).
+    fn reading_segment(&self) -> usize {
+        let Some(row) = self
+            .anchor
+            .and_then(|(key, _)| self.keys.iter().position(|k| *k == key))
+        else {
+            return 0;
+        };
+        self.rows[row..]
+            .iter()
+            .find_map(|row| match *row {
+                Row::Seg(i) | Row::Hidden { first: i, .. } => Some(i),
+                Row::Bm(_) => None,
+            })
+            .unwrap_or(0)
+    }
+
+    /// Whether segment `seg`'s row was wholly on screen last pass.
+    fn seg_visible(&self, seg: usize) -> bool {
+        self.seg_row
+            .get(seg)
+            .is_some_and(|r| self.visible.contains(r))
     }
 
     fn shape(&self, row: usize) -> RowShape {
@@ -977,6 +1354,12 @@ impl RowList {
                     ui.add_space(BOOKMARK_GAP);
                 }
                 bookmark_row(ui, rc, i, actions);
+            }
+            Row::Hidden { first, count } => {
+                if !shape.first {
+                    ui.add_space(HIDDEN_GAP);
+                }
+                hidden_row(ui, rc, first, count);
             }
         });
         ui.add_space(ROW_GAP);
@@ -1069,6 +1452,7 @@ impl RowList {
             });
             self.space_or_editors(ui, rc, 0..first, &pass, &mut out);
             let mut anchor = None;
+            let mut visible: Option<Range<usize>> = None;
             let mut next = first;
             while next < n && ui.cursor().top() < hi {
                 let row_top = ui.cursor().top();
@@ -1076,6 +1460,10 @@ impl RowList {
                 let h = self.draw_row(ui, rc, next, width, &mut out.actions);
                 if row_top <= clip.top() && row_top + h > clip.top() {
                     anchor = Some((key, clip.top() - row_top));
+                }
+                if row_top >= clip.top() - 0.5 && row_top + h - ROW_GAP <= clip.bottom() + 0.5 {
+                    let start = visible.as_ref().map_or(next, |v| v.start);
+                    visible = Some(start..next + 1);
                 }
                 if target == Some(next) {
                     let rect = Rect::from_min_size(
@@ -1121,6 +1509,7 @@ impl RowList {
             if !resizing {
                 self.anchor = anchor;
             }
+            self.visible = visible.unwrap_or(0..0);
             if let (Some(req), Some(rect)) = (req, target_rect) {
                 let animation = if req.animate && icons::animations_enabled() {
                     ui.style().scroll_animation
@@ -1154,13 +1543,15 @@ fn elided_galley(
 }
 
 /// A turn header's time (`m:ss`, 12 pt muted, brighter on hover): the
-/// row's seek button, as tall as the header line.
+/// row's seek button, as tall as the header line and as wide as the time
+/// with `0` digits, so headers line up whatever the digits.
 fn ts_button(ui: &mut egui::Ui, ms: i64, label: &str) -> Response {
+    let text = fmt_ts(ms);
+    let width = player_bar::stable_width(ui, &text, theme::regular(12.0));
     let galley = ui
         .painter()
-        .layout_no_wrap(fmt_ts(ms), theme::regular(12.0), pal().text_muted);
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(galley.size().x, HEADER_H), Sense::click());
+        .layout_no_wrap(text, theme::regular(12.0), pal().text_muted);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, HEADER_H), Sense::click());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
     if ui.is_rect_visible(rect) {
         let color = if response.hovered() {
@@ -1229,8 +1620,9 @@ fn segment_row(
         if head {
             seek = Some(turn_header(ui, rc, seg, &seek_label, actions));
         }
+        let (marks, current) = rc.marks(idx);
         let text = ui.add(
-            egui::Label::new(text_job(&seg.text, rc.tokens))
+            egui::Label::new(text_job(&seg.text, &marks, current))
                 .wrap()
                 .selectable(true),
         );
@@ -1325,11 +1717,7 @@ fn turn_header(
         format!("{} — click to rename", who.name)
     };
     let width = ui.available_width();
-    let ts_width = ui
-        .painter()
-        .layout_no_wrap(fmt_ts(seg.start_ms), theme::regular(12.0), pal().text_muted)
-        .size()
-        .x;
+    let ts_width = player_bar::stable_width(ui, &fmt_ts(seg.start_ms), theme::regular(12.0));
     ui.allocate_ui_with_layout(
         egui::vec2(width, HEADER_H),
         Layout::left_to_right(Align::Center),
@@ -1588,7 +1976,8 @@ fn bookmark_seek(ui: &mut egui::Ui, ts: &str) -> Response {
     let time = ui
         .painter()
         .layout_no_wrap(ts.to_owned(), theme::regular(12.0), pal().text_muted);
-    let size = egui::vec2(glyph.size().x + 6.0 + time.size().x, BOOKMARK_LINE);
+    let time_width = player_bar::stable_width(ui, ts, theme::regular(12.0));
+    let size = egui::vec2(glyph.size().x + 6.0 + time_width, BOOKMARK_LINE);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let label = format!("Play recording at bookmark {ts}");
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
@@ -1613,6 +2002,58 @@ fn bookmark_seek(ui: &mut egui::Ui, ts: &str) -> Response {
         }
     }
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The stand-in for `count` lines the speaker filter hides: a faint
+/// centred "n lines from others" between hairlines. While playback is in
+/// those lines it takes the active row's tint (follow-along scrolls to it).
+fn hidden_row(ui: &mut egui::Ui, rc: &RowCtx, first: usize, count: usize) {
+    let active = rc
+        .active
+        .is_some_and(|a| (first..first + count).contains(&a));
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), HIDDEN_LINE),
+        Sense::hover(),
+    );
+    let text = if count == 1 {
+        "1 line from others".to_owned()
+    } else {
+        format!("{} lines from others", fmt_thousands(count as i64))
+    };
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &text));
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let painter = ui.painter();
+    if active {
+        painter.rect_filled(rect, CornerRadius::same(theme::R_SM), pal().active_seg_bg);
+    }
+    let color = if active {
+        pal().text_muted
+    } else {
+        pal().text_faint
+    };
+    let galley = painter.layout_no_wrap(text, theme::regular(12.0), color);
+    let cx = rect.center().x;
+    let half = galley.size().x / 2.0 + theme::S2;
+    painter.galley(
+        egui::pos2(
+            cx - galley.size().x / 2.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        color,
+    );
+    let stroke = Stroke::new(1.0, pal().border);
+    let inset = rect.left() + ROW_PAD_X;
+    if cx - half > inset {
+        painter.hline(inset..=cx - half, rect.center().y, stroke);
+        painter.hline(
+            cx + half..=rect.right() - ROW_PAD_X,
+            rect.center().y,
+            stroke,
+        );
+    }
 }
 
 /// The note as a button (a faint placeholder when empty); a click edits it.
@@ -1835,15 +2276,8 @@ fn jump_pill(ctx: &egui::Context, id: Id, anchor: egui::Pos2) -> bool {
             let hot = response.hovered() || response.has_focus();
             let radius = CornerRadius::same(255);
             let painter = ui.painter();
-            painter.add(
-                egui::epaint::Shadow {
-                    offset: [0, 8],
-                    blur: 28,
-                    spread: 0,
-                    color: Color32::from_black_alpha(115),
-                }
-                .as_shape(rect, radius),
-            );
+            // The theme's popup shadow (much lighter in the light theme).
+            painter.add(ui.visuals().popup_shadow.as_shape(rect, radius));
             painter.rect(
                 rect,
                 radius,
@@ -1959,6 +2393,19 @@ struct TranscriptState {
     speakers: HashMap<i64, usize>,
     stats: Vec<SpeakerStat>,
     list: RowList,
+    /// The speakers whose lines show (empty: everyone).
+    filter: BTreeSet<SpeakerKey>,
+    /// A legend / proportion-bar click this pass (the speaker, Ctrl held),
+    /// or the filter chip's Clear (`None`): applied after the list is
+    /// drawn, so an editor blurred by the click commits first.
+    filter_click: Option<Option<(SpeakerKey, bool)>>,
+    /// Ctrl+F's find bar while open.
+    find: Option<FindState>,
+    /// Bumped whenever the rows are rebuilt (new data, the filter): find
+    /// recomputes its hits.
+    data_gen: u64,
+    /// Who spoke when, for the scrubber.
+    timeline: Timeline,
 
     audio: Audio,
     /// The `(audio_path, reload_gen)` the audio state belongs to.
@@ -1998,6 +2445,9 @@ struct TranscriptState {
     /// Where the vertical scroll bar was last frame, while it showed.
     scroll_bar: Option<Rect>,
     first_frame: bool,
+    /// Some widget had keyboard focus at the end of the last pass (an Esc
+    /// that blurs it is not one that closes find).
+    focus_last_pass: bool,
     player_bar: PlayerBarState,
     /// Picks the toast when the player reports a play failure.
     play_origin: PlayOrigin,
@@ -2029,6 +2479,11 @@ impl TranscriptState {
             speakers: HashMap::new(),
             stats: Vec::new(),
             list: RowList::default(),
+            filter: BTreeSet::new(),
+            filter_click: None,
+            find: None,
+            data_gen: 0,
+            timeline: Timeline::default(),
             audio: Audio::None,
             audio_key: None,
             pending_seek_ms: None,
@@ -2052,6 +2507,7 @@ impl TranscriptState {
             scroll_outer: None,
             scroll_bar: None,
             first_frame: true,
+            focus_last_pass: false,
             player_bar: PlayerBarState::with_volume_open(debug.volume),
             play_origin: PlayOrigin::Bar,
             live_feed: LiveFeedState::default(),
@@ -2076,14 +2532,19 @@ impl TranscriptState {
             }
             return;
         }
-        if self.detail.is_none() {
-            widgets::padded_column(ui, |ui| widgets::empty_state(ui, "Loading…", None));
+        let layout = header_layout(self.pane(cx));
+        if self.detail.is_none() || self.debug.loading {
+            widgets::padded_column(ui, |ui| loading_skeleton(ui, layout));
             return;
         }
 
         let snap = cx.player.snapshot();
         let playback = self.playback(&snap);
         let playable = playback == Playback::Playable;
+        // Before the player keys: Enter in the find field steps through
+        // the hits (and must not reach anything else).
+        self.find_keys(&ctx, cx);
+        self.update_find();
         if playable {
             self.track_position(&snap);
             self.player_keys(&ctx, cx);
@@ -2092,26 +2553,65 @@ impl TranscriptState {
 
         // The player bar, docked under the scrolling content. It lines up
         // with the text column, which last pass's scroll bar narrowed.
+        let right = ui.max_rect().right();
+        let gutter = self
+            .scroll_inner
+            .map_or(0.0, |inner| (right - inner.right()).clamp(0.0, 20.0));
         if playable {
             let mut bar_out = player_bar::PlayerBarOutput::default();
             let detail = self.detail.as_ref().expect("checked above");
-            let bar_state = &mut self.player_bar;
-            let right = ui.max_rect().right();
-            let gutter = self
-                .scroll_inner
-                .map_or(0.0, |inner| (right - inner.right()).clamp(0.0, 20.0));
+            let (timeline, bar_state) = (&self.timeline, &mut self.player_bar);
             egui::Panel::bottom(Id::new(("transcript-player", self.meeting_id)))
                 .frame(player_bar::bar_frame())
                 .resizable(false)
                 .show_separator_line(false)
                 .show(ui, |ui| {
-                    bar_out = player_bar::show(ui, cx, detail, bar_state, gutter);
+                    bar_out = player_bar::show(ui, cx, detail, timeline, bar_state, gutter);
                 });
             if bar_out.toggled {
                 self.play_origin = PlayOrigin::Bar;
             }
             if let Some(at_ms) = bar_out.add_bookmark_at_ms {
                 self.add_bookmark(cx, at_ms);
+            }
+        }
+
+        // The find bar and the speaker filter's chip, docked over the
+        // transcript column: they stay put while the lines scroll by, and
+        // side by side they say that find searches the shown lines only.
+        let filtering = !self.filter.is_empty();
+        if self.find.is_some() || filtering {
+            let field = self.find_field_id();
+            let names = filter_names(&self.stats, &self.filter);
+            let find = &mut self.find;
+            let (mut outcome, mut clear) = (FindOutcome::None, false);
+            egui::Panel::top(Id::new(("transcript-find-bar", self.meeting_id)))
+                .frame(Frame::new().fill(pal().bg).inner_margin(Margin {
+                    left: 0,
+                    right: 0,
+                    top: 8,
+                    bottom: 4,
+                }))
+                .resizable(false)
+                .show_separator_line(false)
+                .show(ui, |ui| {
+                    player_bar::bar_column(ui, gutter, |ui| {
+                        ui.spacing_mut().item_spacing.y = theme::S2;
+                        if let Some(find) = find.as_mut() {
+                            outcome = find_bar(ui, find, field);
+                        }
+                        if filtering {
+                            clear = filter_chip(ui, &names).clicked();
+                        }
+                    });
+                });
+            if clear {
+                self.filter_click = Some(None);
+            }
+            match outcome {
+                FindOutcome::None => {}
+                FindOutcome::Step { back } => self.step_find(back),
+                FindOutcome::Close => self.close_find(&ctx),
             }
         }
 
@@ -2134,6 +2634,7 @@ impl TranscriptState {
         self.record_scroll_rects(ui, &output);
         self.settle_scroll(&ctx, &list_out);
         self.apply_actions(cx, playable, std::mem::take(&mut list_out.actions));
+        self.apply_filter_click();
         if let Some(error) = take_play_error(cx.player) {
             cx.toasts.error(self.play_origin.failure(), error);
         }
@@ -2151,6 +2652,7 @@ impl TranscriptState {
             }
         }
 
+        self.focus_last_pass = ctx.memory(|m| m.focused().is_some());
         if snap.playing && cx.window.is_shown() && !cx.window.is_minimized() {
             ctx.request_repaint_after(PLAY_FRAME);
         }
@@ -2311,7 +2813,7 @@ impl TranscriptState {
                         at_ms,
                         note: String::new(),
                     });
-                    self.list.rebuild(detail);
+                    self.rebuild_list();
                 }
                 self.bookmark_edit = Some(BookmarkEdit {
                     id,
@@ -2356,7 +2858,10 @@ impl TranscriptState {
             .map(|(i, s)| (s.id, i))
             .collect();
         self.stats = speaker_stats(&detail, &self.speakers);
-        self.list.rebuild(&detail);
+        // Speakers gone after a retranscription leave the filter.
+        let stats = &self.stats;
+        self.filter
+            .retain(|key| stats.iter().any(|s| s.key == *key));
         // New segments (retranscribe): re-derive a shown highlight from the
         // current position, without scrolling.
         if self.active.is_some() {
@@ -2369,18 +2874,225 @@ impl TranscriptState {
             };
         }
         self.detail = Some(detail);
+        self.rebuild_list();
+        self.rebuild_timeline();
         self.deep_link();
         self.apply_debug_hooks();
     }
 
-    /// The first load's share of the [`DebugHooks`] (each applies once).
-    fn apply_debug_hooks(&mut self) {
-        let Some(detail) = self.detail.as_ref() else {
+    /// Rebuild the rows for the data and the speaker filter (find
+    /// recomputes its hits on the next pass).
+    fn rebuild_list(&mut self) {
+        if let Some(detail) = self.detail.as_ref() {
+            let filter = &self.filter;
+            self.list
+                .rebuild(detail, |i| is_shown(filter, &detail.segments[i]));
+        }
+        self.data_gen += 1;
+    }
+
+    /// Rebuild the scrubber's timeline (data, names or filter changed).
+    fn rebuild_timeline(&mut self) {
+        if let Some(detail) = self.detail.as_ref() {
+            let version = self.timeline.version + 1;
+            self.timeline = build_timeline(detail, &self.stats, &self.filter, version);
+        }
+    }
+
+    /// Show only `filter`'s speakers (everyone when empty), keeping the
+    /// line at the top of the view in place.
+    fn set_filter(&mut self, filter: BTreeSet<SpeakerKey>) {
+        if filter == self.filter {
+            return;
+        }
+        self.filter = filter;
+        self.rebuild_list();
+        self.list.keep_reading_position();
+        self.rebuild_timeline();
+        // A rename open on a line that is now hidden would lose its field
+        // (and with it every way to commit): it closes.
+        let hidden = |seg_id: i64| {
+            self.detail.as_ref().is_some_and(|d| {
+                d.segments
+                    .iter()
+                    .find(|s| s.id == seg_id)
+                    .is_some_and(|s| !is_shown(&self.filter, s))
+            })
+        };
+        if self.speaker_edit.as_ref().is_some_and(|e| hidden(e.seg_id)) {
+            self.speaker_edit = None;
+        }
+    }
+
+    /// Apply this pass's legend / proportion-bar click or chip Clear.
+    fn apply_filter_click(&mut self) {
+        let Some(click) = self.filter_click.take() else {
             return;
         };
+        let mut filter = self.filter.clone();
+        match click {
+            Some((key, add)) => toggle_filter(&mut filter, key, add),
+            None => filter.clear(),
+        }
+        self.set_filter(filter);
+    }
+
+    /// Where the view sits in the shell (debug builds can force the split
+    /// layout's detail pane).
+    fn pane(&self, cx: &UiCtx) -> PaneRole {
+        self.debug.pane.unwrap_or(cx.pane)
+    }
+
+    // ------------------------------------------------------------------
+    // Find
+
+    fn find_field_id(&self) -> Id {
+        Id::new(("transcript-find", self.meeting_id))
+    }
+
+    /// Ctrl+F opens find (or refocuses it, selecting the query); F3 /
+    /// Shift+F3 step through the hits (opening find when closed); Enter /
+    /// Shift+Enter step while the field has focus. Ctrl+F works from
+    /// inside a text field too, as in a browser. Esc closes find from the
+    /// field (`find_bar`) or while nothing has focus — not when it only
+    /// blurs another field, nor while a menu is open.
+    fn find_keys(&mut self, ctx: &egui::Context, cx: &UiCtx) {
+        if cx.confirm.is_open() {
+            return;
+        }
+        let field = self.find_field_id();
+        let in_field = ctx.memory(|m| m.has_focus(field));
+        let idle = !self.focus_last_pass && !Popup::is_any_open(ctx);
+        let open = self.find.is_some();
+        let (ctrl_f, f3, enter, escape) = ctx.input_mut(|i| {
+            (
+                consume_press(i, Key::F, |m| m.command && !m.alt && !m.shift).is_some(),
+                consume_press(i, Key::F3, |m| !m.command && !m.alt),
+                if in_field {
+                    consume_press(i, Key::Enter, |m| !m.command && !m.alt)
+                } else {
+                    None
+                },
+                open && idle && consume_press(i, Key::Escape, |m| !m.any()).is_some(),
+            )
+        });
+        if ctrl_f || (f3.is_some() && !open) {
+            self.open_find(ctx);
+        } else if let Some(m) = f3.or(enter) {
+            self.step_find(m.shift);
+        } else if escape {
+            self.close_find(ctx);
+        }
+    }
+
+    fn open_find(&mut self, ctx: &egui::Context) {
+        let field = self.find_field_id();
+        let focused = ctx.memory(|m| m.focused()).filter(|id| *id != field);
+        let find = self.find.get_or_insert_with(FindState::default);
+        find.focus = true;
+        if focused.is_some() {
+            find.return_focus = focused;
+        }
+    }
+
+    /// Esc / ×: close find and give the focus back.
+    fn close_find(&mut self, ctx: &egui::Context) {
+        if let Some(id) = self.find.take().and_then(|f| f.return_focus) {
+            ctx.memory_mut(|m| m.request_focus(id));
+        }
+    }
+
+    /// The next (or previous) hit, scrolled into view.
+    fn step_find(&mut self, back: bool) {
+        let Some(find) = self.find.as_mut() else {
+            return;
+        };
+        find.current = step_hit(find.hits.len(), find.current, back);
+        self.reveal_find_hit();
+    }
+
+    /// Recompute the hits when the query or the rows changed. A new query
+    /// starts from the current hit's line (or the line at the top of the
+    /// view) and scrolls to its first hit; new data keeps the place.
+    fn update_find(&mut self) {
+        let (Some(find), Some(detail)) = (self.find.as_mut(), self.detail.as_ref()) else {
+            return;
+        };
+        let key = (find.query.clone(), self.data_gen);
+        if find.computed.as_ref() == Some(&key) {
+            return;
+        }
+        let new_query = find.computed.as_ref().is_none_or(|(q, _)| *q != key.0);
+        let from = find
+            .current
+            .and_then(|c| find.hits.get(c))
+            .map_or_else(|| self.list.reading_segment(), |h| h.seg);
+        let filter = &self.filter;
+        find.hits = find_hits(
+            detail,
+            |i| is_shown(filter, &detail.segments[i]),
+            &find.query,
+        );
+        find.current = first_hit_from(&find.hits, from);
+        find.computed = Some(key);
+        if new_query {
+            self.reveal_find_hit();
+        }
+    }
+
+    /// Scroll the current hit's line into view (centred, unless it is
+    /// already wholly on screen); follow-along lets go, so playback does
+    /// not scroll it away again (the Jump pill brings it back).
+    fn reveal_find_hit(&mut self) {
+        let Some(seg) = self
+            .find
+            .as_ref()
+            .and_then(|f| f.current.and_then(|c| f.hits.get(c)))
+            .map(|h| h.seg)
+        else {
+            return;
+        };
+        if !self.list.seg_visible(seg) {
+            self.follow = false;
+            self.scroll_req = Some(ScrollReq::new(seg, true, false));
+        }
+    }
+
+    /// The first load's share of the [`DebugHooks`] (each applies once).
+    fn apply_debug_hooks(&mut self) {
+        if self.detail.is_none() {
+            return;
+        }
         if std::mem::take(&mut self.debug.notes_open) {
             self.notes.open = true;
         }
+        if let Some(labels) = self.debug.filter.take() {
+            // Speakers by label (`me`, `S1`…), as the legend colours them.
+            let filter = self
+                .stats
+                .iter()
+                .filter(|stat| labels.split(',').any(|l| l.trim() == stat.label))
+                .map(|stat| stat.key)
+                .collect();
+            self.set_filter(filter);
+        }
+        if let Some((query, index)) = self.debug.find.take() {
+            self.find = Some(FindState {
+                query,
+                focus: true,
+                ..FindState::default()
+            });
+            self.update_find();
+            if let (Some(index), Some(find)) = (index, self.find.as_mut()) {
+                if index < find.hits.len() {
+                    find.current = Some(index);
+                }
+                self.reveal_find_hit();
+            }
+        }
+        let Some(detail) = self.detail.as_ref() else {
+            return;
+        };
         if let Some(idx) = self.debug.segment.take() {
             // A deep link by index, without `focus_segment_id` (which
             // `sync_view_args` keeps equal to the view's).
@@ -2692,6 +3404,10 @@ impl TranscriptState {
             bookmark_edit: &mut self.bookmark_edit,
             people: &self.people,
             focus_seg: &mut focus_seg,
+            find: self
+                .find
+                .as_ref()
+                .filter(|f| !find_needle(&f.query).is_empty()),
         };
         self.list.show(ui, &mut rc, self.scroll_req)
     }
@@ -2716,6 +3432,7 @@ impl TranscriptState {
         let has_segments = !detail.segments.is_empty();
         let copied = self.copied_until.is_some_and(|t| Instant::now() < t);
         let open_menu = self.debug.menu.take();
+        let layout = header_layout(self.pane(cx));
 
         let mut back = false;
         let mut export_choice = None;
@@ -2725,7 +3442,7 @@ impl TranscriptState {
         // The row is as tall as the title block, and the buttons centre on
         // it: the title line is the pencil's 28 pt (the rename field's
         // height while editing), then the 12 pt meta line.
-        let title_font = theme::semibold(TITLE_SIZE);
+        let title_font = theme::semibold(layout.title_size);
         let title_h = if self.title_edit.is_some() {
             // The field's 3 + 3 padding and 1 + 1 border.
             row_height(ui, &title_font) + 8.0
@@ -2740,7 +3457,9 @@ impl TranscriptState {
             Layout::left_to_right(Align::Center),
             |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 2.0);
-                back = widgets::icon_btn(ui, ph::ARROW_LEFT, HEADER_ICON, "Back").clicked();
+                if layout.back {
+                    back = widgets::icon_btn(ui, ph::ARROW_LEFT, HEADER_ICON, "Back").clicked();
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
                     engine_choice = header_menu(
@@ -2793,7 +3512,7 @@ impl TranscriptState {
                                     title_done = Some(outcome);
                                 }
                             } else {
-                                start_edit = title_row(ui, &title);
+                                start_edit = title_row(ui, &title, layout.title_size);
                             }
                             widgets::elide(ui, &meta, meta_font.clone(), pal().text_muted);
                         });
@@ -2801,7 +3520,7 @@ impl TranscriptState {
                 });
             },
         );
-        widgets::gap(ui, theme::S4);
+        widgets::gap(ui, layout.gap_below);
 
         if back {
             self.back(cx);
@@ -2831,11 +3550,15 @@ impl TranscriptState {
 
     /// The speaker summary: one stacked proportion bar (each speaker's
     /// share of the talk time, in their colour) over a wrapping legend
-    /// ("● Name 16 min · 57%"). Hovering either shows the full figures.
-    fn speaker_summary(&self, ui: &mut egui::Ui) {
+    /// ("● Name 16 min · 57%"). Hovering either shows the full figures; a
+    /// click on either filters the transcript to that speaker (Ctrl+click
+    /// adds one; the docked "Showing … · Clear" chip resets it).
+    fn speaker_summary(&mut self, ui: &mut egui::Ui) {
         if self.stats.is_empty() {
             return;
         }
+        let filtering = !self.filter.is_empty();
+        let mut click = None;
         let width = ui.available_width();
         let (bar, _) = ui.allocate_exact_size(egui::vec2(width, SUMMARY_BAR_H), Sense::hover());
         let shares: Vec<f64> = self.stats.iter().map(|s| s.share).collect();
@@ -2857,15 +3580,26 @@ impl TranscriptState {
                 ne: right,
                 se: right,
             };
-            let hover = ui.interact(rect, ui.id().with(("summary-bar", i)), Sense::hover());
+            let segment = ui.interact(rect, ui.id().with(("summary-bar", i)), Sense::click());
+            let selected = self.filter.contains(&stat.key);
+            let full = format!("{} — {}", stat.name, stat_text(stat));
+            segment.widget_info(|| {
+                egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &full)
+            });
             let color = speaker_text(&stat.label);
-            let fill = if hover.hovered() {
-                theme::lighten(color, 0.25)
-            } else {
-                color
+            let fill = match (filtering && !selected, segment.hovered()) {
+                (false, false) => color,
+                (false, true) => theme::lighten(color, 0.25),
+                (true, false) => theme::alpha(color, FILTERED_OUT_ALPHA),
+                (true, true) => theme::alpha(color, 0.7),
             };
             ui.painter().rect_filled(rect, radius, fill);
-            hover.on_hover_text(format!("{} — {}", stat.name, stat_text(stat)));
+            let segment = segment
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(format!("{full}\n{}", filter_hint(&self.filter, stat.key)));
+            if segment.clicked() {
+                click = Some(stat.key);
+            }
         }
         widgets::gap(ui, 10.0);
         ui.scope(|ui| {
@@ -2874,10 +3608,20 @@ impl TranscriptState {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(16.0, 6.0);
                 for stat in &self.stats {
-                    legend_item(ui, stat, width);
+                    let selected = self.filter.contains(&stat.key);
+                    let dimmed = filtering && !selected;
+                    let hint = filter_hint(&self.filter, stat.key);
+                    let item = legend_item(ui, stat, width, selected, dimmed, hint);
+                    if item.clicked() {
+                        click = Some(stat.key);
+                    }
                 }
             });
         });
+        if let Some(key) = click {
+            let add = ui.input(|i| i.modifiers.command);
+            self.filter_click = Some(Some((key, add)));
+        }
         widgets::gap(ui, theme::S3);
     }
 
@@ -3169,6 +3913,8 @@ impl TranscriptState {
             speaker.auto_labeled = false;
         }
         self.stats = speaker_stats(detail, &self.speakers);
+        // The scrubber's tooltip names them too.
+        self.rebuild_timeline();
         if self.synthetic {
             return;
         }
@@ -3207,7 +3953,7 @@ impl TranscriptState {
     fn delete_bookmark(&mut self, cx: &mut UiCtx, id: i64) {
         if let Some(detail) = self.detail.as_mut() {
             detail.bookmarks.retain(|b| b.id != id);
-            self.list.rebuild(detail);
+            self.rebuild_list();
         }
         if self.bookmark_edit.as_ref().is_some_and(|e| e.id == id) {
             self.bookmark_edit = None;
@@ -3337,8 +4083,99 @@ fn transcription_progress(cx: &UiCtx, meeting_id: i64) -> Option<(String, f32)> 
         })
 }
 
-/// The meeting title (18 pt semibold).
+/// The meeting title (18 pt semibold; 16 in the split layout's detail
+/// pane, whose column is narrower).
 const TITLE_SIZE: f32 = 18.0;
+const TITLE_SIZE_DETAIL: f32 = 16.0;
+
+/// How the header is laid out for the view's place in the shell.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HeaderLayout {
+    /// The Back button (the detail pane has the list beside it instead).
+    back: bool,
+    title_size: f32,
+    /// The space under the header.
+    gap_below: f32,
+}
+
+fn header_layout(pane: PaneRole) -> HeaderLayout {
+    match pane {
+        PaneRole::Detail => HeaderLayout {
+            back: false,
+            title_size: TITLE_SIZE_DETAIL,
+            gap_below: theme::S3,
+        },
+        PaneRole::Full | PaneRole::List { .. } => HeaderLayout {
+            back: true,
+            title_size: TITLE_SIZE,
+            gap_below: theme::S4,
+        },
+    }
+}
+
+/// The first load's placeholder, shaped like the view: the header (Back,
+/// the title over its meta line), the proportion bar and legend, the notes
+/// row, then a few speaker turns — shimmering until the meeting arrives.
+fn loading_skeleton(ui: &mut egui::Ui, layout: HeaderLayout) {
+    let width = ui.available_width();
+    let sk = |ui: &mut egui::Ui, w: f32, h: f32| {
+        widgets::skeleton(ui, egui::vec2(w.max(12.0), h));
+    };
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        if layout.back {
+            sk(ui, PENCIL_SIZE, PENCIL_SIZE);
+        }
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 10.0;
+            sk(ui, width * 0.5, layout.title_size - 2.0);
+            sk(ui, width * 0.32, 10.0);
+        });
+    });
+    widgets::gap(ui, layout.gap_below);
+    sk(ui, width, SUMMARY_BAR_H);
+    widgets::gap(ui, 12.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = theme::S4;
+        for w in [96.0f32, 120.0, 84.0] {
+            sk(ui, w.min(width / 3.5), 10.0);
+        }
+    });
+    widgets::gap(ui, theme::S3);
+    // The notes row.
+    ui.horizontal(|ui| {
+        ui.set_height(NOTES_ROW_H);
+        ui.add_space(ROW_PAD_X);
+        sk(ui, 56.0, 11.0);
+    });
+    widgets::gap(ui, theme::S1);
+    // Speaker turns: a name and time over one to three lines of text.
+    let text_w = width - 2.0 * ROW_PAD_X;
+    for (turn, lines) in [3usize, 1, 2, 3, 1].into_iter().enumerate() {
+        if turn > 0 {
+            ui.add_space(TURN_GAP);
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(ROW_PAD_X);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = LINE_HEIGHT - 11.0;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    sk(ui, [72.0, 96.0, 64.0][turn % 3], 11.0);
+                    sk(ui, 28.0, 9.0);
+                });
+                for line in 0..lines {
+                    let share = if line + 1 == lines {
+                        [0.62, 0.48, 0.71][(turn + line) % 3]
+                    } else {
+                        0.96
+                    };
+                    sk(ui, text_w * share, 11.0);
+                }
+            });
+        });
+    }
+}
 /// The rename pencil's square (a 14 pt glyph): the title line's height.
 const PENCIL_SIZE: f32 = 28.0;
 /// The notes disclosure row.
@@ -3347,7 +4184,7 @@ const NOTES_ROW_H: f32 = 32.0;
 /// The title (one line, elided with the full title in its tooltip) and the
 /// inline pencil. Returns true when a rename should start (double-click or
 /// pencil).
-fn title_row(ui: &mut egui::Ui, title: &str) -> bool {
+fn title_row(ui: &mut egui::Ui, title: &str, size: f32) -> bool {
     let mut start = false;
     // As tall as the title line: `horizontal` would reserve the 32 pt
     // interact height, padding the title down and away from its meta line.
@@ -3357,7 +4194,7 @@ fn title_row(ui: &mut egui::Ui, title: &str) -> bool {
         ui.spacing_mut().interact_size.y = interact;
         ui.spacing_mut().item_spacing.x = 2.0;
         let max = (ui.available_width() - PENCIL_SIZE - 2.0).max(40.0);
-        let galley = elided_galley(ui, title, theme::semibold(TITLE_SIZE), pal().text, max);
+        let galley = elided_galley(ui, title, theme::semibold(size), pal().text, max);
         let tooltip = if galley.elided {
             format!("{title}\nDouble-click to rename")
         } else {
@@ -3379,45 +4216,311 @@ fn title_row(ui: &mut egui::Ui, title: &str) -> bool {
     start
 }
 
+/// What a click on a speaker in the summary will do (its tooltip's second
+/// line).
+fn filter_hint(filter: &BTreeSet<SpeakerKey>, key: SpeakerKey) -> &'static str {
+    if filter.len() == 1 && filter.contains(&key) {
+        "Click to show everyone"
+    } else if filter.contains(&key) {
+        "Click to show only them · Ctrl+click to hide them"
+    } else {
+        "Click to show only their lines · Ctrl+click to add them"
+    }
+}
+
 /// One speaker in the summary's legend: a dot in their colour, the name
 /// (elided so the item never outgrows `max_width`) and the short figures;
 /// claimed as one item, so the wrapping legend breaks between speakers,
-/// never inside one.
-fn legend_item(ui: &mut egui::Ui, stat: &SpeakerStat, max_width: f32) -> Response {
+/// never inside one. A toggle for the speaker filter: `selected` speakers
+/// sit on an accent tint, `dimmed` ones (filtered out) fade.
+fn legend_item(
+    ui: &mut egui::Ui,
+    stat: &SpeakerStat,
+    max_width: f32,
+    selected: bool,
+    dimmed: bool,
+    hint: &str,
+) -> Response {
     const DOT: f32 = 8.0;
     const GAP: f32 = 6.0;
+    // The tint reaches this far past the item (inside the 16 pt spacing).
+    const PAD: egui::Vec2 = egui::vec2(6.0, 3.0);
+    let (name_color, figures_color) = if dimmed {
+        (pal().text_faint, pal().text_faint)
+    } else {
+        (pal().text, pal().text_muted)
+    };
     let figures =
         ui.painter()
-            .layout_no_wrap(legend_text(stat), theme::regular(12.0), pal().text_muted);
-    let name_max = (max_width - DOT - 2.0 * GAP - figures.size().x).max(40.0);
-    let name = elided_galley(ui, &stat.name, theme::regular(13.0), pal().text, name_max);
+            .layout_no_wrap(legend_text(stat), theme::regular(12.0), figures_color);
+    let name_max = (max_width - DOT - 2.0 * GAP - figures.size().x - 2.0 * PAD.x).max(40.0);
+    let name = elided_galley(ui, &stat.name, theme::regular(13.0), name_color, name_max);
     let height = name.size().y.max(figures.size().y);
     let size = egui::vec2(DOT + GAP + name.size().x + GAP + figures.size().x, height);
-    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let full = format!("{} — {}", stat.name, stat_text(stat));
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &full));
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &full)
+    });
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
+        let ring = response.has_focus() && widgets::focus_visible(ui.ctx());
+        let tint = rect.expand2(PAD);
+        let radius = CornerRadius::same(theme::R_SM);
+        if selected {
+            painter.rect_filled(tint, radius, pal().accent_soft);
+        }
+        if response.hovered() || ring {
+            painter.rect_filled(tint, radius, pal().bg_hover);
+        }
         let cy = rect.center().y;
+        let dot = speaker_text(&stat.label);
         painter.circle_filled(
             egui::pos2(rect.left() + DOT / 2.0, cy),
             DOT / 2.0,
-            speaker_text(&stat.label),
+            if dimmed {
+                theme::alpha(dot, FILTERED_OUT_ALPHA)
+            } else {
+                dot
+            },
         );
         let name_x = rect.left() + DOT + GAP;
         let figures_x = name_x + name.size().x + GAP;
         painter.galley(
             egui::pos2(name_x, cy - name.size().y / 2.0),
             name,
-            pal().text,
+            name_color,
         );
         painter.galley(
             egui::pos2(figures_x, cy - figures.size().y / 2.0),
             figures,
-            pal().text_muted,
+            figures_color,
         );
+        if ring {
+            focus_ring(ui, tint, theme::R_SM);
+        }
     }
-    response.on_hover_text(full)
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(format!("{full}\n{hint}"))
+}
+
+/// "Showing Paul Gordon · Clear": the speaker filter is on; a click shows
+/// everyone again. The names elide to the column.
+fn filter_chip(ui: &mut egui::Ui, names: &str) -> Response {
+    const PAD_X: f32 = 10.0;
+    const HEIGHT: f32 = 26.0;
+    let font = theme::regular(12.5);
+    let clear =
+        ui.painter()
+            .layout_no_wrap("·  Clear".to_owned(), theme::semibold(12.5), pal().accent);
+    let room = ui.available_width() - 2.0 * PAD_X - clear.size().x - theme::S2;
+    let shown = elided_galley(ui, &format!("Showing {names}"), font, pal().text, room);
+    let size = egui::vec2(
+        PAD_X + shown.size().x + theme::S2 + clear.size().x + PAD_X,
+        HEIGHT,
+    );
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let label = format!("Clear the speaker filter (showing {names})");
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let ring = response.has_focus() && widgets::focus_visible(ui.ctx());
+        let fill = if response.hovered() || ring {
+            theme::alpha(pal().accent, 0.26)
+        } else {
+            pal().accent_soft
+        };
+        let radius = CornerRadius::same(255);
+        painter.rect_filled(rect, radius, fill);
+        let cy = rect.center().y;
+        let x = rect.left() + PAD_X;
+        let clear_x = x + shown.size().x + theme::S2;
+        painter.galley(egui::pos2(x, cy - shown.size().y / 2.0), shown, pal().text);
+        painter.galley(
+            egui::pos2(clear_x, cy - clear.size().y / 2.0),
+            clear,
+            pal().accent,
+        );
+        if ring {
+            painter.rect_stroke(
+                rect.expand(2.0),
+                radius,
+                Stroke::new(2.0, pal().focus),
+                egui::StrokeKind::Outside,
+            );
+        }
+    }
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Show every speaker's lines")
+}
+
+/// What the find bar asked for this pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FindOutcome {
+    None,
+    Step { back: bool },
+    Close,
+}
+
+/// The find bar: a raised field (accent border while focused) holding the
+/// magnifier, the query, "3 of 17" in a fixed-width slot, previous / next
+/// and close. The query updates the hits live (the view recomputes them);
+/// Esc in the field or × closes it.
+fn find_bar(ui: &mut egui::Ui, find: &mut FindState, field_id: Id) -> FindOutcome {
+    let mut outcome = FindOutcome::None;
+    let focused = ui.memory(|m| m.has_focus(field_id));
+    let count = find_count_text(&find.query, find.hits.len(), find.current);
+    let count_font = theme::regular(12.0);
+    // As wide as "17 of 17" with `0` digits: stepping never moves the
+    // buttons (only a new hit count can).
+    let total = find.hits.len().max(1).to_string();
+    let count_w = player_bar::stable_width(ui, &format!("{total} of {total}"), count_font.clone())
+        .max(player_bar::stable_width(ui, &count, count_font.clone()));
+    Frame::new()
+        .fill(pal().bg_raised)
+        .stroke(Stroke::new(
+            1.0,
+            if focused {
+                pal().accent
+            } else {
+                pal().border_strong
+            },
+        ))
+        .corner_radius(CornerRadius::same(theme::R_MD))
+        .inner_margin(Margin {
+            left: 10,
+            right: 2,
+            top: 0,
+            bottom: 0,
+        })
+        .show(ui, |ui| {
+            let width = ui.available_width();
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, FIND_BAR_H - 2.0),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.set_min_size(egui::vec2(width, FIND_BAR_H - 2.0));
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.label(
+                        egui::RichText::new(ph::MAGNIFYING_GLASS)
+                            .size(15.0)
+                            .color(pal().text_muted),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        if widgets::icon_btn(ui, ph::X, 14.0, "Close find (Esc)").clicked() {
+                            outcome = FindOutcome::Close;
+                        }
+                        let any = !find.hits.is_empty();
+                        let next = ui
+                            .add_enabled_ui(any, |ui| {
+                                widgets::icon_btn(ui, ph::CARET_DOWN, 14.0, "Next match (Enter)")
+                            })
+                            .inner;
+                        if next.clicked() {
+                            outcome = FindOutcome::Step { back: false };
+                        }
+                        let previous = ui
+                            .add_enabled_ui(any, |ui| {
+                                widgets::icon_btn(
+                                    ui,
+                                    ph::CARET_UP,
+                                    14.0,
+                                    "Previous match (Shift+Enter)",
+                                )
+                            })
+                            .inner;
+                        if previous.clicked() {
+                            outcome = FindOutcome::Step { back: true };
+                        }
+                        ui.add_space(6.0);
+                        let color = if any {
+                            pal().text_muted
+                        } else {
+                            pal().text_faint
+                        };
+                        let galley = ui
+                            .painter()
+                            .layout_no_wrap(count.clone(), count_font, color);
+                        let (rect, response) =
+                            ui.allocate_exact_size(egui::vec2(count_w, 20.0), Sense::hover());
+                        ui.painter().galley(
+                            egui::pos2(
+                                rect.right() - galley.size().x,
+                                rect.center().y - galley.size().y / 2.0,
+                            ),
+                            galley,
+                            color,
+                        );
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &count)
+                        });
+                        ui.add_space(6.0);
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            let edit = egui::TextEdit::singleline(&mut find.query)
+                                .id(field_id)
+                                .font(theme::regular(TEXT_SIZE))
+                                .frame(Frame::NONE)
+                                .margin(Margin::ZERO)
+                                // Enter steps through the hits (the view
+                                // reads it) instead of ending the edit.
+                                .return_key(None)
+                                .hint_text("Find in transcript")
+                                .desired_width(ui.available_width());
+                            let response = ui.add(edit);
+                            set_accessible_label(ui.ctx(), response.id, "Find in transcript");
+                            widgets::text_edit_menu(&response);
+                            if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
+                                outcome = FindOutcome::Close;
+                            }
+                            if std::mem::take(&mut find.focus) {
+                                response.request_focus();
+                                select_all(ui.ctx(), field_id, &find.query);
+                            }
+                        });
+                    });
+                },
+            );
+        });
+    widgets::announce(ui.ctx(), field_id.with("count"), &count, Politeness::Polite);
+    outcome
+}
+
+/// Select all of a text field's `text` (Ctrl+F on an open find bar).
+fn select_all(ctx: &egui::Context, id: Id, text: &str) {
+    use egui::text::{CCursor, CCursorRange};
+    let mut state = egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+    let end = CCursor::new(text.chars().count());
+    state
+        .cursor
+        .set_char_range(Some(CCursorRange::two(CCursor::new(0), end)));
+    state.store(ctx, id);
+}
+
+/// Consume every press of `key` whose modifiers `accept` takes, returning
+/// the modifiers of the last one. (egui's `consume_key` ignores an extra
+/// Shift, so Enter would also swallow Shift+Enter.)
+fn consume_press(
+    input: &mut egui::InputState,
+    key: Key,
+    accept: impl Fn(Modifiers) -> bool,
+) -> Option<Modifiers> {
+    let mut found = None;
+    input.events.retain(|event| match event {
+        egui::Event::Key {
+            key: k,
+            pressed: true,
+            modifiers,
+            ..
+        } if *k == key && accept(*modifiers) => {
+            found = Some(*modifiers);
+            false
+        }
+        _ => true,
+    });
+    found
 }
 
 /// A new caption scrolls the feed to the bottom only if the reader was
@@ -3476,7 +4579,7 @@ fn live_feed(
     let stick = state.stick(lines.back().map(|line| (line.track, line.start_ms)));
     Frame::new()
         .fill(pal().bg_raised)
-        .stroke(Stroke::new(1.0, LIVE_BORDER))
+        .stroke(Stroke::new(1.0, theme::alpha(pal().rec, LIVE_BORDER_ALPHA)))
         .corner_radius(CornerRadius::same(theme::R_LG))
         .inner_margin(Margin::symmetric(8, 10))
         .show(ui, |ui| {
@@ -3553,11 +4656,11 @@ fn live_feed(
 /// A caption line: a "Me" / "Them" header with the time when the track
 /// changes (not clickable), then the text.
 fn live_line(ui: &mut egui::Ui, line: &LiveTranscript, head: bool) {
-    // Text colours, lifted from the chips like `theme::speaker_text`.
+    // Text colours, made readable from the chips like `theme::speaker_text`.
     let (name, color) = if line.track == "mic" {
         ("Me", speaker_text("me"))
     } else {
-        ("Them", theme::lighten(pal().them_chip, 0.35))
+        ("Them", theme::ink(pal().them_chip))
     };
     if head {
         ui.add_space(6.0);
@@ -3584,7 +4687,7 @@ fn live_line(ui: &mut egui::Ui, line: &LiveTranscript, head: bool) {
                 },
             );
         }
-        ui.add(egui::Label::new(text_job(&line.text, &[])).wrap());
+        ui.add(egui::Label::new(text_job(&line.text, &[], None)).wrap());
     }
     let rect = row_rect(&prepared);
     if ui.rect_contains_pointer(rect) {
@@ -3612,6 +4715,29 @@ struct DebugHooks {
     /// `WITNESS_DEBUG_TRANSCRIPT_RENAME=1`: the speaker rename open on the
     /// first turn with a speaker.
     rename: bool,
+    /// `WITNESS_DEBUG_TRANSCRIPT_FIND=<query>[,<hit index>]`: find open
+    /// with that query (and that hit current).
+    find: Option<(String, Option<usize>)>,
+    /// `WITNESS_DEBUG_TRANSCRIPT_FILTER=<label>[,<label>…]`: only those
+    /// speakers' lines (`me`, `S1`…).
+    filter: Option<String>,
+    /// `WITNESS_DEBUG_TRANSCRIPT_LOADING=1`: the loading skeleton forever.
+    loading: bool,
+    /// `WITNESS_DEBUG_TRANSCRIPT_PANE=detail`: drawn as the split
+    /// layout's detail pane (no Back button).
+    pane: Option<PaneRole>,
+}
+
+/// `<query>[,<index>]`: a trailing number after the last comma is the hit
+/// index; anything else is all query.
+#[cfg_attr(not(any(debug_assertions, test)), allow(dead_code))]
+fn parse_debug_find(spec: &str) -> (String, Option<usize>) {
+    match spec.rsplit_once(',') {
+        Some((query, index)) if index.trim().parse::<usize>().is_ok() => {
+            (query.to_owned(), index.trim().parse().ok())
+        }
+        _ => (spec.to_owned(), None),
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -3629,6 +4755,12 @@ fn debug_hooks() -> DebugHooks {
         menu: var("MENU"),
         volume: on("VOLUME"),
         rename: on("RENAME"),
+        find: var("FIND").map(|spec| parse_debug_find(&spec)),
+        filter: var("FILTER"),
+        loading: on("LOADING"),
+        pane: var("PANE")
+            .filter(|v| v == "detail")
+            .map(|_| PaneRole::Detail),
     }
 }
 
@@ -3814,7 +4946,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            build_rows(&detail),
+            build_rows(&detail, |_| true),
             vec![
                 Row::Seg(0),
                 Row::Bm(1),
@@ -3908,7 +5040,8 @@ mod tests {
     #[test]
     fn highlighted_text_keeps_every_character() {
         let tokens = highlight_tokens("budget");
-        let job = text_job("The Budget and the budget.", &tokens);
+        let text = "The Budget and the budget.";
+        let job = text_job(text, &highlight_ranges(text, &tokens), None);
         assert_eq!(job.text, "The Budget and the budget.");
         let marks = job
             .sections
@@ -4008,10 +5141,23 @@ mod tests {
     fn run_list_editing(
         list: &mut RowList,
         detail: &MeetingDetail,
+        req: Option<ScrollReq>,
+        frames: usize,
+        width: f32,
+        speaker_edit: &mut Option<SpeakerEdit>,
+    ) -> ListOutput {
+        run_list_full(list, detail, req, frames, width, speaker_edit, None)
+    }
+
+    /// `run_list_editing` with find's hits highlighted.
+    fn run_list_full(
+        list: &mut RowList,
+        detail: &MeetingDetail,
         mut req: Option<ScrollReq>,
         frames: usize,
         width: f32,
         speaker_edit: &mut Option<SpeakerEdit>,
+        find: Option<&FindState>,
     ) -> ListOutput {
         let ctx = CTX.with(|ctx| ctx.clone());
         let speakers: HashMap<i64, usize> = detail
@@ -4046,6 +5192,7 @@ mod tests {
                             bookmark_edit: &mut bookmark_edit,
                             people: &[],
                             focus_seg: &mut None,
+                            find,
                         };
                         last = list.show(ui, &mut rc, req);
                     });
@@ -4067,7 +5214,7 @@ mod tests {
     fn long_transcripts_lay_out_only_visible_rows() {
         let detail = synthetic_detail(1, 3_000);
         let mut list = RowList::default();
-        list.rebuild(&detail);
+        list.rebuild(&detail, |_| true);
         let started = Instant::now();
         let out = run_list(&mut list, &detail, None, 3);
         assert!(out.rendered > 0);
@@ -4086,7 +5233,7 @@ mod tests {
     fn deep_link_centres_a_far_row() {
         let detail = synthetic_detail(1, 3_000);
         let mut list = RowList::default();
-        list.rebuild(&detail);
+        list.rebuild(&detail, |_| true);
         let req = ScrollReq::new(2_400, true, false);
         // The view re-aims for up to `SCROLL_SETTLE_FRAMES` passes (the scroll
         // bar animating in narrows the rows, and egui applies some scrolls a
@@ -4103,7 +5250,7 @@ mod tests {
     fn a_resize_keeps_the_reading_position() {
         let detail = synthetic_detail(1, 3_000);
         let mut list = RowList::default();
-        list.rebuild(&detail);
+        list.rebuild(&detail, |_| true);
         let req = ScrollReq::new(1_500, true, false);
         run_list_sized(&mut list, &detail, Some(req), 12, 800.0);
         let (key, above) = list.anchor.expect("anchored after the jump");
@@ -4125,7 +5272,7 @@ mod tests {
     fn a_measurement_at_another_width_yields_to_the_estimate() {
         let detail = synthetic_detail(1, 10);
         let mut list = RowList::default();
-        list.rebuild(&detail);
+        list.rebuild(&detail, |_| true);
         list.heights[4] = Some((800.0, 999.0));
         // The scroll bar fading in: still the measurement.
         assert_eq!(list.height(&detail, 4, 795.0), 999.0);
@@ -4138,11 +5285,11 @@ mod tests {
     fn height_cache_survives_a_rebuild() {
         let mut detail = synthetic_detail(1, 50);
         let mut list = RowList::default();
-        list.rebuild(&detail);
+        list.rebuild(&detail, |_| true);
         list.heights[3] = Some((700.0, 99.0));
         let key = list.keys[3];
         detail.bookmarks.clear();
-        list.rebuild(&detail);
+        list.rebuild(&detail, |_| true);
         let row = list.keys.iter().position(|k| *k == key).unwrap();
         assert_eq!(list.heights[row], Some((700.0, 99.0)));
         assert_eq!(list.seg_row.len(), 50);
@@ -4260,7 +5407,7 @@ mod tests {
     fn an_open_editor_keeps_focus_when_its_row_scrolls_far_away() {
         let detail = synthetic_detail(1, 3_000);
         let mut list = RowList::default();
-        list.rebuild(&detail);
+        list.rebuild(&detail, |_| true);
         let mut edit = Some(SpeakerEdit::new(3, 3, "Bob"));
         let top = Some(ScrollReq::new(0, false, false));
         run_list_editing(&mut list, &detail, top, 3, 800.0, &mut edit);
@@ -4437,7 +5584,7 @@ mod tests {
             .map(|(i, s)| (s.id, i))
             .collect();
         let mut list = RowList::default();
-        list.rebuild(&detail);
+        list.rebuild(&detail, |_| true);
         // Both seek buttons: a turn header's time and the left-padding
         // target of a row without a header.
         let (head, plain) = (2, 3);
@@ -4458,6 +5605,7 @@ mod tests {
                         bookmark_edit: &mut bookmark_edit,
                         people: &[],
                         focus_seg: &mut focus_seg,
+                        find: None,
                     };
                     egui::ScrollArea::vertical().show_viewport(ui, |ui, _| {
                         list.show(ui, &mut rc, None);
@@ -4499,7 +5647,7 @@ mod tests {
             at_ms: 6_000,
             note: String::new(),
         }];
-        let rows = build_rows(&detail);
+        let rows = build_rows(&detail, |_| true);
         assert_eq!(rows[6], Row::Bm(0));
         assert_eq!(
             turn_starts(&detail, &rows),
@@ -4513,7 +5661,7 @@ mod tests {
     fn a_cached_height_is_dropped_when_the_row_gains_a_header() {
         let mut detail = synthetic_detail(1, 20);
         let mut list = RowList::default();
-        list.rebuild(&detail);
+        list.rebuild(&detail, |_| true);
         // A row in the middle of a turn, measured.
         let r = (1..list.rows.len())
             .find(|&r| !list.heads[r])
@@ -4531,7 +5679,7 @@ mod tests {
             at_ms: detail.segments[i].start_ms - 1,
             note: String::new(),
         });
-        list.rebuild(&detail);
+        list.rebuild(&detail, |_| true);
         let row = list.seg_row[i];
         assert!(list.heads[row]);
         assert_eq!(list.heights[row], None, "measured without its header");
@@ -4551,7 +5699,7 @@ mod tests {
             })
             .collect();
         let mut list = RowList::default();
-        list.rebuild(&detail);
+        list.rebuild(&detail, |_| true);
         run_list(&mut list, &detail, None, 2);
         let h = |r: usize| list.heights[r].expect("measured").1;
         // Row 0: header, no turn gap (first row); row 1: text only; row 2:
@@ -4649,5 +5797,369 @@ mod tests {
         }
         assert!(ctx.memory(|m| m.focused().is_some()), "item not focused");
         assert_eq!(fills, 0, "a focused, unhovered item was highlighted");
+    }
+
+    #[test]
+    fn find_folds_case_and_accents() {
+        let needle = find_needle("  CAFE ");
+        assert_eq!(needle, "cafe");
+        let text = "Café crème, then the CAFE again";
+        let hits = find_in(text, &needle);
+        assert_eq!(
+            hits.iter().map(|r| &text[r.clone()]).collect::<Vec<_>>(),
+            ["Café", "CAFE"]
+        );
+        // Decomposed accents match too, and the hit covers the mark.
+        let text = "cafe\u{301} au lait";
+        let hits = find_in(text, &find_needle("café"));
+        assert_eq!((hits.len(), &hits[0]), (1, &(0..6)));
+        // The accent in the query is optional the other way round as well.
+        let zoe = find_in("Zoë and Łukasz", &find_needle("zoe"));
+        assert_eq!((zoe.len(), &zoe[0]), (1, &(0..4)));
+        assert_eq!(find_in("Zoë and Łukasz", &find_needle("lukasz")).len(), 1);
+        // Not overlapping; empty finds nothing.
+        assert_eq!(find_in("aaaa", "aa"), [0..2, 2..4]);
+        assert!(find_in("text", "").is_empty());
+        assert!(find_needle(" \u{301} ").is_empty());
+    }
+
+    #[test]
+    fn latin_extended_a_folds_to_its_base_letters() {
+        let cases = [
+            ('ā', 'a'),
+            ('č', 'c'),
+            ('đ', 'd'),
+            ('ę', 'e'),
+            ('ğ', 'g'),
+            ('ħ', 'h'),
+            ('ı', 'i'),
+            ('ĵ', 'j'),
+            ('ķ', 'k'),
+            ('ł', 'l'),
+            ('ŋ', 'n'),
+            ('ő', 'o'),
+            ('ř', 'r'),
+            ('ś', 's'),
+            ('ť', 't'),
+            ('ů', 'u'),
+            ('ŵ', 'w'),
+            ('ŷ', 'y'),
+            ('ž', 'z'),
+            ('ſ', 's'),
+            // Ligatures stay.
+            ('ĳ', 'ĳ'),
+            ('œ', 'œ'),
+        ];
+        for (c, base) in cases {
+            assert_eq!(fold_char(c), base, "{c}");
+        }
+    }
+
+    #[test]
+    fn find_steps_wrap_and_start_from_the_reading_position() {
+        assert_eq!(step_hit(3, None, false), Some(0));
+        assert_eq!(step_hit(3, None, true), Some(2));
+        assert_eq!(step_hit(3, Some(2), false), Some(0));
+        assert_eq!(step_hit(3, Some(0), true), Some(2));
+        assert_eq!(step_hit(0, Some(0), false), None);
+        let hit = |seg| FindHit { seg, range: 0..1 };
+        let hits = [hit(2), hit(2), hit(9), hit(40)];
+        assert_eq!(first_hit_from(&hits, 0), Some(0));
+        assert_eq!(first_hit_from(&hits, 3), Some(2));
+        assert_eq!(first_hit_from(&hits, 9), Some(2));
+        assert_eq!(first_hit_from(&hits, 41), Some(0), "wraps");
+        assert_eq!(first_hit_from(&[], 3), None);
+        assert_eq!(find_count_text("", 0, None), "");
+        assert_eq!(find_count_text("zzz", 0, None), "No matches");
+        assert_eq!(find_count_text("the", 17, Some(2)), "3 of 17");
+    }
+
+    #[test]
+    fn find_searches_only_the_shown_lines() {
+        let detail = synthetic_detail(1, 300);
+        let all = find_hits(&detail, |_| true, "BUDGET");
+        assert!(!all.is_empty());
+        assert!(all
+            .windows(2)
+            .all(|w| (w[0].seg, w[0].range.start) < (w[1].seg, w[1].range.start)));
+        // Only Bob (speaker 3).
+        let filter = BTreeSet::from([SpeakerKey::Speaker(3)]);
+        let bob = find_hits(
+            &detail,
+            |i| is_shown(&filter, &detail.segments[i]),
+            "budget",
+        );
+        assert!(!bob.is_empty() && bob.len() < all.len());
+        assert!(bob
+            .iter()
+            .all(|h| detail.segments[h.seg].speaker_id == Some(3)));
+        // A row's hits, and which of them is current.
+        let find = FindState {
+            query: "budget".into(),
+            current: Some(1),
+            hits: all.clone(),
+            ..FindState::default()
+        };
+        let (first, in_seg) = find.hits_in(all[1].seg);
+        assert!(first <= 1 && first + in_seg.len() > 1);
+        assert!(in_seg.iter().all(|h| h.seg == all[1].seg));
+    }
+
+    #[test]
+    fn the_current_hit_is_emphasised_and_others_marked() {
+        let text = "the cat and the hat";
+        let job = text_job(text, &[0..3, 12..15], Some(1));
+        assert_eq!(job.text, text);
+        let backgrounds: Vec<Color32> = job.sections.iter().map(|s| s.format.background).collect();
+        assert!(backgrounds.contains(&pal().mark_bg));
+        let strong = job
+            .sections
+            .iter()
+            .find(|s| s.format.background == pal().accent)
+            .expect("the current hit");
+        let range = strong.byte_range.start.0..strong.byte_range.end.0;
+        assert_eq!(range, 12..15);
+    }
+
+    #[test]
+    fn find_scrolls_a_far_hit_into_the_virtualised_list() {
+        let detail = synthetic_detail(1, 3_000);
+        let mut list = RowList::default();
+        list.rebuild(&detail, |_| true);
+        let hits = find_hits(&detail, |_| true, "latency");
+        // Far down, but not so near the end that it cannot be centred.
+        let current = hits.partition_point(|h| h.seg < 2_200);
+        let target = hits[current].seg;
+        assert!(target < 2_600, "a far hit: {target}");
+        let find = FindState {
+            query: "latency".into(),
+            current: Some(current),
+            hits,
+            ..FindState::default()
+        };
+        run_list(&mut list, &detail, None, 2);
+        assert!(!list.seg_visible(target), "starts off screen");
+        let req = Some(ScrollReq::new(target, true, false));
+        let out = run_list_full(
+            &mut list,
+            &detail,
+            req,
+            SCROLL_SETTLE_FRAMES.into(),
+            800.0,
+            &mut None,
+            Some(&find),
+        );
+        let error = out.target_error.expect("the hit's row was laid out");
+        assert!(
+            error.abs() <= SCROLL_SETTLED_PX * 2.0,
+            "off centre by {error}"
+        );
+        assert!(out.rendered < 120, "still virtualised: {}", out.rendered);
+        // One more pass at rest: the hit's row is wholly on screen now.
+        run_list_full(&mut list, &detail, None, 1, 800.0, &mut None, Some(&find));
+        assert!(list.seg_visible(target));
+    }
+
+    #[test]
+    fn filtered_rows_collapse_hidden_lines_into_runs() {
+        let mut detail = synthetic_detail(1, 0);
+        let on = |id, speaker: i64, start| Segment {
+            speaker_id: Some(speaker),
+            track: "loopback".into(),
+            ..seg(id, start, "text")
+        };
+        detail.segments = vec![
+            on(1, 2, 0),
+            on(2, 3, 1_000),
+            on(3, 3, 2_000),
+            on(4, 2, 3_000),
+            on(5, 3, 4_000),
+            on(6, 3, 6_000),
+            on(7, 2, 7_000),
+        ];
+        detail.bookmarks = vec![Bookmark {
+            id: 1,
+            meeting_id: 1,
+            at_ms: 5_000,
+            note: String::new(),
+        }];
+        let filter = BTreeSet::from([SpeakerKey::Speaker(2)]);
+        let shown = |i: usize| is_shown(&filter, &detail.segments[i]);
+        let rows = build_rows(&detail, shown);
+        assert_eq!(
+            rows,
+            [
+                Row::Seg(0),
+                Row::Hidden { first: 1, count: 2 },
+                Row::Seg(3),
+                // A bookmark splits a hidden run.
+                Row::Hidden { first: 4, count: 1 },
+                Row::Bm(0),
+                Row::Hidden { first: 5, count: 1 },
+                Row::Seg(6),
+            ]
+        );
+        // Every line after hidden ones starts a turn again.
+        assert_eq!(
+            turn_starts(&detail, &rows),
+            [true, false, true, false, false, false, true]
+        );
+        let mut list = RowList::default();
+        list.rebuild(&detail, shown);
+        // Hidden segments point at the row standing in for them.
+        assert_eq!(list.seg_row, [0, 1, 1, 2, 3, 5, 6]);
+        assert_eq!(list.keys[1], RowKey::Hidden(2));
+    }
+
+    #[test]
+    fn a_filtered_list_stays_virtualised_and_follows_into_hidden_lines() {
+        let detail = synthetic_detail(1, 3_000);
+        let filter = BTreeSet::from([SpeakerKey::Speaker(3)]);
+        let mut list = RowList::default();
+        list.rebuild(&detail, |i| is_shown(&filter, &detail.segments[i]));
+        let hidden = list
+            .rows
+            .iter()
+            .filter(|r| matches!(r, Row::Hidden { .. }))
+            .count();
+        assert!(hidden > 100, "{hidden} hidden runs");
+        // Follow-along to a segment of someone else's, far down: the list
+        // centres the run that stands in for it.
+        let far = (2_000..3_000)
+            .find(|&i| !is_shown(&filter, &detail.segments[i]))
+            .unwrap();
+        assert!(matches!(list.rows[list.seg_row[far]], Row::Hidden { .. }));
+        let req = Some(ScrollReq::new(far, true, false));
+        let out = run_list(&mut list, &detail, req, SCROLL_SETTLE_FRAMES.into());
+        let error = out.target_error.expect("laid out");
+        assert!(
+            error.abs() <= SCROLL_SETTLED_PX * 2.0,
+            "off centre by {error}"
+        );
+        assert!(out.rendered < 160, "virtualised: {}", out.rendered);
+    }
+
+    #[test]
+    fn the_reading_anchor_moves_to_the_row_holding_its_line() {
+        let detail = synthetic_detail(1, 400);
+        let mut list = RowList::default();
+        list.rebuild(&detail, |_| true);
+        // Reading Bob's (speaker 3) line; then only speaker 4 is shown.
+        let bob = detail
+            .segments
+            .iter()
+            .position(|s| s.speaker_id == Some(3) && s.start_ms > 100_000)
+            .unwrap();
+        list.anchor = Some((RowKey::Seg(detail.segments[bob].id), 12.0));
+        let filter = BTreeSet::from([SpeakerKey::Speaker(4)]);
+        list.rebuild(&detail, |i| is_shown(&filter, &detail.segments[i]));
+        let (key, above) = list.anchor.expect("still anchored");
+        assert_eq!(key, list.keys[list.seg_row[bob]]);
+        assert!(matches!(key, RowKey::Hidden(_)));
+        assert_eq!(above, 0.0);
+        list.keep_reading_position();
+        assert_eq!(list.resize_settle, RESIZE_SETTLE_PASSES);
+        // Shown again: back on the line itself.
+        list.rebuild(&detail, |_| true);
+        assert!(matches!(list.anchor, Some((RowKey::Seg(_), _))));
+        assert!(list.reading_segment() <= bob);
+    }
+
+    #[test]
+    fn legend_clicks_toggle_the_filter() {
+        let (a, b) = (SpeakerKey::Speaker(1), SpeakerKey::Unassigned { mic: true });
+        let mut filter = BTreeSet::new();
+        toggle_filter(&mut filter, a, false);
+        assert_eq!(filter, BTreeSet::from([a]));
+        // Another speaker alone replaces it; Ctrl adds.
+        toggle_filter(&mut filter, b, false);
+        assert_eq!(filter, BTreeSet::from([b]));
+        toggle_filter(&mut filter, a, true);
+        assert_eq!(filter, BTreeSet::from([a, b]));
+        // A plain click on a selected one of several: only them.
+        toggle_filter(&mut filter, a, false);
+        assert_eq!(filter, BTreeSet::from([a]));
+        // Again: everyone.
+        toggle_filter(&mut filter, a, false);
+        assert!(filter.is_empty());
+        // Ctrl-removing the last one shows everyone too.
+        toggle_filter(&mut filter, b, true);
+        toggle_filter(&mut filter, b, true);
+        assert!(filter.is_empty());
+        assert_eq!(
+            filter_hint(&BTreeSet::from([a]), a),
+            "Click to show everyone"
+        );
+    }
+
+    #[test]
+    fn the_timeline_follows_the_summary_and_the_filter() {
+        let detail = synthetic_detail(1, 40);
+        let index: HashMap<i64, usize> = detail
+            .speakers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.id, i))
+            .collect();
+        let stats = speaker_stats(&detail, &index);
+        let filter = BTreeSet::from([stats[1].key]);
+        let timeline = build_timeline(&detail, &stats, &filter, 7);
+        assert_eq!(timeline.version, 7);
+        assert_eq!(timeline.spans.len(), 40);
+        assert_eq!(timeline.speakers.len(), stats.len());
+        for (speaker, stat) in timeline.speakers.iter().zip(&stats) {
+            assert_eq!(speaker.name, stat.name);
+            assert_eq!(speaker.dimmed, stat.key != stats[1].key);
+        }
+        // Each span points at its segment's speaker.
+        for (span, seg) in timeline.spans.iter().zip(&detail.segments) {
+            assert_eq!(stats[usize::from(span.speaker)].key, speaker_key(seg));
+        }
+        assert_eq!(filter_names(&stats, &filter), stats[1].name);
+        let two = BTreeSet::from([stats[0].key, stats[1].key]);
+        assert_eq!(
+            filter_names(&stats, &two),
+            format!("{} and {}", stats[0].name, stats[1].name)
+        );
+    }
+
+    #[test]
+    fn the_detail_pane_header_has_no_back_button() {
+        let full = header_layout(PaneRole::Full);
+        assert!(full.back);
+        assert_eq!(full.title_size, TITLE_SIZE);
+        assert_eq!(header_layout(PaneRole::List { selected: None }), full);
+        let detail = header_layout(PaneRole::Detail);
+        assert!(!detail.back);
+        assert!(detail.title_size < full.title_size);
+        assert!(detail.gap_below < full.gap_below);
+    }
+
+    #[test]
+    fn debug_find_specs_split_an_index_off() {
+        assert_eq!(parse_debug_find("the,5"), ("the".into(), Some(5)));
+        assert_eq!(parse_debug_find("the"), ("the".into(), None));
+        assert_eq!(parse_debug_find("a, b"), ("a, b".into(), None));
+    }
+
+    #[test]
+    fn find_keys_match_modifiers_exactly() {
+        let press = |key, modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let mut input = egui::InputState::default();
+        input.events = vec![
+            press(Key::Enter, Modifiers::SHIFT),
+            press(Key::F, Modifiers::COMMAND | Modifiers::ALT),
+        ];
+        let shift = consume_press(&mut input, Key::Enter, |m| !m.command && !m.alt);
+        assert!(shift.is_some_and(|m| m.shift));
+        // Ctrl+Alt+F (AltGr+F) is not Ctrl+F.
+        assert!(consume_press(&mut input, Key::F, |m| m.command && !m.alt).is_none());
+        assert_eq!(input.events.len(), 1);
     }
 }
