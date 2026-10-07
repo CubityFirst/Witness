@@ -1,6 +1,11 @@
 //! Settings: Startup, Updates, Storage, Recording, Transcription, Models,
-//! Diagnostics and People sections (map-ui-settings §1, settings.tsx).
+//! Diagnostics and Voice prints sections (map-ui-settings §1, settings.tsx).
 //!
+//! - **Layout** (design/ui-rework.md): a sticky page title, then per section
+//!   a header and one raised group of [`row`]s — title + muted description
+//!   on the left, the control (switch, select, button, badge) on the right,
+//!   stacking under the text when the row gets narrow. Long names and paths
+//!   elide with a tooltip.
 //! - **Saving** goes through the app-owned `SettingsStore` (`cx.settings`):
 //!   the view renders from its optimistic copy, writes are serialised
 //!   (≤1 in flight + 1 queued, latest wins) and survive leaving Settings,
@@ -25,11 +30,11 @@ use super::updates::UpdatesSection;
 use crate::bridge::{OpDone, OpHandle, Task};
 use crate::platform::{autostart, dialogs};
 use crate::ui::icons::ph;
-use crate::ui::theme::{self, BG, OK, TEXT, TEXT_MUTED};
+use crate::ui::theme::{self, BG, BORDER, OK, TEXT, TEXT_MUTED};
 use crate::ui::toasts::Notice;
 use crate::ui::widgets::{self, BadgeKind, KeyScroll, Politeness};
 use crate::ui::{UiCmd, UiCtx};
-use eframe::egui::{self, Align, CornerRadius, Layout, Margin, RichText};
+use eframe::egui::{self, Align, CornerRadius, Layout, Margin, RichText, Stroke};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -41,14 +46,14 @@ use witness_core::service::{AudioDevices, Diagnostics, GpuLibsInfo, GpuStatus, P
 use witness_core::settings::{Engine, Settings};
 use witness_core::{AppCore, CoreResult};
 
-/// `.setting-row > label:first-child { min-width: 140px }`.
-const LABEL_WIDTH: f32 = 140.0;
-/// `.text-input { min-width: 220px }`.
-const INPUT_WIDTH: f32 = 220.0;
 /// The voice-match slider's UI range (the backend accepts 0–1).
 const THRESHOLD_MIN: f32 = 0.40;
 const THRESHOLD_MAX: f32 = 0.80;
 const THRESHOLD_STEP: f32 = 0.05;
+/// What the voice-match slider trades off.
+const THRESHOLD_HELP: &str = "Lower = more auto-labels (more mistakes), higher = fewer.";
+/// What the diagnostics report holds (and does not).
+const DIAGNOSTICS_PRIVACY: &str = "This report contains operational state and local paths, but no audio, transcript text, notes, voice prints, or private settings.";
 /// "Copied ✓" stays this long.
 const COPIED_FLASH: Duration = Duration::from_millis(1500);
 /// The backup folder picker's title (commands.rs `create_backup`).
@@ -162,7 +167,7 @@ struct SettingsState {
     people: Vec<PersonInfo>,
     devices: Option<AudioDevices>,
     devices_error: Option<String>,
-    /// None until loaded (the checkbox is disabled meanwhile).
+    /// None until loaded (the switch is disabled meanwhile).
     autostart: Option<bool>,
     diagnostics: Option<Diagnostics>,
     diagnostics_error: Option<String>,
@@ -182,7 +187,7 @@ struct SettingsState {
 
     /// A data_dir change was saved while this view was open.
     needs_restart: bool,
-    /// The registry write after toggling autostart (the checkbox is
+    /// The registry write after toggling autostart (the switch is
     /// disabled meanwhile); an op, so a failure toasts after leaving too.
     autostart_write: Option<OpRun<bool>>,
     backup: Option<OpRun<BackupSummary>>,
@@ -199,6 +204,14 @@ struct SettingsState {
     /// void — closing it on leave needs a `Confirm` API (integration).
     asked_cache: bool,
     asked_restart: bool,
+
+    /// The scroller's content width last pass (the header matches it).
+    content_width: Option<f32>,
+    /// `WITNESS_DEBUG_SCROLL` was applied (or is not set).
+    #[cfg(debug_assertions)]
+    debug_scrolled: bool,
+    #[cfg(debug_assertions)]
+    started: Instant,
 }
 
 impl SettingsState {
@@ -236,6 +249,11 @@ impl SettingsState {
             confirm_forget: None,
             asked_cache: false,
             asked_restart: false,
+            content_width: None,
+            #[cfg(debug_assertions)]
+            debug_scrolled: false,
+            #[cfg(debug_assertions)]
+            started: Instant::now(),
         }
     }
 
@@ -248,27 +266,77 @@ impl SettingsState {
         self.answer_confirms(cx);
         self.sync_buffers(ui.ctx(), cx.settings.current());
 
-        // The sticky header stays above the scrolling sections.
-        widgets::centered_column(ui, 720.0, |ui| self.header(ui, cx));
-        // The header ends with its own 12 pt gap: no item spacing on top.
-        ui.add_space(-ui.spacing().item_spacing.y);
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                widgets::keyboard_scroll(ui, KeyScroll { space: true });
-                widgets::centered_column(ui, 720.0, |ui| {
-                    section(ui, "Startup", |ui| self.startup(ui, cx));
-                    self.updates.show(ui, cx);
-                    section(ui, "Storage", |ui| self.storage(ui, cx));
-                    section(ui, "Recording", |ui| self.recording(ui, cx));
-                    section(ui, "Transcription", |ui| self.transcription(ui, cx));
-                    section(ui, "Models", |ui| self.models_section(ui, cx));
-                    section(ui, "Diagnostics", |ui| self.diagnostics_section(ui, cx));
-                    section(ui, "People (voice prints)", |ui| {
-                        self.people_section(ui, cx)
-                    });
-                });
-            });
+        // The title (and its "saved ✓" flash) stays above the scroller, so
+        // the flash shows wherever the edit was made. It is laid out as wide
+        // as the scroller's content was (without its bar), so it lines up
+        // with the sections.
+        let width = self
+            .content_width
+            .unwrap_or(ui.available_width())
+            .min(ui.available_width());
+        ui.allocate_ui_with_layout(egui::vec2(width, 0.0), Layout::top_down(Align::Min), |ui| {
+            ui.set_width(width);
+            widgets::padded_column(ui, |ui| self.header(ui, cx));
+        });
+        let out = widgets::scroll_column(ui, "settings", KeyScroll { space: true }, |ui| {
+            // The column helpers zero the horizontal spacing; rows of
+            // buttons need theirs back.
+            ui.spacing_mut().item_spacing.x = theme::S2;
+            self.startup(ui, cx);
+            self.updates.show(ui, cx);
+            self.storage(ui, cx);
+            self.recording(ui, cx);
+            self.transcription(ui, cx);
+            self.models_section(ui, cx);
+            self.diagnostics_section(ui, cx);
+            self.people_section(ui, cx);
+        });
+        if self.content_width != Some(out.inner_rect.width()) {
+            self.content_width = Some(out.inner_rect.width());
+            ui.ctx().request_repaint();
+        }
+        // A hairline under the title once the sections scroll beneath it.
+        if out.state.offset.y > 0.5 {
+            ui.painter().hline(
+                ui.max_rect().x_range(),
+                out.inner_rect.top(),
+                Stroke::new(1.0, BORDER),
+            );
+        }
+        #[cfg(debug_assertions)]
+        self.debug_scroll(ui.ctx(), &out);
+    }
+
+    /// Debug builds: `WITNESS_DEBUG_SCROLL=<pt>` opens Settings scrolled
+    /// down that far, once the page is tall enough (off-screen snapshots of
+    /// the lower sections; the window cannot be taller than the screen).
+    #[cfg(debug_assertions)]
+    fn debug_scroll<R>(
+        &mut self,
+        ctx: &egui::Context,
+        out: &egui::scroll_area::ScrollAreaOutput<R>,
+    ) {
+        if self.debug_scrolled {
+            return;
+        }
+        let Some(y) = std::env::var("WITNESS_DEBUG_SCROLL")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+        else {
+            self.debug_scrolled = true;
+            return;
+        };
+        // Wait for the loads: before them the page is too short to scroll.
+        let max = out.content_size.y - out.inner_rect.height();
+        if max >= y || self.started.elapsed() > Duration::from_millis(1500) {
+            self.debug_scrolled = true;
+            let mut state = out.state;
+            state.offset.y = y.min(max.max(0.0));
+            state.store(ctx, out.id);
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
     }
 
     /// Save the watch patterns / noise phrases if they were typed into
@@ -406,7 +474,7 @@ impl SettingsState {
                 Err(error) => cx.toasts.error("Could not read autostart status", error),
             }
         }
-        // A failed write was toasted by the op; the checkbox stays as it was.
+        // A failed write was toasted by the op; the switch stays as it was.
         if let Some(Some(enabled)) = OpRun::finished(&mut self.autostart_write) {
             self.autostart = Some(enabled);
         }
@@ -506,23 +574,20 @@ impl SettingsState {
     }
 
     // ------------------------------------------------------------------
-    // Header and sections
+    // Header and sections. Each section is a header plus one group of
+    // `row`s; a row's controls report what was clicked and the section
+    // acts on it afterwards (the closures cannot borrow `self` mutably).
 
     fn header(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
-        ui.add_space(4.0);
-        // As tall as the heading line, not the 30 pt interact height.
-        let interact = ui.spacing().interact_size.y;
-        ui.spacing_mut().interact_size.y = 0.0;
         ui.horizontal(|ui| {
-            ui.spacing_mut().interact_size.y = interact;
-            ui.spacing_mut().item_spacing.x = 10.0;
+            ui.spacing_mut().item_spacing.x = theme::S3;
             ui.label(
                 RichText::new("Settings")
-                    .font(theme::semibold(17.0))
+                    .font(theme::semibold(20.0))
                     .color(TEXT),
             );
             if let Some(at) = cx.settings.saved_flash() {
-                ui.label(RichText::new("saved ✓").size(13.0).color(OK));
+                ui.label(RichText::new("saved ✓").size(12.5).color(OK));
                 widgets::announce(
                     ui.ctx(),
                     egui::Id::new("settings-saved-flash"),
@@ -533,22 +598,23 @@ impl SettingsState {
                 ui.ctx().request_repaint_after(left);
             }
         });
-        ui.spacing_mut().interact_size.y = interact;
-        // `.settings-head { padding-bottom: 12px }`
-        widgets::gap(ui, 12.0);
     }
 
     fn startup(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
         let mut enabled = self.autostart.unwrap_or(false);
         let loaded = self.autostart.is_some() && self.autostart_write.is_none();
-        let response = widgets::checkbox(
-            ui,
-            loaded,
-            &mut enabled,
-            "Start Witness with Windows (minimized to tray)",
-        );
-        if response.changed() {
-            // The checkbox shows the new value once the registry write
+        let changed = section(ui, "Startup", |ui| {
+            toggle(
+                ui,
+                loaded,
+                &mut enabled,
+                "Start Witness with Windows",
+                "Opens minimized to the tray.",
+            )
+            .changed()
+        });
+        if changed {
+            // The switch shows the new value once the registry write
             // succeeds; a failure toasts even if Settings was left.
             self.autostart_write =
                 Some(OpRun::spawn(
@@ -570,457 +636,457 @@ impl SettingsState {
     fn storage(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
         let data_dir = cx.settings.current().data_dir.clone();
         cx.fonts.note_texts(ui.ctx(), data_dir.as_deref());
-        row(ui, |ui| {
-            row_label(ui, "Data directory");
-            path_code(ui, data_dir.as_deref().unwrap_or("(next to witness.exe)"));
-            if ghost(ui, "Change…").clicked() && self.loads.pick_dir.is_none() {
-                let owner = cx.dialog_owner();
-                self.loads.pick_dir = Some(cx.tasks.spawn("pick-data-dir", move |_| {
-                    dialogs::pick_folder_blocking(owner, None)
-                }));
-            }
-        });
-        muted_paragraph(
-            ui,
-            "Holds the database, recordings and models. Changing it does not move existing data.",
-        );
-
-        let running = self.backup.is_some();
-        row(ui, |ui| {
-            let label = if running {
-                "Creating backup..."
-            } else {
-                "Create backup..."
-            };
-            if ghost_enabled(ui, !running, label).clicked() {
-                self.start_backup(cx);
-            }
-            muted(
-                ui,
-                "Complete snapshot; recording and processing must be idle.",
-            );
-        });
         if let Some(backup) = &self.last_backup {
             cx.fonts.note_texts(ui.ctx(), [backup.path.as_str()]);
-            // "Backup saved to <path> (N files, X MB). Models can be …"
-            let details = backup_details(backup);
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                muted(ui, "Backup saved to");
-                path_code(ui, &backup.path);
-                muted(ui, &details);
-            });
-            // `<p role="status">`: screen readers announce the finished backup.
-            widgets::announce(
-                ui.ctx(),
-                egui::Id::new("settings-backup-status"),
-                &format!("Backup saved to {} {details}", backup.path),
-                Politeness::Polite,
-            );
         }
-
+        let running = self.backup.is_some();
         let restart_pending = self.needs_restart
             || self
                 .diagnostics
                 .as_ref()
                 .is_some_and(|d| d.restart_required);
-        if restart_pending {
-            row(ui, |ui| {
-                muted(ui, "The new data directory applies after a restart.");
-                if primary(ui, "Restart Witness").clicked() {
-                    self.restart(cx);
-                }
-            });
+        let last_backup = self.last_backup.as_ref();
+
+        let (change, backup, restart) = section(ui, "Storage", |ui| {
+            let change = row(
+                ui,
+                "data-dir",
+                Slot::Fit,
+                |ui| {
+                    let id = title(ui, "Data directory");
+                    note(
+                        ui,
+                        "Holds the database, recordings and models. Changing it does not move existing data.",
+                    );
+                    path_box(ui, data_dir.as_deref().unwrap_or("(next to witness.exe)"));
+                    id
+                },
+                |ui, _| widgets::btn(ui, "Change…").clicked(),
+            );
+            widgets::group_divider(ui);
+            let backup = row(
+                ui,
+                "backup",
+                Slot::Fit,
+                |ui| {
+                    let id = title(ui, "Backup");
+                    note(
+                        ui,
+                        "Complete snapshot; recording and processing must be idle.",
+                    );
+                    if let Some(backup) = last_backup {
+                        // "Backup saved to <path> (N files, X MB). Models …"
+                        ui.add_space(theme::S1);
+                        note(ui, "Backup saved to");
+                        path_box(ui, &backup.path);
+                        note(ui, &backup_details(backup));
+                    }
+                    id
+                },
+                |ui, _| {
+                    let label = if running {
+                        "Creating backup..."
+                    } else {
+                        "Create backup..."
+                    };
+                    button(ui, !running, label).clicked()
+                },
+            );
+            let mut restart = false;
+            if restart_pending {
+                widgets::group_divider(ui);
+                restart = row(
+                    ui,
+                    "restart",
+                    Slot::Fit,
+                    |ui| {
+                        let id = title(ui, "Restart required");
+                        note(ui, "The new data directory applies after a restart.");
+                        id
+                    },
+                    |ui, _| widgets::btn_primary(ui, "Restart Witness").clicked(),
+                );
+            }
+            (change, backup, restart)
+        });
+
+        if let Some(backup) = &self.last_backup {
+            // `<p role="status">`: screen readers announce the finished backup.
+            widgets::announce(
+                ui.ctx(),
+                egui::Id::new("settings-backup-status"),
+                &format!("Backup saved to {} {}", backup.path, backup_details(backup)),
+                Politeness::Polite,
+            );
+        }
+        if change && self.loads.pick_dir.is_none() {
+            let owner = cx.dialog_owner();
+            self.loads.pick_dir = Some(cx.tasks.spawn("pick-data-dir", move |_| {
+                dialogs::pick_folder_blocking(owner, None)
+            }));
+        }
+        if backup {
+            self.start_backup(cx);
+        }
+        if restart {
+            self.restart(cx);
         }
     }
 
     fn recording(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
-        let mut auto_record = cx.settings.current().auto_record;
-        if widgets::checkbox(
-            ui,
-            true,
-            &mut auto_record,
-            "Auto-record when a meeting is detected",
-        )
-        .changed()
-        {
+        let settings = cx.settings.current().clone();
+        let watcher = watcher_text(cx.shell.status.as_ref().map(|s| &s.watcher));
+        let record_hotkey = cx.shell.record_hotkey.clone();
+        let bookmark_hotkey = cx.shell.bookmark_hotkey.clone();
+        let mut auto_record = settings.auto_record;
+        let failed = self.devices_error.is_some();
+        let devices = self.devices.as_ref();
+        let devices_error = self.devices_error.as_deref();
+        let patterns_text = &mut self.patterns_text;
+
+        let (auto, patterns, mic, loopback, refresh) = section(ui, "Recording", |ui| {
+            let auto = toggle(
+                ui,
+                true,
+                &mut auto_record,
+                "Auto-record",
+                "Start recording when a meeting is detected.",
+            )
+            .changed();
+            widgets::group_divider(ui);
+            let patterns = row(
+                ui,
+                "watch-patterns",
+                Slot::Fill(FIELD_WIDTH),
+                |ui| {
+                    let id = title(ui, "Watch patterns");
+                    note(ui, "Comma-separated, matched against mic-using app names.");
+                    id
+                },
+                |ui, label| {
+                    let field = widgets::text_input(
+                        ui,
+                        patterns_id(),
+                        egui::TextEdit::singleline(patterns_text).desired_width(f32::INFINITY),
+                    );
+                    let response = ui.add(field).labelled_by(label);
+                    widgets::text_edit_menu(&response);
+                    response
+                },
+            );
+            widgets::group_divider(ui);
+            let mic = device_row(
+                ui,
+                &DeviceRow {
+                    label: "Microphone",
+                    id: "mic-device",
+                    default_label: "Default input device",
+                    missing_badge: "configured microphone is not connected",
+                    help: None,
+                    configured: settings.mic_device.as_deref(),
+                    devices: devices.map(|d| d.capture.as_slice()),
+                    list_failed: failed,
+                },
+            );
+            widgets::group_divider(ui);
+            let loopback = device_row(
+                ui,
+                &DeviceRow {
+                    label: "Meeting audio",
+                    id: "loopback-device",
+                    default_label: "Default output device",
+                    missing_badge: "configured output is not connected",
+                    help: Some(
+                        "The output Teams plays through — pick a dedicated one (e.g. \"Chat\") to keep music & game audio out of recordings.",
+                    ),
+                    configured: settings.loopback_device.as_deref(),
+                    devices: devices.map(|d| d.render.as_slice()),
+                    list_failed: failed,
+                },
+            );
+            if let Some(error) = devices_error {
+                widgets::inline_warning(ui, &format!("Audio devices could not be listed: {error}"));
+            }
+            widgets::group_divider(ui);
+            let refresh = row(
+                ui,
+                "refresh-devices",
+                Slot::Fit,
+                |ui| {
+                    let id = title(ui, "Audio devices");
+                    note(ui, "Re-scan after plugging a device in.");
+                    id
+                },
+                |ui, _| widgets::btn(ui, "Refresh devices").clicked(),
+            );
+            widgets::group_divider(ui);
+            hotkey_row(
+                ui,
+                "Recording hotkey",
+                "Starts/stops recording.",
+                record_hotkey.as_deref(),
+            );
+            widgets::group_divider(ui);
+            hotkey_row(
+                ui,
+                "Bookmark hotkey",
+                "Bookmarks the current moment.",
+                bookmark_hotkey.as_deref(),
+            );
+            (auto, patterns, mic, loopback, refresh)
+        });
+        footnote(ui, &watcher);
+
+        if auto {
             save(cx, |s| s.auto_record = auto_record);
         }
-
-        row(ui, |ui| {
-            let label = row_label(ui, "Watch patterns");
-            let width = input_width(ui, INPUT_WIDTH);
-            wrap_for(ui, width);
-            let field = widgets::text_input(
-                ui,
-                patterns_id(),
-                egui::TextEdit::singleline(&mut self.patterns_text).desired_width(width),
-            );
-            let response = ui.add(field).labelled_by(label);
-            widgets::text_edit_menu(&response);
-            self.patterns_dirty |= response.changed();
-            // Enter surrenders focus too, so this covers blur and Enter. A
-            // clean buffer was already committed (or re-synced): skipping it
-            // keeps a draft that `flush` committed — and the store reverted
-            // — from failing a second time when the field finally blurs.
-            if response.lost_focus() && self.patterns_dirty {
-                self.commit_patterns(cx, parse_patterns(&self.patterns_text));
-            }
-            muted(ui, "comma-separated, matched against mic-using app names");
-        });
-
-        let settings = cx.settings.current().clone();
-        let failed = self.devices_error.is_some();
-        device_row(
-            ui,
-            cx,
-            &DeviceRow {
-                label: "Microphone",
-                id: "mic-device",
-                default_label: "Default input device",
-                missing_badge: "configured microphone is not connected",
-                help: None,
-                configured: settings.mic_device.as_deref(),
-                devices: self.devices.as_ref().map(|d| d.capture.as_slice()),
-                list_failed: failed,
-            },
-            |s, value| s.mic_device = value,
-        );
-        device_row(
-            ui,
-            cx,
-            &DeviceRow {
-                label: "Meeting audio",
-                id: "loopback-device",
-                default_label: "Default output device",
-                missing_badge: "configured output is not connected",
-                help: Some(
-                    "the output Teams plays through — pick a dedicated one (e.g. \"Chat\") to keep music & game audio out of recordings",
-                ),
-                configured: settings.loopback_device.as_deref(),
-                devices: self.devices.as_ref().map(|d| d.render.as_slice()),
-                list_failed: failed,
-            },
-            |s, value| s.loopback_device = value,
-        );
-        if let Some(error) = &self.devices_error {
-            widgets::inline_warning(ui, &format!("Audio devices could not be listed: {error}"));
+        self.patterns_dirty |= patterns.changed();
+        // Enter surrenders focus too, so this covers blur and Enter. A clean
+        // buffer was already committed (or re-synced): skipping it keeps a
+        // draft that `flush` committed — and the store reverted — from
+        // failing a second time when the field finally blurs.
+        if patterns.lost_focus() && self.patterns_dirty {
+            self.commit_patterns(cx, parse_patterns(&self.patterns_text));
         }
-        row(ui, |ui| {
-            if ghost(ui, "Refresh devices").clicked() {
-                self.refresh_devices(cx);
-            }
-            muted(ui, "re-scan after plugging a device in");
-        });
-        muted_paragraph(
-            ui,
-            &watcher_text(cx.shell.status.as_ref().map(|s| &s.watcher)),
-        );
+        if let Some(value) = mic {
+            save(cx, |s| s.mic_device = value);
+        }
+        if let Some(value) = loopback {
+            save(cx, |s| s.loopback_device = value);
+        }
+        if refresh {
+            self.refresh_devices(cx);
+        }
     }
 
     fn transcription(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
         let settings = cx.settings.current().clone();
-
-        let mut auto_transcribe = settings.auto_transcribe;
-        if widgets::checkbox(
-            ui,
-            true,
-            &mut auto_transcribe,
-            "Auto-transcribe after each recording",
-        )
-        .changed()
-        {
-            save(cx, |s| s.auto_transcribe = auto_transcribe);
-        }
-        let mut live = settings.live_transcribe;
-        if widgets::checkbox(
-            ui,
-            true,
-            &mut live,
-            "Live captions while recording (Parakeet; provisional — the final pass replaces them)",
-        )
-        .changed()
-        {
-            save(cx, |s| s.live_transcribe = live);
-        }
-        // Disabled without live captions, but its value is kept.
-        let mut overlay = settings.caption_overlay;
-        if widgets::checkbox(
-            ui,
-            settings.live_transcribe,
-            &mut overlay,
-            "Floating caption window on top of other apps while recording",
-        )
-        .changed()
-        {
-            save(cx, |s| s.caption_overlay = overlay);
-        }
-
-        row(ui, |ui| {
-            row_label(ui, "Voice match strictness");
-            let shown_before = self
-                .local_threshold
-                .unwrap_or(settings.speaker_match_threshold);
-            let mut value = shown_before;
-            let enabled = ui.is_enabled();
-            let response = widgets::slider(
-                ui,
-                &mut value,
-                THRESHOLD_MIN..=THRESHOLD_MAX,
-                THRESHOLD_STEP as f64,
-                None,
-            );
-            let shown = value;
-            response.widget_info(|| {
-                egui::WidgetInfo::slider(
-                    enabled,
-                    shown as f64,
-                    format!("Voice match strictness: {}", threshold_value_text(shown)),
-                )
-            });
-            let interacted = response.is_pointer_button_down_on()
-                || response.dragged()
-                || response.drag_stopped()
-                || response.clicked()
-                || (response.has_focus()
-                    && ui.input(|i| {
-                        i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::ArrowRight)
-                    }));
-            if let Some(edit) = threshold_edit(shown_before, value, response.changed(), interacted)
-            {
-                self.local_threshold = Some(edit);
-            }
-            // Commit once the pointer lets go (a keyboard change commits at
-            // once), like the range input's `onChange`.
-            if let Some(local) = self.local_threshold {
-                if !response.dragged() && !response.is_pointer_button_down_on() {
-                    self.local_threshold = None;
-                    if local != settings.speaker_match_threshold {
-                        save(cx, |s| s.speaker_match_threshold = local);
-                    }
-                }
-            }
-            let readout = self
-                .local_threshold
-                .unwrap_or(settings.speaker_match_threshold);
-            muted(ui, &threshold_readout(readout));
-        });
-
-        // `.setting-row-top`: the label sits beside the textarea's top when
-        // both fit, otherwise above it (flex-wrap).
-        let label = "Discarded noise phrases";
-        let label_width = text_width(ui, label, theme::regular(theme::BASE_SIZE)).max(LABEL_WIDTH);
-        let side_by_side = label_width + 10.0 + INPUT_WIDTH <= row_width(ui);
-        let layout = if side_by_side {
-            Layout::left_to_right(Align::Min)
-        } else {
-            Layout::top_down(Align::Min)
-        };
-        ui.with_layout(layout, |ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
-            let label = row_label(ui, label);
-            let room = if side_by_side {
-                ui.available_width()
-            } else {
-                row_width(ui)
-            };
-            let width = room.min(320.0);
-            let field = widgets::text_input(
-                ui,
-                junk_id(),
-                egui::TextEdit::multiline(&mut self.junk_text)
-                    .desired_rows(4)
-                    .desired_width(width),
-            );
-            let response = ui.add(field).labelled_by(label);
-            widgets::text_edit_menu(&response);
-            self.junk_dirty |= response.changed();
-            // Blur only (Enter inserts a line); a clean buffer is skipped as
-            // for the watch patterns.
-            if response.lost_focus() && self.junk_dirty {
-                self.commit_junk(cx, parse_lines(&self.junk_text));
-            }
-        });
-        muted(
-            ui,
-            "one exact phrase per line; clear the list to disable phrase filtering",
-        );
-
-        muted_paragraph(
-            ui,
-            &hotkeys_text(
-                cx.shell.record_hotkey.as_deref(),
-                cx.shell.bookmark_hotkey.as_deref(),
-            ),
-        );
-
         let download_active = download_active(cx.shell.download.as_ref());
-        row(ui, |ui| {
-            row_label(ui, "Engine");
-            let mut engine = settings.engine;
-            widgets::radio_value(
+        let missing = self
+            .models
+            .iter()
+            .any(|m| m.engine == settings.engine && !m.present);
+        let gpu = self
+            .gpu
+            .as_ref()
+            .map_or_else(|| "checking…".to_string(), |g| g.detail.clone());
+        let mut auto_transcribe = settings.auto_transcribe;
+        let mut live = settings.live_transcribe;
+        let mut overlay = settings.caption_overlay;
+        let mut engine = settings.engine;
+        let local_threshold = &mut self.local_threshold;
+        let junk_text = &mut self.junk_text;
+
+        let out = section(ui, "Transcription", |ui| {
+            let auto = toggle(
                 ui,
-                &mut engine,
-                Engine::Parakeet,
-                "Parakeet TDT v3 (fast, GPU)",
+                true,
+                &mut auto_transcribe,
+                "Auto-transcribe",
+                "Runs after each recording.",
+            )
+            .changed();
+            widgets::group_divider(ui);
+            let live_changed = toggle(
+                ui,
+                true,
+                &mut live,
+                "Live captions",
+                "Parakeet, while recording. Provisional — the final pass replaces them.",
+            )
+            .changed();
+            widgets::group_divider(ui);
+            // Disabled without live captions, but its value is kept.
+            let overlay_changed = toggle(
+                ui,
+                settings.live_transcribe,
+                &mut overlay,
+                "Floating caption window",
+                "On top of other apps while recording.",
+            )
+            .changed();
+            widgets::group_divider(ui);
+            let threshold = threshold_row(ui, local_threshold, settings.speaker_match_threshold);
+            widgets::group_divider(ui);
+            let junk = row(
+                ui,
+                "junk-phrases",
+                Slot::Below,
+                |ui| {
+                    let id = title(ui, "Discarded noise phrases");
+                    note(
+                        ui,
+                        "One exact phrase per line; clear the list to disable phrase filtering.",
+                    );
+                    id
+                },
+                |ui, label| {
+                    let field = widgets::text_input(
+                        ui,
+                        junk_id(),
+                        egui::TextEdit::multiline(junk_text)
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY),
+                    );
+                    let response = ui.add(field).labelled_by(label);
+                    widgets::text_edit_menu(&response);
+                    response
+                },
             );
-            widgets::radio_value(ui, &mut engine, Engine::Whisper, "Whisper large-v3-turbo");
-            if engine != settings.engine {
-                save(cx, |s| s.engine = engine);
-            }
-            let missing = self
-                .models
-                .iter()
-                .any(|m| m.engine == settings.engine && !m.present);
-            if missing {
-                warning_chip(ui, "model not downloaded — transcription will fail");
-                if ghost_enabled(ui, !download_active, "Download").clicked() {
-                    start_model_download(cx, settings.engine, "Could not download models".into());
-                }
-            }
+            widgets::group_divider(ui);
+            row(
+                ui,
+                "engine",
+                Slot::Fill(FIELD_WIDTH),
+                |ui| title(ui, "Engine"),
+                |ui, label| engine_picker(ui, label, &mut engine),
+            );
+            let download = missing
+                && warning_strip(
+                    ui,
+                    "Model not downloaded — transcription will fail",
+                    "Download",
+                    !download_active,
+                );
+            widgets::group_divider(ui);
+            row(
+                ui,
+                "gpu",
+                Slot::Fit,
+                |ui| {
+                    let id = title(ui, "GPU");
+                    note(ui, &gpu);
+                    id
+                },
+                |_, _| {},
+            );
+            (
+                auto,
+                live_changed,
+                overlay_changed,
+                threshold,
+                junk,
+                download,
+            )
         });
-        muted_paragraph(
-            ui,
-            &format!(
-                "GPU: {}",
-                self.gpu.as_ref().map_or("checking…", |g| g.detail.as_str())
-            ),
-        );
-        muted_paragraph(
+        footnote(
             ui,
             "Speaker separation covers up to 8 remote speakers (NVIDIA Nemotron 3 Diarization).",
         );
+
+        let (auto, live_changed, overlay_changed, threshold, junk, download) = out;
+        if auto {
+            save(cx, |s| s.auto_transcribe = auto_transcribe);
+        }
+        if live_changed {
+            save(cx, |s| s.live_transcribe = live);
+        }
+        if overlay_changed {
+            save(cx, |s| s.caption_overlay = overlay);
+        }
+        if let Some(threshold) = threshold {
+            save(cx, |s| s.speaker_match_threshold = threshold);
+        }
+        self.junk_dirty |= junk.changed();
+        // Blur only (Enter inserts a line); a clean buffer is skipped as for
+        // the watch patterns.
+        if junk.lost_focus() && self.junk_dirty {
+            self.commit_junk(cx, parse_lines(&self.junk_text));
+        }
+        if engine != settings.engine {
+            save(cx, |s| s.engine = engine);
+        }
+        if download {
+            start_model_download(cx, settings.engine, "Could not download models".into());
+        }
     }
 
     fn models_section(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
         let dl = cx.shell.download.clone();
         let active = download_active(dl.as_ref());
-        for model in &self.models {
-            row(ui, |ui| {
-                row_label(ui, &model.display_name);
-                let failure = format!("Could not download {}", model.display_name);
-                match model_state(model, dl.as_ref()) {
-                    ModelState::Installed { text, tooltip } => {
-                        badge(ui, BadgeKind::Ok, &text).on_hover_text(tooltip);
-                    }
-                    ModelState::Failed(error) => {
-                        badge(ui, BadgeKind::Failed, &format!("failed: {error}"));
-                        if ghost(ui, "Retry").clicked() {
-                            cx.shell.download = None;
-                            start_model_download(cx, model.engine, failure);
-                        }
-                    }
-                    ModelState::Progress(text) => {
-                        badge(ui, BadgeKind::Busy, &text);
-                    }
-                    ModelState::Waiting => {
-                        badge(ui, BadgeKind::Busy, "waiting…");
-                    }
-                    ModelState::Idle { integrity_error } => {
-                        if let Some(error) = &integrity_error {
-                            badge(ui, BadgeKind::Failed, "integrity check failed")
-                                .on_hover_text(error);
-                        }
-                        let label = if integrity_error.is_some() {
-                            "Repair"
-                        } else {
-                            "Download"
-                        };
-                        if ghost_enabled(ui, !active, label).clicked() {
-                            start_model_download(cx, model.engine, failure);
-                        }
-                    }
-                }
-                let short: String = model.expected_revision.chars().take(8).collect();
-                ui.label(
-                    RichText::new(format!("rev {short}"))
-                        .monospace()
-                        .color(TEXT_MUTED),
-                )
-                .on_hover_text(format!("Expected revision {}", model.expected_revision));
-            });
-        }
-
-        if let Some(libs) = self.gpu_libs.as_ref().filter(|l| l.driver_present) {
-            row(ui, |ui| {
-                row_label(ui, "CUDA runtime + cuDNN (GPU)");
-                match gpu_libs_state(libs, dl.as_ref()) {
-                    GpuLibsState::Installed(text) => {
-                        badge(ui, BadgeKind::Ok, &text);
-                    }
-                    GpuLibsState::Failed(error) => {
-                        badge(ui, BadgeKind::Failed, &format!("failed: {error}"));
-                        if ghost(ui, "Retry").clicked() {
-                            cx.shell.download = None;
-                            start_gpu_libs_download(cx);
-                        }
-                    }
-                    GpuLibsState::Progress(text) => {
-                        badge(ui, BadgeKind::Busy, &text);
-                    }
-                    GpuLibsState::System => muted(ui, "using system CUDA libraries"),
-                    GpuLibsState::Idle {
-                        integrity_error,
-                        label,
-                    } => {
-                        if let Some(error) = &integrity_error {
-                            badge(ui, BadgeKind::Failed, "integrity check failed")
-                                .on_hover_text(error);
-                        }
-                        if ghost_enabled(ui, !active, label.as_str()).clicked() {
-                            start_gpu_libs_download(cx);
-                        }
-                    }
-                }
-            });
-        }
-
         let deleting = self.deleting_cache.is_some();
-        row(ui, |ui| {
-            row_label(ui, "Model cache");
-            muted(ui, &cache_text(self.cache_bytes));
-            let enabled = !active && !deleting && self.cache_bytes.is_some_and(|b| b > 0);
-            let label = if deleting {
-                "Deleting…"
-            } else {
-                "Delete model cache"
-            };
-            // The tooltip shows while disabled too, like the button's title.
-            let tip = "Deletes every downloaded model, including old versions — Shift-click to skip confirmation";
-            let response = ghost_enabled(ui, enabled, label)
-                .on_hover_text(tip)
-                .on_disabled_hover_text(tip);
-            if response.clicked() {
-                if ui.input(|i| i.modifiers.shift) {
-                    self.delete_cache(cx);
-                } else {
-                    cx.confirm.ask(
-                        cache_confirm_id(),
-                        "Delete all downloaded models?\nTranscription stops working until you download them again.",
-                        "Delete models",
-                    );
-                    self.asked_cache = true;
+        let cache_bytes = self.cache_bytes;
+        let models = &self.models;
+        let gpu_libs = self.gpu_libs.as_ref().filter(|l| l.driver_present);
+
+        let (model_action, libs_action, delete) = section(ui, "Models", |ui| {
+            let mut model_action = None;
+            for model in models {
+                if let Some(engine) = model_row(ui, model, dl.as_ref(), active) {
+                    model_action = Some((engine, model.display_name.clone()));
                 }
+                widgets::group_divider(ui);
             }
+            let libs_action = gpu_libs.and_then(|libs| {
+                let action = gpu_libs_row(ui, libs, dl.as_ref(), active);
+                widgets::group_divider(ui);
+                action
+            });
+            let delete = row(
+                ui,
+                "model-cache",
+                Slot::Fit,
+                |ui| {
+                    let id = title(ui, "Model cache");
+                    note(ui, &cache_text(cache_bytes));
+                    id
+                },
+                |ui, _| {
+                    let enabled = !active && !deleting && cache_bytes.is_some_and(|b| b > 0);
+                    let label = if deleting {
+                        "Deleting…"
+                    } else {
+                        "Delete model cache"
+                    };
+                    // The tooltip shows while disabled too, like the button's title.
+                    let tip = "Deletes every downloaded model, including old versions — Shift-click to skip confirmation";
+                    ui.add_enabled_ui(enabled, |ui| widgets::btn_danger(ui, label))
+                        .inner
+                        .on_hover_text(tip)
+                        .on_disabled_hover_text(tip)
+                        .clicked()
+                },
+            );
+            (model_action, libs_action, delete)
         });
-        muted_paragraph(
+        footnote(
             ui,
             "Recording works without models — they're only needed for transcription.",
         );
+
+        if let Some((engine, name)) = model_action {
+            // A retry clears the failed badge first.
+            cx.shell.download = None;
+            start_model_download(cx, engine, format!("Could not download {name}"));
+        }
+        if libs_action.is_some() {
+            cx.shell.download = None;
+            start_gpu_libs_download(cx);
+        }
+        if delete {
+            if ui.input(|i| i.modifiers.shift) {
+                self.delete_cache(cx);
+            } else {
+                cx.confirm.ask(
+                    cache_confirm_id(),
+                    "Delete all downloaded models?\nTranscription stops working until you download them again.",
+                    "Delete models",
+                );
+                self.asked_cache = true;
+            }
+        }
     }
 
     fn diagnostics_section(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
-        muted_paragraph(
-            ui,
-            "This report contains operational state and local paths, but no audio, transcript text, notes, voice prints, or private settings.",
-        );
-        if let Some(error) = &self.diagnostics_error {
-            widgets::inline_warning(ui, &format!("Diagnostics unavailable: {error}"));
-        }
         let Some(d) = self.diagnostics.clone() else {
-            if self.diagnostics_error.is_none() {
-                muted_paragraph(ui, "Checking…");
-            }
+            let error = self.diagnostics_error.clone();
+            section(ui, "Diagnostics", |ui| match &error {
+                Some(error) => {
+                    widgets::inline_warning(ui, &format!("Diagnostics unavailable: {error}"));
+                }
+                None => note(ui, "Checking…"),
+            });
+            footnote(ui, DIAGNOSTICS_PRIVACY);
             return;
         };
         // User-profile paths may hold any script: load its fallback font.
@@ -1032,97 +1098,140 @@ impl SettingsState {
                 d.log_path.as_str(),
             ],
         );
-        row(ui, |ui| {
-            row_label(ui, "Build");
-            value(ui, &format!("Witness {} · {}", d.app_version, d.platform));
-        });
-        row(ui, |ui| {
-            row_label(ui, "Runtime data");
-            path_code(ui, &d.runtime_data_dir);
-            if d.restart_required {
-                badge(ui, BadgeKind::Busy, "restart pending");
+        let copied = self
+            .diagnostics_copied_at
+            .is_some_and(|at| at.elapsed() < COPIED_FLASH);
+        let error = self.diagnostics_error.clone();
+
+        let (refresh, copy, export) = section(ui, "Diagnostics", |ui| {
+            if let Some(error) = &error {
+                widgets::inline_warning(ui, &format!("Diagnostics unavailable: {error}"));
             }
-        });
-        row(ui, |ui| {
-            row_label(ui, "Database");
-            path_code(ui, &d.database.path);
-            let (kind, text) = if d.database.healthy {
-                (BadgeKind::Ok, "healthy")
-            } else {
-                (BadgeKind::Failed, "check failed")
-            };
-            badge(ui, kind, text).on_hover_text(&d.database.detail);
-        });
-        row(ui, |ui| {
-            row_label(ui, "Log");
-            path_code(ui, &d.log_path);
-        });
-        for (label, text) in [
-            ("Recording", recording_text(&d)),
-            ("Processing", processing_text(&d)),
-            ("Capture health", capture_health_text(&d)),
-            ("Model integrity", model_integrity_text(&d)),
-            ("GPU runtime", gpu_runtime_text(&d)),
-        ] {
-            row(ui, |ui| {
-                row_label(ui, label);
-                value(ui, &text);
-            });
-        }
-        row(ui, |ui| {
-            if ghost(ui, "Refresh").clicked() {
-                self.refresh_diagnostics(cx);
-            }
-            let copied = self
-                .diagnostics_copied_at
-                .is_some_and(|at| at.elapsed() < COPIED_FLASH);
-            let label = if copied { "Copied ✓" } else { "Copy report" };
-            if ghost(ui, label).clicked() {
-                ui.ctx().copy_text(d.report.clone());
-                self.diagnostics_copied_at = Some(Instant::now());
-                cx.toasts.success("Diagnostic report copied");
-            }
-            if let Some(at) = self.diagnostics_copied_at {
-                match COPIED_FLASH.checked_sub(at.elapsed()) {
-                    Some(left) => ui.ctx().request_repaint_after(left),
-                    None => self.diagnostics_copied_at = None,
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.y = theme::S2;
+                kv_row(ui, "Build", |ui| {
+                    value(ui, &format!("Witness {} · {}", d.app_version, d.platform));
+                });
+                kv_row(ui, "Runtime data", |ui| {
+                    let pending = d.restart_required.then_some("restart pending");
+                    path_value(
+                        ui,
+                        &d.runtime_data_dir,
+                        pending.map(|t| (BadgeKind::Busy, t)),
+                    );
+                });
+                kv_row(ui, "Database", |ui| {
+                    let badge = if d.database.healthy {
+                        (BadgeKind::Ok, "healthy")
+                    } else {
+                        (BadgeKind::Failed, "check failed")
+                    };
+                    if let Some(r) = path_value(ui, &d.database.path, Some(badge)) {
+                        r.on_hover_text(&d.database.detail);
+                    }
+                });
+                kv_row(ui, "Log", |ui| {
+                    path_value(ui, &d.log_path, None);
+                });
+                for (label, text) in [
+                    ("Recording", recording_text(&d)),
+                    ("Processing", processing_text(&d)),
+                    ("Capture health", capture_health_text(&d)),
+                    ("Model integrity", model_integrity_text(&d)),
+                    ("GPU runtime", gpu_runtime_text(&d)),
+                ] {
+                    kv_row(ui, label, |ui| value(ui, &text));
                 }
-            }
-            if ghost(ui, "Export…").clicked() {
-                export_diagnostics(cx);
-            }
-            muted(
+            });
+            widgets::group_divider(ui);
+            row(
                 ui,
-                &format!("generated {}", fmt_generated_at(&d.generated_at)),
-            );
+                "diagnostics-actions",
+                Slot::Fit,
+                |ui| {
+                    let id = title(ui, "Report");
+                    note(
+                        ui,
+                        &format!("generated {}", fmt_generated_at(&d.generated_at)),
+                    );
+                    id
+                },
+                |ui, _| {
+                    let refresh = widgets::btn(ui, "Refresh").clicked();
+                    let label = if copied { "Copied ✓" } else { "Copy report" };
+                    let copy = widgets::btn(ui, label).clicked();
+                    let export = widgets::btn(ui, "Export…").clicked();
+                    (refresh, copy, export)
+                },
+            )
         });
+        footnote(ui, DIAGNOSTICS_PRIVACY);
+
+        if let Some(at) = self.diagnostics_copied_at {
+            match COPIED_FLASH.checked_sub(at.elapsed()) {
+                Some(left) => ui.ctx().request_repaint_after(left),
+                None => self.diagnostics_copied_at = None,
+            }
+        }
+        if refresh {
+            self.refresh_diagnostics(cx);
+        }
+        if copy {
+            ui.ctx().copy_text(d.report.clone());
+            self.diagnostics_copied_at = Some(Instant::now());
+            cx.toasts.success("Diagnostic report copied");
+        }
+        if export {
+            export_diagnostics(cx);
+        }
     }
 
     fn people_section(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
-        if self.people.is_empty() {
-            muted_paragraph(
-                ui,
-                "No one enrolled yet. Rename a speaker in any transcript to teach Witness their voice — future meetings will label them automatically.",
-            );
-            return;
-        }
-        let mut forget = None;
-        for person in &self.people {
-            row(ui, |ui| {
-                row_label(ui, &person.name);
-                muted(ui, &speech_learned(person.sample_seconds));
-                if widgets::icon_btn_danger(
+        let people = &self.people;
+        let forget = section(ui, "Voice prints", |ui| {
+            if people.is_empty() {
+                note(
                     ui,
-                    ph::TRASH,
-                    15.0,
-                    "Forget this voice — Shift-click to skip confirmation",
-                )
-                .clicked()
-                {
+                    "No one enrolled yet. Rename a speaker in any transcript to teach Witness their voice — future meetings will label them automatically.",
+                );
+                return None;
+            }
+            let mut forget = None;
+            for (i, person) in people.iter().enumerate() {
+                if i > 0 {
+                    widgets::group_divider(ui);
+                }
+                let clicked = row(
+                    ui,
+                    ("person", person.id),
+                    Slot::Fit,
+                    |ui| {
+                        let id = title(ui, &person.name);
+                        note(ui, &speech_learned(person.sample_seconds));
+                        id
+                    },
+                    |ui, _| {
+                        widgets::icon_btn_danger(
+                            ui,
+                            ph::TRASH,
+                            15.0,
+                            "Forget this voice — Shift-click to skip confirmation",
+                        )
+                        .clicked()
+                    },
+                );
+                if clicked {
                     let shift = ui.input(|i| i.modifiers.shift);
                     forget = Some((person.id, person.name.clone(), shift));
                 }
-            });
+            }
+            forget
+        });
+        if !self.people.is_empty() {
+            footnote(
+                ui,
+                "Speakers matched by voice show a ≈ before their name; renaming them confirms or corrects the match.",
+            );
         }
         if let Some((id, name, shift)) = forget {
             if shift {
@@ -1136,10 +1245,6 @@ impl SettingsState {
                 self.confirm_forget = Some((id, name));
             }
         }
-        muted_paragraph(
-            ui,
-            "Speakers matched by voice show a ≈ before their name; renaming them confirms or corrects the match.",
-        );
     }
 
     // ------------------------------------------------------------------
@@ -1317,12 +1422,9 @@ struct DeviceRow<'a> {
     list_failed: bool,
 }
 
-fn device_row(
-    ui: &mut egui::Ui,
-    cx: &mut UiCtx,
-    spec: &DeviceRow,
-    set: impl FnOnce(&mut Settings, Option<String>),
-) {
+/// A device picker row; returns the newly picked value (None inside =
+/// the default device).
+fn device_row(ui: &mut egui::Ui, spec: &DeviceRow) -> Option<Option<String>> {
     let options = device_options(
         spec.configured,
         spec.devices,
@@ -1330,83 +1432,622 @@ fn device_row(
         spec.default_label,
     );
     let kind = configured_device(spec.configured, spec.devices.unwrap_or(&[]));
-    row(ui, |ui| {
-        let label = row_label(ui, spec.label);
-        let selected = spec.configured.unwrap_or("");
-        if let Some(value) = device_picker(ui, spec.id, label, &options, selected) {
-            let value = (!value.is_empty()).then_some(value);
-            save(cx, |s| set(s, value));
-        }
-        if spec.devices.is_some() {
-            match kind {
-                Some(ConfiguredDevice::Missing) => {
-                    badge(ui, BadgeKind::Failed, spec.missing_badge);
+    let selected = spec.configured.unwrap_or("");
+    let picked = row(
+        ui,
+        spec.id,
+        Slot::Fill(FIELD_WIDTH),
+        |ui| {
+            let id = title(ui, spec.label);
+            if let Some(help) = spec.help {
+                note(ui, help);
+            }
+            if spec.devices.is_some() {
+                match kind {
+                    Some(ConfiguredDevice::Missing) => {
+                        ui.add_space(theme::S1);
+                        badge_or_text(ui, BadgeKind::Failed, spec.missing_badge);
+                    }
+                    Some(ConfiguredDevice::Legacy(_)) => note(
+                        ui,
+                        "Stored by its old friendly name; reselect it to use the stable ID.",
+                    ),
+                    _ => {}
                 }
-                Some(ConfiguredDevice::Legacy(_)) => muted(
-                    ui,
-                    "Stored by its old friendly name; reselect it to use the stable ID.",
-                ),
+            }
+            id
+        },
+        |ui, label| device_picker(ui, spec.id, label, &options, selected),
+    );
+    picked.map(|value| (!value.is_empty()).then_some(value))
+}
+
+/// The voice-match slider row: the value readout, then the slider. Returns
+/// the threshold to save once an edit is finished.
+fn threshold_row(ui: &mut egui::Ui, local: &mut Option<f32>, stored: f32) -> Option<f32> {
+    row(
+        ui,
+        "threshold",
+        Slot::Fill(FIELD_WIDTH),
+        |ui| {
+            let id = title(ui, "Voice match strictness");
+            note(ui, THRESHOLD_HELP);
+            id
+        },
+        |ui, _| {
+            let shown_before = local.unwrap_or(stored);
+            let mut value = shown_before;
+            let enabled = ui.is_enabled();
+            // The readout's place; painted after the slider moved.
+            let (readout, _) = ui.allocate_exact_size(
+                egui::vec2(34.0, ui.spacing().interact_size.y),
+                egui::Sense::hover(),
+            );
+            let width = ui.available_width().clamp(60.0, 360.0);
+            let response = widgets::slider(
+                ui,
+                &mut value,
+                THRESHOLD_MIN..=THRESHOLD_MAX,
+                THRESHOLD_STEP as f64,
+                Some(width),
+            );
+            let shown = value;
+            response.widget_info(|| {
+                egui::WidgetInfo::slider(
+                    enabled,
+                    shown as f64,
+                    format!("Voice match strictness: {}", threshold_value_text(shown)),
+                )
+            });
+            let interacted = response.is_pointer_button_down_on()
+                || response.dragged()
+                || response.drag_stopped()
+                || response.clicked()
+                || (response.has_focus()
+                    && ui.input(|i| {
+                        i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::ArrowRight)
+                    }));
+            if let Some(edit) = threshold_edit(shown_before, value, response.changed(), interacted)
+            {
+                *local = Some(edit);
+            }
+            // Commit once the pointer lets go (a keyboard change commits at
+            // once), like the range input's `onChange`.
+            let mut commit = None;
+            if let Some(value) = *local {
+                if !response.dragged() && !response.is_pointer_button_down_on() {
+                    *local = None;
+                    commit = (value != stored).then_some(value);
+                }
+            }
+            ui.painter().text(
+                egui::pos2(readout.left(), response.rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                threshold_readout(local.or(commit).unwrap_or(stored)),
+                theme::regular(theme::BASE_SIZE),
+                TEXT,
+            );
+            commit
+        },
+    )
+}
+
+/// The engine `<select>`.
+fn engine_picker(ui: &mut egui::Ui, label: egui::Id, engine: &mut Engine) {
+    let width = ui.available_width();
+    widgets::select(ui, widgets::SelectKind::TextInput, |ui| {
+        egui::ComboBox::from_id_salt("settings-engine")
+            .width(width)
+            .selected_text(engine_label(*engine))
+            .truncate()
+            .show_ui(ui, |ui| {
+                for option in [Engine::Parakeet, Engine::Whisper] {
+                    ui.selectable_value(engine, option, engine_label(option));
+                }
+            })
+            .response
+            .labelled_by(label);
+    });
+}
+
+fn engine_label(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Parakeet => "Parakeet TDT v3 (fast, GPU)",
+        Engine::Whisper => "Whisper large-v3-turbo",
+    }
+}
+
+/// A model's row; returns the engine to download when its Download /
+/// Repair / Retry button was clicked.
+fn model_row(
+    ui: &mut egui::Ui,
+    model: &ModelInfo,
+    dl: Option<&ModelDownloadProgress>,
+    active: bool,
+) -> Option<Engine> {
+    let state = model_state(model, dl);
+    let fraction = dl
+        .filter(|d| d.model_id == model.id)
+        .and_then(download_fraction);
+    let clicked = row(
+        ui,
+        ("model", &model.id),
+        Slot::Fit,
+        |ui| {
+            let id = title(ui, &model.display_name);
+            let short: String = model.expected_revision.chars().take(8).collect();
+            ui.label(
+                RichText::new(format!("rev {short}"))
+                    .font(egui::FontId::monospace(11.5))
+                    .color(TEXT_MUTED),
+            )
+            .on_hover_text(format!("Expected revision {}", model.expected_revision));
+            match &state {
+                ModelState::Failed(error) => {
+                    status_note(ui, theme::REC_LIGHT, &format!("failed: {error}"));
+                }
+                ModelState::Progress(text) => {
+                    status_note(ui, theme::WARN, text);
+                    if let Some(f) = fraction {
+                        progress_bar(ui, f);
+                    }
+                }
+                ModelState::Idle {
+                    integrity_error: Some(error),
+                } => {
+                    status_note(ui, theme::REC_LIGHT, "integrity check failed")
+                        .on_hover_text(error);
+                }
                 _ => {}
             }
-        }
-        if let Some(help) = spec.help {
-            muted(ui, help);
-        }
-    });
+            id
+        },
+        |ui, _| match &state {
+            ModelState::Installed { text, tooltip } => {
+                widgets::badge(ui, BadgeKind::Ok, text).on_hover_text(tooltip);
+                false
+            }
+            ModelState::Failed(_) => widgets::btn(ui, "Retry").clicked(),
+            ModelState::Progress(_) => {
+                widgets::badge(ui, BadgeKind::Busy, "downloading");
+                false
+            }
+            ModelState::Waiting => {
+                widgets::badge(ui, BadgeKind::Busy, "waiting…");
+                false
+            }
+            ModelState::Idle { integrity_error } => {
+                let label = if integrity_error.is_some() {
+                    "Repair"
+                } else {
+                    "Download"
+                };
+                button(ui, !active, label).clicked()
+            }
+        },
+    );
+    clicked.then_some(model.engine)
+}
+
+/// The GPU-library row; `Some(())` when its download / repair / retry
+/// button was clicked.
+fn gpu_libs_row(
+    ui: &mut egui::Ui,
+    libs: &GpuLibsInfo,
+    dl: Option<&ModelDownloadProgress>,
+    active: bool,
+) -> Option<()> {
+    let state = gpu_libs_state(libs, dl);
+    let fraction = dl
+        .filter(|d| d.model_id == GPU_LIBS_ID)
+        .and_then(download_fraction);
+    let clicked = row(
+        ui,
+        "gpu-libs",
+        Slot::Fit,
+        |ui| {
+            let id = title(ui, "CUDA runtime + cuDNN (GPU)");
+            match &state {
+                GpuLibsState::Failed(error) => {
+                    status_note(ui, theme::REC_LIGHT, &format!("failed: {error}"));
+                }
+                GpuLibsState::Progress(text) => {
+                    status_note(ui, theme::WARN, text);
+                    if let Some(f) = fraction {
+                        progress_bar(ui, f);
+                    }
+                }
+                GpuLibsState::System => note(ui, "using system CUDA libraries"),
+                GpuLibsState::Idle {
+                    integrity_error: Some(error),
+                    ..
+                } => {
+                    status_note(ui, theme::REC_LIGHT, "integrity check failed")
+                        .on_hover_text(error);
+                }
+                _ => {}
+            }
+            id
+        },
+        |ui, _| match &state {
+            GpuLibsState::Installed(text) => {
+                widgets::badge(ui, BadgeKind::Ok, text);
+                false
+            }
+            GpuLibsState::Failed(_) => widgets::btn(ui, "Retry").clicked(),
+            GpuLibsState::Progress(_) => {
+                widgets::badge(ui, BadgeKind::Busy, "downloading");
+                false
+            }
+            GpuLibsState::System => false,
+            GpuLibsState::Idle { label, .. } => button(ui, !active, label).clicked(),
+        },
+    );
+    clicked.then_some(())
+}
+
+/// A global-hotkey row: the bound combo as a key cap, or "Unavailable".
+fn hotkey_row(ui: &mut egui::Ui, name: &str, what: &str, combo: Option<&str>) {
+    let (description, key) = hotkey_parts(what, combo);
+    row(
+        ui,
+        name,
+        Slot::Fit,
+        |ui| {
+            let id = title(ui, name);
+            note(ui, &description);
+            id
+        },
+        |ui, _| match &key {
+            Some(key) => keycap(ui, key),
+            None => {
+                ui.label(RichText::new("Unavailable").color(TEXT_MUTED));
+            }
+        },
+    );
 }
 
 // ----------------------------------------------------------------------
 // Layout helpers (shared with updates.rs)
 
-/// A settings section card: raised fill, 1 px border, radius 8, padding
-/// 14×18, an uppercase muted heading, 14 pt below.
-pub(super) fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+/// TODO(rework): Settings was the last user of the kit's checkbox, radio
+/// and card; until widgets.rs drops (or allows) them, this keeps them from
+/// failing `-D warnings`. Delete with them.
+#[allow(dead_code)]
+fn kit_keepalive(ui: &mut egui::Ui, on: &mut bool, engine: &mut Engine) -> egui::Frame {
+    widgets::checkbox(ui, true, on, "");
+    widgets::radio_value(ui, engine, Engine::Parakeet, "");
     widgets::card_frame()
-        .inner_margin(Margin::symmetric(18, 14))
+}
+
+/// Below this a row's text column would be squeezed: the control stacks
+/// under the text instead.
+const TEXT_MIN_WIDTH: f32 = 200.0;
+/// Room for a select / text field / slider beside its text.
+const FIELD_WIDTH: f32 = 260.0;
+/// The gap between a row's text and its control.
+const ROW_GAP: f32 = theme::S4;
+/// Diagnostics key column; under this much row width keys stack.
+const KEY_WIDTH: f32 = 128.0;
+const KV_SIDE_BY_SIDE: f32 = 400.0;
+
+/// A settings section: its header and one group holding `add`'s rows.
+pub(super) fn section<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    widgets::section_header(ui, title);
+    widgets::group(ui, add)
+}
+
+/// How a [`row`]'s control is sized.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum Slot {
+    /// As wide as its content (switches, buttons, badges): measured, so the
+    /// control stays beside the text whenever the text keeps
+    /// [`TEXT_MIN_WIDTH`].
+    Fit,
+    /// A field that fills the given width beside the text, or the whole
+    /// row once stacked (selects, text inputs, sliders).
+    Fill(f32),
+    /// Always under the text, full width (multi-line inputs).
+    Below,
+}
+
+/// What a [`row`] measured last pass, to centre and right-align its parts.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct RowMetrics {
+    text_height: f32,
+    /// The title's one-line width: a control never squeezes it into `…`.
+    title_width: f32,
+    /// The control's natural (one-line) width.
+    control_width: f32,
+}
+
+/// A settings row (the kit's `setting_row`, with what Settings needs on
+/// top): `text` draws the title + description column and returns the
+/// title's id, `control` gets that id (for `labelled_by`) and is placed on
+/// the right in a control-high band, vertically centred on the text. When
+/// the text would get narrower than [`TEXT_MIN_WIDTH`] the control stacks
+/// under it, so a switch stays beside its label at 380 pt while a select
+/// stacks; stacked controls wider than the row wrap.
+///
+/// Immediate mode cannot centre or right-align before it knows the sizes,
+/// so the row remembers last pass's text height and control width under
+/// `salt` and discards the pass when they change (no visible jump).
+pub(super) fn row<R>(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash + std::fmt::Debug,
+    slot: Slot,
+    text: impl FnOnce(&mut egui::Ui) -> egui::Id,
+    control: impl FnOnce(&mut egui::Ui, egui::Id) -> R,
+) -> R {
+    let id = egui::Id::new(("settings-row", salt));
+    let last: Option<RowMetrics> = ui.data(|d| d.get_temp(id));
+    let full = ui.available_width();
+    let band = ui.spacing().interact_size.y;
+    let control_width = match slot {
+        Slot::Fit => last.map(|m| m.control_width),
+        Slot::Fill(width) => Some(width),
+        Slot::Below => None,
+    };
+    let title_width = last.map_or(0.0, |m| m.title_width);
+    let beside = control_width.filter(|w| {
+        let text = full - w - ROW_GAP;
+        text >= TEXT_MIN_WIDTH && text >= title_width
+    });
+    let text_block = |ui: &mut egui::Ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        text(ui)
+    };
+
+    let (out, now) = match beside {
+        Some(width) => {
+            let text_height = last.map_or(0.0, |m| m.text_height);
+            let height = text_height.max(band);
+            let origin = ui.cursor().min;
+            let text_width = full - width - ROW_GAP;
+            let mut text_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt((id, "text"))
+                    .max_rect(egui::Rect::from_min_size(
+                        origin + egui::vec2(0.0, (height - text_height) / 2.0),
+                        egui::vec2(text_width, f32::INFINITY),
+                    ))
+                    .layout(Layout::top_down(Align::Min)),
+            );
+            let label = text_block(&mut text_ui);
+            let mut control_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt((id, "control"))
+                    .max_rect(egui::Rect::from_min_size(
+                        origin + egui::vec2(full - width, (height - band) / 2.0),
+                        egui::vec2(width, band),
+                    ))
+                    .layout(Layout::left_to_right(Align::Center)),
+            );
+            let out = control(&mut control_ui, label);
+            let (text_rect, control_rect) = (text_ui.min_rect(), control_ui.min_rect());
+            let bottom = text_rect.bottom().max(control_rect.bottom());
+            ui.advance_cursor_after_rect(egui::Rect::from_min_max(
+                origin,
+                egui::pos2(origin.x + full, bottom),
+            ));
+            let now = RowMetrics {
+                text_height: text_rect.height(),
+                title_width: natural_title_width(ui, label),
+                control_width: match slot {
+                    Slot::Fit => control_rect.width(),
+                    _ => width,
+                },
+            };
+            (out, now)
+        }
+        None => {
+            ui.scope_builder(egui::UiBuilder::new().id_salt((id, "stacked")), |ui| {
+                let label = ui.scope(text_block).inner;
+                widgets::gap(ui, theme::S2);
+                // Wrap (several buttons) only once the controls are known
+                // to be wider than the row; otherwise lay them out on one
+                // line, so what is measured is their natural width. Fields
+                // never wrap: they size to the row (in a wrapping layout
+                // the available width would be the whole row again).
+                let wrap = slot == Slot::Fit && last.is_some_and(|m| m.control_width > full);
+                let layout = Layout::left_to_right(Align::Center).with_main_wrap(wrap);
+                let inner = ui.allocate_ui_with_layout(egui::vec2(full, band), layout, |ui| {
+                    control(ui, label)
+                });
+                let now = RowMetrics {
+                    // Kept for when the row goes back beside.
+                    text_height: last.map_or(0.0, |m| m.text_height),
+                    title_width: natural_title_width(ui, label),
+                    control_width: match (slot, last) {
+                        (Slot::Fit, Some(m)) if wrap => m.control_width,
+                        (Slot::Fit, _) => inner.response.rect.width(),
+                        // Only a `Fit` control's width is ever used.
+                        _ => 0.0,
+                    },
+                };
+                (inner.inner, now)
+            })
+            .inner
+        }
+    };
+
+    let changed = last.is_none_or(|m| {
+        (m.text_height - now.text_height).abs() > 0.5
+            || (m.title_width - now.title_width).abs() > 0.5
+            || (m.control_width - now.control_width).abs() > 0.5
+    });
+    if changed {
+        ui.data_mut(|d| d.insert_temp(id, now));
+        // Re-run the pass with the new sizes before anything is shown (and
+        // repaint, should this pass already be the last one allowed).
+        ui.ctx().request_discard("settings row measured");
+        ui.ctx().request_repaint();
+    }
+    out
+}
+
+/// A boolean setting: title + muted description, the switch on the right.
+pub(super) fn toggle(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    on: &mut bool,
+    name: &str,
+    description: &str,
+) -> egui::Response {
+    row(
+        ui,
+        name,
+        Slot::Fit,
+        |ui| {
+            if !enabled {
+                ui.disable();
+            }
+            let id = title(ui, name);
+            note(ui, description);
+            id
+        },
+        |ui, _| widgets::switch(ui, enabled, on, name),
+    )
+}
+
+/// A row title: body text, one line, elided with a tooltip when long. Its
+/// one-line width is noted for [`row`].
+pub(super) fn title(ui: &mut egui::Ui, text: &str) -> egui::Id {
+    let font = theme::regular(theme::BASE_SIZE);
+    let natural = text_width(ui, text, font.clone());
+    let id = widgets::elide(ui, text, font, TEXT).id;
+    ui.data_mut(|d| d.insert_temp(id.with("natural-width"), natural));
+    id
+}
+
+/// What [`title`] noted for the title `id` (0 for other row texts).
+fn natural_title_width(ui: &egui::Ui, id: egui::Id) -> f32 {
+    ui.data(|d| d.get_temp(id.with("natural-width")))
+        .unwrap_or(0.0)
+}
+
+/// A row description: muted 12.5 pt, wrapping.
+pub(super) fn note(ui: &mut egui::Ui, text: &str) {
+    ui.add(
+        egui::Label::new(
+            RichText::new(text)
+                .font(theme::regular(12.5))
+                .color(TEXT_MUTED),
+        )
+        .wrap(),
+    );
+}
+
+/// A coloured status line under a row title (download progress, errors).
+fn status_note(ui: &mut egui::Ui, color: egui::Color32, text: &str) -> egui::Response {
+    ui.add(egui::Label::new(RichText::new(text).font(theme::regular(12.5)).color(color)).wrap())
+}
+
+/// Help text under a group, aligned with its section header.
+pub(super) fn footnote(ui: &mut egui::Ui, text: &str) {
+    ui.add(
+        egui::Label::new(
+            RichText::new(text)
+                .font(theme::regular(12.5))
+                .color(TEXT_MUTED),
+        )
+        .wrap(),
+    );
+}
+
+/// A thin accent progress bar across the available width (`fraction`
+/// 0..1).
+pub(super) fn progress_bar(ui: &mut egui::Ui, fraction: f32) {
+    ui.add_space(theme::S1);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 4.0), egui::Sense::hover());
+    let radius = CornerRadius::same(2);
+    ui.painter().rect_filled(rect, radius, theme::BORDER_STRONG);
+    let mut done = rect;
+    done.set_width(rect.width() * fraction.clamp(0.0, 1.0));
+    if done.width() > 0.0 {
+        ui.painter().rect_filled(done, radius, theme::ACCENT);
+    }
+}
+
+/// A secondary button, disabled unless `enabled`.
+pub(super) fn button(ui: &mut egui::Ui, enabled: bool, text: &str) -> egui::Response {
+    ui.add_enabled_ui(enabled, |ui| widgets::btn(ui, text))
+        .inner
+}
+
+/// A path in a small inset box: monospace, one line, elided (the tooltip
+/// has the whole path).
+fn path_box(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(theme::S1);
+    egui::Frame::new()
+        .fill(BG)
+        .corner_radius(CornerRadius::same(theme::R_SM))
+        .inner_margin(Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            widgets::elide(ui, text, egui::FontId::monospace(12.0), TEXT);
+        });
+}
+
+/// A key cap for a hotkey combo.
+fn keycap(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::new()
+        .fill(BG)
+        .stroke(Stroke::new(1.0, theme::BORDER_STRONG))
+        .corner_radius(CornerRadius::same(theme::R_SM))
+        .inner_margin(Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(text)
+                    .font(egui::FontId::monospace(12.0))
+                    .color(TEXT),
+            );
+        });
+}
+
+/// A warning line inside a group (warn tint) with one action button on the
+/// right; true when it was clicked.
+fn warning_strip(ui: &mut egui::Ui, text: &str, action: &str, enabled: bool) -> bool {
+    egui::Frame::new()
+        .fill(theme::WARN_BG)
+        .stroke(Stroke::new(1.0, theme::WARN_BORDER))
+        .corner_radius(CornerRadius::same(theme::R_MD))
+        .inner_margin(Margin::symmetric(12, 8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let mut job = egui::text::LayoutJob::default();
-            job.append(
-                &title.to_uppercase(),
-                0.0,
-                egui::TextFormat {
-                    font_id: theme::semibold(14.0),
-                    color: TEXT_MUTED,
-                    extra_letter_spacing: 0.5,
-                    ..Default::default()
+            row(
+                ui,
+                ("warning", text),
+                Slot::Fit,
+                |ui| {
+                    ui.add(egui::Label::new(RichText::new(text).color(theme::WARN)).wrap())
+                        .id
                 },
-            );
-            ui.add(egui::Label::new(job).wrap());
-            ui.add_space(2.0);
-            add(ui);
-        });
-    // `section { margin-bottom: 14px }`
-    widgets::gap(ui, 14.0);
+                |ui, _| button(ui, enabled, action).clicked(),
+            )
+        })
+        .inner
 }
 
-/// `.setting-row`: a wrapping row with 10 pt gaps.
-pub(super) fn row<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 10.0;
-        add(ui)
-    })
-    .inner
-}
-
-/// The width of a row (not what is left of the current line).
-fn row_width(ui: &egui::Ui) -> f32 {
-    ui.max_rect().width()
-}
-
-/// CSS `flex-wrap`: move to a new line unless an item `width` wide fits in
-/// what is left of this one. An item wider than the whole row gets a line
-/// of its own (and wraps its text there).
-pub(super) fn wrap_for(ui: &mut egui::Ui, width: f32) {
-    // `available_width()` of a wrapping layout is the whole row; what is
-    // left of the current line is the rect before the wrap.
-    let at_line_start = ui.cursor().min.x <= ui.max_rect().min.x + 0.5;
-    if !at_line_start && width > ui.available_rect_before_wrap().width() {
-        ui.end_row();
+/// The uppercase badge when it fits the width left, else its text in the
+/// badge's colour, wrapping (a long "not connected" in a narrow column).
+fn badge_or_text(ui: &mut egui::Ui, kind: BadgeKind, text: &str) {
+    let upper = text.to_uppercase();
+    let width =
+        text_width(ui, &upper, theme::regular(11.0)) + 0.4 * upper.chars().count() as f32 + 16.0;
+    if width <= ui.available_width() {
+        widgets::badge(ui, kind, text);
+    } else {
+        let color = match kind {
+            BadgeKind::Ok => theme::OK_LIGHT,
+            BadgeKind::Busy => theme::WARN,
+            BadgeKind::Failed => theme::REC_LIGHT,
+        };
+        status_note(ui, color, text);
     }
 }
 
@@ -1418,115 +2059,88 @@ fn text_width(ui: &egui::Ui, text: &str, font: egui::FontId) -> f32 {
         .x
 }
 
-/// The row's leading label, at least 140 pt wide (a pseudo label column
-/// that grows with longer labels, like `min-width`). Returns the label's
-/// id, so a control can name itself after it (`<label for=…>`) through
-/// `Response::labelled_by`.
-pub(super) fn row_label(ui: &mut egui::Ui, text: &str) -> egui::Id {
-    let needed = text_width(ui, text, theme::regular(theme::BASE_SIZE));
-    let width = needed.max(LABEL_WIDTH).min(row_width(ui));
-    ui.allocate_ui_with_layout(
-        egui::vec2(width, ui.spacing().interact_size.y),
-        Layout::left_to_right(Align::Center),
-        |ui| {
-            ui.set_min_width(width);
-            ui.add(egui::Label::new(RichText::new(text).color(TEXT)).wrap())
-                .id
-        },
-    )
-    .inner
+/// A diagnostics key/value line: the key in a muted column beside the
+/// value, or above it when the group is narrow.
+fn kv_row(ui: &mut egui::Ui, key: &str, value: impl FnOnce(&mut egui::Ui)) {
+    let full = ui.available_width();
+    let key_label = |ui: &mut egui::Ui| {
+        ui.add(egui::Label::new(RichText::new(key).color(TEXT_MUTED)).wrap());
+    };
+    if full >= KV_SIDE_BY_SIDE {
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = theme::S3;
+            ui.allocate_ui_with_layout(
+                egui::vec2(KEY_WIDTH, 0.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ui.set_width(KEY_WIDTH);
+                    key_label(ui);
+                },
+            );
+            let width = ui.available_width();
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, 0.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ui.set_width(width);
+                    value(ui);
+                },
+            );
+        });
+    } else {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.add(
+                egui::Label::new(
+                    RichText::new(key)
+                        .font(theme::regular(12.5))
+                        .color(TEXT_MUTED),
+                )
+                .wrap(),
+            );
+            value(ui);
+        });
+    }
 }
 
-/// Inline muted text (`span.muted`): next to the previous item when it
-/// fits, otherwise on its own line.
-pub(super) fn muted(ui: &mut egui::Ui, text: &str) {
-    let width = text_width(ui, text, theme::regular(theme::BASE_SIZE));
-    wrap_for(ui, width);
-    ui.add(egui::Label::new(RichText::new(text).color(TEXT_MUTED)).wrap());
-}
-
-/// A row's value text: beside the label when it fits, else on its own line.
+/// A diagnostics value: body text, wrapping.
 fn value(ui: &mut egui::Ui, text: &str) {
-    wrap_for(ui, text_width(ui, text, theme::regular(theme::BASE_SIZE)));
     ui.add(egui::Label::new(RichText::new(text).color(TEXT)).wrap());
 }
 
-/// A muted help paragraph (`p.muted`).
-pub(super) fn muted_paragraph(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(4.0);
-    ui.add(egui::Label::new(RichText::new(text).color(TEXT_MUTED)).wrap());
-    ui.add_space(4.0);
-}
-
-/// `<code class="path">`: 12 pt monospace on the page background.
-fn path_code(ui: &mut egui::Ui, text: &str) {
-    let font = egui::FontId::monospace(12.0);
-    wrap_for(ui, text_width(ui, text, font.clone()) + 16.0);
-    egui::Frame::new()
-        .fill(BG)
-        .corner_radius(CornerRadius::same(4))
-        .inner_margin(Margin::symmetric(8, 4))
-        .show(ui, |ui| {
-            ui.add(egui::Label::new(RichText::new(text).font(font).color(TEXT)).wrap());
+/// A diagnostics path (monospace, elided) with an optional trailing badge;
+/// returns the badge's response.
+fn path_value(
+    ui: &mut egui::Ui,
+    path: &str,
+    badge: Option<(BadgeKind, &str)>,
+) -> Option<egui::Response> {
+    // 12 pt monospace is a little shorter than the body-text key beside it.
+    ui.add_space(2.0);
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = theme::S2;
+        let badge_width = badge.map_or(0.0, |(_, text)| {
+            let upper = text.to_uppercase();
+            text_width(ui, &upper, theme::regular(11.0))
+                + 0.4 * upper.chars().count() as f32
+                + 16.0
+                + theme::S2
         });
+        let path_width = (ui.available_width() - badge_width).max(40.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(path_width, 0.0),
+            Layout::left_to_right(Align::Min),
+            |ui| {
+                widgets::elide(ui, path, egui::FontId::monospace(12.0), TEXT);
+            },
+        );
+        badge.map(|(kind, text)| widgets::badge(ui, kind, text))
+    })
+    .inner
 }
 
-/// The engine row's inline `.inline-warning` (sized to its text).
-fn warning_chip(ui: &mut egui::Ui, text: &str) {
-    wrap_for(
-        ui,
-        text_width(ui, text, theme::regular(theme::BASE_SIZE)) + 22.0,
-    );
-    egui::Frame::new()
-        .fill(theme::WARN_BG)
-        .stroke(egui::Stroke::new(1.0, theme::WARN_BORDER))
-        .corner_radius(CornerRadius::same(6))
-        .inner_margin(Margin::symmetric(10, 8))
-        .show(ui, |ui| {
-            ui.add(egui::Label::new(RichText::new(text).color(theme::WARN)).wrap());
-        });
-}
-
-/// Width of a `.btn` labelled `text` (padding 6/14 plus the border).
-fn button_width(ui: &egui::Ui, text: &str) -> f32 {
-    text_width(ui, text, theme::regular(theme::BASE_SIZE)) + 30.0
-}
-
-/// `.btn.btn-ghost` that moves to a new line when it does not fit.
-pub(super) fn ghost(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    wrap_for(ui, button_width(ui, text));
-    widgets::btn_ghost(ui, text)
-}
-
-/// [`ghost`], disabled unless `enabled`.
-pub(super) fn ghost_enabled(ui: &mut egui::Ui, enabled: bool, text: &str) -> egui::Response {
-    wrap_for(ui, button_width(ui, text));
-    ui.add_enabled_ui(enabled, |ui| widgets::btn_ghost(ui, text))
-        .inner
-}
-
-/// The primary `.btn` that moves to a new line when it does not fit.
-pub(super) fn primary(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    wrap_for(ui, button_width(ui, text));
-    widgets::btn(ui, text)
-}
-
-/// A `.badge` that moves to a new line when it does not fit.
-pub(super) fn badge(ui: &mut egui::Ui, kind: BadgeKind, text: &str) -> egui::Response {
-    let upper = text.to_uppercase();
-    let width =
-        text_width(ui, &upper, theme::regular(11.0)) + 0.4 * upper.chars().count() as f32 + 16.0;
-    wrap_for(ui, width);
-    widgets::badge(ui, kind, text)
-}
-
-/// A `.text-input` width: 220–`max` pt, never wider than the row.
-fn input_width(ui: &egui::Ui, max: f32) -> f32 {
-    max.min(row_width(ui)).max(INPUT_WIDTH.min(row_width(ui)))
-}
-
-/// A device `<select>` named by the row label `label`; returns the newly
-/// picked value ("" = default).
+/// A device `<select>` named by the row title `label_id`, as wide as the
+/// slot; returns the newly picked value ("" = default).
 fn device_picker(
     ui: &mut egui::Ui,
     id: &str,
@@ -1538,16 +2152,12 @@ fn device_picker(
         .iter()
         .find(|o| o.value == selected)
         .map_or(selected, |o| o.label.as_str());
-    // Sized to the selected text (min 220, like `.text-input`), truncated
-    // at the row width; the button plus its arrow need ~40 pt more.
-    let needed = text_width(ui, label, theme::regular(theme::BASE_SIZE)) + 40.0;
-    let width = needed.max(INPUT_WIDTH).min(row_width(ui));
-    wrap_for(ui, width);
+    let width = ui.available_width();
+    // The button plus its arrow need ~40 pt besides the text.
+    let truncated = text_width(ui, label, theme::regular(theme::BASE_SIZE)) + 40.0 > width;
     let mut picked = None;
-    // A fixed-width child keeps the truncation inside `width`.
-    ui.allocate_ui(egui::vec2(width, ui.spacing().interact_size.y), |ui| {
-        widgets::select_style(ui.style_mut(), widgets::SelectKind::TextInput);
-        egui::ComboBox::from_id_salt(id)
+    widgets::select(ui, widgets::SelectKind::TextInput, |ui| {
+        let response = egui::ComboBox::from_id_salt(id)
             .width(width)
             .selected_text(label)
             .truncate()
@@ -1565,6 +2175,9 @@ fn device_picker(
             })
             .response
             .labelled_by(label_id);
+        if truncated {
+            response.on_hover_text(label);
+        }
     });
     picked
 }
@@ -1595,23 +2208,16 @@ fn hotkey_label(combo: &str) -> String {
     combo.to_uppercase().replace('+', " + ")
 }
 
-fn hotkeys_text(record: Option<&str>, bookmark: Option<&str>) -> String {
-    let record = match record {
-        Some(combo) => format!(
-            "Global hotkey: {} starts/stops recording.",
-            hotkey_label(combo)
+/// A global-hotkey row's description and key cap: `what` it does and the
+/// bound combo, or why there is none.
+fn hotkey_parts(what: &str, combo: Option<&str>) -> (String, Option<String>) {
+    match combo {
+        Some(combo) => (what.to_string(), Some(hotkey_label(combo))),
+        None => (
+            format!("{what} All candidate combos are taken by other apps."),
+            None,
         ),
-        None => "Global record hotkey unavailable (all candidate combos are taken by other apps)."
-            .into(),
-    };
-    let bookmark = match bookmark {
-        Some(combo) => format!("{} bookmarks the current moment.", hotkey_label(combo)),
-        None => {
-            "Global bookmark hotkey unavailable (all candidate combos are taken by other apps)."
-                .into()
-        }
-    };
-    format!("{record} {bookmark}")
+    }
 }
 
 fn watcher_text(watcher: Option<&WatcherStatus>) -> String {
@@ -1672,8 +2278,9 @@ fn threshold_edit(shown: f32, value: f32, changed: bool, interacted: bool) -> Op
     (changed && (interacted || snapped != snap_threshold(shown))).then_some(snapped)
 }
 
+/// The value shown beside the slider.
 fn threshold_readout(t: f32) -> String {
-    format!("{t:.2} — lower = more auto-labels (more mistakes), higher = fewer")
+    format!("{t:.2}")
 }
 
 /// The slider's accessible value text (not shown visually).
@@ -1711,6 +2318,16 @@ fn download_progress_text(p: &ModelDownloadProgress) -> String {
             (p.downloaded_bytes as f64 / 1e6).round()
         ),
     }
+}
+
+/// How far a download is overall (0..1), when its size is known: the
+/// finished files plus the current file's share.
+fn download_fraction(p: &ModelDownloadProgress) -> Option<f32> {
+    let total = p.total_bytes.filter(|t| *t > 0)?;
+    let count = p.file_count.max(1) as f32;
+    let file = (p.downloaded_bytes as f32 / total as f32).clamp(0.0, 1.0);
+    let done = (p.file_index.max(1) - 1) as f32;
+    Some(((done + file) / count).clamp(0.0, 1.0))
 }
 
 fn installed_text(size_mb: Option<f64>) -> String {
@@ -2021,15 +2638,22 @@ mod tests {
     }
 
     #[test]
-    fn hotkey_paragraph() {
+    fn hotkey_rows() {
+        assert_eq!(hotkey_label("ctrl+alt+r"), "CTRL + ALT + R");
         assert_eq!(
-            hotkeys_text(Some("ctrl+alt+r"), Some("ctrl+alt+b")),
-            "Global hotkey: CTRL + ALT + R starts/stops recording. CTRL + ALT + B bookmarks the current moment."
+            hotkey_parts("Starts/stops recording.", Some("ctrl+alt+r")),
+            (
+                "Starts/stops recording.".to_string(),
+                Some("CTRL + ALT + R".to_string())
+            )
         );
         assert_eq!(
-            hotkeys_text(None, None),
-            "Global record hotkey unavailable (all candidate combos are taken by other apps). \
-             Global bookmark hotkey unavailable (all candidate combos are taken by other apps)."
+            hotkey_parts("Bookmarks the current moment.", None),
+            (
+                "Bookmarks the current moment. All candidate combos are taken by other apps."
+                    .to_string(),
+                None
+            )
         );
     }
 
@@ -2054,10 +2678,7 @@ mod tests {
         assert_eq!(snap_threshold(0.1), 0.4);
         assert_eq!(snap_threshold(0.93), 0.8);
         assert_eq!(snap_threshold(0.62), 0.6);
-        assert_eq!(
-            threshold_readout(0.6),
-            "0.60 — lower = more auto-labels (more mistakes), higher = fewer"
-        );
+        assert_eq!(threshold_readout(0.6), "0.60");
         assert_eq!(threshold_value_text(0.5), "0.50 — lenient");
         assert_eq!(threshold_value_text(0.55), "0.55 — balanced");
         assert_eq!(threshold_value_text(0.7), "0.70 — strict");
@@ -2132,6 +2753,18 @@ mod tests {
         assert_eq!(download_progress_text(&p), "file 2 of 5 — 250 MB…");
         p.total_bytes = Some(0);
         assert_eq!(download_progress_text(&p), "file 2 of 5 — 250 MB…");
+    }
+
+    #[test]
+    fn download_fraction_spans_all_files() {
+        let mut p = progress("parakeet", false, None);
+        // File 2 of 5, a quarter through: (1 + 0.25) / 5.
+        assert_eq!(download_fraction(&p), Some(0.25));
+        p.file_index = 5;
+        p.downloaded_bytes = 1_000_000_000;
+        assert_eq!(download_fraction(&p), Some(1.0));
+        p.total_bytes = None;
+        assert_eq!(download_fraction(&p), None);
     }
 
     #[test]
@@ -2415,25 +3048,113 @@ mod tests {
         );
     }
 
+    /// Lay out `f` in a `width` pt panel for a few passes (rows measure
+    /// themselves on the first) and return what it produced last.
+    fn run_at<R>(width: f32, mut f: impl FnMut(&mut egui::Ui) -> R) -> R {
+        let ctx = theme::test_context();
+        let mut out = None;
+        for _ in 0..4 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 2000.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| out = Some(f(ui)));
+            });
+            output.textures_delta.clear(); // no renderer to upload the font atlas
+        }
+        out.expect("ran")
+    }
+
     /// The section helpers lay out in a themed context without panicking.
     #[test]
     fn layout_helpers_render() {
-        let ctx = theme::test_context();
-        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            egui::CentralPanel::default().show(ui, |ui| {
-                section(ui, "Models", |ui| {
-                    row(ui, |ui| {
-                        let label = row_label(ui, "Parakeet TDT 0.6B v3 (ONNX)");
-                        path_code(ui, "C:\\Users\\me\\AppData\\Local\\Witness");
-                        warning_chip(ui, "model not downloaded — transcription will fail");
+        run_at(460.0, |ui| {
+            section(ui, "Models", |ui| {
+                row(
+                    ui,
+                    "test-row",
+                    Slot::Fill(FIELD_WIDTH),
+                    |ui| {
+                        let id = title(ui, "Parakeet TDT 0.6B v3 (ONNX)");
+                        note(ui, "muted");
+                        path_box(ui, "C:\\Users\\me\\AppData\\Local\\Witness");
+                        progress_bar(ui, 0.4);
+                        id
+                    },
+                    |ui, label| {
                         let options = device_options(None, Some(&[]), false, "Default");
                         assert_eq!(device_picker(ui, "test-picker", label, &options, ""), None);
-                        muted(ui, "muted");
-                    });
-                    muted_paragraph(ui, "paragraph");
+                    },
+                );
+                widgets::group_divider(ui);
+                assert!(!warning_strip(
+                    ui,
+                    "model not downloaded — transcription will fail",
+                    "Download",
+                    true
+                ));
+                kv_row(ui, "Database", |ui| {
+                    path_value(ui, "C:\\data\\witness.db", Some((BadgeKind::Ok, "healthy")));
                 });
+                hotkey_row(
+                    ui,
+                    "Recording hotkey",
+                    "Starts/stops recording.",
+                    Some("ctrl+alt+r"),
+                );
+                keycap(ui, "CTRL + ALT + B");
             });
+            footnote(ui, "paragraph");
         });
-        output.textures_delta.clear(); // no renderer to upload the font atlas
+    }
+
+    /// A switch stays beside its label even in the narrowest window, while
+    /// a field wide enough to squeeze the text stacks under it.
+    #[test]
+    fn rows_keep_switches_beside_and_stack_fields() {
+        for width in [380.0, 460.0, 640.0, 1000.0] {
+            let (title_rect, switch_rect, field_label, field) = run_at(width, |ui| {
+                let mut on = true;
+                let mut title_rect = egui::Rect::NOTHING;
+                let switch = row(
+                    ui,
+                    "switch",
+                    Slot::Fit,
+                    |ui| {
+                        let r = widgets::elide(ui, "Auto-record", theme::regular(14.0), TEXT);
+                        title_rect = r.rect;
+                        r.id
+                    },
+                    |ui, _| widgets::switch(ui, true, &mut on, "Auto-record"),
+                );
+                let mut label_rect = egui::Rect::NOTHING;
+                let field = row(
+                    ui,
+                    "field",
+                    Slot::Fill(FIELD_WIDTH),
+                    |ui| {
+                        let r = widgets::elide(ui, "Watch patterns", theme::regular(14.0), TEXT);
+                        label_rect = r.rect;
+                        r.id
+                    },
+                    |ui, _| ui.label("field").rect,
+                );
+                (title_rect, switch.rect, label_rect, field)
+            });
+            // Beside, right-aligned, vertically centred on the title.
+            assert!(switch_rect.left() > title_rect.right(), "{width}");
+            assert!(
+                (switch_rect.center().y - title_rect.center().y).abs() < 1.5,
+                "{width}"
+            );
+            let stacked = field.top() > field_label.bottom();
+            // The panel has 8 pt margins; the field stacks below 2*8 + 260 +
+            // 16 + 200 pt.
+            assert_eq!(stacked, width < 492.0, "{width}");
+        }
     }
 }
