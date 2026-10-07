@@ -110,8 +110,6 @@ pub struct StartParts {
     pub minimized: bool,
     /// Debug builds: an off-screen snapshot run (`crate::snapshot`).
     pub snapshot: Option<crate::snapshot::Config>,
-    /// The window was created transparent for the Mica backdrop.
-    pub backdrop: bool,
 }
 
 /// The OS-shell objects released at the point of no return of an exit path.
@@ -203,8 +201,6 @@ pub struct WitnessApp {
     palette: CommandPalette,
     /// First-run setup (shown instead of the views while active).
     onboarding: Onboarding,
-    /// The Mica backdrop is showing (window background transparent).
-    backdrop_on: bool,
 }
 
 /// Windows' theme inputs, cached (registry reads are not per-frame work).
@@ -230,7 +226,7 @@ impl SystemTheme {
 
 /// The palette for `prefs` (Appearance, accent source) given Windows'
 /// settings. Debug builds honour `WITNESS_DEBUG_THEME=light|dark`.
-fn resolve_palette(prefs: &UiPrefs, system: &SystemTheme, backdrop: bool) -> theme::Palette {
+fn resolve_palette(prefs: &UiPrefs, system: &SystemTheme) -> theme::Palette {
     use crate::ui_state::{AccentSource, Appearance};
     let mut dark = match prefs.appearance {
         Appearance::System => !system.light.unwrap_or(false),
@@ -248,12 +244,7 @@ fn resolve_palette(prefs: &UiPrefs, system: &SystemTheme, backdrop: bool) -> the
         AccentSource::Windows => system.accent.as_ref(),
         AccentSource::Witness => None,
     };
-    let palette = theme::Palette::resolve(dark, accent);
-    if backdrop {
-        palette.with_backdrop()
-    } else {
-        palette
-    }
+    theme::Palette::resolve(dark, accent)
 }
 
 impl WitnessApp {
@@ -267,7 +258,6 @@ impl WitnessApp {
             instance_guard,
             minimized,
             snapshot,
-            backdrop,
         } = parts;
         let ctx = cc.egui_ctx.clone();
 
@@ -306,12 +296,9 @@ impl WitnessApp {
 
         let data_dir = core.runtime_data_dir();
         let prefs = UiPrefs::load(&data_dir);
-        // Mica needs the transparent window `main.rs` created; without it
-        // (or if DWM refuses) the window paints its opaque background.
-        let backdrop_on = backdrop && window.set_backdrop(true);
         let system_theme = SystemTheme::read();
         let onboarding = Onboarding::new(&prefs);
-        theme::apply(&ctx, resolve_palette(&prefs, &system_theme, backdrop_on));
+        theme::apply(&ctx, resolve_palette(&prefs, &system_theme));
         let repaint_ctx = ctx.clone();
         let player = Player::spawn(Arc::new(move || wake_root(&repaint_ctx)));
 
@@ -374,7 +361,6 @@ impl WitnessApp {
                 && std::env::var_os("WITNESS_DEBUG_PANIC_HOTKEY").is_some_and(|v| v == "1"),
             snapshot: snapshot.map(crate::snapshot::Snapshot::new),
             system_theme,
-            backdrop_on,
             palette: CommandPalette::new(),
             onboarding,
         };
@@ -1546,11 +1532,7 @@ impl eframe::App for WitnessApp {
         {
             self.system_theme = SystemTheme::read();
         }
-        let palette = resolve_palette(&self.prefs, &self.system_theme, self.backdrop_on);
-        theme::apply(ctx, palette);
-        if self.backdrop_on {
-            self.window.set_dark_frame(palette.dark);
-        }
+        theme::apply(ctx, resolve_palette(&self.prefs, &self.system_theme));
         if self.window.is_shown() && !minimized {
             ctx.request_repaint_after(SYSTEM_THEME_POLL);
         }

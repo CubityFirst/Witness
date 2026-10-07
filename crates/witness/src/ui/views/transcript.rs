@@ -1566,7 +1566,7 @@ fn ts_button(ui: &mut egui::Ui, ms: i64, label: &str) -> Response {
             focus_ring(ui, rect, 4);
         }
     }
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    response
 }
 
 fn focus_ring(ui: &egui::Ui, rect: Rect, radius: u8) {
@@ -1678,7 +1678,7 @@ fn segment_row(
         if seek.has_focus() && widgets::focus_visible(ui.ctx()) {
             focus_ring(ui, row, theme::R_SM);
         }
-        seek.on_hover_cursor(egui::CursorIcon::PointingHand)
+        seek
     });
     if *rc.focus_seg == Some(seg.id) {
         // 0.2.x focused the hit's seek button: Tab continues from the hit
@@ -1731,9 +1731,7 @@ fn turn_header(
                     click.widget_info(|| {
                         egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name)
                     });
-                    let click = click
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_text(tooltip);
+                    let click = click.on_hover_text(tooltip);
                     if click.clicked() {
                         actions.push(RowAction::OpenSpeaker {
                             speaker_id,
@@ -2001,7 +1999,7 @@ fn bookmark_seek(ui: &mut egui::Ui, ts: &str) -> Response {
             focus_ring(ui, rect, 4);
         }
     }
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    response
 }
 
 /// The stand-in for `count` lines the speaker filter hides: a faint
@@ -2137,7 +2135,7 @@ fn menu_item(ui: &mut egui::Ui, text: &str) -> Response {
             );
         }
     }
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    response
 }
 
 /// A header menu: an icon button toggling a right-aligned popup whose
@@ -2286,9 +2284,7 @@ fn jump_pill(ctx: &egui::Context, id: Id, anchor: egui::Pos2) -> bool {
                 egui::StrokeKind::Inside,
             );
             painter.galley(rect.center() - galley.size() / 2.0, galley, pal().text);
-            response
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .clicked()
+            response.clicked()
         })
         .inner
 }
@@ -3594,9 +3590,8 @@ impl TranscriptState {
                 (true, true) => theme::alpha(color, 0.7),
             };
             ui.painter().rect_filled(rect, radius, fill);
-            let segment = segment
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(format!("{full}\n{}", filter_hint(&self.filter, stat.key)));
+            let segment =
+                segment.on_hover_text(format!("{full}\n{}", filter_hint(&self.filter, stat.key)));
             if segment.clicked() {
                 click = Some(stat.key);
             }
@@ -3697,10 +3692,7 @@ impl TranscriptState {
                 focus_ring(ui, rect, theme::R_MD);
             }
         }
-        if summary
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .clicked()
-        {
+        if summary.clicked() {
             self.notes.open = !self.notes.open;
         }
         widgets::announce(
@@ -4300,9 +4292,7 @@ fn legend_item(
             focus_ring(ui, tint, theme::R_SM);
         }
     }
-    response
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(format!("{full}\n{hint}"))
+    response.on_hover_text(format!("{full}\n{hint}"))
 }
 
 /// "Showing Paul Gordon · Clear": the speaker filter is on; a click shows
@@ -4351,9 +4341,7 @@ fn filter_chip(ui: &mut egui::Ui, names: &str) -> Response {
             );
         }
     }
-    response
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text("Show every speaker's lines")
+    response.on_hover_text("Show every speaker's lines")
 }
 
 /// What the find bar asked for this pass.

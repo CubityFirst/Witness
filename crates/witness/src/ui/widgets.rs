@@ -153,7 +153,7 @@ fn styled_button(
         }
     }
     if enabled {
-        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+        response
     } else {
         response.on_hover_cursor(egui::CursorIcon::NotAllowed)
     }
@@ -846,11 +846,7 @@ pub fn switch(ui: &mut egui::Ui, enabled: bool, on: &mut bool, label: &str) -> R
             );
         }
     }
-    if enabled {
-        response.on_hover_cursor(egui::CursorIcon::PointingHand)
-    } else {
-        response
-    }
+    response
 }
 
 /// A grouped surface whose rows are separated by [`group_divider`]: one
@@ -953,17 +949,14 @@ pub fn list_row<R>(
     let response = scope.response;
     let rect = response.rect;
     let hovered = response.contains_pointer();
-    let fill = if selected {
-        pal().bg_active
+    if selected {
+        ui.painter().set(
+            bg_idx,
+            egui::epaint::RectShape::filled(rect, CornerRadius::same(theme::R_MD), pal().bg_active),
+        );
     } else if hovered {
-        pal().bg_hover
-    } else {
-        Color32::TRANSPARENT
-    };
-    ui.painter().set(
-        bg_idx,
-        egui::epaint::RectShape::filled(rect, CornerRadius::same(theme::R_MD), fill),
-    );
+        paint_hover_pill(ui, rect);
+    }
     if response.has_focus() && focus_visible(ui.ctx()) {
         ui.painter().rect_stroke(
             rect,
@@ -972,10 +965,19 @@ pub fn list_row<R>(
             egui::StrokeKind::Inside,
         );
     }
-    (
-        response.on_hover_cursor(egui::CursorIcon::PointingHand),
-        scope.inner,
-    )
+    (response, scope.inner)
+}
+
+/// The hover mark of a list row: a short neutral pill at its left edge
+/// (selected rows fill instead, and an open meeting's pill is the accent).
+pub fn paint_hover_pill(ui: &egui::Ui, rect: egui::Rect) {
+    let height = (rect.height() * 0.4).clamp(12.0, 18.0);
+    let pill = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 4.0, rect.center().y),
+        egui::vec2(3.0, height),
+    );
+    ui.painter()
+        .rect_filled(pill, CornerRadius::same(2), pal().text_faint);
 }
 
 /// Up to two initials of `name` ("Paul Gordon" → "PG", "me" → "ME").

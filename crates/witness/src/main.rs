@@ -78,12 +78,6 @@ fn main() {
     };
     panic::register_core(core.clone());
 
-    // Mica: the window must be created transparent. Decided once, at start
-    // (the Settings toggle applies on restart); never in snapshot runs.
-    let backdrop = snapshot::config().is_none()
-        && ui_state::UiPrefs::load(&core.runtime_data_dir()).backdrop
-        && platform::system::backdrop_supported();
-
     // The creator may run at most once per process (UiSink's context and the
     // tray's / hotkeys' event handlers are once-cells, and the tray must stay
     // the process's first icon), so its inputs live outside the closure and
@@ -95,19 +89,18 @@ fn main() {
         instance_guard,
         minimized,
         snapshot: snapshot::config(),
-        backdrop,
     }));
     let creator_ran = AtomicBool::new(false);
 
     let (first, fallback) = renderer_plan();
     #[allow(unused_mut)] // reassigned only with the wgpu fallback
-    let mut result = run(first, &parts, &creator_ran, backdrop);
+    let mut result = run(first, &parts, &creator_ran);
     if let Err(error) = &result {
         if fallback && !creator_ran.load(Ordering::SeqCst) {
             log::warn!("the OpenGL renderer failed ({error}); retrying with Direct3D 12");
             #[cfg(feature = "wgpu-fallback")]
             {
-                result = run(RendererChoice::Wgpu, &parts, &creator_ran, backdrop);
+                result = run(RendererChoice::Wgpu, &parts, &creator_ran);
             }
         }
     }
@@ -185,12 +178,11 @@ fn run(
     renderer: RendererChoice,
     parts: &RefCell<Option<StartParts>>,
     creator_ran: &AtomicBool,
-    backdrop: bool,
 ) -> eframe::Result {
     log::info!("starting the window ({renderer:?})");
     eframe::run_native(
         "Witness",
-        native_options(renderer, backdrop),
+        native_options(renderer),
         Box::new(|cc| {
             creator_ran.store(true, Ordering::SeqCst);
             let parts = parts
@@ -203,7 +195,7 @@ fn run(
     )
 }
 
-fn native_options(renderer: RendererChoice, backdrop: bool) -> eframe::NativeOptions {
+fn native_options(renderer: RendererChoice) -> eframe::NativeOptions {
     let snapshot = snapshot::config();
     let size = snapshot.as_ref().map_or([460.0, 620.0], |s| s.size);
     let min_size = match &snapshot {
@@ -218,8 +210,7 @@ fn native_options(renderer: RendererChoice, backdrop: bool) -> eframe::NativeOpt
         .with_resizable(true)
         // Nothing drops files on Witness, and winit's OleInitialize for
         // drag-and-drop must never fight the core over the COM apartment.
-        .with_drag_and_drop(false)
-        .with_transparent(backdrop);
+        .with_drag_and_drop(false);
     match eframe::icon_data::from_png_bytes(include_bytes!("../icons/128x128.png")) {
         Ok(icon) => viewport = viewport.with_icon(icon),
         Err(error) => log::warn!("window icon: {error}"),

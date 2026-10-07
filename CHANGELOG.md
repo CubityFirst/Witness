@@ -21,8 +21,7 @@ still evolve quickly.
   minimum window width; long titles and paths are shortened with "…" and a
   tooltip.
 - Light and dark themes (Settings → Appearance: follow Windows, light or
-  dark) with Windows' accent colour, Segoe UI Variable, and the Windows 11
-  Mica backdrop (22H2 and later; applies after a restart).
+  dark) with Windows' accent colour and Segoe UI Variable.
 - Wide windows split into the meeting list and the open transcript side
   by side; the divider can be dragged and is remembered.
 - Ctrl+K command palette: jump to any meeting or person, or run an action

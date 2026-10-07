@@ -176,7 +176,7 @@ struct SettingsState {
     diagnostics: Option<Diagnostics>,
     diagnostics_error: Option<String>,
     diagnostics_copied_at: Option<Instant>,
-    /// Windows' accent and Mica support (None until read).
+    /// Windows' accent shades (None until read).
     look: Option<SystemLook>,
 
     /// Watch patterns as typed, and the settings value the text reflects
@@ -509,7 +509,7 @@ impl SettingsState {
         }
 
         if let Some(result) = take(&mut self.loads.look) {
-            // A failed read only costs the swatch and the Mica switch.
+            // A failed read only costs the accent swatch.
             self.look = Some(result.unwrap_or_default());
         }
 
@@ -614,46 +614,17 @@ impl SettingsState {
         });
     }
 
-    /// Theme, accent and the Mica backdrop. UI preferences (`cx.prefs`), not
-    /// settings: the shell persists them and re-resolves the palette every
-    /// frame, so theme and accent apply at once; Mica needs a restart.
+    /// Theme and accent. UI preferences (`cx.prefs`), not settings: the
+    /// shell persists them and re-resolves the palette every frame, so they
+    /// apply at once.
     fn appearance(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
-        // What the window opened with, noted on the first draw (before any
-        // click could change it) and kept in egui memory, so leaving and
-        // reopening Settings still offers the restart.
-        let at_start = ui.ctx().data_mut(|d| {
-            *d.get_temp_mut_or_insert_with(egui::Id::new("settings-backdrop-at-start"), || {
-                cx.prefs.backdrop
-            })
-        });
         let look = self.look;
         let prefs = &mut *cx.prefs;
-        let restart = section(ui, "Appearance", |ui| {
+        section(ui, "Appearance", |ui| {
             theme_row(ui, prefs);
             widgets::group_divider(ui);
             accent_row(ui, prefs, look.as_ref());
-            widgets::group_divider(ui);
-            backdrop_row(ui, prefs, look.as_ref());
-            let mut restart = false;
-            if prefs.backdrop != at_start {
-                widgets::group_divider(ui);
-                restart = row(
-                    ui,
-                    "backdrop-restart",
-                    Slot::Fit,
-                    |ui| {
-                        let id = title(ui, "Restart to apply");
-                        note(ui, "The backdrop changes the next time Witness starts.");
-                        id
-                    },
-                    |ui, _| widgets::btn(ui, "Restart Witness").clicked(),
-                );
-            }
-            restart
         });
-        if restart {
-            self.restart(cx);
-        }
     }
 
     fn startup(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
@@ -1762,14 +1733,12 @@ fn gpu_libs_row(
 // Appearance (shared with the first-run setup)
 
 /// What Windows offers the Appearance rows: its accent shades (for the
-/// "Windows" swatch, shown even while Witness blue is picked) and whether
-/// the Mica backdrop can work at all. Registry reads, so loaded off the UI
-/// thread.
+/// "Windows" swatch, shown even while Witness blue is picked). Registry
+/// reads, so loaded off the UI thread.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct SystemLook {
     /// `AccentPalette`: light3 … base … dark3.
     pub accent: Option<[egui::Color32; 7]>,
-    pub backdrop_supported: bool,
 }
 
 impl SystemLook {
@@ -1777,7 +1746,6 @@ impl SystemLook {
         cx.tasks.spawn("system-look", |_| SystemLook {
             accent: system::accent_palette()
                 .map(|shades| shades.map(|[r, g, b]| egui::Color32::from_rgb(r, g, b))),
-            backdrop_supported: system::backdrop_supported(),
         })
     }
 
@@ -1854,22 +1822,6 @@ pub(crate) fn accent_row(ui: &mut egui::Ui, prefs: &mut UiPrefs, look: Option<&S
             );
         },
     );
-}
-
-/// The Mica switch: disabled (saying why) where Windows cannot draw it.
-fn backdrop_row(ui: &mut egui::Ui, prefs: &mut UiPrefs, look: Option<&SystemLook>) {
-    let supported = look.is_some_and(|l| l.backdrop_supported);
-    let description = match look {
-        Some(look) if !look.backdrop_supported => {
-            "Needs Windows 11 version 22H2 or later, and is not available over Remote Desktop."
-        }
-        _ => "Translucent Windows 11 material behind the window. Applies after restart.",
-    };
-    // Shown off where it cannot work, without forgetting the preference.
-    let mut on = prefs.backdrop && (supported || look.is_none());
-    if toggle(ui, supported, &mut on, "Mica backdrop", description).changed() {
-        prefs.backdrop = on;
-    }
 }
 
 /// One option of a [`segmented`] control.
@@ -1962,12 +1914,12 @@ pub(crate) fn segmented<T: PartialEq + Copy>(
         let hovered = enabled && (response.hovered() || ring);
         let radius = CornerRadius::same(theme::R_SM);
         if selected {
-            ui.painter().rect_filled(seg, radius, p.accent_soft);
+            ui.painter().rect_filled(seg, radius, p.bg_active);
         } else if hovered {
             ui.painter().rect_filled(seg, radius, p.bg_hover);
         }
         let (font, color) = if selected {
-            (theme::semibold(13.0), theme::ink(p.accent))
+            (theme::semibold(13.0), p.text)
         } else if hovered {
             (theme::regular(13.0), p.text)
         } else {
@@ -1981,9 +1933,6 @@ pub(crate) fn segmented<T: PartialEq + Copy>(
                 Stroke::new(2.0, p.focus),
                 egui::StrokeKind::Outside,
             );
-        }
-        if enabled {
-            response.on_hover_cursor(egui::CursorIcon::PointingHand);
         }
     }
     if !enabled {

@@ -780,7 +780,6 @@ fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
     );
     let close = ui
         .interact(close_rect, ui.id().with("captions-close"), Sense::click())
-        .on_hover_cursor(CursorIcon::PointingHand)
         .on_hover_text("Close captions (Escape)");
     close.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Close live captions")

@@ -722,11 +722,11 @@ fn bar_button(
             focus_ring(ui, rect, theme::R_MD);
         }
     }
-    response.on_hover_cursor(if enabled {
-        CursorIcon::PointingHand
+    if enabled {
+        response
     } else {
-        CursorIcon::NotAllowed
-    })
+        response.on_hover_cursor(CursorIcon::NotAllowed)
+    }
 }
 
 /// The 2 pt FOCUS ring, 2 pt outside `rect`.
@@ -825,14 +825,14 @@ fn captions_button(ui: &mut egui::Ui) -> egui::Response {
     .on_hover_text(label)
 }
 
-/// The settings gear; accent-tinted while Settings is open.
+/// The settings gear; filled (neutral) while Settings is open.
 fn settings_button(ui: &mut egui::Ui, selected: bool) -> egui::Response {
     let look = if selected {
         Look {
-            fill: pal().accent_soft,
-            hover_fill: pal().accent_soft,
-            glyph: pal().accent_hover,
-            hover_glyph: pal().accent_hover,
+            fill: pal().bg_active,
+            hover_fill: pal().bg_active,
+            glyph: pal().text,
+            hover_glyph: pal().text,
         }
     } else {
         ghost()
@@ -893,14 +893,14 @@ fn nav_segment(
         let ring = response.has_focus() && widgets::focus_visible(ui.ctx());
         let hot = response.hovered() || ring;
         let fill = if selected {
-            pal().accent_soft
+            pal().bg_active
         } else if hot {
             pal().bg_hover
         } else {
             Color32::TRANSPARENT
         };
         let (icon_color, text_color) = match (selected, hot) {
-            (true, _) => (pal().accent_hover, pal().text),
+            (true, _) => (pal().text, pal().text),
             (false, true) => (pal().text, pal().text),
             (false, false) => (pal().text_muted, pal().text_muted),
         };
@@ -930,7 +930,7 @@ fn nav_segment(
             focus_ring(ui, rect, theme::R_SM);
         }
     }
-    let response = response.on_hover_cursor(CursorIcon::PointingHand);
+    let response = response;
     if icons_only {
         response.on_hover_text(label)
     } else {
@@ -1347,9 +1347,7 @@ fn recording_pill_response(
     time_shown: bool,
     meter: Option<Rect>,
 ) -> egui::Response {
-    let response = ui
-        .interact(rect, ui.id().with("recording-pill"), Sense::click())
-        .on_hover_cursor(CursorIcon::PointingHand);
+    let response = ui.interact(rect, ui.id().with("recording-pill"), Sense::click());
     // The pill's click response sits above the hover-only meter, so the
     // meter's own tooltip would never show: pick the text by where the
     // pointer is (the web meter's `title` won over the pill's inside it).
@@ -1516,9 +1514,7 @@ pub fn health_banner(ui: &mut egui::Ui, cx: &mut UiCtx, full_width: bool) {
     let Some(warning) = warning else {
         return;
     };
-    // The window background, like the bar and the content below it (it is
-    // transparent under the Mica backdrop; an opaque fill would show as a
-    // band).
+    // The window background, like the bar and the content below it.
     let pad = if full_width {
         widgets::pad_x(ui.available_width()) as i8
     } else {

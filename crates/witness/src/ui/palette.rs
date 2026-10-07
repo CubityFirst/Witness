@@ -1209,7 +1209,7 @@ fn draw_row(ui: &mut egui::Ui, item: &Item, selected: bool) -> egui::Response {
     let p = pal();
     let (full, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), Sense::CLICK);
-    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let response = response;
     response.widget_info(|| {
         let mut info = WidgetInfo::labeled(WidgetType::Button, true, &item.title);
         info.selected = Some(selected);

@@ -73,8 +73,6 @@ pub struct MainWindow {
     /// cloaked and `WS_EX_NOACTIVATE` meanwhile). `show_normal` cancels it:
     /// a show the user asked for (tray, second launch) always wins.
     startup_hide: Cell<bool>,
-    /// The dark-mode frame attribute last given to DWM.
-    dark_frame: Cell<Option<bool>>,
 }
 
 impl MainWindow {
@@ -103,7 +101,6 @@ impl MainWindow {
             ui_pass: Cell::new(None),
             ui_pass_finished_at: Cell::new(None),
             startup_hide: Cell::new(false),
-            dark_frame: Cell::new(None),
         })
     }
 
@@ -294,23 +291,6 @@ impl MainWindow {
     pub fn hide_for_snapshot(&self) {
         self.set_cloaked(true);
         imp::set_no_activate(self.hwnd, true);
-    }
-
-    /// Turn the Windows 11 Mica backdrop on behind the (transparent)
-    /// window: `DWMWA_SYSTEMBACKDROP_TYPE` = main window, with the frame
-    /// extended over the whole client area. False when DWM refused (the
-    /// caller then keeps the window opaque).
-    pub fn set_backdrop(&self, on: bool) -> bool {
-        imp::set_backdrop(self.hwnd, on)
-    }
-
-    /// Tell DWM whether the window is dark (`DWMWA_USE_IMMERSIVE_DARK_MODE`),
-    /// so the Mica tint and the resize border match the palette.
-    pub fn set_dark_frame(&self, dark: bool) {
-        if self.dark_frame.get() != Some(dark) {
-            self.dark_frame.set(Some(dark));
-            imp::set_dark_frame(self.hwnd, dark);
-        }
     }
 
     /// DWM-cloak (composed but invisible) or uncloak the window.
@@ -676,62 +656,6 @@ mod imp {
         }
     }
 
-    pub fn set_backdrop(raw: isize, on: bool) -> bool {
-        use windows::Win32::Graphics::Dwm::{
-            DwmExtendFrameIntoClientArea, DWMSBT_MAINWINDOW, DWMSBT_NONE, DWMWA_SYSTEMBACKDROP_TYPE,
-        };
-        use windows::Win32::UI::Controls::MARGINS;
-        if raw == 0 {
-            return false;
-        }
-        let kind = if on { DWMSBT_MAINWINDOW } else { DWMSBT_NONE };
-        let margins = if on {
-            MARGINS {
-                cxLeftWidth: -1,
-                cxRightWidth: -1,
-                cyTopHeight: -1,
-                cyBottomHeight: -1,
-            }
-        } else {
-            MARGINS::default()
-        };
-        // SAFETY: our own window handle; the attribute value is a DWORD-
-        // sized enum read by DWM during the call.
-        let result = unsafe {
-            DwmSetWindowAttribute(
-                hwnd(raw),
-                DWMWA_SYSTEMBACKDROP_TYPE,
-                &kind as *const _ as *const _,
-                std::mem::size_of_val(&kind) as u32,
-            )
-            .and_then(|()| DwmExtendFrameIntoClientArea(hwnd(raw), &margins))
-        };
-        match result {
-            Ok(()) => true,
-            Err(error) => {
-                log::warn!("Mica backdrop unavailable: {error}");
-                false
-            }
-        }
-    }
-
-    pub fn set_dark_frame(raw: isize, dark: bool) {
-        use windows::Win32::Graphics::Dwm::DWMWA_USE_IMMERSIVE_DARK_MODE;
-        if raw == 0 {
-            return;
-        }
-        let value = windows::core::BOOL::from(dark);
-        // SAFETY: our own window handle; a BOOL read during the call.
-        let _ = unsafe {
-            DwmSetWindowAttribute(
-                hwnd(raw),
-                DWMWA_USE_IMMERSIVE_DARK_MODE,
-                &value as *const _ as *const _,
-                std::mem::size_of_val(&value) as u32,
-            )
-        };
-    }
-
     /// Add or remove `WS_EX_NOACTIVATE`.
     pub fn set_no_activate(raw: isize, on: bool) {
         if raw == 0 {
@@ -766,10 +690,6 @@ mod imp {
     }
     pub fn set_restore_to_maximized(_raw: isize) {}
     pub fn set_no_activate(_raw: isize, _on: bool) {}
-    pub fn set_backdrop(_raw: isize, _on: bool) -> bool {
-        false
-    }
-    pub fn set_dark_frame(_raw: isize, _dark: bool) {}
 }
 
 #[cfg(test)]

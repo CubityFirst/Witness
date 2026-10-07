@@ -12,8 +12,8 @@ use std::sync::RwLock;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Palette {
     pub dark: bool,
-    /// The window background behind every view (transparent when the Mica
-    /// backdrop shows through). Opaque masks use `bg`.
+    /// The window background behind every view (the shell's panels and
+    /// `clear_color`); opaque masks use `bg`.
     pub window_bg: Color32,
     pub bg: Color32,
     pub bg_raised: Color32,
@@ -88,19 +88,20 @@ const fn rgba(c: Color32, a: u8) -> Color32 {
 impl Palette {
     /// The dark palette around `accent` (a light-enough accent shade).
     pub fn dark(accent: Color32) -> Palette {
-        let bg = Color32::from_rgb(0x0f, 0x10, 0x13);
+        // Neutral greys (no blue cast next to Windows' accent).
+        let bg = Color32::from_rgb(0x13, 0x13, 0x13);
         Palette {
             dark: true,
             window_bg: bg,
             bg,
-            bg_raised: Color32::from_rgb(0x17, 0x18, 0x1c),
-            bg_hover: Color32::from_rgb(0x1f, 0x21, 0x26),
-            bg_active: Color32::from_rgb(0x26, 0x29, 0x30),
-            border: Color32::from_rgb(0x26, 0x29, 0x2f),
-            border_strong: Color32::from_rgb(0x34, 0x38, 0x41),
-            text: Color32::from_rgb(0xe8, 0xea, 0xee),
-            text_muted: Color32::from_rgb(0x96, 0x9b, 0xa5),
-            text_faint: Color32::from_rgb(0x6b, 0x70, 0x7a),
+            bg_raised: Color32::from_rgb(0x1c, 0x1c, 0x1c),
+            bg_hover: Color32::from_rgb(0x25, 0x25, 0x25),
+            bg_active: Color32::from_rgb(0x2c, 0x2c, 0x2c),
+            border: Color32::from_rgb(0x2a, 0x2a, 0x2a),
+            border_strong: Color32::from_rgb(0x3b, 0x3b, 0x3b),
+            text: Color32::from_rgb(0xec, 0xec, 0xec),
+            text_muted: Color32::from_rgb(0xa3, 0xa3, 0xa3),
+            text_faint: Color32::from_rgb(0x72, 0x72, 0x72),
             accent,
             accent_hover: lighten(accent, 0.18),
             accent_soft: rgba(accent, 41),
@@ -137,19 +138,19 @@ impl Palette {
 
     /// The light palette around `accent` (a dark-enough accent shade).
     pub fn light(accent: Color32) -> Palette {
-        let bg = Color32::from_rgb(0xf4, 0xf5, 0xf7);
+        let bg = Color32::from_rgb(0xf6, 0xf6, 0xf6);
         Palette {
             dark: false,
             window_bg: bg,
             bg,
             bg_raised: Color32::from_rgb(0xff, 0xff, 0xff),
-            bg_hover: Color32::from_rgb(0xea, 0xec, 0xf0),
-            bg_active: Color32::from_rgb(0xe0, 0xe3, 0xe9),
-            border: Color32::from_rgb(0xe1, 0xe4, 0xe9),
-            border_strong: Color32::from_rgb(0xc9, 0xce, 0xd6),
-            text: Color32::from_rgb(0x1a, 0x1c, 0x21),
-            text_muted: Color32::from_rgb(0x5a, 0x61, 0x6d),
-            text_faint: Color32::from_rgb(0x86, 0x8c, 0x97),
+            bg_hover: Color32::from_rgb(0xec, 0xec, 0xec),
+            bg_active: Color32::from_rgb(0xe3, 0xe3, 0xe3),
+            border: Color32::from_rgb(0xe5, 0xe5, 0xe5),
+            border_strong: Color32::from_rgb(0xcc, 0xcc, 0xcc),
+            text: Color32::from_rgb(0x1b, 0x1b, 0x1b),
+            text_muted: Color32::from_rgb(0x5f, 0x5f, 0x5f),
+            text_faint: Color32::from_rgb(0x8a, 0x8a, 0x8a),
             accent,
             accent_hover: darken(accent, 0.12),
             accent_soft: rgba(accent, 33),
@@ -194,13 +195,6 @@ impl Palette {
             (true, None) => Palette::dark(WITNESS_ACCENT),
             (false, None) => Palette::light(WITNESS_ACCENT_LIGHT),
         }
-    }
-
-    /// For the Mica backdrop: the window background turns transparent so
-    /// the system material shows through behind the views.
-    pub fn with_backdrop(mut self) -> Palette {
-        self.window_bg = Color32::TRANSPARENT;
-        self
     }
 }
 
@@ -489,7 +483,7 @@ pub fn test_context() -> egui::Context {
 }
 
 /// `App::clear_color`: the window background in normalized gamma space
-/// (no white resize gaps; transparent under the Mica backdrop).
+/// (no white resize gaps).
 pub fn clear_color() -> [f32; 4] {
     pal().window_bg.to_normalized_gamma_f32()
 }

@@ -29,8 +29,8 @@ use crate::ui::toasts::Notice;
 use crate::ui::widgets;
 use crate::ui::UiCtx;
 use eframe::egui::{
-    self, Align, Color32, CornerRadius, FontId, Frame, Key, Layout, Margin, Popup,
-    PopupCloseBehavior, Rect, RectAlign, Response, Sense, Stroke,
+    self, Align, CornerRadius, FontId, Frame, Key, Layout, Margin, Popup, PopupCloseBehavior, Rect,
+    RectAlign, Response, Sense, Stroke,
 };
 use std::time::{Duration, Instant};
 use witness_core::player::PlayerSnapshot;
@@ -51,12 +51,11 @@ const SCRUB_HEIGHT: f32 = 24.0;
 const TRACK_HEIGHT: f32 = 4.0;
 const THUMB_RADIUS: f32 = 7.0;
 const THUMB_RADIUS_REST: f32 = 6.0;
-/// The speaker timeline is a little thicker than the plain track, so the
-/// colours read; the thumb sits in a ring of the surface colour over it.
-const TIMELINE_HEIGHT: f32 = 6.0;
-const THUMB_RING: f32 = 2.0;
-/// Speaker colour strength ahead of the thumb (not played yet).
-const UNPLAYED_ALPHA: f32 = 0.6;
+/// The speaker-timeline strip under the track, and the gap above it.
+const TIMELINE_HEIGHT: f32 = 3.0;
+const TIMELINE_GAP: f32 = 4.0;
+/// Speaker colour strength on the strip (quiet beside the accent track).
+const TIMELINE_ALPHA: f32 = 0.75;
 /// A timeline column shows its dominant speaker once speech covers this
 /// share of it; below that it is silence.
 const COLUMN_SPEECH_MIN: f64 = 0.3;
@@ -536,20 +535,8 @@ fn scrubber(
     let visible = ui.is_rect_visible(rect);
     let cy = rect.center().y;
     let has_timeline = duration > 0 && !timeline.spans.is_empty();
-    if visible && has_timeline {
-        let columns = track.span().round().max(0.0) as usize;
-        let key = (timeline.version, columns, duration);
-        if st.timeline_cache.as_ref().is_none_or(|(k, _)| *k != key) {
-            st.timeline_cache = Some((key, timeline_runs(timeline, duration, columns)));
-        }
-        let runs = st.timeline_cache.as_ref().map_or(&[][..], |(_, r)| r);
-        let bar = egui::Rect::from_x_y_ranges(
-            track.min..=track.max,
-            (cy - TIMELINE_HEIGHT / 2.0)..=(cy + TIMELINE_HEIGHT / 2.0),
-        );
-        paint_timeline(ui.painter(), bar, runs, columns, timeline, to_x(value));
-    } else if visible {
-        // No transcript yet: the plain track, played part in the accent.
+    if visible {
+        // The seek track: a plain rail, the played part in the accent.
         let painter = ui.painter();
         let bar = egui::Rect::from_x_y_ranges(
             track.min..=track.max,
@@ -558,6 +545,20 @@ fn scrubber(
         painter.rect_filled(bar, CornerRadius::same(2), pal().border_strong);
         let filled = egui::Rect::from_x_y_ranges(bar.left()..=to_x(value), bar.y_range());
         painter.rect_filled(filled, CornerRadius::same(2), pal().accent);
+    }
+    if visible && has_timeline {
+        // Who spoke when: its own thin strip under the track, so the seek
+        // bar stays a clean progress bar.
+        let columns = track.span().round().max(0.0) as usize;
+        let key = (timeline.version, columns, duration);
+        if st.timeline_cache.as_ref().is_none_or(|(k, _)| *k != key) {
+            st.timeline_cache = Some((key, timeline_runs(timeline, duration, columns)));
+        }
+        let runs = st.timeline_cache.as_ref().map_or(&[][..], |(_, r)| r);
+        let top = cy + TRACK_HEIGHT / 2.0 + TIMELINE_GAP;
+        let strip =
+            egui::Rect::from_x_y_ranges(track.min..=track.max, top..=(top + TIMELINE_HEIGHT));
+        paint_timeline(ui.painter(), strip, runs, columns, timeline);
     }
 
     // Bookmark markers (only once the duration is known): 24×24
@@ -573,10 +574,6 @@ fn scrubber(
         let radius = if hot { THUMB_RADIUS } else { THUMB_RADIUS_REST };
         let painter = ui.painter();
         let thumb = egui::pos2(to_x(value), cy);
-        if has_timeline {
-            // Set off from the coloured track around it.
-            painter.circle_filled(thumb, radius + THUMB_RING, pal().bg_raised);
-        }
         painter.circle_filled(thumb, radius, pal().accent);
         if response.has_focus() && widgets::focus_visible(ui.ctx()) {
             painter.rect_stroke(
@@ -593,7 +590,7 @@ fn scrubber(
             .hover_pos()
             .filter(|_| response.hovered())
             .map(|pos| hover_text(timeline, to_ms(pos.x)));
-        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        let response = response;
         if let Some(text) = hover {
             response.on_hover_text_at_pointer(text);
         }
@@ -610,56 +607,38 @@ fn hover_text(timeline: &Timeline, ms: u64) -> String {
     }
 }
 
-/// Paint the timeline `runs` (over `columns` equal columns of `bar`):
-/// speakers in their colour — full strength left of `played_x`, faded
-/// right of it — and silence (or filtered-out speakers) neutral, a step
-/// stronger where played. Only the bar's two ends are round.
+/// Paint the timeline `runs` (over `columns` equal columns of `strip`):
+/// each speaker's runs in their colour, silence (and filtered-out
+/// speakers) left empty. Only a run's outer ends at the strip's two ends
+/// are round.
 fn paint_timeline(
     painter: &egui::Painter,
-    bar: Rect,
+    strip: Rect,
     runs: &[Run],
     columns: usize,
     timeline: &Timeline,
-    played_x: f32,
 ) {
     if columns == 0 {
         return;
     }
-    let p = pal();
-    let column = bar.width() / columns as f32;
-    let round = (bar.height() / 2.0) as u8;
-    let piece = |x0: f32, x1: f32, color: Color32| {
-        if x1 - x0 <= 0.01 {
-            return;
-        }
-        let rect = Rect::from_x_y_ranges(x0..=x1, bar.y_range());
-        let left = if x0 <= bar.left() + 0.5 { round } else { 0 };
-        let right = if x1 >= bar.right() - 0.5 { round } else { 0 };
-        let radius = CornerRadius {
-            nw: left,
-            sw: left,
-            ne: right,
-            se: right,
-        };
-        painter.rect_filled(rect, radius, color);
-    };
+    let column = strip.width() / columns as f32;
+    let round = (strip.height() / 2.0).round() as u8;
     for run in runs {
-        let x0 = bar.left() + run.from as f32 * column;
-        let x1 = bar.left() + run.to as f32 * column;
-        let speaker = run
+        let Some(speaker) = run
             .who
             .and_then(|i| timeline.speakers.get(usize::from(i)))
-            .filter(|s| !s.dimmed);
-        let (played, ahead) = match speaker {
-            Some(s) => {
-                let color = theme::speaker_text(&s.label);
-                (color, theme::alpha(color, UNPLAYED_ALPHA))
-            }
-            None => (p.text_faint, p.border_strong),
+            .filter(|s| !s.dimmed)
+        else {
+            continue;
         };
-        let split = played_x.clamp(x0, x1);
-        piece(x0, split, played);
-        piece(split, x1, ahead);
+        let x0 = strip.left() + run.from as f32 * column;
+        let x1 = strip.left() + run.to as f32 * column;
+        if x1 - x0 <= 0.01 {
+            continue;
+        }
+        let rect = Rect::from_x_y_ranges(x0..=x1, strip.y_range());
+        let color = theme::alpha(theme::speaker_text(&speaker.label), TIMELINE_ALPHA);
+        painter.rect_filled(rect, CornerRadius::same(round), color);
     }
 }
 
@@ -707,9 +686,7 @@ fn bookmark_marker(
             egui::StrokeKind::Outside,
         );
     }
-    let marker = marker
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(tooltip);
+    let marker = marker.on_hover_text(tooltip);
     if marker.clicked() {
         // Markers seek without playing.
         cx.player.seek_ms(at);
@@ -1030,9 +1007,7 @@ fn player_btn(ui: &mut egui::Ui, glyph: &str, size: f32, label: &str, tooltip: &
             );
         }
     }
-    response
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(tooltip)
+    response.on_hover_text(tooltip)
 }
 
 /// The primary play/pause: an accent disc with a solid white triangle or
@@ -1077,9 +1052,7 @@ fn play_btn(ui: &mut egui::Ui, playing: bool, label: &str, tooltip: &str) -> Res
             painter.circle_stroke(c, radius + 3.0, Stroke::new(2.0, pal().focus));
         }
     }
-    response
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(tooltip)
+    response.on_hover_text(tooltip)
 }
 
 #[cfg(test)]

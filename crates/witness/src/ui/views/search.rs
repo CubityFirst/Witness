@@ -26,8 +26,8 @@ use crate::ui::widgets::{self, KeyScroll, Politeness};
 use crate::ui::{PaneRole, SearchFilters, UiCtx, View, Who};
 use chrono::{DateTime, Local, NaiveDate};
 use eframe::egui::{
-    self, text::LayoutJob, text::TextWrapping, CornerRadius, CursorIcon, Key, Margin, Rect, Sense,
-    Stroke, StrokeKind, TextFormat, WidgetInfo, WidgetType,
+    self, text::LayoutJob, text::TextWrapping, CornerRadius, Key, Margin, Rect, Sense, Stroke,
+    StrokeKind, TextFormat, WidgetInfo, WidgetType,
 };
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -166,10 +166,7 @@ fn clear_button(ui: &mut egui::Ui, field: Rect) -> bool {
         paint_focus_ring(ui, rect, theme::R_SM);
     }
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Clear search"));
-    response
-        .on_hover_cursor(CursorIcon::PointingHand)
-        .on_hover_text("Clear search")
-        .clicked()
+    response.on_hover_text("Clear search").clicked()
 }
 
 // ----------------------------------------------------------------------
@@ -511,10 +508,7 @@ fn group_title(ui: &mut egui::Ui, hit: &SearchHit, today: NaiveDate, open: bool)
     }
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Link, true, &hit.meeting_title));
     follow_focus(&response);
-    (
-        rect,
-        response.on_hover_cursor(CursorIcon::PointingHand).clicked(),
-    )
+    (rect, response.clicked())
 }
 
 /// The first page's placeholder, on the real layout: meeting groups (a

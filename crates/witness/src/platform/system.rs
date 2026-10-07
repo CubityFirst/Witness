@@ -342,33 +342,6 @@ fn accent_palette_from_bytes(bytes: &[u8]) -> Option<[[u8; 3]; 7]> {
     Some(out)
 }
 
-/// Windows 11 22H2+ (build 22621), where `DWMWA_SYSTEMBACKDROP_TYPE`
-/// (Mica) exists, and not a remote session (RDP draws no backdrop).
-pub fn backdrop_supported() -> bool {
-    #[cfg(windows)]
-    {
-        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_REMOTESESSION};
-        // SAFETY: GetSystemMetrics has no preconditions.
-        let remote = unsafe { GetSystemMetrics(SM_REMOTESESSION) } != 0;
-        !remote && windows_build().is_some_and(|b| b >= 22621)
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
-
-/// The Windows build number (`CurrentBuildNumber`).
-#[cfg(windows)]
-fn windows_build() -> Option<u32> {
-    use winreg::enums::HKEY_LOCAL_MACHINE;
-    let key = winreg::RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey(r"Software\Microsoft\Windows NT\CurrentVersion")
-        .ok()?;
-    let build: String = key.get_value("CurrentBuildNumber").ok()?;
-    build.trim().parse().ok()
-}
-
 /// Whether a Windows high-contrast theme is active (`SPI_GETHIGHCONTRAST`).
 pub fn high_contrast_on() -> bool {
     imp::high_contrast_on()

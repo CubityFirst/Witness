@@ -21,9 +21,6 @@ pub struct UiPrefs {
     pub appearance: Appearance,
     /// Windows' accent colour, or Witness blue.
     pub accent: AccentSource,
-    /// The Windows 11 Mica backdrop behind the window (where supported;
-    /// applies on restart).
-    pub backdrop: bool,
     /// The first-run setup was finished or skipped.
     pub onboarded: bool,
     /// The split layout's list column width (dragged at its divider).
@@ -55,7 +52,6 @@ impl Default for UiPrefs {
             speed: 1.0,
             appearance: Appearance::System,
             accent: AccentSource::Windows,
-            backdrop: true,
             onboarded: false,
             list_width: crate::ui::LIST_WIDTH,
         }
@@ -190,7 +186,6 @@ mod tests {
             speed: 1.5,
             appearance: Appearance::Light,
             accent: AccentSource::Witness,
-            backdrop: false,
             onboarded: true,
             list_width: 420.0,
         };
@@ -210,7 +205,6 @@ mod tests {
         .unwrap();
         assert_eq!(prefs.appearance, Appearance::System);
         assert_eq!(prefs.accent, AccentSource::Windows);
-        assert!(prefs.backdrop);
         assert!(!prefs.onboarded);
         let text = toml::to_string(&UiPrefs::default()).unwrap();
         assert!(text.contains("appearance = \"system\""), "{text}");

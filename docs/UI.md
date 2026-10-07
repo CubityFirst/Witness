@@ -49,11 +49,11 @@ building blocks in the "Rework kit" section of `ui/widgets.rs`.
 `theme::Palette` holds every colour; read it with `pal()` at paint time,
 never cache colours in consts or statics. The shell resolves it each frame
 from the Appearance prefs (`ui_state.rs`: System / Light / Dark, accent
-source, Mica) and Windows' app mode and accent ramp (polled every 2 s), and
-`theme::apply` restyles on a change. Windows 11 22H2+ can show the **Mica**
-backdrop: the window is created transparent and `window_bg` (the shell's
-panels, `clear_color`) turns transparent; opaque masks keep using `bg`.
-The live-caption overlay stays dark in both themes. Check every change in
+source) and Windows' app mode and accent ramp (polled every 2 s), and
+`theme::apply` restyles on a change. Both palettes are neutral greys, so
+nothing takes a cast from the accent. There is no Mica: on this
+undecorated, self-drawn window DWM drew its own caption buttons over ours
+and left the client area see-through. The live-caption overlay stays dark in both themes. Check every change in
 **both** themes (`WITNESS_DEBUG_THEME=light|dark`).
 
 ## Layout
@@ -125,5 +125,6 @@ input:
   `WITNESS_DEBUG_TRANSCRIPT_FILTER=<label>[,<label>]`,
   `WITNESS_DEBUG_TRANSCRIPT_LOADING=1`, `WITNESS_DEBUG_TRANSCRIPT_PANE=detail`.
 
-The Mica backdrop and anything needing real input (hover, drag, typing)
-can't be snapshotted — check those by hand.
+Anything needing real input (hover, drag, typing) can't be snapshotted —
+check those by hand. Hover marks are a neutral pill at a row's left edge,
+not a fill (fills mean selected); the cursor stays the normal arrow.

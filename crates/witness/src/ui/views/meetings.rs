@@ -1776,16 +1776,10 @@ struct RowMark {
 }
 
 impl RowMark {
-    /// The row's fill: selected (or open) rows keep theirs under the
-    /// pointer; others fill on hover.
-    fn fill(self, hovered: bool) -> Option<Color32> {
-        if self.selected || self.open {
-            Some(pal().bg_active)
-        } else if hovered {
-            Some(pal().bg_hover)
-        } else {
-            None
-        }
+    /// The row's fill: selected (or open) rows only. Hover shows as a
+    /// neutral pill at the left edge instead ([`widgets::paint_hover_pill`]).
+    fn fill(self) -> Option<Color32> {
+        (self.selected || self.open).then(|| pal().bg_active)
     }
 }
 
@@ -1822,12 +1816,14 @@ fn meeting_row(
     let is_editing = editing.is_some();
     let ring = widgets::focus_visible(row.ctx());
     let revealed = hovered || is_editing || (focus_kept && ring);
-    if let Some(fill) = mark.fill(hovered) {
+    if let Some(fill) = mark.fill() {
         row.painter()
             .rect_filled(rect, CornerRadius::same(theme::R_MD), fill);
     }
     if mark.open {
         paint_open_pill(&row, rect);
+    } else if hovered && !mark.selected {
+        widgets::paint_hover_pill(&row, rect);
     }
 
     let metrics = if is_editing {
@@ -1983,7 +1979,7 @@ fn open_row(
     if focused && widgets::focus_visible(row.ctx()) {
         paint_row_focus(row, rect);
     }
-    let response = response.clone().on_hover_cursor(CursorIcon::PointingHand);
+    let response = response.clone();
     // The tooltip sits on the title only, like the TSX `title` attribute
     // (with the whole title first when it had to be cut).
     let on_title = row
@@ -2120,9 +2116,7 @@ fn status_button(
     }
     follow_focus(&response);
     response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, name));
-    response
-        .on_hover_cursor(CursorIcon::PointingHand)
-        .on_hover_text(tooltip)
+    response.on_hover_text(tooltip)
 }
 
 /// A full-width, flat "Load more" (accent text, hover fill), as wide as
@@ -2158,7 +2152,7 @@ pub(crate) fn load_more_button(ui: &mut egui::Ui, label: &str, enabled: bool) ->
     }
     follow_focus(&response);
     if enabled {
-        response.on_hover_cursor(CursorIcon::PointingHand)
+        response
     } else {
         response.on_hover_cursor(CursorIcon::NotAllowed)
     }
@@ -2236,7 +2230,7 @@ fn bin_head(ui: &mut egui::Ui, width: f32, count: usize, open: bool) -> Response
         info.selected = Some(open); // aria-expanded
         info
     });
-    response.on_hover_cursor(CursorIcon::PointingHand)
+    response
 }
 
 /// What a drawn recycle-bin row reports.
@@ -2308,11 +2302,13 @@ fn bin_row(
         selected,
         ..RowMark::default()
     };
-    if let Some(fill) = mark.fill(ui.rect_contains_pointer(row.rect)) {
+    if let Some(fill) = mark.fill() {
         ui.painter().set(
             background,
             egui::epaint::RectShape::filled(row.rect, CornerRadius::same(theme::R_MD), fill),
         );
+    } else if ui.rect_contains_pointer(row.rect) {
+        widgets::paint_hover_pill(ui, row.rect);
     }
     BinRowOut {
         rect: row.rect,
@@ -3057,11 +3053,10 @@ mod tests {
             open: true,
             ..RowMark::default()
         };
-        assert_eq!(selected.fill(false), Some(pal().bg_active));
-        assert_eq!(selected.fill(true), Some(pal().bg_active), "not hover's");
-        assert_eq!(open.fill(false), Some(pal().bg_active));
-        assert_eq!(RowMark::default().fill(true), Some(pal().bg_hover));
-        assert_eq!(RowMark::default().fill(false), None);
+        assert_eq!(selected.fill(), Some(pal().bg_active));
+        assert_eq!(open.fill(), Some(pal().bg_active));
+        // Hover never fills (it shows a pill at the left edge).
+        assert_eq!(RowMark::default().fill(), None);
     }
 
     /// The texts `view` draws in one 600 × 300 pass (after a settling
