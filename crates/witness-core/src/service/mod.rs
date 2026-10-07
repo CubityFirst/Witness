@@ -11,6 +11,7 @@
 //! are safe on the UI thread because they only touch short-lived locks no
 //! thread holds across I/O, or a channel.
 
+pub(crate) mod level_check;
 pub(crate) mod library;
 pub(crate) mod maintenance;
 pub(crate) mod notes;
@@ -21,6 +22,7 @@ pub mod testing;
 pub mod types;
 pub mod updater;
 
+pub use level_check::LevelCheck;
 pub use rec_control::{RecCmd, RecOutcome};
 pub use types::*;
 pub use updater::PreparedUpdate;
