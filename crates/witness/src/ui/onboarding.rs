@@ -78,6 +78,14 @@ impl Onboarding {
         Onboarding { state }
     }
 
+    /// The wizard from its first step, whatever the library holds
+    /// (Settings → Run setup again).
+    pub fn run_now() -> Onboarding {
+        Onboarding {
+            state: State::Running(Box::new(Wizard::new(Step::Welcome))),
+        }
+    }
+
     /// True while the wizard shows — and while the library check is still
     /// out, so no view flashes before it is replaced.
     pub fn is_active(&self) -> bool {

@@ -415,29 +415,6 @@ pub fn view_error(ui: &mut egui::Ui, message: &str, buttons: &[&str]) -> Option<
     clicked
 }
 
-/// Empty state: centred, generous vertical padding, a 15 pt semibold title
-/// and an optional muted explanation.
-pub fn empty_state(ui: &mut egui::Ui, title: &str, muted: Option<&str>) {
-    ui.add_space(56.0);
-    ui.vertical_centered(|ui| {
-        ui.spacing_mut().item_spacing.y = 6.0;
-        if !title.is_empty() {
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(title)
-                        .font(theme::semibold(15.0))
-                        .color(pal().text),
-                )
-                .wrap(),
-            );
-        }
-        if let Some(muted) = muted {
-            ui.add(egui::Label::new(egui::RichText::new(muted).color(pal().text_muted)).wrap());
-        }
-    });
-    ui.add_space(56.0);
-}
-
 /// A column of at most `max_width` centred in the available width (the
 /// CSS `max-width: 900px; margin: 0 auto` convention).
 pub fn centered_column<R>(
@@ -1084,7 +1061,6 @@ pub fn scroll_column<R>(
         })
 }
 
-#[allow(dead_code)] // TODO(v2): views adopt it
 /// A loading placeholder block: a rounded `bg_hover` bar with a soft
 /// shimmer sweeping across it (static when Windows animations are off).
 pub fn skeleton(ui: &mut egui::Ui, size: egui::Vec2) -> Response {
@@ -1117,7 +1093,6 @@ pub fn skeleton(ui: &mut egui::Ui, size: egui::Vec2) -> Response {
     response
 }
 
-#[allow(dead_code)] // TODO(v2): views adopt it
 /// `rows` list-row placeholders (a title bar and a shorter meta bar each),
 /// widths varied so it reads as content, for a view's first load.
 pub fn skeleton_rows(ui: &mut egui::Ui, rows: usize) {
@@ -1193,11 +1168,6 @@ mod tests {
             badge(ui, BadgeKind::Ok, "Transcribed");
             inline_warning(ui, "Microphone device was lost during recording");
             assert_eq!(view_error(ui, "Could not load", &["Try again"]), None);
-            empty_state(
-                ui,
-                "No meetings yet.",
-                Some("Join a meeting or hit record."),
-            );
             centered_column(ui, 900.0, |ui| ui.label("column"));
             keyboard_scroll(ui, KeyScroll { space: true });
             let edit = ui.text_edit_singleline(&mut String::new());

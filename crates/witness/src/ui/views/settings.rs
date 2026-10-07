@@ -659,16 +659,32 @@ impl SettingsState {
     fn startup(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
         let mut enabled = self.autostart.unwrap_or(false);
         let loaded = self.autostart.is_some() && self.autostart_write.is_none();
-        let changed = section(ui, "Startup", |ui| {
-            toggle(
+        let (changed, setup) = section(ui, "Startup", |ui| {
+            let changed = toggle(
                 ui,
                 loaded,
                 &mut enabled,
                 "Start Witness with Windows",
                 "Opens minimized to the tray.",
             )
-            .changed()
+            .changed();
+            widgets::group_divider(ui);
+            let setup = row(
+                ui,
+                "run-setup",
+                Slot::Fit,
+                |ui| {
+                    let id = title(ui, "Setup assistant");
+                    note(ui, "Walk through devices, models and preferences again.");
+                    id
+                },
+                |ui, _| widgets::btn(ui, "Run setup").clicked(),
+            );
+            (changed, setup)
         });
+        if setup {
+            cx.cmds.push(UiCmd::RunSetup);
+        }
         if changed {
             // The switch shows the new value once the registry write
             // succeeds; a failure toasts even if Settings was left.

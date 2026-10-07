@@ -689,6 +689,11 @@ impl WitnessApp {
                         self.ensure_ui_pass();
                     }
                 }
+                UiCmd::RunSetup => {
+                    self.prefs.onboarded = false;
+                    self.palette = CommandPalette::new();
+                    self.onboarding = Onboarding::run_now();
+                }
                 UiCmd::Restart => {
                     self.tasks.spawn_op_or(
                         "restart",
@@ -913,6 +918,8 @@ impl WitnessApp {
             self.palette.toggle();
         }
         if self.palette.is_open() {
+            // Nothing behind the palette reacts to Ctrl+F (find, search).
+            ctx.input_mut(|i| consume_key_exact(i, Key::F, |m| m.command && !m.alt));
             return;
         }
         // In a transcript Ctrl+F is find-in-transcript (the view's) — in a
@@ -1163,7 +1170,10 @@ fn draw_single(
     onboarding: &mut Onboarding,
     fades: Fades,
 ) {
-    view_header(ui, cx);
+    // Setup covers the banner's job (its Models step) and needs no search.
+    if !onboarding.is_active() {
+        view_header(ui, cx);
+    }
     faded(ui, fades.page, PAGE_RISE, |ui| {
         if onboarding.is_active() {
             view_root(ui, "onboarding", |ui| onboarding.show(ui, cx));

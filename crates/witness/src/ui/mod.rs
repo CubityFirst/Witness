@@ -250,6 +250,8 @@ pub enum UiCmd {
     CheckUpdate,
     /// Settings → Updates → Install.
     InstallUpdate,
+    /// Settings → Startup → Run setup again: show the first-run wizard.
+    RunSetup,
 }
 
 /// Search "Who" filter.
