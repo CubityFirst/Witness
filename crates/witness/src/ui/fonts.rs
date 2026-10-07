@@ -19,6 +19,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 const SEGOE: &str = "segoe-ui";
+/// Classic Segoe UI behind Segoe UI Variable: the variable font covers
+/// Latin, Greek and Cyrillic only, the classic one also Arabic, Hebrew…
+const SEGOE_CLASSIC: &str = "segoe-ui-classic";
+const SEGOE_CLASSIC_SEMIBOLD: &str = "segoe-ui-classic-semibold";
 const SEGOE_SEMIBOLD: &str = "segoe-ui-semibold";
 const SEGOE_SYMBOL: &str = "segoe-ui-symbol";
 const CONSOLAS: &str = "consolas";
@@ -63,6 +67,14 @@ fn eager_definitions() -> (FontDefinitions, Vec<&'static str>) {
         );
         proportional(&mut fonts).insert(0, SEGOE.into());
         eager_loaded.push("seguivar");
+        if let Some(classic) = read_font("segoeui.ttf") {
+            fonts.font_data.insert(
+                SEGOE_CLASSIC.into(),
+                Arc::new(FontData::from_owned(classic)),
+            );
+            proportional(&mut fonts).insert(1, SEGOE_CLASSIC.into());
+            eager_loaded.push("segoeui");
+        }
     } else if let Some(bytes) = read_font("segoeui.ttf") {
         fonts
             .font_data
@@ -88,8 +100,15 @@ fn eager_definitions() -> (FontDefinitions, Vec<&'static str>) {
             SEGOE_SEMIBOLD.into(),
             Arc::new(variable_instance(bytes, 600.0)),
         );
-        semibold.retain(|name| name != SEGOE);
+        semibold.retain(|name| name != SEGOE && name != SEGOE_CLASSIC);
         semibold.insert(0, SEGOE_SEMIBOLD.into());
+        if let Some(classic) = read_font("seguisb.ttf") {
+            fonts.font_data.insert(
+                SEGOE_CLASSIC_SEMIBOLD.into(),
+                Arc::new(FontData::from_owned(classic)),
+            );
+            semibold.insert(1, SEGOE_CLASSIC_SEMIBOLD.into());
+        }
     } else if let Some(bytes) = read_font("seguisb.ttf") {
         fonts
             .font_data
