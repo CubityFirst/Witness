@@ -1,5 +1,6 @@
-//! Settings: Startup, Updates, Storage, Recording, Transcription, Models,
-//! Diagnostics and Voice prints sections (map-ui-settings §1, settings.tsx).
+//! Settings: Appearance, Startup, Updates, Storage, Recording,
+//! Transcription, Models, Diagnostics and Voice prints sections
+//! (map-ui-settings §1, settings.tsx).
 //!
 //! - **Layout** (design/ui-rework.md): a sticky page title, then per section
 //!   a header and one raised group of [`row`]s — title + muted description
@@ -13,7 +14,8 @@
 //!   edit starts from the store's *current* value, so two commits in one
 //!   pass (a text field blurring because a checkbox was clicked) compose.
 //! - **Loads** (models, cache size, GPU, GPU libraries, people, devices,
-//!   autostart, diagnostics) run in parallel as view-owned `Task`s; leaving
+//!   autostart, diagnostics, Windows' accent) run in parallel as view-owned
+//!   `Task`s; leaving
 //!   the view drops them. Download progress is global (`shell.download`),
 //!   so badges survive leaving and returning; when a download finishes
 //!   (`shell.download_done_tick`) the model, cache, GPU and GPU-library rows
@@ -28,12 +30,13 @@
 
 use super::updates::UpdatesSection;
 use crate::bridge::{OpDone, OpHandle, Task};
-use crate::platform::{autostart, dialogs};
+use crate::platform::{autostart, dialogs, system};
 use crate::ui::icons::ph;
 use crate::ui::theme::{self, pal};
 use crate::ui::toasts::Notice;
 use crate::ui::widgets::{self, BadgeKind, KeyScroll, Politeness};
 use crate::ui::{UiCmd, UiCtx};
+use crate::ui_state::{AccentSource, Appearance, UiPrefs};
 use eframe::egui::{self, Align, CornerRadius, Layout, Margin, RichText, Stroke};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -65,14 +68,14 @@ const GPU_LIBS_ID: &str = "gpu-libs";
 /// the view also wants (the backup summary, the new autostart state): the
 /// op's completion flag plus the slot its worker fills on success (read
 /// back here; dropped harmlessly if the view is gone).
-struct OpRun<T> {
+pub(crate) struct OpRun<T> {
     handle: OpHandle,
     result: Arc<Mutex<Option<T>>>,
 }
 
 impl<T> OpRun<T> {
     /// Run `f` as an op; it gets the slot to fill and returns the `OpDone`.
-    fn spawn(
+    pub(crate) fn spawn(
         cx: &UiCtx,
         name: &'static str,
         f: impl FnOnce(&AppCore, &Mutex<Option<T>>) -> OpDone + Send + 'static,
@@ -87,14 +90,14 @@ impl<T> OpRun<T> {
     }
 
     /// Once the op finished: `Some(result)` (`None` inside when it failed).
-    fn finished(slot: &mut Option<Self>) -> Option<Option<T>> {
+    pub(crate) fn finished(slot: &mut Option<Self>) -> Option<Option<T>> {
         let run = slot.take_if(|run| run.handle.is_done())?;
         Some(run.result.lock().ok().and_then(|mut r| r.take()))
     }
 }
 
 /// Fill an `OpRun` slot from its worker.
-fn fill<T>(slot: &Mutex<Option<T>>, value: T) {
+pub(crate) fn fill<T>(slot: &Mutex<Option<T>>, value: T) {
     if let Ok(mut slot) = slot.lock() {
         *slot = Some(value);
     }
@@ -113,6 +116,7 @@ struct Loads {
     autostart: Option<Task<Result<bool, String>>>,
     diagnostics: Option<Task<Diagnostics>>,
     pick_dir: Option<Task<Option<PathBuf>>>,
+    look: Option<Task<SystemLook>>,
 }
 
 /// The view handle: its state is boxed so `ActiveView` stays small.
@@ -172,6 +176,8 @@ struct SettingsState {
     diagnostics: Option<Diagnostics>,
     diagnostics_error: Option<String>,
     diagnostics_copied_at: Option<Instant>,
+    /// Windows' accent and Mica support (None until read).
+    look: Option<SystemLook>,
 
     /// Watch patterns as typed, and the settings value the text reflects
     /// (re-synced when the stored value moves away, e.g. a failed save).
@@ -233,6 +239,7 @@ impl SettingsState {
             diagnostics: None,
             diagnostics_error: None,
             diagnostics_copied_at: None,
+            look: None,
             patterns_text: String::new(),
             patterns_source: Vec::new(),
             patterns_dirty: false,
@@ -282,6 +289,7 @@ impl SettingsState {
             // The column helpers zero the horizontal spacing; rows of
             // buttons need theirs back.
             ui.spacing_mut().item_spacing.x = theme::S2;
+            self.appearance(ui, cx);
             self.startup(ui, cx);
             self.updates.show(ui, cx);
             self.storage(ui, cx);
@@ -393,6 +401,7 @@ impl SettingsState {
                 .spawn("autostart-read", |_| autostart::is_enabled()),
         );
         self.refresh_diagnostics(cx);
+        self.loads.look = Some(SystemLook::load(cx));
     }
 
     fn refresh_models(&mut self, cx: &UiCtx) {
@@ -499,6 +508,11 @@ impl SettingsState {
             }
         }
 
+        if let Some(result) = take(&mut self.loads.look) {
+            // A failed read only costs the swatch and the Mica switch.
+            self.look = Some(result.unwrap_or_default());
+        }
+
         if let Some(Some(summary)) = OpRun::finished(&mut self.backup) {
             self.last_backup = Some(summary);
         }
@@ -598,6 +612,48 @@ impl SettingsState {
                 ui.ctx().request_repaint_after(left);
             }
         });
+    }
+
+    /// Theme, accent and the Mica backdrop. UI preferences (`cx.prefs`), not
+    /// settings: the shell persists them and re-resolves the palette every
+    /// frame, so theme and accent apply at once; Mica needs a restart.
+    fn appearance(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
+        // What the window opened with, noted on the first draw (before any
+        // click could change it) and kept in egui memory, so leaving and
+        // reopening Settings still offers the restart.
+        let at_start = ui.ctx().data_mut(|d| {
+            *d.get_temp_mut_or_insert_with(egui::Id::new("settings-backdrop-at-start"), || {
+                cx.prefs.backdrop
+            })
+        });
+        let look = self.look;
+        let prefs = &mut *cx.prefs;
+        let restart = section(ui, "Appearance", |ui| {
+            theme_row(ui, prefs);
+            widgets::group_divider(ui);
+            accent_row(ui, prefs, look.as_ref());
+            widgets::group_divider(ui);
+            backdrop_row(ui, prefs, look.as_ref());
+            let mut restart = false;
+            if prefs.backdrop != at_start {
+                widgets::group_divider(ui);
+                restart = row(
+                    ui,
+                    "backdrop-restart",
+                    Slot::Fit,
+                    |ui| {
+                        let id = title(ui, "Restart to apply");
+                        note(ui, "The backdrop changes the next time Witness starts.");
+                        id
+                    },
+                    |ui, _| widgets::btn(ui, "Restart Witness").clicked(),
+                );
+            }
+            restart
+        });
+        if restart {
+            self.restart(cx);
+        }
     }
 
     fn startup(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
@@ -1331,14 +1387,14 @@ fn save(cx: &mut UiCtx, edit: impl FnOnce(&mut Settings)) {
     cx.settings.save(next, cx.tasks);
 }
 
-fn quiet() -> OpDone {
+pub(crate) fn quiet() -> OpDone {
     OpDone::Notice {
         notice: None,
         refresh: false,
     }
 }
 
-fn notice_done(notice: Notice) -> OpDone {
+pub(crate) fn notice_done(notice: Notice) -> OpDone {
     OpDone::Notice {
         notice: Some(notice),
         refresh: false,
@@ -1346,7 +1402,7 @@ fn notice_done(notice: Notice) -> OpDone {
 }
 
 /// `download_models(engine)` (returns at once; progress is global).
-fn start_model_download(cx: &mut UiCtx, engine: Engine, failure: String) {
+pub(crate) fn start_model_download(cx: &mut UiCtx, engine: Engine, failure: String) {
     cx.tasks.spawn_op("download-models", move |c| {
         match c.download_models(engine) {
             Ok(()) => quiet(),
@@ -1410,21 +1466,21 @@ fn forget_confirm_id(person_id: i64) -> egui::Id {
 }
 
 /// One audio-device picker row (settings.tsx's two `<select>`s).
-struct DeviceRow<'a> {
-    label: &'static str,
-    id: &'static str,
-    default_label: &'static str,
-    missing_badge: &'static str,
-    help: Option<&'static str>,
-    configured: Option<&'a str>,
+pub(crate) struct DeviceRow<'a> {
+    pub label: &'static str,
+    pub id: &'static str,
+    pub default_label: &'static str,
+    pub missing_badge: &'static str,
+    pub help: Option<&'static str>,
+    pub configured: Option<&'a str>,
     /// None while loading or after listing failed.
-    devices: Option<&'a [AudioDevice]>,
-    list_failed: bool,
+    pub devices: Option<&'a [AudioDevice]>,
+    pub list_failed: bool,
 }
 
 /// A device picker row; returns the newly picked value (None inside =
 /// the default device).
-fn device_row(ui: &mut egui::Ui, spec: &DeviceRow) -> Option<Option<String>> {
+pub(crate) fn device_row(ui: &mut egui::Ui, spec: &DeviceRow) -> Option<Option<String>> {
     let options = device_options(
         spec.configured,
         spec.devices,
@@ -1686,6 +1742,292 @@ fn gpu_libs_row(
     clicked.then_some(())
 }
 
+// ----------------------------------------------------------------------
+// Appearance (shared with the first-run setup)
+
+/// What Windows offers the Appearance rows: its accent shades (for the
+/// "Windows" swatch, shown even while Witness blue is picked) and whether
+/// the Mica backdrop can work at all. Registry reads, so loaded off the UI
+/// thread.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct SystemLook {
+    /// `AccentPalette`: light3 … base … dark3.
+    pub accent: Option<[egui::Color32; 7]>,
+    pub backdrop_supported: bool,
+}
+
+impl SystemLook {
+    pub(crate) fn load(cx: &UiCtx) -> Task<SystemLook> {
+        cx.tasks.spawn("system-look", |_| SystemLook {
+            accent: system::accent_palette()
+                .map(|shades| shades.map(|[r, g, b]| egui::Color32::from_rgb(r, g, b))),
+            backdrop_supported: system::backdrop_supported(),
+        })
+    }
+
+    /// The Windows accent shade the current theme uses (as
+    /// `Palette::resolve` picks it).
+    fn windows_accent(&self) -> Option<egui::Color32> {
+        let shades = self.accent?;
+        Some(if pal().dark { shades[1] } else { shades[4] })
+    }
+}
+
+/// Theme: System / Light / Dark. Applies on the next frame.
+pub(crate) fn theme_row(ui: &mut egui::Ui, prefs: &mut UiPrefs) {
+    row(
+        ui,
+        "appearance-theme",
+        Slot::Fill(FIELD_WIDTH),
+        |ui| {
+            let id = title(ui, "Theme");
+            note(ui, "System follows Windows' light or dark app mode.");
+            id
+        },
+        |ui, label| {
+            segmented(
+                ui,
+                "appearance-theme",
+                label,
+                &mut prefs.appearance,
+                &[
+                    Segment::new(Appearance::System, "System").icon(ph::MONITOR),
+                    Segment::new(Appearance::Light, "Light").icon(ph::SUN),
+                    Segment::new(Appearance::Dark, "Dark").icon(ph::MOON),
+                ],
+            );
+        },
+    );
+}
+
+/// Accent: Windows' accent colour or Witness blue, each with its swatch.
+pub(crate) fn accent_row(ui: &mut egui::Ui, prefs: &mut UiPrefs, look: Option<&SystemLook>) {
+    let windows = look.and_then(SystemLook::windows_accent);
+    // Unknown until read; a Windows without an accent palette falls back
+    // to Witness blue anyway (`Palette::resolve`).
+    let description = match look {
+        Some(look) if look.accent.is_none() => {
+            "Windows has no accent colour to offer, so Witness blue is used."
+        }
+        _ => "Buttons, selection, focus and progress.",
+    };
+    row(
+        ui,
+        "appearance-accent",
+        Slot::Fill(FIELD_WIDTH),
+        |ui| {
+            let id = title(ui, "Accent colour");
+            note(ui, description);
+            id
+        },
+        |ui, label| {
+            let mut windows_option = Segment::new(AccentSource::Windows, "Windows");
+            if let Some(color) = windows {
+                windows_option = windows_option.swatch(color);
+            }
+            segmented(
+                ui,
+                "appearance-accent",
+                label,
+                &mut prefs.accent,
+                &[
+                    windows_option,
+                    Segment::new(AccentSource::Witness, "Witness blue")
+                        .swatch(theme::Palette::resolve(pal().dark, None).accent),
+                ],
+            );
+        },
+    );
+}
+
+/// The Mica switch: disabled (saying why) where Windows cannot draw it.
+fn backdrop_row(ui: &mut egui::Ui, prefs: &mut UiPrefs, look: Option<&SystemLook>) {
+    let supported = look.is_some_and(|l| l.backdrop_supported);
+    let description = match look {
+        Some(look) if !look.backdrop_supported => {
+            "Needs Windows 11 version 22H2 or later, and is not available over Remote Desktop."
+        }
+        _ => "Translucent Windows 11 material behind the window. Applies after restart.",
+    };
+    // Shown off where it cannot work, without forgetting the preference.
+    let mut on = prefs.backdrop && (supported || look.is_none());
+    if toggle(ui, supported, &mut on, "Mica backdrop", description).changed() {
+        prefs.backdrop = on;
+    }
+}
+
+/// One option of a [`segmented`] control.
+pub(crate) struct Segment<T> {
+    value: T,
+    text: &'static str,
+    lead: Option<Lead>,
+}
+
+/// What sits before a segment's text.
+#[derive(Clone, Copy)]
+enum Lead {
+    Icon(&'static str),
+    Swatch(egui::Color32),
+}
+
+impl<T> Segment<T> {
+    pub(crate) fn new(value: T, text: &'static str) -> Self {
+        Segment {
+            value,
+            text,
+            lead: None,
+        }
+    }
+
+    pub(crate) fn icon(mut self, glyph: &'static str) -> Self {
+        self.lead = Some(Lead::Icon(glyph));
+        self
+    }
+
+    pub(crate) fn swatch(mut self, color: egui::Color32) -> Self {
+        self.lead = Some(Lead::Swatch(color));
+        self
+    }
+}
+
+/// The gap between a segmented control's track and its segments.
+const SEGMENT_INSET: f32 = 3.0;
+
+/// A segmented choice (Windows 11's selector bar): an inset track as wide
+/// as the slot, equal segments, the picked one an accent tint with accent
+/// text. Each segment is a focusable radio button named after its text,
+/// the group labelled by the row title `label`. Returns whether the value
+/// changed.
+pub(crate) fn segmented<T: PartialEq + Copy>(
+    ui: &mut egui::Ui,
+    salt: &str,
+    label: egui::Id,
+    value: &mut T,
+    options: &[Segment<T>],
+) -> bool {
+    let height = ui.spacing().interact_size.y;
+    let (rect, group) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::hover(),
+    );
+    let group = group.labelled_by(label);
+    let enabled = ui.is_enabled();
+    let p = pal();
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(theme::R_MD),
+        p.bg,
+        Stroke::new(1.0, p.border),
+        egui::StrokeKind::Inside,
+    );
+    let inner = rect.shrink(SEGMENT_INSET);
+    let width = inner.width() / options.len().max(1) as f32;
+    let mut changed = false;
+    for (i, option) in options.iter().enumerate() {
+        let seg = egui::Rect::from_min_size(
+            inner.min + egui::vec2(width * i as f32, 0.0),
+            egui::vec2(width, inner.height()),
+        );
+        let response = ui.interact(seg, group.id.with((salt, i)), egui::Sense::click());
+        if enabled && response.clicked() && option.value != *value {
+            *value = option.value;
+            changed = true;
+        }
+        let selected = option.value == *value;
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::RadioButton,
+                enabled,
+                selected,
+                option.text,
+            )
+        });
+        let ring = response.has_focus() && widgets::focus_visible(ui.ctx());
+        let hovered = enabled && (response.hovered() || ring);
+        let radius = CornerRadius::same(theme::R_SM);
+        if selected {
+            ui.painter().rect_filled(seg, radius, p.accent_soft);
+        } else if hovered {
+            ui.painter().rect_filled(seg, radius, p.bg_hover);
+        }
+        let (font, color) = if selected {
+            (theme::semibold(13.0), theme::ink(p.accent))
+        } else if hovered {
+            (theme::regular(13.0), p.text)
+        } else {
+            (theme::regular(13.0), p.text_muted)
+        };
+        paint_segment(ui, seg, option, font, color);
+        if ring {
+            ui.painter().rect_stroke(
+                seg.expand(1.0),
+                radius,
+                Stroke::new(2.0, p.focus),
+                egui::StrokeKind::Outside,
+            );
+        }
+        if enabled {
+            response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        }
+    }
+    if !enabled {
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::same(theme::R_MD),
+            theme::alpha(p.bg_raised, 0.45),
+        );
+    }
+    changed
+}
+
+/// A segment's lead (icon or swatch) and text, centred; the text elides
+/// when the segment is narrow.
+fn paint_segment<T>(
+    ui: &egui::Ui,
+    seg: egui::Rect,
+    option: &Segment<T>,
+    font: egui::FontId,
+    color: egui::Color32,
+) {
+    const LEAD: f32 = 14.0;
+    const GAP: f32 = 6.0;
+    let lead_w = if option.lead.is_some() {
+        LEAD + GAP
+    } else {
+        0.0
+    };
+    let room = (seg.width() - 2.0 * theme::S2 - lead_w).max(8.0);
+    let mut job = egui::text::LayoutJob::simple_singleline(option.text.to_owned(), font, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(room);
+    let galley = ui.painter().layout_job(job);
+    let left = seg.center().x - (lead_w + galley.size().x) / 2.0;
+    let painter = ui.painter();
+    let lead_center = egui::pos2(left + LEAD / 2.0, seg.center().y);
+    match option.lead {
+        Some(Lead::Icon(glyph)) => {
+            painter.text(
+                lead_center,
+                egui::Align2::CENTER_CENTER,
+                glyph,
+                egui::FontId::proportional(LEAD),
+                color,
+            );
+        }
+        Some(Lead::Swatch(fill)) => {
+            painter.circle_filled(lead_center, 6.0, fill);
+            // A hairline keeps a pale swatch visible on the light track.
+            painter.circle_stroke(
+                lead_center,
+                6.0,
+                Stroke::new(1.0, theme::alpha(pal().text, 0.15)),
+            );
+        }
+        None => {}
+    }
+    let pos = egui::pos2(left + lead_w, seg.center().y - galley.size().y / 2.0);
+    painter.galley(pos, galley, color);
+}
+
 /// A global-hotkey row: the bound combo as a key cap, or "Unavailable".
 fn hotkey_row(ui: &mut egui::Ui, name: &str, what: &str, combo: Option<&str>) {
     let (description, key) = hotkey_parts(what, combo);
@@ -1708,7 +2050,7 @@ fn hotkey_row(ui: &mut egui::Ui, name: &str, what: &str, combo: Option<&str>) {
 }
 
 // ----------------------------------------------------------------------
-// Layout helpers (shared with updates.rs)
+// Layout helpers (shared with updates.rs and the first-run setup)
 
 /// Below this a row's text column would be squeezed: the control stacks
 /// under the text instead.
@@ -1722,7 +2064,7 @@ const KEY_WIDTH: f32 = 128.0;
 const KV_SIDE_BY_SIDE: f32 = 400.0;
 
 /// A settings section: its header and one group holding `add`'s rows.
-pub(super) fn section<R>(
+pub(crate) fn section<R>(
     ui: &mut egui::Ui,
     title: &str,
     add: impl FnOnce(&mut egui::Ui) -> R,
@@ -1733,7 +2075,7 @@ pub(super) fn section<R>(
 
 /// How a [`row`]'s control is sized.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) enum Slot {
+pub(crate) enum Slot {
     /// As wide as its content (switches, buttons, badges): measured, so the
     /// control stays beside the text whenever the text keeps
     /// [`TEXT_MIN_WIDTH`].
@@ -1766,7 +2108,7 @@ struct RowMetrics {
 /// Immediate mode cannot centre or right-align before it knows the sizes,
 /// so the row remembers last pass's text height and control width under
 /// `salt` and discards the pass when they change (no visible jump).
-pub(super) fn row<R>(
+pub(crate) fn row<R>(
     ui: &mut egui::Ui,
     salt: impl std::hash::Hash + std::fmt::Debug,
     slot: Slot,
@@ -1881,7 +2223,7 @@ pub(super) fn row<R>(
 }
 
 /// A boolean setting: title + muted description, the switch on the right.
-pub(super) fn toggle(
+pub(crate) fn toggle(
     ui: &mut egui::Ui,
     enabled: bool,
     on: &mut bool,
@@ -1906,7 +2248,7 @@ pub(super) fn toggle(
 
 /// A row title: body text, one line, elided with a tooltip when long. Its
 /// one-line width is noted for [`row`].
-pub(super) fn title(ui: &mut egui::Ui, text: &str) -> egui::Id {
+pub(crate) fn title(ui: &mut egui::Ui, text: &str) -> egui::Id {
     let font = theme::regular(theme::BASE_SIZE);
     let natural = text_width(ui, text, font.clone());
     let id = widgets::elide(ui, text, font, pal().text).id;
@@ -1921,7 +2263,7 @@ fn natural_title_width(ui: &egui::Ui, id: egui::Id) -> f32 {
 }
 
 /// A row description: muted 12.5 pt, wrapping.
-pub(super) fn note(ui: &mut egui::Ui, text: &str) {
+pub(crate) fn note(ui: &mut egui::Ui, text: &str) {
     ui.add(
         egui::Label::new(
             RichText::new(text)
@@ -1933,12 +2275,12 @@ pub(super) fn note(ui: &mut egui::Ui, text: &str) {
 }
 
 /// A coloured status line under a row title (download progress, errors).
-fn status_note(ui: &mut egui::Ui, color: egui::Color32, text: &str) -> egui::Response {
+pub(crate) fn status_note(ui: &mut egui::Ui, color: egui::Color32, text: &str) -> egui::Response {
     ui.add(egui::Label::new(RichText::new(text).font(theme::regular(12.5)).color(color)).wrap())
 }
 
 /// Help text under a group, aligned with its section header.
-pub(super) fn footnote(ui: &mut egui::Ui, text: &str) {
+pub(crate) fn footnote(ui: &mut egui::Ui, text: &str) {
     ui.add(
         egui::Label::new(
             RichText::new(text)
@@ -1951,7 +2293,7 @@ pub(super) fn footnote(ui: &mut egui::Ui, text: &str) {
 
 /// A thin accent progress bar across the available width (`fraction`
 /// 0..1).
-pub(super) fn progress_bar(ui: &mut egui::Ui, fraction: f32) {
+pub(crate) fn progress_bar(ui: &mut egui::Ui, fraction: f32) {
     ui.add_space(theme::S1);
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 4.0), egui::Sense::hover());
@@ -1966,7 +2308,7 @@ pub(super) fn progress_bar(ui: &mut egui::Ui, fraction: f32) {
 }
 
 /// A secondary button, disabled unless `enabled`.
-pub(super) fn button(ui: &mut egui::Ui, enabled: bool, text: &str) -> egui::Response {
+pub(crate) fn button(ui: &mut egui::Ui, enabled: bool, text: &str) -> egui::Response {
     ui.add_enabled_ui(enabled, |ui| widgets::btn(ui, text))
         .inner
 }
@@ -1985,7 +2327,7 @@ fn path_box(ui: &mut egui::Ui, text: &str) {
 }
 
 /// A key cap for a hotkey combo.
-fn keycap(ui: &mut egui::Ui, text: &str) {
+pub(crate) fn keycap(ui: &mut egui::Ui, text: &str) {
     egui::Frame::new()
         .fill(pal().bg)
         .stroke(Stroke::new(1.0, theme::pal().border_strong))
@@ -2195,7 +2537,7 @@ fn parse_lines(text: &str) -> Vec<String> {
 }
 
 /// `ctrl+alt+r` → `CTRL + ALT + R`.
-fn hotkey_label(combo: &str) -> String {
+pub(crate) fn hotkey_label(combo: &str) -> String {
     combo.to_uppercase().replace('+', " + ")
 }
 
@@ -2288,12 +2630,12 @@ fn threshold_value_text(t: f32) -> String {
 
 /// `dl != null && !dl.done`: a failed download keeps its badge but no
 /// longer disables the buttons.
-fn download_active(dl: Option<&ModelDownloadProgress>) -> bool {
+pub(crate) fn download_active(dl: Option<&ModelDownloadProgress>) -> bool {
     dl.is_some_and(|d| !d.done)
 }
 
 /// The progress badge text (map-ui-settings §1.9).
-fn download_progress_text(p: &ModelDownloadProgress) -> String {
+pub(crate) fn download_progress_text(p: &ModelDownloadProgress) -> String {
     match p.total_bytes.filter(|t| *t > 0) {
         Some(total) => format!(
             "file {} of {} — {}% of {} MB",
@@ -2313,7 +2655,7 @@ fn download_progress_text(p: &ModelDownloadProgress) -> String {
 
 /// How far a download is overall (0..1), when its size is known: the
 /// finished files plus the current file's share.
-fn download_fraction(p: &ModelDownloadProgress) -> Option<f32> {
+pub(crate) fn download_fraction(p: &ModelDownloadProgress) -> Option<f32> {
     let total = p.total_bytes.filter(|t| *t > 0)?;
     let count = p.file_count.max(1) as f32;
     let file = (p.downloaded_bytes as f32 / total as f32).clamp(0.0, 1.0);
@@ -2364,8 +2706,14 @@ fn model_state(model: &ModelInfo, dl: Option<&ModelDownloadProgress>) -> ModelSt
     if download_active(dl) && dl.is_some_and(|d| d.model_id == model.engine.to_string()) {
         return ModelState::Waiting;
     }
+    // A model that was never installed has no manifest entry and so an
+    // "integrity" error too ("… has no verified installation manifest"):
+    // that is plain "not downloaded", not a failed check to repair.
     ModelState::Idle {
-        integrity_error: model.integrity_error.clone(),
+        integrity_error: model
+            .installed_revision
+            .as_ref()
+            .and(model.integrity_error.clone()),
     }
 }
 
@@ -2542,7 +2890,12 @@ fn capture_health_text(d: &Diagnostics) -> String {
 
 fn model_integrity_text(d: &Diagnostics) -> String {
     let present = d.models.iter().filter(|m| m.present).count();
-    let failed = d.models.iter().any(|m| m.integrity_error.is_some());
+    // Only installed models can fail a check (a never-downloaded one has no
+    // manifest entry, which the core also reports as an integrity error).
+    let failed = d
+        .models
+        .iter()
+        .any(|m| m.installed_revision.is_some() && m.integrity_error.is_some());
     format!(
         "{present}/{} verified{}",
         d.models.len(),
@@ -2804,11 +3157,21 @@ mod tests {
         assert!(download_active(Some(&running)));
 
         let mut broken = model("whisper", Engine::Whisper, false);
+        broken.installed_revision = Some("0123456789abcdef".into());
         broken.integrity_error = Some("hash mismatch".into());
         assert_eq!(
             model_state(&broken, None),
             ModelState::Idle {
                 integrity_error: Some("hash mismatch".into())
+            }
+        );
+        // Never downloaded: Download, not Repair.
+        let mut absent = model("whisper", Engine::Whisper, false);
+        absent.integrity_error = Some("whisper has no verified installation manifest".into());
+        assert_eq!(
+            model_state(&absent, None),
+            ModelState::Idle {
+                integrity_error: None
             }
         );
     }
@@ -2988,6 +3351,8 @@ mod tests {
         });
         d.capture_health_is_current = true;
         d.models[1].integrity_error = Some("bad".into());
+        assert_eq!(model_integrity_text(&d), "1/2 verified", "never installed");
+        d.models[1].installed_revision = Some("old".into());
         d.gpu.driver_present = true;
         d.gpu.managed_libraries_present = true;
         assert_eq!(recording_text(&d), "recording · meeting 12");
