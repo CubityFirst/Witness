@@ -58,6 +58,23 @@ const PLACE_TOLERANCE: i32 = 2;
 /// The error band: red @ 0.15.
 const ERROR_BG: Color32 = Color32::from_rgba_unmultiplied_const(0xe5, 0x48, 0x4d, 38);
 
+/// The overlay's colours: always the dark palette, whatever the app's theme
+/// (captions float over Teams and anything else; light text on near-black
+/// reads everywhere). With a dark theme it is the app's own palette, Windows
+/// accent included; with a light one, the dark palette around a lightened
+/// accent, so "Me" stays readable on the dark surface.
+fn overlay_palette() -> theme::Palette {
+    overlay_palette_for(pal())
+}
+
+fn overlay_palette_for(app: theme::Palette) -> theme::Palette {
+    if app.dark {
+        app
+    } else {
+        theme::Palette::dark(theme::lighten(app.accent, 0.4))
+    }
+}
+
 /// The overlay's viewport id.
 pub fn captions_id() -> ViewportId {
     ViewportId::from_hash_of("witness-captions")
@@ -699,13 +716,14 @@ fn place_window(st: &mut CaptionsState, ctx: &egui::Context) {
 /// Paint the overlay; returns whether × was clicked. A primary press
 /// anywhere else starts the OS move loop (unless it began a resize).
 fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
+    let p = overlay_palette();
     let ctx = ui.ctx().clone();
     let rect = ui.max_rect();
     // CSS px scale: the overlay's zoom × Windows text size, independent of
     // the main window's zoom (which egui applies to every viewport).
     let k = st.scale * st.text_scale / ctx.zoom_factor().max(0.1);
     let painter = ui.painter().with_clip_rect(rect);
-    painter.rect_filled(rect, CornerRadius::ZERO, pal().caption_bg);
+    painter.rect_filled(rect, CornerRadius::ZERO, p.caption_bg);
 
     // The surface: drags the window (registered first, so × stays on top).
     let surface = ui
@@ -731,22 +749,22 @@ fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
         color,
         ..Default::default()
     };
-    title_job.append("Live captions", 0.0, section(theme::pal().text_muted));
-    title_job.append("  ·  drag to move", 0.0, section(theme::pal().text_faint));
+    title_job.append("Live captions", 0.0, section(p.text_muted));
+    title_job.append("  ·  drag to move", 0.0, section(p.text_faint));
     title_job.wrap = egui::text::TextWrapping::truncate_at_width(title_width);
     let title_galley = painter.layout_job(title_job);
     let grip_height = title_galley.size().y.max(close_size.y) + 8.0 * k;
     let grip = Rect::from_min_size(rect.min, egui::vec2(rect.width(), grip_height));
-    painter.rect_filled(grip, CornerRadius::ZERO, theme::pal().bg_raised);
+    painter.rect_filled(grip, CornerRadius::ZERO, p.bg_raised);
     painter.hline(
         grip.x_range(),
         grip.bottom() - 0.5,
-        Stroke::new(1.0, theme::pal().border),
+        Stroke::new(1.0, p.border),
     );
     painter.circle_filled(
         egui::pos2(grip.left() + pad_x + dot_r, grip.center().y),
         dot_r,
-        theme::pal().rec,
+        p.rec,
     );
     painter.galley(
         egui::pos2(
@@ -754,7 +772,7 @@ fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
             grip.center().y - title_galley.size().y / 2.0,
         ),
         title_galley,
-        theme::pal().text_muted,
+        p.text_muted,
     );
     let close_rect = Rect::from_center_size(
         egui::pos2(grip.right() - pad_x - close_size.x / 2.0, grip.center().y),
@@ -771,11 +789,11 @@ fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
         painter.rect_filled(
             close_rect,
             CornerRadius::same((6.0 * k).round().clamp(0.0, 255.0) as u8),
-            theme::pal().bg_hover,
+            p.bg_hover,
         );
-        pal().caption_text
+        p.caption_text
     } else {
-        theme::pal().text_muted
+        p.text_muted
     };
     let close_galley = painter.layout_no_wrap(
         icons::ph::X.to_owned(),
@@ -794,7 +812,7 @@ fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
         let mut job = egui::text::LayoutJob::simple(
             error.clone(),
             theme::regular(11.0 * k),
-            pal().caption_err,
+            p.caption_err,
             (rect.width() - 2.0 * pad_x).max(10.0),
         );
         job.wrap.max_rows = 3;
@@ -807,7 +825,7 @@ fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
         painter.galley(
             egui::pos2(band.left() + pad_x, band.top() + 5.0 * k),
             galley,
-            pal().caption_err,
+            p.caption_err,
         );
         top = band.bottom();
         // The web banner was `role="alert"`.
@@ -837,41 +855,33 @@ fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
         job.append(
             "Listening…",
             0.0,
-            format(theme::regular(size), theme::pal().text_muted),
+            format(theme::regular(size), p.text_muted),
         );
         job.wrap.max_width = wrap_width;
         let galley = lines_painter.layout_job(job);
         y -= galley.size().y;
-        lines_painter.galley(
-            egui::pos2(area.left() + pad_x, y),
-            galley,
-            pal().caption_text,
-        );
+        lines_painter.galley(egui::pos2(area.left() + pad_x, y), galley, p.caption_text);
     }
     for line in st.lines.iter().rev() {
         if y < area.top() {
             break;
         }
         let (who, color) = if line.track == "mic" {
-            ("Me", pal().accent)
+            ("Me", p.accent)
         } else {
-            ("Them", pal().ok_light)
+            ("Them", p.ok_light)
         };
         let mut job = egui::text::LayoutJob::default();
         job.append(who, 0.0, format(theme::semibold(size), color));
         job.append(
             &format!(" {}", line.text),
             0.0,
-            format(theme::regular(size), pal().caption_text),
+            format(theme::regular(size), p.caption_text),
         );
         job.wrap.max_width = wrap_width;
         let galley = lines_painter.layout_job(job);
         y -= galley.size().y;
-        lines_painter.galley(
-            egui::pos2(area.left() + pad_x, y),
-            galley,
-            pal().caption_text,
-        );
+        lines_painter.galley(egui::pos2(area.left() + pad_x, y), galley, p.caption_text);
         y -= 4.0 * k;
     }
     if let Some(newest) = st.lines.back() {
@@ -888,7 +898,7 @@ fn paint(ui: &mut egui::Ui, st: &CaptionsState, resizing: bool) -> bool {
     painter.rect_stroke(
         rect.shrink(0.5),
         CornerRadius::ZERO,
-        Stroke::new(1.0, theme::pal().border_strong),
+        Stroke::new(1.0, p.border_strong),
         egui::StrokeKind::Inside,
     );
 
@@ -1041,6 +1051,20 @@ mod tests {
             "a new window never takes focus"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_overlay_stays_dark_in_both_themes() {
+        let dark = theme::Palette::resolve(true, None);
+        assert_eq!(overlay_palette_for(dark), dark);
+        let light = theme::Palette::resolve(false, None);
+        let overlay = overlay_palette_for(light);
+        assert!(overlay.dark);
+        assert_eq!(overlay.caption_bg, dark.caption_bg);
+        assert_eq!(overlay.bg_raised, dark.bg_raised);
+        // "Me" is the accent, lifted to read on the dark surface.
+        let luma = |c: Color32| 0.3 * c.r() as f32 + 0.59 * c.g() as f32 + 0.11 * c.b() as f32;
+        assert!(luma(overlay.accent) > luma(light.accent));
     }
 
     #[test]

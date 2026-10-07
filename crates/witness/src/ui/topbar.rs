@@ -187,12 +187,24 @@ struct BarModel {
     /// runs full passes).
     animate_meter: bool,
     /// Meetings is "active" only on Meetings (not on Search or a
-    /// transcript).
+    /// transcript) — and beside a transcript while the Meetings list is on
+    /// screen in a split.
     active: Option<NavItem>,
 }
 
+/// The highlighted nav item for `view`; `split_list` is the list shown
+/// beside it in a split.
+fn active_nav(view: &View, split_list: Option<&View>) -> Option<NavItem> {
+    match split_list.unwrap_or(view) {
+        View::Meetings => Some(NavItem::Meetings),
+        View::People => Some(NavItem::People),
+        View::Settings => Some(NavItem::Settings),
+        View::Transcript { .. } | View::Search { .. } => None,
+    }
+}
+
 impl BarModel {
-    fn of(cx: &UiCtx) -> BarModel {
+    fn of(cx: &UiCtx, split_list: Option<&View>) -> BarModel {
         let recording = cx.shell.recording();
         let mut model = BarModel {
             recording,
@@ -209,12 +221,7 @@ impl BarModel {
             animate_meter: cx.window.is_shown()
                 && !cx.window.is_minimized()
                 && icons::animations_enabled(),
-            active: match cx.view {
-                View::Meetings => Some(NavItem::Meetings),
-                View::People => Some(NavItem::People),
-                View::Settings => Some(NavItem::Settings),
-                View::Transcript { .. } | View::Search { .. } => None,
-            },
+            active: active_nav(cx.view, split_list),
         };
         match fake_recording() {
             Some(Fake::Recording { warning }) => {
@@ -306,8 +313,10 @@ fn press_drags_window(press: egui::Pos2, screen: Rect) -> bool {
 }
 
 /// Draw the bar inside `Panel::top("topbar")` (framed by [`frame`]).
-pub fn show(ui: &mut egui::Ui, cx: &mut UiCtx) -> TopBarOutput {
-    let model = BarModel::of(cx);
+/// `split_list` is the list on screen beside a transcript, if the window
+/// shows a split.
+pub fn show(ui: &mut egui::Ui, cx: &mut UiCtx, split_list: Option<&View>) -> TopBarOutput {
+    let model = BarModel::of(cx, split_list);
     let bar = draw_bar(ui, &model);
     let faking = fake_recording().is_some();
 
@@ -1494,8 +1503,9 @@ pub fn resize_edges(ui: &mut egui::Ui, cx: &mut UiCtx) {
 // Banners
 
 /// The capture-health warning under the bar while recording (role=alert,
-/// selectable), in the content column.
-pub fn health_banner(ui: &mut egui::Ui, cx: &mut UiCtx) {
+/// selectable): in the content column, or across the whole width (with the
+/// page padding) when `full_width` — a split, whose columns it spans.
+pub fn health_banner(ui: &mut egui::Ui, cx: &mut UiCtx, full_width: bool) {
     let warning = match fake_recording() {
         Some(Fake::Recording { warning: true }) => Some(FAKE_WARNING.to_owned()),
         Some(_) => None,
@@ -1505,19 +1515,31 @@ pub fn health_banner(ui: &mut egui::Ui, cx: &mut UiCtx) {
     let Some(warning) = warning else {
         return;
     };
+    // The window background, like the bar and the content below it (it is
+    // transparent under the Mica backdrop; an opaque fill would show as a
+    // band).
+    let pad = if full_width {
+        widgets::pad_x(ui.available_width()) as i8
+    } else {
+        0
+    };
     egui::Panel::top("health-banner")
-        .frame(Frame::new().fill(pal().bg).inner_margin(Margin {
-            left: 0,
-            right: 0,
+        .frame(Frame::new().fill(pal().window_bg).inner_margin(Margin {
+            left: pad,
+            right: pad,
             top: 12,
             bottom: 0,
         }))
         .resizable(false)
         .show_separator_line(false)
         .show(ui, |ui| {
-            widgets::padded_column(ui, |ui| {
+            if full_width {
                 widgets::inline_warning(ui, &warning);
-            });
+            } else {
+                widgets::padded_column(ui, |ui| {
+                    widgets::inline_warning(ui, &warning);
+                });
+            }
             widgets::announce(
                 ui.ctx(),
                 egui::Id::new("witness-health-alert"),
@@ -2110,6 +2132,29 @@ mod tests {
         assert_eq!(at(457.0, 300.0), vec![ResizeDirection::East]);
         assert!(at(200.0, 300.0).is_empty());
         assert!(at(200.0, 7.0).is_empty(), "below the 6 pt top strip");
+    }
+
+    #[test]
+    fn meetings_is_active_while_its_list_is_on_screen() {
+        let transcript = View::Transcript {
+            meeting_id: 1,
+            segment_id: None,
+            highlight: None,
+            from: Some(Box::new(View::Meetings)),
+        };
+        let search = View::Search { query: "q".into() };
+        assert_eq!(active_nav(&View::Meetings, None), Some(NavItem::Meetings));
+        assert_eq!(active_nav(&View::People, None), Some(NavItem::People));
+        assert_eq!(active_nav(&View::Settings, None), Some(NavItem::Settings));
+        // One view: a transcript or a search highlights nothing (parity).
+        assert_eq!(active_nav(&transcript, None), None);
+        assert_eq!(active_nav(&search, None), None);
+        // A split shows the Meetings list beside the transcript.
+        assert_eq!(
+            active_nav(&transcript, Some(&View::Meetings)),
+            Some(NavItem::Meetings)
+        );
+        assert_eq!(active_nav(&transcript, Some(&search)), None);
     }
 
     #[test]
