@@ -35,6 +35,21 @@ pub struct Meeting {
     /// The meeting was retranscribed after `ai_summary` was written: the
     /// summary describes the previous transcript.
     pub ai_summary_stale: bool,
+    /// Bumped by every `replace_transcript`: an AI summary is written only
+    /// if the transcript it was made from is still the current one.
+    pub transcript_rev: i64,
+}
+
+/// An automatic title change, applied only while the meeting still is what
+/// the caller read: same row (`started_at` — ids are reused after a purge),
+/// same title and same `title_source`.
+#[derive(Debug, Clone, Copy)]
+pub struct AutoTitle<'a> {
+    pub started_at: &'a str,
+    pub title: &'a str,
+    pub source: &'a str,
+    pub expected_title: &'a str,
+    pub expected_source: &'a str,
 }
 
 /// `meetings.title_source` values.
@@ -457,6 +472,7 @@ impl Db {
                 ALTER TABLE meetings ADD COLUMN ai_summary TEXT NOT NULL DEFAULT '';
                 ALTER TABLE meetings ADD COLUMN ai_summary_at TEXT;
                 ALTER TABLE meetings ADD COLUMN ai_summary_stale INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE meetings ADD COLUMN transcript_rev INTEGER NOT NULL DEFAULT 0;
                 UPDATE meetings SET title_source = 'auto'
                   WHERE title GLOB 'Meeting [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]';
                 PRAGMA user_version = 6;
@@ -663,42 +679,55 @@ impl Db {
     }
 
     /// An automatic rename (Teams window, AI) as compare-and-swap: applied
-    /// only while the title and its source are still what the caller read,
-    /// and the meeting is not in the bin. A user rename in between changes
-    /// the source to `user`, so it always wins. Returns whether it applied.
-    pub fn replace_title_if(
-        &self,
-        id: i64,
-        title: &str,
-        source: &str,
-        expected_title: &str,
-        expected_source: &str,
-    ) -> Result<bool> {
+    /// only while the row is the same meeting (`started_at`), its title and
+    /// title source are still what the caller read, and it is not in the
+    /// bin. A user rename in between changes the source to `user`, so it
+    /// always wins. Returns whether it applied.
+    pub fn replace_title_if(&self, id: i64, change: &AutoTitle<'_>) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute(
             "UPDATE meetings SET title = ?2, title_source = ?3
-             WHERE id = ?1 AND title = ?4 AND title_source = ?5 AND deleted_at IS NULL",
-            params![id, title, source, expected_title, expected_source],
+             WHERE id = ?1 AND started_at = ?4 AND title = ?5 AND title_source = ?6
+               AND deleted_at IS NULL",
+            params![
+                id,
+                change.title,
+                change.source,
+                change.started_at,
+                change.expected_title,
+                change.expected_source
+            ],
         )? == 1)
     }
 
-    /// Store AI notes (fresh: clears the stale flag). Not for binned
-    /// meetings. Returns whether the meeting was there to take them.
-    pub fn set_ai_summary(&self, id: i64, summary: &str, at: &str) -> Result<bool> {
+    /// Store AI notes (fresh: clears the stale flag) — only into the same
+    /// meeting (`started_at`; ids are reused after a purge), not in the bin,
+    /// and only while its transcript is still revision `transcript_rev` (the
+    /// one the notes were written from). Returns whether it applied.
+    pub fn set_ai_summary(
+        &self,
+        id: i64,
+        started_at: &str,
+        transcript_rev: i64,
+        summary: &str,
+        at: &str,
+    ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute(
-            "UPDATE meetings SET ai_summary = ?2, ai_summary_at = ?3, ai_summary_stale = 0
-             WHERE id = ?1 AND deleted_at IS NULL",
-            params![id, summary, at],
+            "UPDATE meetings SET ai_summary = ?4, ai_summary_at = ?5, ai_summary_stale = 0
+             WHERE id = ?1 AND started_at = ?2 AND transcript_rev = ?3 AND deleted_at IS NULL",
+            params![id, started_at, transcript_rev, summary, at],
         )? == 1)
     }
 
-    /// The meeting exists and is not in the recycle bin.
-    pub fn is_live_meeting(&self, id: i64) -> Result<bool> {
+    /// The row `id` is still the meeting that started at `started_at` and
+    /// is not in the recycle bin.
+    pub fn is_same_live_meeting(&self, id: i64, started_at: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM meetings WHERE id = ?1 AND deleted_at IS NULL)",
-            params![id],
+            "SELECT EXISTS(SELECT 1 FROM meetings
+               WHERE id = ?1 AND started_at = ?2 AND deleted_at IS NULL)",
+            params![id, started_at],
             |row| row.get(0),
         )?)
     }
@@ -731,15 +760,16 @@ impl Db {
             ai_summary: row.get(11)?,
             ai_summary_at: row.get(12)?,
             ai_summary_stale: row.get::<_, i64>(13)? != 0,
+            transcript_rev: row.get(14)?,
         })
     }
 
     /// `MEETING_COLS` count: the next column index after them.
-    const MEETING_COL_COUNT: usize = 14;
+    const MEETING_COL_COUNT: usize = 15;
 
     const MEETING_COLS: &'static str =
         "id, started_at, ended_at, title, audio_path, duration_ms, status, engine, trigger, notes,
-         title_source, ai_summary, ai_summary_at, ai_summary_stale";
+         title_source, ai_summary, ai_summary_at, ai_summary_stale, transcript_rev";
 
     pub fn list_meetings(&self, offset: i64, limit: i64) -> Result<Vec<Meeting>> {
         let conn = self.conn.lock().unwrap();
@@ -1258,7 +1288,8 @@ impl Db {
         // automatic notes feature does so by itself).
         tx.execute(
             "UPDATE meetings SET status = 'transcribed', engine = ?2,
-               ai_summary_stale = (ai_summary != '')
+               ai_summary_stale = (ai_summary != ''),
+               transcript_rev = transcript_rev + 1
              WHERE id = ?1",
             params![meeting_id, engine],
         )?;
@@ -1762,6 +1793,7 @@ mod tests {
                  ALTER TABLE meetings DROP COLUMN ai_summary;
                  ALTER TABLE meetings DROP COLUMN ai_summary_at;
                  ALTER TABLE meetings DROP COLUMN ai_summary_stale;
+                 ALTER TABLE meetings DROP COLUMN transcript_rev;
                  PRAGMA user_version = 4;",
             )
             .unwrap();
@@ -1791,6 +1823,7 @@ mod tests {
                  ALTER TABLE meetings DROP COLUMN ai_summary;
                  ALTER TABLE meetings DROP COLUMN ai_summary_at;
                  ALTER TABLE meetings DROP COLUMN ai_summary_stale;
+                 ALTER TABLE meetings DROP COLUMN transcript_rev;
                  PRAGMA user_version = 5;",
             )
             .unwrap();
@@ -1847,44 +1880,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn swap<'a>(
+        started_at: &'a str,
+        title: &'a str,
+        source: &'a str,
+        expected_title: &'a str,
+        expected_source: &'a str,
+    ) -> AutoTitle<'a> {
+        AutoTitle {
+            started_at,
+            title,
+            source,
+            expected_title,
+            expected_source,
+        }
+    }
+
     #[test]
     fn automatic_titles_never_replace_a_user_rename() {
         let (db, dir) = test_db("titles");
+        let at = "2026-08-01T12:00:00Z";
         let id = db
-            .create_meeting("Meeting 2026-08-01 12:00", "2026-08-01T12:00:00Z", "auto")
+            .create_meeting("Meeting 2026-08-01 12:00", at, "auto")
             .unwrap();
         let meeting = db.get_meeting(id).unwrap().unwrap();
         assert_eq!(meeting.title_source, TitleSource::AUTO);
         // Teams names it; the AI renames the Teams name.
-        assert!(db
-            .replace_title_if(
-                id,
-                "Q3 planning",
-                TitleSource::TEAMS,
-                &meeting.title,
-                "auto"
-            )
-            .unwrap());
-        assert!(db
-            .replace_title_if(
-                id,
-                "Q3 budget planning",
-                TitleSource::AI,
-                "Q3 planning",
-                "teams"
-            )
-            .unwrap());
+        let teams = swap(
+            at,
+            "Q3 planning",
+            TitleSource::TEAMS,
+            &meeting.title,
+            "auto",
+        );
+        assert!(db.replace_title_if(id, &teams).unwrap());
+        let ai = swap(
+            at,
+            "Q3 budget planning",
+            TitleSource::AI,
+            "Q3 planning",
+            "teams",
+        );
+        assert!(db.replace_title_if(id, &ai).unwrap());
         // A stale read (the title moved on) does not apply.
-        assert!(!db
-            .replace_title_if(id, "Late", TitleSource::AI, "Q3 planning", "teams")
-            .unwrap());
+        let late = swap(at, "Late", TitleSource::AI, "Q3 planning", "teams");
+        assert!(!db.replace_title_if(id, &late).unwrap());
         // The user renames — even to the same text — and wins from then on.
         db.rename_meeting(id, "Q3 budget planning").unwrap();
         let renamed = db.get_meeting(id).unwrap().unwrap();
         assert_eq!(renamed.title_source, TitleSource::USER);
-        assert!(!db
-            .replace_title_if(id, "AI again", TitleSource::AI, "Q3 budget planning", "ai")
-            .unwrap());
+        let again = swap(at, "AI again", TitleSource::AI, "Q3 budget planning", "ai");
+        assert!(!db.replace_title_if(id, &again).unwrap());
         assert_eq!(
             db.get_meeting(id).unwrap().unwrap().title,
             "Q3 budget planning"
@@ -1893,22 +1939,57 @@ mod tests {
         assert!(!TitleSource::is_automatic(TitleSource::AI));
         assert!(TitleSource::is_automatic(TitleSource::TEAMS));
         // Binned meetings take no automatic writes.
+        let binned_at = "2026-08-02T09:00:00Z";
         let binned = db
-            .create_meeting("Meeting 2026-08-02 09:00", "2026-08-02T09:00:00Z", "auto")
+            .create_meeting("Meeting 2026-08-02 09:00", binned_at, "auto")
             .unwrap();
         db.soft_delete_meeting(binned).unwrap();
+        let x = swap(
+            binned_at,
+            "x",
+            TitleSource::AI,
+            "Meeting 2026-08-02 09:00",
+            "auto",
+        );
+        assert!(!db.replace_title_if(binned, &x).unwrap());
         assert!(!db
-            .replace_title_if(
-                binned,
-                "x",
-                TitleSource::AI,
-                "Meeting 2026-08-02 09:00",
-                "auto"
-            )
+            .set_ai_summary(binned, binned_at, 0, "notes", "now")
             .unwrap());
-        assert!(!db.set_ai_summary(binned, "notes", "now").unwrap());
-        assert!(!db.is_live_meeting(binned).unwrap());
-        assert!(db.is_live_meeting(id).unwrap());
+        assert!(!db.is_same_live_meeting(binned, binned_at).unwrap());
+        assert!(db.is_same_live_meeting(id, at).unwrap());
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ids are reused once the newest meeting is purged: a result computed
+    /// for the purged meeting must not land on its successor.
+    #[test]
+    fn results_for_a_purged_meeting_never_land_on_a_reused_id() {
+        let (db, dir) = test_db("reuse");
+        let old_at = "2026-08-01T12:00:00Z";
+        let id = db
+            .create_meeting("Meeting 2026-08-01 12:00", old_at, "auto")
+            .unwrap();
+        db.soft_delete_meeting(id).unwrap();
+        db.delete_meeting(id).unwrap();
+        let new_at = "2026-08-02T12:00:00Z";
+        let reused = db
+            .create_meeting("Meeting 2026-08-02 12:00", new_at, "auto")
+            .unwrap();
+        assert_eq!(reused, id, "SQLite reuses the id");
+        let stale = swap(
+            old_at,
+            "Old AI title",
+            TitleSource::AI,
+            "Meeting 2026-08-02 12:00",
+            "auto",
+        );
+        assert!(!db.replace_title_if(id, &stale).unwrap());
+        assert!(!db.set_ai_summary(id, old_at, 0, "old notes", "t").unwrap());
+        assert!(!db.is_same_live_meeting(id, old_at).unwrap());
+        let meeting = db.get_meeting(id).unwrap().unwrap();
+        assert_eq!(meeting.title, "Meeting 2026-08-02 12:00");
+        assert_eq!(meeting.ai_summary, "");
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1916,8 +1997,9 @@ mod tests {
     #[test]
     fn retranscription_marks_the_summary_stale_and_purge_removes_it() {
         let (db, dir) = test_db("summary");
+        let at = "2026-08-01T12:00:00Z";
         let id = db
-            .create_meeting("Meeting 2026-08-01 12:00", "2026-08-01T12:00:00Z", "manual")
+            .create_meeting("Meeting 2026-08-01 12:00", at, "manual")
             .unwrap();
         let segment = |text: &str| NewSegment {
             speaker_label: None,
@@ -1926,11 +2008,14 @@ mod tests {
             end_ms: 1000,
             text: text.into(),
         };
+        assert_eq!(db.get_meeting(id).unwrap().unwrap().transcript_rev, 0);
         db.replace_transcript(id, &[], &[segment("first")], "parakeet")
             .unwrap();
-        assert!(!db.get_meeting(id).unwrap().unwrap().ai_summary_stale);
+        let first = db.get_meeting(id).unwrap().unwrap();
+        assert!(!first.ai_summary_stale);
+        assert_eq!(first.transcript_rev, 1);
         assert!(db
-            .set_ai_summary(id, "## Summary\nok", "2026-08-01T13:00:00Z")
+            .set_ai_summary(id, at, 1, "## Summary\nok", "2026-08-01T13:00:00Z")
             .unwrap());
         let fresh = db.get_meeting(id).unwrap().unwrap();
         assert_eq!(fresh.ai_summary, "## Summary\nok");
@@ -1942,7 +2027,18 @@ mod tests {
         let stale = db.get_meeting(id).unwrap().unwrap();
         assert_eq!(stale.ai_summary, "## Summary\nok", "kept");
         assert!(stale.ai_summary_stale);
-        assert!(db.set_ai_summary(id, "## Summary\nnew", "later").unwrap());
+        assert_eq!(stale.transcript_rev, 2);
+        // Notes written from the first transcript (a request that was in
+        // flight during the retranscription) do not clear the flag.
+        assert!(!db
+            .set_ai_summary(id, at, 1, "## Summary\nlate", "t")
+            .unwrap());
+        let still = db.get_meeting(id).unwrap().unwrap();
+        assert!(still.ai_summary_stale);
+        assert_eq!(still.ai_summary, "## Summary\nok");
+        assert!(db
+            .set_ai_summary(id, at, 2, "## Summary\nnew", "later")
+            .unwrap());
         assert!(!db.get_meeting(id).unwrap().unwrap().ai_summary_stale);
 
         // The bin lists the new columns too; purging removes the row.

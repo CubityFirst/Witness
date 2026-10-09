@@ -26,13 +26,17 @@
 //!   ("reduce"); the title then comes from the notes.
 
 use super::{assert_off_ui_thread, AppCore, CoreEvent, CoreResult, EventSink, Notifier};
-use crate::ai_client::{self, AiClient, AiError, AiTransport, ApiKey, ChatMessage};
-use crate::credentials::CredentialStore;
-use crate::db::{Db, Meeting, Segment, Speaker, TitleSource};
+use crate::ai_client::{
+    self, truncate_bytes, AiClient, AiError, AiTransport, ApiKey, BaseUrl, ChatMessage,
+};
+use crate::credentials::{binding_host, CredentialStore, StoredKey};
+use crate::db::{AutoTitle, Db, Meeting, Segment, Speaker, TitleSource};
 use crate::events::{AiDone, AiOutcome, AiProgress, AiTask};
-use crate::settings::Settings;
+use crate::settings::{AiSettings, Settings};
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -49,6 +53,14 @@ const FAILURE_TOAST_EVERY: Duration = Duration::from_secs(15 * 60);
 /// A generated title keeps at most this many words / characters.
 const TITLE_WORDS: usize = 8;
 const TITLE_CHARS: usize = 100;
+/// Replies are cut to these sizes before use, so a runaway model can
+/// neither inflate the next request nor what is stored.
+const PART_REPLY_BYTES: usize = 8 * 1024;
+const NOTES_REPLY_BYTES: usize = 32 * 1024;
+const TITLE_REPLY_BYTES: usize = 512;
+/// Requests one job may make on top of one per transcript part (notes,
+/// title, condensing rounds).
+const EXTRA_REQUESTS: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Prompts
@@ -349,6 +361,12 @@ pub(crate) fn title_messages(
 /// "Title:" label, Markdown, quotes or trailing punctuation, at most
 /// [`TITLE_WORDS`] words / [`TITLE_CHARS`] characters.
 pub(crate) fn clean_title(raw: &str) -> Option<String> {
+    // Control and invisible formatting characters (bidi overrides, zero
+    // widths, BOM) would end up in toasts, lists, exports and file names.
+    let raw: String = raw
+        .chars()
+        .filter(|c| *c == '\n' || !(c.is_control() || is_format_char(*c)))
+        .collect();
     let line = raw.lines().map(str::trim).find(|l| !l.is_empty())?;
     let mut text = line.trim_start_matches('#').trim();
     for label in ["title:", "titel:", "titre:", "título:", "titolo:"] {
@@ -377,6 +395,22 @@ pub(crate) fn clean_title(raw: &str) -> Option<String> {
             .to_string();
     }
     (!title.is_empty()).then_some(title)
+}
+
+/// Invisible formatting characters: zero widths and directional marks,
+/// bidi embeddings / overrides / isolates, word joiners, the BOM.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
 }
 
 /// A notes reply without a surrounding code fence.
@@ -417,6 +451,10 @@ impl Job {
             AiTask::Summary => &mut self.summary,
         }
     }
+
+    fn automatic(&self, task: AiTask) -> bool {
+        self.tasks().any(|(t, a)| t == task && a)
+    }
 }
 
 #[derive(Default)]
@@ -442,6 +480,10 @@ struct Shared {
     changed: Condvar,
     env: AiEnv,
     last_failure_toast: Mutex<Option<Instant>>,
+    /// Bumped whenever a running job must stop before its next request or
+    /// write: the assistant switched off, the base URL / model changed, the
+    /// API key was saved or removed.
+    epoch: AtomicU64,
 }
 
 /// The "ai-worker" thread and its queue. Cheap to clone (the pipeline
@@ -458,6 +500,7 @@ impl AiService {
             changed: Condvar::new(),
             env,
             last_failure_toast: Mutex::new(None),
+            epoch: AtomicU64::new(0),
         });
         let worker = shared.clone();
         if let Err(error) = std::thread::Builder::new()
@@ -473,17 +516,13 @@ impl AiService {
         &self.shared.env
     }
 
-    /// Queue `task` for `meeting_id`. Merges with a waiting job for the same
-    /// meeting (a manual request upgrades an automatic one); a task already
-    /// waiting or running is not queued twice. [ui-ok]
+    /// Queue `task` for `meeting_id`. Merges into a *waiting* job for the
+    /// same meeting (a manual request upgrades an automatic one). A task
+    /// that is already running is queued again: the request came after the
+    /// running one read the meeting (a retranscription, a Regenerate), so
+    /// it must run once more. [ui-ok]
     pub(crate) fn request(&self, meeting_id: i64, task: AiTask, automatic: bool) -> CoreResult<()> {
         let mut queue = self.shared.queue.lock().unwrap();
-        let running = queue
-            .running
-            .is_some_and(|mut job| job.meeting_id == meeting_id && job.slot(task).is_some());
-        if running {
-            return Ok(());
-        }
         if let Some(job) = queue
             .pending
             .iter_mut()
@@ -528,6 +567,72 @@ impl AiService {
                 if let Err(error) = self.request(meeting_id, task, true) {
                     log::warn!("AI {task:?} for meeting {meeting_id} not queued: {error}");
                 }
+            }
+        }
+    }
+
+    /// The meeting went to the bin or was purged: drop its waiting jobs (a
+    /// running one stops at its next request or write) and clear every AI
+    /// state the UI shows for it. [ui-ok]
+    pub(crate) fn cancel_meeting(&self, meeting_id: i64) {
+        self.shared
+            .queue
+            .lock()
+            .unwrap()
+            .pending
+            .retain(|job| job.meeting_id != meeting_id);
+        self.shared.changed.notify_all();
+        for task in [AiTask::Summary, AiTask::Title] {
+            self.env().sink.emit(CoreEvent::AiDone(AiDone {
+                meeting_id,
+                task,
+                automatic: true,
+                outcome: AiOutcome::Skipped("the meeting was deleted".into()),
+            }));
+        }
+    }
+
+    /// Settings were saved: switching the assistant off drops every waiting
+    /// job and stops the running one; a new base URL or model stops the
+    /// running one (it would otherwise keep talking to the old service).
+    pub(crate) fn settings_changed(&self, old: &AiSettings, new: &AiSettings) {
+        if old.enabled && !new.enabled {
+            self.stop_all(Some("the AI service was turned off"));
+        } else if old.base_url != new.base_url || old.model != new.model {
+            self.stop_all(None);
+        }
+    }
+
+    /// The API key was saved or removed: the running job stops (it holds
+    /// the old key); waiting jobs read the new one when they start.
+    pub(crate) fn key_changed(&self) {
+        self.stop_all(None);
+    }
+
+    /// Bump the epoch (the running job stops), and with `drop_pending`
+    /// also drop every waiting job, reporting it as skipped.
+    fn stop_all(&self, drop_pending: Option<&str>) {
+        self.shared.epoch.fetch_add(1, Ordering::SeqCst);
+        let Some(why) = drop_pending else {
+            return;
+        };
+        let dropped: Vec<Job> = self
+            .shared
+            .queue
+            .lock()
+            .unwrap()
+            .pending
+            .drain(..)
+            .collect();
+        self.shared.changed.notify_all();
+        for job in dropped {
+            for (task, automatic) in job.tasks() {
+                self.env().sink.emit(CoreEvent::AiDone(AiDone {
+                    meeting_id: job.meeting_id,
+                    task,
+                    automatic,
+                    outcome: AiOutcome::Skipped(why.into()),
+                }));
             }
         }
     }
@@ -597,19 +702,20 @@ fn run(shared: &Shared) {
                 stage: stage.to_string(),
             }));
         };
-        let outcomes = std::panic::catch_unwind(AssertUnwindSafe(|| run_job(env, job, &progress)))
-            .unwrap_or_else(|panic| {
-                let message = format!(
-                    "internal error: {}",
-                    super::rec_control::panic_message(&panic)
-                );
-                job.tasks()
-                    .map(|(task, _)| (task, AiOutcome::Failed(message.clone())))
-                    .collect()
-            });
+        let outcomes =
+            std::panic::catch_unwind(AssertUnwindSafe(|| run_job(shared, job, &progress)))
+                .unwrap_or_else(|panic| {
+                    let message = format!(
+                        "internal error: {}",
+                        super::rec_control::panic_message(&panic)
+                    );
+                    job.tasks()
+                        .map(|(task, _)| (task, AiOutcome::Failed(message.clone())))
+                        .collect()
+                });
         let mut changed = false;
         for (task, outcome) in outcomes {
-            let automatic = job.tasks().any(|(t, a)| t == task && a);
+            let automatic = job.automatic(task);
             match &outcome {
                 AiOutcome::Applied => {
                     changed = true;
@@ -669,9 +775,49 @@ fn fail_all(job: Job, error: &str) -> Vec<(AiTask, AiOutcome)> {
         .collect()
 }
 
+/// The stored key, if it may go to `base`: only to the host it was saved
+/// for. A key for another host is never attached; a local server then
+/// gets no key, a remote one is refused (the user enters its key).
+pub(crate) fn key_for(
+    base: &BaseUrl,
+    stored: Option<StoredKey>,
+) -> Result<Option<ApiKey>, AiError> {
+    match stored {
+        None => Ok(None),
+        Some(stored) if stored.host == binding_host(base.host()) => Ok(Some(stored.key)),
+        Some(_) if base.is_local() => Ok(None),
+        Some(stored) => Err(AiError::KeyForOtherHost {
+            key_host: stored.host,
+            host: binding_host(base.host()),
+        }),
+    }
+}
+
+/// Why a step stopped early, or how its request failed.
+enum Halt {
+    /// Turned off, settings changed, meeting gone…: reported as Skipped.
+    Stop(String),
+    Fail(AiError),
+}
+
+impl Halt {
+    fn outcome(self) -> AiOutcome {
+        match self {
+            Halt::Stop(why) => AiOutcome::Skipped(why),
+            Halt::Fail(error) => AiOutcome::Failed(error.to_string()),
+        }
+    }
+}
+
 /// Run one job: re-check the switches and the meeting, read the
-/// transcript, ask the service, write the results.
-fn run_job(env: &AiEnv, job: Job, progress: &dyn Fn(AiTask, &str)) -> Vec<(AiTask, AiOutcome)> {
+/// transcript, ask the service, write the results. Before every request
+/// and every write the gate re-checks that the assistant is still on with
+/// the same service and model (and the same key: the epoch), that an
+/// automatic task's feature switch is still on, and that the meeting is
+/// still the same live meeting.
+fn run_job(shared: &Shared, job: Job, progress: &dyn Fn(AiTask, &str)) -> Vec<(AiTask, AiOutcome)> {
+    let env = &shared.env;
+    let epoch = shared.epoch.load(Ordering::SeqCst);
     let ai = env.settings.lock().unwrap().ai.clone();
     if !ai.enabled {
         return skip_all(job, "the AI service is turned off");
@@ -680,7 +826,14 @@ fn run_job(env: &AiEnv, job: Job, progress: &dyn Fn(AiTask, &str)) -> Vec<(AiTas
         return fail_all(job, &AiError::InvalidConfig(error).to_string());
     }
     let meeting = match env.db.get_meeting(job.meeting_id) {
-        Ok(Some(meeting)) if env.db.is_live_meeting(job.meeting_id).unwrap_or(false) => meeting,
+        Ok(Some(meeting))
+            if env
+                .db
+                .is_same_live_meeting(job.meeting_id, &meeting.started_at)
+                .unwrap_or(false) =>
+        {
+            meeting
+        }
         Ok(_) => return skip_all(job, "the meeting was deleted"),
         Err(error) => return fail_all(job, &format!("{error:#}")),
     };
@@ -729,10 +882,22 @@ fn run_job(env: &AiEnv, job: Job, progress: &dyn Fn(AiTask, &str)) -> Vec<(AiTas
         outcomes.extend(skip_all(wanted, "the meeting has no transcript yet"));
         return outcomes;
     }
-    let key: Option<ApiKey> = match env.credentials.read() {
+    let base = match BaseUrl::parse(&ai.base_url) {
+        Ok(base) => base,
+        Err(error) => {
+            outcomes.extend(fail_all(wanted, &AiError::InvalidConfig(error).to_string()));
+            return outcomes;
+        }
+    };
+    let key = match env
+        .credentials
+        .read()
+        .map_err(AiError::Credentials)
+        .and_then(|stored| key_for(&base, stored))
+    {
         Ok(key) => key,
         Err(error) => {
-            outcomes.extend(fail_all(wanted, &AiError::Credentials(error).to_string()));
+            outcomes.extend(fail_all(wanted, &error.to_string()));
             return outcomes;
         }
     };
@@ -743,22 +908,61 @@ fn run_job(env: &AiEnv, job: Job, progress: &dyn Fn(AiTask, &str)) -> Vec<(AiTas
             return outcomes;
         }
     };
-    let ask = Asker {
-        client: &client,
-        model: &ai.model,
+
+    let gate = |tasks: &[AiTask]| -> Result<(), String> {
+        let now = env.settings.lock().unwrap().ai.clone();
+        if !now.enabled {
+            return Err("the AI service was turned off".into());
+        }
+        if shared.epoch.load(Ordering::SeqCst) != epoch
+            || now.base_url != ai.base_url
+            || now.model != ai.model
+        {
+            return Err("the AI settings changed while it ran".into());
+        }
+        let feature_on = |task: &AiTask| match task {
+            AiTask::Title => now.auto_title,
+            AiTask::Summary => now.auto_notes,
+        };
+        if !tasks
+            .iter()
+            .any(|task| !wanted.automatic(*task) || feature_on(task))
+        {
+            return Err("the automatic feature was turned off".into());
+        }
+        match env
+            .db
+            .is_same_live_meeting(job.meeting_id, &meeting.started_at)
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("the meeting was deleted".into()),
+            Err(error) => Err(format!("{error:#}")),
+        }
     };
-    let header = header(&meeting, &input);
     let tasks: Vec<AiTask> = wanted.tasks().map(|(task, _)| task).collect();
+    let header = header(&meeting, &input);
     let progress_all = |stage: &str| tasks.iter().for_each(|task| progress(*task, stage));
 
     // Long meetings: notes per part first (shared by both tasks).
     let long = input.char_len() > CHUNK_CHARS;
+    let chunks = if long {
+        chunk_lines(&input.lines, CHUNK_CHARS)
+    } else {
+        Vec::new()
+    };
+    let ask = Asker {
+        client: &client,
+        model: &ai.model,
+        gate: &gate,
+        left: Cell::new(chunks.len() + EXTRA_REQUESTS),
+    };
     let part_notes = if long {
         progress_all("Reading the transcript");
-        match ask.part_notes(&header, &input, &progress_all) {
+        match ask.part_notes(&tasks, &header, &chunks, &progress_all) {
             Ok(notes) => Some(notes),
-            Err(error) => {
-                outcomes.extend(fail_all(wanted, &error.to_string()));
+            Err(halt) => {
+                let outcome = halt.outcome();
+                outcomes.extend(tasks.iter().map(|task| (*task, outcome.clone())));
                 return outcomes;
             }
         }
@@ -773,20 +977,36 @@ fn run_job(env: &AiEnv, job: Job, progress: &dyn Fn(AiTask, &str)) -> Vec<(AiTas
             Some(notes) => reduce_messages(&header, notes),
             None => notes_messages(&header, &input.joined()),
         };
-        let outcome = match ask.chat(&messages).map(|reply| clean_notes(&reply)) {
+        let reply = ask
+            .ask(&[AiTask::Summary], &messages, NOTES_REPLY_BYTES)
+            .map(|reply| clean_notes(&reply))
+            .and_then(|notes| {
+                gate(&[AiTask::Summary]).map_err(Halt::Stop)?;
+                Ok(notes)
+            });
+        let outcome = match reply {
             Ok(notes) if notes.is_empty() => AiOutcome::Failed(AiError::Empty.to_string()),
             Ok(notes) => {
                 let at = chrono::Local::now().to_rfc3339();
-                match env.db.set_ai_summary(job.meeting_id, &notes, &at) {
+                match env.db.set_ai_summary(
+                    job.meeting_id,
+                    &meeting.started_at,
+                    meeting.transcript_rev,
+                    &notes,
+                    &at,
+                ) {
                     Ok(true) => {
                         new_summary = Some(notes);
                         AiOutcome::Applied
                     }
-                    Ok(false) => AiOutcome::Skipped("the meeting was deleted".into()),
+                    Ok(false) => AiOutcome::Skipped(
+                        "the meeting was retranscribed or deleted while the notes were written"
+                            .into(),
+                    ),
                     Err(error) => AiOutcome::Failed(format!("{error:#}")),
                 }
             }
-            Err(error) => AiOutcome::Failed(error.to_string()),
+            Err(halt) => halt.outcome(),
         };
         outcomes.push((AiTask::Summary, outcome));
     }
@@ -794,65 +1014,97 @@ fn run_job(env: &AiEnv, job: Job, progress: &dyn Fn(AiTask, &str)) -> Vec<(AiTas
     if wanted.title.is_some() {
         progress(AiTask::Title, "Writing the title");
         let messages = if long {
-            let material = new_summary
+            let mut material = new_summary
                 .as_deref()
                 .or(part_notes.as_deref())
-                .unwrap_or_default();
-            let material: String = material.chars().take(CHUNK_CHARS).collect();
+                .unwrap_or_default()
+                .to_string();
+            truncate_bytes(&mut material, CHUNK_CHARS);
             title_messages(&header, &material, false)
         } else {
             title_messages(&header, &input.joined(), true)
         };
-        let outcome = match ask.chat(&messages) {
+        let reply = ask
+            .ask(&[AiTask::Title], &messages, TITLE_REPLY_BYTES)
+            .and_then(|reply| {
+                gate(&[AiTask::Title]).map_err(Halt::Stop)?;
+                Ok(reply)
+            });
+        let outcome = match reply {
             Ok(reply) => match clean_title(&reply) {
                 None => AiOutcome::Failed(AiError::Empty.to_string()),
-                Some(title) => match env.db.replace_title_if(
-                    job.meeting_id,
-                    &title,
-                    TitleSource::AI,
-                    &meeting.title,
-                    &meeting.title_source,
-                ) {
-                    Ok(true) => AiOutcome::Applied,
-                    Ok(false) => {
-                        AiOutcome::Skipped("the meeting was renamed in the meantime".into())
+                Some(title) => {
+                    let change = AutoTitle {
+                        started_at: &meeting.started_at,
+                        title: &title,
+                        source: TitleSource::AI,
+                        expected_title: &meeting.title,
+                        expected_source: &meeting.title_source,
+                    };
+                    match env.db.replace_title_if(job.meeting_id, &change) {
+                        Ok(true) => AiOutcome::Applied,
+                        Ok(false) => AiOutcome::Skipped(
+                            "the meeting was renamed or deleted in the meantime".into(),
+                        ),
+                        Err(error) => AiOutcome::Failed(format!("{error:#}")),
                     }
-                    Err(error) => AiOutcome::Failed(format!("{error:#}")),
-                },
+                }
             },
-            Err(error) => AiOutcome::Failed(error.to_string()),
+            Err(halt) => halt.outcome(),
         };
         outcomes.push((AiTask::Title, outcome));
     }
     outcomes
 }
 
-/// One configured model behind a client.
+/// One configured model behind a client, with the job's gate and its
+/// request budget.
 struct Asker<'a> {
     client: &'a AiClient<'a>,
     model: &'a str,
+    /// Re-checked before every request (see `run_job`).
+    gate: &'a dyn Fn(&[AiTask]) -> Result<(), String>,
+    /// Requests this job may still make.
+    left: Cell<usize>,
 }
 
 impl Asker<'_> {
-    fn chat(&self, messages: &[ChatMessage]) -> Result<String, AiError> {
-        self.client
+    /// One request for `tasks`, after the gate; the reply is cut to `cap`
+    /// bytes, so a runaway model cannot inflate later requests or storage.
+    fn ask(&self, tasks: &[AiTask], messages: &[ChatMessage], cap: usize) -> Result<String, Halt> {
+        (self.gate)(tasks).map_err(Halt::Stop)?;
+        let left = self.left.get();
+        if left == 0 {
+            return Err(Halt::Fail(AiError::TooManyRequests));
+        }
+        self.left.set(left - 1);
+        let mut reply = self
+            .client
             .chat(self.model, messages, ai_client::CHAT_TIMEOUT)
+            .map_err(Halt::Fail)?;
+        truncate_bytes(&mut reply, cap);
+        Ok(reply)
     }
 
     /// Map step: notes per transcript part, then (for very long meetings)
-    /// condensed until they fit one request.
+    /// condensed until they fit one request — and cut to fit if they still
+    /// don't after three rounds.
     fn part_notes(
         &self,
+        tasks: &[AiTask],
         header: &str,
-        input: &TranscriptInput,
+        chunks: &[Chunk],
         progress: &dyn Fn(&str),
-    ) -> Result<String, AiError> {
-        let chunks = chunk_lines(&input.lines, CHUNK_CHARS);
+    ) -> Result<String, Halt> {
         let count = chunks.len();
         let mut notes = Vec::with_capacity(count);
         for (i, chunk) in chunks.iter().enumerate() {
             progress(&format!("Reading part {} of {count}", i + 1));
-            let reply = self.chat(&part_messages(header, i + 1, count, chunk))?;
+            let reply = self.ask(
+                tasks,
+                &part_messages(header, i + 1, count, chunk),
+                PART_REPLY_BYTES,
+            )?;
             notes.push(format!(
                 "### Part {} ({}–{})\n{}",
                 i + 1,
@@ -869,10 +1121,12 @@ impl Asker<'_> {
             progress("Condensing");
             let mut condensed = Vec::new();
             for piece in chunk_text(&joined, CHUNK_CHARS) {
-                condensed.push(clean_notes(&self.chat(&condense_messages(&piece))?));
+                let reply = self.ask(tasks, &condense_messages(&piece), PART_REPLY_BYTES)?;
+                condensed.push(clean_notes(&reply));
             }
             joined = condensed.join("\n\n");
         }
+        truncate_bytes(&mut joined, CHUNK_CHARS);
         Ok(joined)
     }
 }
@@ -902,37 +1156,42 @@ impl AppCore {
         self.ai.pending(meeting_id)
     }
 
-    /// Whether an API key is stored in Credential Manager. ⏳
-    pub fn ai_key_stored(&self) -> CoreResult<bool> {
-        assert_off_ui_thread("ai_key_stored");
-        self.ai.env().credentials.read().map(|key| key.is_some())
+    /// The host the stored API key belongs to (None = no key). Copies no
+    /// secret into our memory. ⏳
+    pub fn ai_key_host(&self) -> CoreResult<Option<String>> {
+        assert_off_ui_thread("ai_key_host");
+        self.ai.env().credentials.stored_host()
     }
 
-    /// Store the API key (blank = remove it). ⏳
-    pub fn set_ai_key(&self, key: &str) -> CoreResult<()> {
+    /// Store the API key for `base_url`'s host (blank key = remove it). A
+    /// running AI job stops: it holds the previous key. ⏳
+    pub fn set_ai_key(&self, key: &str, base_url: &str) -> CoreResult<()> {
         assert_off_ui_thread("set_ai_key");
         let store = &self.ai.env().credentials;
         match ApiKey::new(key) {
-            Some(key) => store.write(&key)?,
-            None => store.delete()?,
-        }
-        log::info!(
-            "AI API key {}",
-            if key.trim().is_empty() {
-                "removed"
-            } else {
-                "saved"
+            Some(key) => {
+                let base = BaseUrl::parse(base_url)
+                    .map_err(|e| format!("Enter a valid base URL first: {e}"))?;
+                store.write(&key, base.host())?;
+                log::info!("AI API key saved for {}", base.host());
             }
-        );
+            None => {
+                store.delete()?;
+                log::info!("AI API key removed");
+            }
+        }
+        self.ai.key_changed();
         Ok(())
     }
 
-    /// A client for `base_url` with `key` (typed but not saved yet) or the
-    /// stored key; refused while the master switch is off.
+    /// A client for `base_url` with `key` (typed but not saved yet, meant
+    /// for this base) or the stored key — the latter only when it was saved
+    /// for the same host. Refused while the master switch is off.
     fn probe_client(&self, base_url: &str, key: Option<&str>) -> CoreResult<AiClient<'_>> {
         if !self.state.settings.lock().unwrap().ai.enabled {
             return Err(AiError::Disabled.to_string());
         }
+        let base = BaseUrl::parse(base_url).map_err(|e| AiError::InvalidConfig(e).to_string())?;
         let key = match key.and_then(ApiKey::new) {
             Some(key) => Some(key),
             None => self
@@ -940,7 +1199,9 @@ impl AppCore {
                 .env()
                 .credentials
                 .read()
-                .map_err(|e| AiError::Credentials(e).to_string())?,
+                .map_err(AiError::Credentials)
+                .and_then(|stored| key_for(&base, stored))
+                .map_err(|e| e.to_string())?,
         };
         AiClient::new(self.ai.env().transport.as_ref(), base_url, key).map_err(|e| e.to_string())
     }
@@ -982,6 +1243,16 @@ impl AppCore {
             }
         ))
     }
+
+    /// Settings saved (`update_settings`): tell the AI worker. [ui-ok]
+    pub(crate) fn ai_settings_changed(&self, old: &AiSettings, new: &AiSettings) {
+        self.ai.settings_changed(old, new);
+    }
+
+    /// A meeting was binned or purged: drop its AI work. [ui-ok]
+    pub(crate) fn ai_cancel_meeting(&self, meeting_id: i64) {
+        self.ai.cancel_meeting(meeting_id);
+    }
 }
 
 #[cfg(test)]
@@ -991,16 +1262,22 @@ mod tests {
     use crate::credentials::MemoryCredentials;
     use crate::db::NewSegment;
     use crate::service::testing::CollectSink;
-    use crate::settings::AiSettings;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
 
     const KEY: &str = "sk-unit-test-key-0123456789";
+
+    /// Called with the 0-based request number before the reply (tests flip
+    /// settings, remove the key, bin or retranscribe "mid-request" here).
+    type Hook = Box<dyn Fn(usize) + Send + Sync>;
 
     /// Answers by prompt kind; records every request.
     struct FakeService {
         seen: Mutex<Vec<HttpRequest>>,
         title: String,
         fail_with: Option<u16>,
+        hook: Mutex<Option<Hook>>,
+        /// Reply with this many bytes of text instead (runaway model).
+        huge: Option<usize>,
     }
 
     impl FakeService {
@@ -1009,7 +1286,30 @@ mod tests {
                 seen: Mutex::new(Vec::new()),
                 title: title.into(),
                 fail_with: None,
+                hook: Mutex::new(None),
+                huge: None,
             })
+        }
+        fn failing(status: u16) -> Arc<FakeService> {
+            Arc::new(FakeService {
+                seen: Mutex::new(Vec::new()),
+                title: String::new(),
+                fail_with: Some(status),
+                hook: Mutex::new(None),
+                huge: None,
+            })
+        }
+        fn runaway(bytes: usize) -> Arc<FakeService> {
+            Arc::new(FakeService {
+                seen: Mutex::new(Vec::new()),
+                title: "t".into(),
+                fail_with: None,
+                hook: Mutex::new(None),
+                huge: Some(bytes),
+            })
+        }
+        fn on_request(&self, hook: impl Fn(usize) + Send + Sync + 'static) {
+            *self.hook.lock().unwrap() = Some(Box::new(hook));
         }
         fn bodies(&self) -> Vec<serde_json::Value> {
             self.seen
@@ -1033,12 +1333,22 @@ mod tests {
 
     impl AiTransport for FakeService {
         fn send(&self, request: &HttpRequest) -> Result<HttpResponse, TransportError> {
-            self.seen.lock().unwrap().push(request.clone());
+            let n = {
+                let mut seen = self.seen.lock().unwrap();
+                seen.push(request.clone());
+                seen.len() - 1
+            };
+            if let Some(hook) = self.hook.lock().unwrap().as_ref() {
+                hook(n);
+            }
             if let Some(status) = self.fail_with {
                 return Ok(HttpResponse {
                     status,
                     body: format!(r#"{{"error":{{"message":"bad key {KEY}"}}}}"#),
                 });
+            }
+            if let Some(bytes) = self.huge {
+                return Ok(reply(&"word ".repeat(bytes / 5)));
             }
             let body: serde_json::Value =
                 serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
@@ -1070,6 +1380,7 @@ mod tests {
         sink: Arc<CollectSink>,
         notifier: Arc<CountingNotifier>,
         fake: Arc<FakeService>,
+        creds: Arc<MemoryCredentials>,
         dir: std::path::PathBuf,
     }
 
@@ -1103,13 +1414,14 @@ mod tests {
         }));
         let sink = Arc::new(CollectSink::default());
         let notifier = Arc::new(CountingNotifier::default());
+        let creds = Arc::new(MemoryCredentials::with(KEY, "api.example.com"));
         let service = AiService::spawn(AiEnv {
             db: db.clone(),
             settings: settings.clone(),
             sink: sink.clone(),
             notifier: notifier.clone(),
             transport: fake.clone(),
-            credentials: Arc::new(MemoryCredentials::with(KEY)),
+            credentials: creds.clone(),
         });
         Fixture {
             service,
@@ -1118,6 +1430,7 @@ mod tests {
             sink,
             notifier,
             fake,
+            creds,
             dir,
         }
     }
@@ -1391,7 +1704,7 @@ mod tests {
             title: Some(true),
             summary: Some(true),
         };
-        let outcomes = run_job(&f.service.shared.env, job, &|_, _| {});
+        let outcomes = run_job(&f.service.shared, job, &|_, _| {});
         assert!(outcomes
             .iter()
             .all(|(_, o)| matches!(o, AiOutcome::Skipped(_))));
@@ -1595,11 +1908,7 @@ mod tests {
 
     #[test]
     fn failures_report_once_without_the_key_and_never_retry() {
-        let fake = Arc::new(FakeService {
-            seen: Mutex::new(Vec::new()),
-            title: String::new(),
-            fail_with: Some(401),
-        });
+        let fake = FakeService::failing(401);
         let notes_only = AiSettings {
             auto_title: false,
             ..configured()
@@ -1663,5 +1972,325 @@ mod tests {
             AiOutcome::Skipped(_)
         ));
         assert_eq!(f.fake.calls(), 0);
+    }
+
+    /// A meeting long enough to be read in several parts (several requests).
+    fn long_meeting(db: &Db) -> i64 {
+        let sentence = "We discussed the roadmap in a lot of detail again. ".repeat(10);
+        let lines: Vec<(&str, &str)> = (0..140)
+            .map(|i| (if i % 2 == 0 { "me" } else { "S1" }, sentence.as_str()))
+            .collect();
+        meeting(db, &lines)
+    }
+
+    fn last_outcomes(sink: &CollectSink, meeting_id: i64) -> Vec<(AiTask, AiOutcome)> {
+        let mut last: Vec<(AiTask, AiOutcome)> = Vec::new();
+        for d in done(sink)
+            .into_iter()
+            .filter(|d| d.meeting_id == meeting_id)
+        {
+            last.retain(|(task, _)| *task != d.task);
+            last.push((d.task, d.outcome));
+        }
+        last
+    }
+
+    type Intervene = fn(&Arc<Mutex<Settings>>, &AiService, &Arc<MemoryCredentials>, &Arc<Db>, i64);
+
+    fn flip(settings: &Arc<Mutex<Settings>>, service: &AiService, edit: impl Fn(&mut AiSettings)) {
+        let old = settings.lock().unwrap().ai.clone();
+        let mut new = old.clone();
+        edit(&mut new);
+        settings.lock().unwrap().ai = new.clone();
+        service.settings_changed(&old, &new);
+    }
+
+    /// Switching off, removing the key, another base URL / model, the
+    /// automatic switch going off, or the bin — during the first request —
+    /// all stop the job: no further request, nothing written.
+    #[test]
+    fn changes_mid_job_stop_it_before_the_next_request_or_write() {
+        let cases: [(&str, bool, Intervene); 6] = [
+            ("off", false, |s, svc, _, _, _| {
+                flip(s, svc, |ai| ai.enabled = false)
+            }),
+            ("key", false, |_, svc, creds, _, _| {
+                creds.delete().unwrap();
+                svc.key_changed();
+            }),
+            ("base", false, |s, svc, _, _, _| {
+                flip(s, svc, |ai| {
+                    ai.base_url = "https://other.example.com/v1".into()
+                })
+            }),
+            ("model", false, |s, svc, _, _, _| {
+                flip(s, svc, |ai| ai.model = "other-model".into())
+            }),
+            ("feature", true, |s, svc, _, _, _| {
+                flip(s, svc, |ai| {
+                    ai.auto_notes = false;
+                    ai.auto_title = false;
+                })
+            }),
+            ("bin", false, |_, svc, _, db, id| {
+                db.soft_delete_meeting(id).unwrap();
+                svc.cancel_meeting(id);
+            }),
+        ];
+        for (tag, automatic, intervene) in cases {
+            let f = fixture(tag, configured(), FakeService::new("New title"));
+            let id = long_meeting(&f.db);
+            let before = f.db.get_meeting(id).unwrap().unwrap();
+            let (settings, service, creds, db) = (
+                f.settings.clone(),
+                f.service.clone(),
+                f.creds.clone(),
+                f.db.clone(),
+            );
+            f.fake.on_request(move |n| {
+                if n == 0 {
+                    intervene(&settings, &service, &creds, &db, id);
+                }
+            });
+            if automatic {
+                f.service.on_transcribed(id);
+            } else {
+                f.service.request(id, AiTask::Summary, false).unwrap();
+                f.service.request(id, AiTask::Title, false).unwrap();
+            }
+            assert!(f.service.wait_idle(Duration::from_secs(20)), "{tag}");
+            assert_eq!(f.fake.calls(), 1, "{tag}: no request after the change");
+            let after = f.db.get_meeting(id).unwrap().unwrap();
+            assert_eq!(after.title, before.title, "{tag}");
+            assert_eq!(after.ai_summary, "", "{tag}");
+            let outcomes = last_outcomes(&f.sink, id);
+            assert_eq!(outcomes.len(), 2, "{tag}");
+            for (task, outcome) in outcomes {
+                assert!(
+                    matches!(outcome, AiOutcome::Skipped(_)),
+                    "{tag} {task:?}: {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// A retranscription while the notes are being written: the late notes
+    /// (from the old transcript) are not stored as current, and the request
+    /// the new transcription made runs afterwards instead of being dropped.
+    #[test]
+    fn a_retranscription_during_the_notes_request_reruns_them() {
+        let notes_only = AiSettings {
+            auto_title: false,
+            ..configured()
+        };
+        let f = fixture("retx", notes_only, FakeService::new("x"));
+        let id = meeting(&f.db, &[("S1", "Hello.")]);
+        let (db, service) = (f.db.clone(), f.service.clone());
+        f.fake.on_request(move |n| {
+            if n == 0 {
+                let segment = NewSegment {
+                    speaker_label: None,
+                    track: "loopback".into(),
+                    start_ms: 0,
+                    end_ms: 1000,
+                    text: "Retranscribed words.".into(),
+                };
+                db.replace_transcript(id, &[], &[segment], "whisper")
+                    .unwrap();
+                service.on_transcribed(id);
+            }
+        });
+        f.service.on_transcribed(id);
+        assert!(f.service.wait_idle(Duration::from_secs(10)));
+        assert_eq!(f.fake.calls(), 2, "the second request was not swallowed");
+        let second = f.fake.bodies()[1]["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(second.contains("Retranscribed words."), "{second}");
+        let summaries: Vec<AiOutcome> = done(&f.sink)
+            .into_iter()
+            .filter(|d| d.task == AiTask::Summary)
+            .map(|d| d.outcome)
+            .collect();
+        assert!(
+            matches!(summaries[0], AiOutcome::Skipped(_)),
+            "{summaries:?}"
+        );
+        assert_eq!(summaries[1], AiOutcome::Applied);
+        let meeting = f.db.get_meeting(id).unwrap().unwrap();
+        assert!(!meeting.ai_summary_stale);
+        assert_eq!(meeting.transcript_rev, 2);
+    }
+
+    /// Regenerate pressed while an automatic job writes the same notes:
+    /// the manual request runs again afterwards.
+    #[test]
+    fn a_manual_request_during_a_running_task_runs_again() {
+        let f = fixture("again", configured(), FakeService::new("x"));
+        let id = meeting(&f.db, &[("S1", "Hello.")]);
+        let service = f.service.clone();
+        f.fake.on_request(move |n| {
+            if n == 0 {
+                service.request(id, AiTask::Summary, false).unwrap();
+            }
+        });
+        f.service.request(id, AiTask::Summary, true).unwrap();
+        assert!(f.service.wait_idle(Duration::from_secs(10)));
+        assert_eq!(f.fake.calls(), 2);
+        let summaries: Vec<AiDone> = done(&f.sink)
+            .into_iter()
+            .filter(|d| d.task == AiTask::Summary)
+            .collect();
+        assert_eq!(summaries.len(), 2);
+        assert!(summaries[0].automatic && !summaries[1].automatic);
+        assert!(summaries.iter().all(|d| d.outcome == AiOutcome::Applied));
+    }
+
+    /// A model that answers with 100 KB every time: a bounded number of
+    /// requests, bounded request bodies, a bounded stored summary.
+    #[test]
+    fn runaway_replies_are_capped() {
+        let f = fixture("runaway", configured(), FakeService::runaway(100_000));
+        let id = long_meeting(&f.db);
+        let parts = chunk_lines(
+            &transcript_input(
+                &f.db.get_speakers(id).unwrap(),
+                &f.db.get_segments(id).unwrap(),
+            )
+            .lines,
+            CHUNK_CHARS,
+        )
+        .len();
+        f.service.request(id, AiTask::Summary, false).unwrap();
+        f.service.request(id, AiTask::Title, false).unwrap();
+        assert!(f.service.wait_idle(Duration::from_secs(30)));
+        assert!(
+            f.fake.calls() <= parts + EXTRA_REQUESTS,
+            "{} calls",
+            f.fake.calls()
+        );
+        for body in f.fake.bodies() {
+            let user = body["messages"][1]["content"].as_str().unwrap();
+            assert!(
+                user.len() <= CHUNK_CHARS + 2_000,
+                "request of {}",
+                user.len()
+            );
+        }
+        let meeting = f.db.get_meeting(id).unwrap().unwrap();
+        assert!(!meeting.ai_summary.is_empty());
+        assert!(meeting.ai_summary.len() <= NOTES_REPLY_BYTES);
+        assert!(meeting.title.chars().count() <= TITLE_CHARS);
+    }
+
+    /// The stored key goes only to the host it was saved for.
+    #[test]
+    fn the_key_never_goes_to_another_host() {
+        let other = AiSettings {
+            base_url: "https://other.example.com/v1".into(),
+            ..configured()
+        };
+        let f = fixture("host", other, FakeService::new("x"));
+        let id = meeting(&f.db, &[("S1", "Hello.")]);
+        f.service.request(id, AiTask::Summary, false).unwrap();
+        assert!(f.service.wait_idle(Duration::from_secs(10)));
+        assert_eq!(f.fake.calls(), 0);
+        let AiOutcome::Failed(error) = outcome(&f.sink, AiTask::Summary) else {
+            panic!("expected a failure");
+        };
+        assert!(
+            error.contains("for api.example.com, not other.example.com"),
+            "{error}"
+        );
+        assert!(!error.contains(KEY));
+
+        // A local server simply gets no key.
+        let local = AiSettings {
+            base_url: "http://localhost:11434/v1".into(),
+            ..configured()
+        };
+        let f = fixture("host-local", local, FakeService::new("x"));
+        let id = meeting(&f.db, &[("S1", "Hello.")]);
+        f.service.request(id, AiTask::Summary, false).unwrap();
+        assert!(f.service.wait_idle(Duration::from_secs(10)));
+        assert_eq!(f.fake.calls(), 1);
+        assert!(f.fake.seen.lock().unwrap()[0].bearer.is_none());
+        assert_eq!(outcome(&f.sink, AiTask::Summary), AiOutcome::Applied);
+
+        // The matching host gets it.
+        let base = BaseUrl::parse("https://API.example.com/v1").unwrap();
+        let stored = StoredKey {
+            key: ApiKey::new(KEY).unwrap(),
+            host: "api.example.com".into(),
+        };
+        assert_eq!(key_for(&base, Some(stored)).unwrap().unwrap().expose(), KEY);
+    }
+
+    #[test]
+    fn switching_off_drops_waiting_jobs_and_binning_clears_the_ui_state() {
+        let f = fixture("drop", configured(), FakeService::new("x"));
+        let id = meeting(&f.db, &[("S1", "Hello.")]);
+        let other = meeting(&f.db, &[("S1", "Again.")]);
+        f.service.set_paused(true);
+        f.service.request(id, AiTask::Summary, false).unwrap();
+        f.service.request(other, AiTask::Title, true).unwrap();
+        f.service.cancel_meeting(other);
+        assert_eq!(f.service.pending(other), []);
+        let cleared: Vec<AiTask> = done(&f.sink)
+            .into_iter()
+            .filter(|d| d.meeting_id == other)
+            .map(|d| d.task)
+            .collect();
+        assert_eq!(cleared, [AiTask::Summary, AiTask::Title]);
+        flip(&f.settings, &f.service, |ai| ai.enabled = false);
+        assert_eq!(f.service.pending(id), []);
+        assert!(matches!(
+            outcome(&f.sink, AiTask::Summary),
+            AiOutcome::Skipped(why) if why.contains("turned off")
+        ));
+        f.service.set_paused(false);
+        assert!(f.service.wait_idle(Duration::from_secs(5)));
+        assert_eq!(f.fake.calls(), 0);
+    }
+
+    #[test]
+    fn titles_lose_control_and_bidi_characters() {
+        assert_eq!(
+            clean_title("Budget\u{202E}gnp.exe\u{0001} review\u{200B}\u{FEFF}").as_deref(),
+            Some("Budgetgnp.exe review")
+        );
+        assert_eq!(clean_title("\u{2066}\u{2069}"), None);
+    }
+
+    /// Probes (Load models / Test) never attach the stored key to another
+    /// host either — and fail before any request.
+    #[test]
+    fn probes_bind_the_stored_key_to_its_host() {
+        let (core, _sink, _dir) = super::super::testing::scratch_core("ai-probe");
+        core.state.settings.lock().unwrap().ai.enabled = true;
+        assert_eq!(core.ai_key_host().unwrap(), None);
+        assert!(core
+            .set_ai_key("sk-probe-key", "not a url")
+            .unwrap_err()
+            .contains("valid base URL"));
+        core.set_ai_key("sk-probe-key", "https://api.openai.com/v1")
+            .unwrap();
+        assert_eq!(
+            core.ai_key_host().unwrap().as_deref(),
+            Some("api.openai.com")
+        );
+        let error = core
+            .ai_list_models("https://evil.example.com/v1", None)
+            .unwrap_err();
+        assert!(error.contains("for api.openai.com"), "{error}");
+        assert!(!error.contains("sk-probe-key"));
+        let error = core
+            .ai_test_connection("https://evil.example.com/v1", "m", None)
+            .unwrap_err();
+        assert!(error.contains("for api.openai.com"), "{error}");
+        core.set_ai_key("", "").unwrap();
+        assert_eq!(core.ai_key_host().unwrap(), None);
+        core.shutdown();
     }
 }

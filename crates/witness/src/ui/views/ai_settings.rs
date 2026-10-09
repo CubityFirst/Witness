@@ -29,7 +29,7 @@ use crate::ui::toasts::Notice;
 use crate::ui::widgets;
 use crate::ui::UiCtx;
 use eframe::egui;
-use witness_core::ai_client::{ApiKey, BaseUrl};
+use witness_core::ai_client::{wipe, ApiKey, BaseUrl};
 use witness_core::settings::AiSettings;
 use witness_core::CoreResult;
 
@@ -99,29 +99,32 @@ pub struct AiSection {
     /// The key being typed (never loaded from the store).
     key_text: String,
     show_key: bool,
-    /// Whether Credential Manager holds a key (None until known).
-    key_stored: Option<bool>,
-    key_load: Option<Task<CoreResult<bool>>>,
-    key_write: Option<OpRun<bool>>,
+    /// The host of the key in Credential Manager: None until known,
+    /// Some(None) = no key.
+    key_host: Option<Option<String>>,
+    key_load: Option<Task<CoreResult<Option<String>>>>,
+    key_write: Option<OpRun<Option<String>>>,
     models: Vec<String>,
     models_task: Option<Task<CoreResult<Vec<String>>>>,
     models_error: Option<String>,
     test_task: Option<Task<CoreResult<String>>>,
     test_result: Option<Result<String, String>>,
-    /// Debug builds: `WITNESS_DEBUG_AI_SETTINGS=on|error`.
+    /// Debug builds: `WITNESS_DEBUG_AI_SETTINGS=on|error|other`.
     #[cfg(debug_assertions)]
     debug: Option<String>,
 }
 
 impl AiSection {
     pub fn new() -> Self {
-        AiSection {
-            #[cfg(debug_assertions)]
-            debug: std::env::var("WITNESS_DEBUG_AI_SETTINGS")
+        #[allow(unused_mut)]
+        let mut section = AiSection::default();
+        #[cfg(debug_assertions)]
+        {
+            section.debug = std::env::var("WITNESS_DEBUG_AI_SETTINGS")
                 .ok()
-                .filter(|v| !v.is_empty()),
-            ..Default::default()
+                .filter(|v| !v.is_empty());
         }
+        section
     }
 
     /// Save a base URL / model draft that has not been blurred yet (the
@@ -139,23 +142,23 @@ impl AiSection {
         self.mounted = true;
         #[cfg(debug_assertions)]
         if self.debug.is_some() {
-            self.key_stored = Some(true);
+            self.key_host = Some(Some("api.openai.com".into()));
             return;
         }
-        self.key_load = Some(cx.tasks.spawn("ai-key-status", |c| c.ai_key_stored()));
+        self.key_load = Some(cx.tasks.spawn("ai-key-status", |c| c.ai_key_host()));
     }
 
     fn poll(&mut self) {
         if let Some(result) = self.key_load.as_mut().and_then(Task::poll_flat) {
             self.key_load = None;
             match result {
-                Ok(stored) => self.key_stored = Some(stored),
+                Ok(host) => self.key_host = Some(host),
                 Err(error) => log::warn!("could not check the stored AI key: {error}"),
             }
         }
         // A failed write keeps the old state (the op toasted the error).
         if let Some(Some(stored)) = OpRun::finished(&mut self.key_write) {
-            self.key_stored = Some(stored);
+            self.key_host = Some(stored);
         }
         if let Some(result) = self.models_task.as_mut().and_then(Task::poll_flat) {
             self.models_task = None;
@@ -194,10 +197,11 @@ impl AiSection {
             }
             return AiSettings {
                 enabled: true,
-                base_url: if error {
-                    "http://ai.example.com/v1".into()
-                } else {
-                    "https://api.openai.com/v1".into()
+                base_url: match mode.as_str() {
+                    "error" => "http://ai.example.com/v1".into(),
+                    // A base on another host than the saved key.
+                    "other" => "https://ai.example.com/v1".into(),
+                    _ => "https://api.openai.com/v1".into(),
                 },
                 model: "example-small".into(),
                 auto_title: !error,
@@ -220,7 +224,7 @@ impl AiSection {
         let has_model = !self.model.text.trim().is_empty();
         let on = ai.enabled;
         let configured = on && base_check.is_ok() && has_model;
-        let key_stored = self.key_stored;
+        let key_host = self.key_host.clone();
         let key_busy = self.key_write.is_some();
         let loading = self.models_task.is_some();
         let testing = self.test_task.is_some();
@@ -309,10 +313,14 @@ impl AiSection {
                         ui,
                         "Kept in Windows Credential Manager, never in Witness\u{2019}s files. Local servers usually need none.",
                     );
-                    match key_stored {
-                        Some(true) => {
+                    match &key_host {
+                        Some(Some(host)) => {
                             ui.horizontal_wrapped(|ui| {
-                                status_note(ui, pal().ok_light, "A key is saved.");
+                                status_note(
+                                    ui,
+                                    pal().ok_light,
+                                    &format!("A key is saved for {host}."),
+                                );
                                 out.remove_key = ui
                                     .add_enabled_ui(!key_busy, |ui| {
                                         widgets::btn_ghost(ui, "Remove")
@@ -320,8 +328,11 @@ impl AiSection {
                                     .inner
                                     .clicked();
                             });
+                            if let Some(warning) = key_mismatch(host, base_check.as_ref().ok()) {
+                                status_note(ui, pal().rec_light, &warning);
+                            }
                         }
-                        Some(false) => {
+                        Some(None) => {
                             status_note(ui, pal().text_faint, "No key saved.");
                         }
                         None => {}
@@ -331,7 +342,7 @@ impl AiSection {
                 |ui, label| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     let width = (ui.available_width() - 32.0).max(80.0);
-                    let hint = if key_stored == Some(true) {
+                    let hint = if matches!(key_host, Some(Some(_))) {
                         "Saved \u{2014} type to replace"
                     } else {
                         "Paste the key, then Enter"
@@ -530,9 +541,9 @@ impl AiSection {
         }
         if out.remove_key {
             self.key_write = Some(OpRun::spawn(cx, "ai-key-remove", |c, slot| {
-                match c.set_ai_key("") {
+                match c.set_ai_key("", "") {
                     Ok(()) => {
-                        fill(slot, false);
+                        fill(slot, None);
                         notice_done(Notice::success("API key removed"))
                     }
                     Err(error) => notice_done(Notice::error("Could not remove the API key", error)),
@@ -570,7 +581,12 @@ impl AiSection {
         let Some(key) = ApiKey::new(&self.key_text) else {
             return;
         };
-        self.key_text = String::new();
+        // The key is bound to the host of the base URL shown right now.
+        let base = self.base.text.trim().to_string();
+        let host = BaseUrl::parse(&base)
+            .ok()
+            .map(|b| b.host().to_ascii_lowercase());
+        wipe(&mut self.key_text);
         self.show_key = false;
         if let Some(mut state) = egui::text_edit::TextEditState::load(ctx, key_id()) {
             state.clear_undoer();
@@ -578,9 +594,9 @@ impl AiSection {
             state.store(ctx, key_id());
         }
         self.key_write = Some(OpRun::spawn(cx, "ai-key-save", move |c, slot| {
-            match c.set_ai_key(key.expose()) {
+            match c.set_ai_key(key.expose(), &base) {
                 Ok(()) => {
-                    fill(slot, true);
+                    fill(slot, host);
                     notice_done(Notice::success(
                         "API key saved in Windows Credential Manager",
                     ))
@@ -589,6 +605,28 @@ impl AiSection {
             }
         }));
     }
+}
+
+impl Drop for AiSection {
+    /// A key typed but never saved is overwritten when Settings closes.
+    fn drop(&mut self) {
+        wipe(&mut self.key_text);
+    }
+}
+
+/// The warning when the saved key belongs to another host than the base
+/// URL shown (it will not be sent there).
+fn key_mismatch(key_host: &str, base: Option<&BaseUrl>) -> Option<String> {
+    let base = base?;
+    let host = base.host().to_ascii_lowercase();
+    if host == key_host {
+        return None;
+    }
+    Some(if base.is_local() {
+        format!("It is not sent to {host} (a local server gets no key).")
+    } else {
+        format!("It is not sent to {host} \u{2014} enter the key for {host}.")
+    })
 }
 
 /// The loaded model list as a select; returns a newly picked id.
@@ -628,6 +666,21 @@ fn model_picker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_key_for_another_host_is_flagged() {
+        let openai = BaseUrl::parse("https://API.openai.com/v1").unwrap();
+        assert_eq!(key_mismatch("api.openai.com", Some(&openai)), None);
+        let other = BaseUrl::parse("https://ai.example.com/v1").unwrap();
+        assert!(key_mismatch("api.openai.com", Some(&other))
+            .unwrap()
+            .contains("enter the key for ai.example.com"));
+        let local = BaseUrl::parse("http://localhost:11434/v1").unwrap();
+        assert!(key_mismatch("api.openai.com", Some(&local))
+            .unwrap()
+            .contains("local server gets no key"));
+        assert_eq!(key_mismatch("api.openai.com", None), None);
+    }
 
     #[test]
     fn drafts_resync_only_while_clean_and_commit_once() {

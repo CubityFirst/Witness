@@ -31,6 +31,11 @@ pub const CHAT_TIMEOUT: Duration = Duration::from_secs(600);
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 /// The most of an error body kept for the message (it is scrubbed first).
 const ERROR_DETAIL_CHARS: usize = 200;
+/// A model list keeps at most this many ids, each at most this long.
+pub const MAX_MODELS: usize = 1000;
+const MAX_MODEL_ID_BYTES: usize = 256;
+/// The `User-Agent` of AI requests (no version, no platform).
+pub const AI_USER_AGENT: &str = "Witness";
 
 // ---------------------------------------------------------------------------
 // API key
@@ -62,8 +67,31 @@ impl fmt::Debug for ApiKey {
 
 impl Drop for ApiKey {
     fn drop(&mut self) {
-        // SAFETY: zero bytes are valid UTF-8, so the String stays valid.
-        unsafe { self.0.as_bytes_mut() }.fill(0);
+        wipe(&mut self.0);
+    }
+}
+
+/// Overwrite a string's bytes in place before it is dropped or reused
+/// (best effort: copies made elsewhere — the HTTP library's buffers, the
+/// OS — are out of reach).
+pub fn wipe(text: &mut String) {
+    let len = text.len();
+    text.clear();
+    // Writes `len` NULs over the same allocation (capacity ≥ len).
+    text.extend(std::iter::repeat_n('\0', len));
+    // Keep the stores from being optimised away as dead.
+    std::hint::black_box(text.as_str());
+    text.clear();
+}
+
+/// `text` cut to at most `max` bytes at a character boundary.
+pub fn truncate_bytes(text: &mut String, max: usize) {
+    if text.len() > max {
+        let mut cut = max;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
     }
 }
 
@@ -235,6 +263,8 @@ impl AiTransport for UreqTransport {
             // API roots don't redirect, so a 3xx is reported instead.
             .redirects(0)
             .https_only(request.https_only)
+            // A neutral user agent: no version (PRIVACY.md lists it).
+            .user_agent(AI_USER_AGENT)
             .build();
         let mut call = match request.method {
             Method::Get => agent.get(&request.url),
@@ -242,8 +272,10 @@ impl AiTransport for UreqTransport {
         }
         .timeout(request.timeout)
         .set("Accept", "application/json");
+        let mut authorization = String::new();
         if let Some(key) = &request.bearer {
-            call = call.set("Authorization", &format!("Bearer {}", key.expose()));
+            authorization = format!("Bearer {}", key.expose());
+            call = call.set("Authorization", &authorization);
         }
         let result = match &request.body {
             Some(body) => call
@@ -251,6 +283,7 @@ impl AiTransport for UreqTransport {
                 .send_string(body),
             None => call.call(),
         };
+        wipe(&mut authorization);
         let response = match result {
             Ok(response) => response,
             Err(ureq::Error::Status(_, response)) => response,
@@ -327,6 +360,14 @@ pub enum AiError {
     Empty,
     /// The credential store could not be read.
     Credentials(String),
+    /// The stored key belongs to another host than the configured base URL.
+    KeyForOtherHost {
+        key_host: String,
+        host: String,
+    },
+    /// One job reached its request budget (a model whose replies kept it
+    /// from finishing).
+    TooManyRequests,
 }
 
 impl fmt::Display for AiError {
@@ -362,6 +403,13 @@ impl fmt::Display for AiError {
             }
             AiError::Empty => f.write_str("The AI service sent an empty reply."),
             AiError::Credentials(why) => write!(f, "Could not read the API key: {why}"),
+            AiError::KeyForOtherHost { key_host, host } => write!(
+                f,
+                "The saved API key is for {key_host}, not {host}. Enter the key for {host} in Settings \u{2192} AI assistant."
+            ),
+            AiError::TooManyRequests => f.write_str(
+                "The AI service\u{2019}s replies kept the job from finishing; it was stopped.",
+            ),
         }
     }
 }
@@ -543,7 +591,10 @@ pub fn parse_models(body: &str) -> Result<Vec<String>, AiError> {
         .data
         .into_iter()
         .map(|m| m.id.trim().to_string())
-        .filter(|id| !id.is_empty())
+        .filter(|id| {
+            !id.is_empty() && id.len() <= MAX_MODEL_ID_BYTES && !id.contains(char::is_control)
+        })
+        .take(MAX_MODELS)
         .collect();
     ids.sort_by_key(|id| id.to_lowercase());
     ids.dedup();
@@ -895,6 +946,39 @@ mod tests {
             1,
             "only list_models above"
         );
+    }
+
+    #[test]
+    fn wipe_truncate_and_model_list_caps() {
+        let mut secret = String::from("sk-secret");
+        let ptr = secret.as_ptr();
+        wipe(&mut secret);
+        assert!(secret.is_empty());
+        // The same allocation now holds zeros where the secret was.
+        // SAFETY: capacity ≥ 9, and the bytes were written by `wipe`.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, 9) };
+        assert!(bytes.iter().all(|b| *b == 0), "{bytes:?}");
+
+        let mut text = String::from("héllo");
+        truncate_bytes(&mut text, 2);
+        assert_eq!(text, "h", "never splits a character");
+        let mut short = String::from("ok");
+        truncate_bytes(&mut short, 10);
+        assert_eq!(short, "ok");
+
+        let many: Vec<serde_json::Value> = (0..1500)
+            .map(|i| serde_json::json!({ "id": format!("model-{i:04}") }))
+            .chain([
+                serde_json::json!({ "id": "x".repeat(300) }),
+                serde_json::json!({ "id": "bad\u{0007}id" }),
+            ])
+            .collect();
+        let body = serde_json::json!({ "data": many }).to_string();
+        let models = parse_models(&body).unwrap();
+        assert_eq!(models.len(), MAX_MODELS);
+        assert!(models
+            .iter()
+            .all(|m| m.len() <= 256 && !m.contains('\u{7}')));
     }
 
     #[test]

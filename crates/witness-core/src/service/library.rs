@@ -188,6 +188,7 @@ impl AppCore {
             let _ = state.db.restore_meeting(id);
             return Err(format!("Cannot delete this meeting yet: {error:#}"));
         }
+        self.ai_cancel_meeting(id);
         self.rematch_speakers();
         self.emit(CoreEvent::MeetingsChanged);
         Ok(())
@@ -218,6 +219,7 @@ impl AppCore {
     pub fn purge_meeting(&self, id: i64) -> CoreResult<()> {
         assert_off_ui_thread("purge_meeting");
         purge_meeting_data(&self.state, id)?;
+        self.ai_cancel_meeting(id);
         self.emit(CoreEvent::MeetingsChanged);
         Ok(())
     }
@@ -227,6 +229,7 @@ impl AppCore {
         assert_off_ui_thread("empty_recycle_bin");
         for (meeting, _) in self.state.db.list_deleted_meetings().map_err(err)? {
             purge_meeting_data(&self.state, meeting.id)?;
+            self.ai_cancel_meeting(meeting.id);
         }
         self.emit(CoreEvent::MeetingsChanged);
         Ok(())

@@ -4,9 +4,16 @@
 //! `witness-settings.toml`, the database, logs, backups or the diagnostics
 //! report.
 //!
+//! The key is **bound to the host** it was entered for: the credential's
+//! user name holds that host, and the core attaches the key only to
+//! requests for the same host — changing the base URL to another server
+//! never sends it there (the user enters a key for the new host instead).
+//!
 //! [`CredentialStore`] is the seam: the core reads and writes through it,
 //! unit tests use [`MemoryCredentials`], and only an `#[ignore]` test
 //! touches the real store. Errors name the Win32 failure, never the key.
+//! Our copies of the secret are overwritten when done (best effort: the
+//! buffer Windows hands back is zeroed before it is freed).
 
 use crate::ai_client::ApiKey;
 use std::sync::Mutex;
@@ -15,30 +22,54 @@ use std::sync::Mutex;
 /// Windows Credentials → "Witness/ai-api-key").
 pub const AI_KEY_TARGET: &str = "Witness/ai-api-key";
 
+/// The stored key and the host it belongs to (lower case).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredKey {
+    pub key: ApiKey,
+    pub host: String,
+}
+
 /// Reads, writes and deletes the one stored API key.
 pub trait CredentialStore: Send + Sync + 'static {
-    fn read(&self) -> Result<Option<ApiKey>, String>;
-    fn write(&self, key: &ApiKey) -> Result<(), String>;
+    fn read(&self) -> Result<Option<StoredKey>, String>;
+    /// The host of the stored key, if one is stored — without copying the
+    /// secret anywhere (presence checks in Settings).
+    fn stored_host(&self) -> Result<Option<String>, String>;
+    fn write(&self, key: &ApiKey, host: &str) -> Result<(), String>;
     /// Deleting a key that is not there succeeds.
     fn delete(&self) -> Result<(), String>;
 }
 
+/// Normalised host for binding: lower case, no surrounding whitespace.
+pub fn binding_host(host: &str) -> String {
+    host.trim().to_ascii_lowercase()
+}
+
 /// In-memory store for tests.
 #[derive(Default)]
-pub struct MemoryCredentials(Mutex<Option<ApiKey>>);
+pub struct MemoryCredentials(Mutex<Option<StoredKey>>);
 
 impl MemoryCredentials {
-    pub fn with(key: &str) -> Self {
-        MemoryCredentials(Mutex::new(ApiKey::new(key)))
+    pub fn with(key: &str, host: &str) -> Self {
+        MemoryCredentials(Mutex::new(ApiKey::new(key).map(|key| StoredKey {
+            key,
+            host: binding_host(host),
+        })))
     }
 }
 
 impl CredentialStore for MemoryCredentials {
-    fn read(&self) -> Result<Option<ApiKey>, String> {
+    fn read(&self) -> Result<Option<StoredKey>, String> {
         Ok(self.0.lock().unwrap().clone())
     }
-    fn write(&self, key: &ApiKey) -> Result<(), String> {
-        *self.0.lock().unwrap() = Some(key.clone());
+    fn stored_host(&self) -> Result<Option<String>, String> {
+        Ok(self.0.lock().unwrap().as_ref().map(|s| s.host.clone()))
+    }
+    fn write(&self, key: &ApiKey, host: &str) -> Result<(), String> {
+        *self.0.lock().unwrap() = Some(StoredKey {
+            key: key.clone(),
+            host: binding_host(host),
+        });
         Ok(())
     }
     fn delete(&self) -> Result<(), String> {
@@ -87,8 +118,13 @@ fn win32_error(action: &str, error: &windows::core::Error) -> String {
 }
 
 #[cfg(windows)]
-impl CredentialStore for WindowsCredentials {
-    fn read(&self) -> Result<Option<ApiKey>, String> {
+impl WindowsCredentials {
+    /// CredReadW; `take` sees the credential (and may copy the secret out),
+    /// then the secret is zeroed in Windows' buffer and the buffer freed.
+    fn with_credential<T>(
+        &self,
+        take: impl FnOnce(&windows::Win32::Security::Credentials::CREDENTIALW) -> T,
+    ) -> Result<Option<T>, String> {
         use windows::core::PCWSTR;
         use windows::Win32::Foundation::ERROR_NOT_FOUND;
         use windows::Win32::Security::Credentials::{
@@ -113,31 +149,69 @@ impl CredentialStore for WindowsCredentials {
             }
             return Err(win32_error("read", &error));
         }
-        // SAFETY: CredReadW succeeded, so `credential` is valid until freed;
-        // the blob is `CredentialBlobSize` bytes long.
-        let key = unsafe {
-            let blob = std::slice::from_raw_parts(
-                (*credential).CredentialBlob,
-                (*credential).CredentialBlobSize as usize,
-            );
-            let mut bytes = blob.to_vec();
-            let key = std::str::from_utf8(&bytes).ok().and_then(ApiKey::new);
-            bytes.fill(0);
+        // SAFETY: CredReadW succeeded, so `credential` is valid until freed,
+        // and the blob is `CredentialBlobSize` writable bytes.
+        unsafe {
+            let value = take(&*credential);
+            let blob = (*credential).CredentialBlob;
+            if !blob.is_null() {
+                std::ptr::write_bytes(blob, 0, (*credential).CredentialBlobSize as usize);
+            }
             CredFree(credential as *const _);
-            key
-        };
-        Ok(key)
+            Ok(Some(value))
+        }
+    }
+}
+
+/// The credential's user name (the host the key is bound to).
+#[cfg(windows)]
+fn user_name(credential: &windows::Win32::Security::Credentials::CREDENTIALW) -> String {
+    if credential.UserName.is_null() {
+        return String::new();
+    }
+    // SAFETY: a non-null UserName from CredReadW is NUL-terminated.
+    binding_host(&unsafe { credential.UserName.to_string() }.unwrap_or_default())
+}
+
+#[cfg(windows)]
+impl CredentialStore for WindowsCredentials {
+    fn read(&self) -> Result<Option<StoredKey>, String> {
+        let found = self.with_credential(|credential| {
+            if credential.CredentialBlob.is_null() {
+                return None;
+            }
+            // SAFETY: the blob is `CredentialBlobSize` bytes (see above).
+            let blob = unsafe {
+                std::slice::from_raw_parts(
+                    credential.CredentialBlob,
+                    credential.CredentialBlobSize as usize,
+                )
+            };
+            let mut text = String::from_utf8_lossy(blob).into_owned();
+            let key = ApiKey::new(&text);
+            crate::ai_client::wipe(&mut text);
+            key.map(|key| StoredKey {
+                key,
+                host: user_name(credential),
+            })
+        })?;
+        Ok(found.flatten())
     }
 
-    fn write(&self, key: &ApiKey) -> Result<(), String> {
+    fn stored_host(&self) -> Result<Option<String>, String> {
+        self.with_credential(user_name)
+    }
+
+    fn write(&self, key: &ApiKey, host: &str) -> Result<(), String> {
         use windows::core::PWSTR;
         use windows::Win32::Security::Credentials::{
             CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
         };
 
         let mut target = wide(&self.target);
-        let mut user = wide("Witness");
-        let mut comment = wide("API key for the AI service used by Witness");
+        let mut user = wide(&binding_host(host));
+        let mut comment =
+            wide("API key for the AI service used by Witness (user name = the service's host)");
         let mut blob = key.expose().as_bytes().to_vec();
         let credential = CREDENTIALW {
             Type: CRED_TYPE_GENERIC,
@@ -173,10 +247,13 @@ impl CredentialStore for WindowsCredentials {
 
 #[cfg(not(windows))]
 impl CredentialStore for WindowsCredentials {
-    fn read(&self) -> Result<Option<ApiKey>, String> {
+    fn read(&self) -> Result<Option<StoredKey>, String> {
         Ok(None)
     }
-    fn write(&self, _key: &ApiKey) -> Result<(), String> {
+    fn stored_host(&self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    fn write(&self, _key: &ApiKey, _host: &str) -> Result<(), String> {
         Err("Credential Manager is only available on Windows".into())
     }
     fn delete(&self) -> Result<(), String> {
@@ -189,11 +266,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn memory_store_round_trips() {
+    fn memory_store_round_trips_with_its_host() {
         let store = MemoryCredentials::default();
         assert_eq!(store.read().unwrap(), None);
-        store.write(&ApiKey::new("sk-one").unwrap()).unwrap();
-        assert_eq!(store.read().unwrap().unwrap().expose(), "sk-one");
+        assert_eq!(store.stored_host().unwrap(), None);
+        store
+            .write(&ApiKey::new("sk-one").unwrap(), " API.OpenAI.com ")
+            .unwrap();
+        let stored = store.read().unwrap().unwrap();
+        assert_eq!(stored.key.expose(), "sk-one");
+        assert_eq!(stored.host, "api.openai.com");
+        assert_eq!(
+            store.stored_host().unwrap().as_deref(),
+            Some("api.openai.com")
+        );
         store.delete().unwrap();
         store.delete().unwrap();
         assert_eq!(store.read().unwrap(), None);
@@ -208,11 +294,17 @@ mod tests {
         let store = WindowsCredentials::with_target(&target);
         assert_eq!(store.read().unwrap(), None);
         let key = ApiKey::new("sk-witness-test-ünïcødé").unwrap();
-        store.write(&key).unwrap();
-        assert_eq!(store.read().unwrap().as_ref(), Some(&key));
+        store.write(&key, "api.example.com").unwrap();
+        let stored = store.read().unwrap().unwrap();
+        assert_eq!(stored.key, key);
+        assert_eq!(stored.host, "api.example.com");
+        assert_eq!(
+            store.stored_host().unwrap().as_deref(),
+            Some("api.example.com")
+        );
         let replaced = ApiKey::new("sk-witness-test-2").unwrap();
-        store.write(&replaced).unwrap();
-        assert_eq!(store.read().unwrap().as_ref(), Some(&replaced));
+        store.write(&replaced, "localhost").unwrap();
+        assert_eq!(store.read().unwrap().unwrap().key, replaced);
         store.delete().unwrap();
         assert_eq!(store.read().unwrap(), None);
         store.delete().unwrap();

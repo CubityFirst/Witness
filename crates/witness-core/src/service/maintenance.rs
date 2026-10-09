@@ -283,10 +283,17 @@ impl AppCore {
         // Applying only some of them immediately can strand a new recording in a
         // directory whose DB row still lives in the old database.
         *state.configured_data_dir.lock().unwrap() = settings.data_dir.clone();
-        let active_data_dir = state.settings.lock().unwrap().data_dir.clone();
+        let (active_data_dir, old_ai) = {
+            let current = state.settings.lock().unwrap();
+            (current.data_dir.clone(), current.ai.clone())
+        };
+        let new_ai = settings.ai.clone();
         let mut active_settings = settings;
         active_settings.data_dir = active_data_dir;
         *state.settings.lock().unwrap() = active_settings;
+        // Switching the AI assistant off (or to another service) stops its
+        // running job before its next request.
+        self.ai_settings_changed(&old_ai, &new_ai);
         Ok(())
     }
 
