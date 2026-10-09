@@ -12,3 +12,6 @@
 
 # Verbatim Tauri NSIS output kept as reference (CRLF + BOM as generated).
 installer/reference/** -text
+
+# Patches are applied to other trees byte for byte.
+*.patch -text
