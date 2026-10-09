@@ -110,6 +110,95 @@ pub struct Settings {
     /// request carries no meeting data; installing always needs a click.
     #[serde(default = "default_true")]
     pub check_for_updates: bool,
+
+    /// The opt-in AI assistant (meeting titles and notes through an
+    /// OpenAI-compatible service). Off by default; the API key is never
+    /// stored here (Windows Credential Manager, `credentials.rs`). Kept
+    /// last: TOML writes tables after plain values.
+    #[serde(default)]
+    pub ai: AiSettings,
+}
+
+/// The base URL the AI section starts with (the user can point it at any
+/// OpenAI-compatible server, local ones included).
+pub const DEFAULT_AI_BASE_URL: &str = "https://api.openai.com/v1";
+
+fn default_ai_base_url() -> String {
+    DEFAULT_AI_BASE_URL.to_string()
+}
+
+/// `[ai]` in witness-settings.toml. Nothing here is secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiSettings {
+    /// Master switch "Use an AI service": while off, Witness makes no AI
+    /// request of any kind (not even a connection test or a model list).
+    #[serde(default)]
+    pub enabled: bool,
+    /// OpenAI-compatible API root, e.g. `https://api.openai.com/v1` or
+    /// `http://localhost:11434/v1`. `http://` only for loopback hosts.
+    #[serde(default = "default_ai_base_url")]
+    pub base_url: String,
+    /// The model id. Deliberately no default: the user picks or types one.
+    #[serde(default)]
+    pub model: String,
+    /// Title newly transcribed meetings whose title is still automatic.
+    #[serde(default)]
+    pub auto_title: bool,
+    /// Write notes (the AI summary) for newly transcribed meetings.
+    #[serde(default)]
+    pub auto_notes: bool,
+}
+
+impl Default for AiSettings {
+    fn default() -> Self {
+        AiSettings {
+            enabled: false,
+            base_url: default_ai_base_url(),
+            model: String::new(),
+            auto_title: false,
+            auto_notes: false,
+        }
+    }
+}
+
+impl AiSettings {
+    /// Why requests cannot be made with this configuration (ignoring the
+    /// master switch), or None when the base URL and model are usable.
+    pub fn config_error(&self) -> Option<String> {
+        if let Err(error) = crate::ai_client::validate_base_url(&self.base_url) {
+            return Some(error);
+        }
+        if self.model.trim().is_empty() {
+            return Some("Choose a model.".into());
+        }
+        None
+    }
+
+    /// On, with a usable base URL and a model: the AI actions show.
+    pub fn is_configured(&self) -> bool {
+        self.enabled && self.config_error().is_none()
+    }
+
+    fn normalized(mut self) -> AiSettings {
+        let base = self.base_url.trim().trim_end_matches('/').to_string();
+        self.base_url = if base.is_empty() {
+            default_ai_base_url()
+        } else {
+            base
+        };
+        self.model = self.model.trim().to_string();
+        self
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.base_url.len() > 2048 || self.base_url.contains('\0') {
+            return Err("ai.base_url is too long or contains a NUL character".into());
+        }
+        if self.model.len() > 256 || self.model.contains('\0') {
+            return Err("ai.model is too long or contains a NUL character".into());
+        }
+        Ok(())
+    }
 }
 
 impl Default for Settings {
@@ -128,6 +217,7 @@ impl Default for Settings {
             opus_bitrate_kbps: DEFAULT_OPUS_BITRATE_KBPS,
             mic_device: None,
             loopback_device: None,
+            ai: AiSettings::default(),
         }
     }
 }
@@ -271,6 +361,10 @@ impl Settings {
         if let Some(device) = &self.loopback_device {
             validate_nonempty_text("loopback_device", device)?;
         }
+        // The base URL's scheme rule is enforced before every request (and
+        // shown in Settings), not here: a half-typed URL must not make every
+        // other settings save fail.
+        self.ai.validate()?;
         Ok(())
     }
 
@@ -295,6 +389,7 @@ impl Settings {
             .collect();
         settings.mic_device = normalize_optional_text(settings.mic_device);
         settings.loopback_device = normalize_optional_text(settings.loopback_device);
+        settings.ai = settings.ai.normalized();
         settings.validate()?;
         Ok(settings)
     }
@@ -477,6 +572,60 @@ mod tests {
 
         assert_eq!(settings.opus_bitrate_kbps, DEFAULT_OPUS_BITRATE_KBPS);
         assert_eq!(settings.watch_patterns, vec!["MSTeams"]);
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn ai_is_off_by_default_and_round_trips_without_a_key() {
+        let directory = TestDir::new();
+        let path = directory.settings_path();
+        let defaults = Settings::load_from_path(&path).unwrap();
+        assert!(!defaults.ai.enabled);
+        assert!(!defaults.ai.auto_title && !defaults.ai.auto_notes);
+        assert_eq!(defaults.ai.base_url, DEFAULT_AI_BASE_URL);
+        assert_eq!(defaults.ai.model, "", "no hard-coded model");
+        assert!(!defaults.ai.is_configured());
+
+        // An older settings file without the table still loads.
+        std::fs::write(&path, "auto_record = false\n").unwrap();
+        assert_eq!(
+            Settings::load_from_path(&path).unwrap().ai,
+            AiSettings::default()
+        );
+
+        let mut settings = Settings::default();
+        settings.ai = AiSettings {
+            enabled: true,
+            base_url: "  http://localhost:11434/v1/  ".into(),
+            model: " llama3.1 ".into(),
+            auto_title: true,
+            auto_notes: false,
+        };
+        settings.save_to_path(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[ai]"), "{text}");
+        assert!(!text.to_lowercase().contains("key"), "no key field: {text}");
+        let loaded = Settings::load_from_path(&path).unwrap();
+        assert_eq!(loaded.ai.base_url, "http://localhost:11434/v1");
+        assert_eq!(loaded.ai.model, "llama3.1");
+        assert!(loaded.ai.is_configured());
+
+        // A half-typed URL saves (other settings must keep saving) but is
+        // not configured; plain http to a remote host is refused.
+        let mut remote = loaded.ai.clone();
+        remote.base_url = "http://ai.example.com/v1".into();
+        assert!(!remote.is_configured());
+        assert!(remote.config_error().unwrap().contains("https"));
+        let mut no_model = loaded.ai;
+        no_model.model.clear();
+        assert_eq!(no_model.config_error().as_deref(), Some("Choose a model."));
+        // An empty base URL falls back to the default.
+        let mut cleared = Settings::default();
+        cleared.ai.base_url = "   ".into();
+        assert_eq!(
+            cleared.normalized().unwrap().ai.base_url,
+            DEFAULT_AI_BASE_URL
+        );
     }
 
     #[test]

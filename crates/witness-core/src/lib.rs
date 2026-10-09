@@ -7,11 +7,13 @@
 //! [`CoreEvent`]s through an [`EventSink`] and OS toasts go through a
 //! [`Notifier`].
 
+pub mod ai_client;
 pub mod asr;
 pub mod asr_parakeet;
 pub mod asr_whisper;
 pub mod audio_capture;
 pub mod backup;
+pub mod credentials;
 pub mod db;
 pub mod diarize;
 pub mod encoder;

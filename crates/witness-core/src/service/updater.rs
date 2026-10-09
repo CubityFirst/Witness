@@ -323,27 +323,43 @@ fn base64_to_string(b64: &str) -> anyhow::Result<String> {
 
 /// One agent for the feed and the installer download (redirects followed).
 fn agent() -> anyhow::Result<ureq::Agent> {
+    Ok(agent_builder("updater", &UPDATE_HOSTS)?
+        .timeout_read(READ_TIMEOUT)
+        .build())
+}
+
+/// The shared HTTPS client setup (the updater's, reused by the AI client):
+/// SChannel TLS (Windows certificate store), connect timeout, user agent,
+/// and the WinINet system proxy (else `HTTPS_PROXY`/`ALL_PROXY`) chosen for
+/// `hosts`. Loopback hosts always connect directly. `label` prefixes the
+/// proxy log lines. Callers add their own read/overall timeouts.
+pub(crate) fn agent_builder(label: &str, hosts: &[&str]) -> anyhow::Result<ureq::AgentBuilder> {
     let tls = native_tls::TlsConnector::new().context("TLS setup failed")?;
     let mut builder = ureq::AgentBuilder::new()
         .tls_connector(Arc::new(tls))
         .timeout_connect(CONNECT_TIMEOUT)
-        .timeout_read(READ_TIMEOUT)
         .user_agent(&format!("{APP_NAME}/{}", current_version()))
         // We pick the proxy ourselves: ureq's own environment lookup also
         // takes HTTP_PROXY for HTTPS requests and ignores NO_PROXY.
         .try_proxy_from_env(false);
+    if !hosts.is_empty() && hosts.iter().all(|host| is_loopback_host(host)) {
+        return Ok(builder);
+    }
     let environment = || {
-        env_proxy(|name| std::env::var(name).ok(), &UPDATE_HOSTS)
-            .and_then(|address| usable_proxy("environment", &address))
+        env_proxy(label, |name| std::env::var(name).ok(), hosts)
+            .and_then(|address| usable_proxy(label, "environment", &address))
     };
-    let proxy = match system_proxy() {
+    let proxy = match system_proxy(hosts) {
         // An unusable system proxy (e.g. an `https://` one, which ureq
         // cannot speak): the environment or a direct connection is the best
         // remaining try.
-        SystemProxy::Use(address) => usable_proxy("system", &address).or_else(environment),
+        SystemProxy::Use(address) => usable_proxy(label, "system", &address).or_else(environment),
         SystemProxy::Direct => {
             // WinINet says go direct; an environment proxy must not override it.
-            log::info!("updater: the system proxy is bypassed for the update hosts");
+            log::info!(
+                "{label}: the system proxy is bypassed for {}",
+                hosts.join(", ")
+            );
             None
         }
         SystemProxy::None => environment(),
@@ -351,18 +367,27 @@ fn agent() -> anyhow::Result<ureq::Agent> {
     if let Some(proxy) = proxy {
         builder = builder.proxy(proxy);
     }
-    Ok(builder.build())
+    Ok(builder)
+}
+
+/// `localhost`, `127.x.x.x` or `::1` (brackets allowed).
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// `address` as a ureq proxy, or None (logged) when ureq cannot use it.
-fn usable_proxy(source: &str, address: &str) -> Option<ureq::Proxy> {
+fn usable_proxy(label: &str, source: &str, address: &str) -> Option<ureq::Proxy> {
     match ureq::Proxy::new(address) {
         Ok(proxy) => {
-            log::info!("updater: using the {source} proxy {address}");
+            log::info!("{label}: using the {source} proxy {address}");
             Some(proxy)
         }
         Err(e) => {
-            log::warn!("updater: ignoring the unusable {source} proxy {address:?}: {e}");
+            log::warn!("{label}: ignoring the unusable {source} proxy {address:?}: {e}");
             None
         }
     }
@@ -372,7 +397,7 @@ fn usable_proxy(source: &str, address: &str) -> Option<ureq::Proxy> {
 /// `ALL_PROXY` (each upper case first, as reqwest read them) — unless
 /// `NO_PROXY` covers every one of `hosts`. `var` reads a variable (injected
 /// so tests need not touch the process environment).
-fn env_proxy(var: impl Fn(&str) -> Option<String>, hosts: &[&str]) -> Option<String> {
+fn env_proxy(label: &str, var: impl Fn(&str) -> Option<String>, hosts: &[&str]) -> Option<String> {
     let first_set = |names: &[&str]| {
         names
             .iter()
@@ -383,7 +408,10 @@ fn env_proxy(var: impl Fn(&str) -> Option<String>, hosts: &[&str]) -> Option<Str
     let address = first_set(&["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"])?;
     let no_proxy = first_set(&["NO_PROXY", "no_proxy"]).unwrap_or_default();
     if hosts.iter().all(|host| no_proxy_matches(&no_proxy, host)) {
-        log::info!("updater: NO_PROXY bypasses the environment proxy for the update hosts");
+        log::info!(
+            "{label}: NO_PROXY bypasses the environment proxy for {}",
+            hosts.join(", ")
+        );
         return None;
     }
     Some(address)
@@ -422,9 +450,9 @@ enum SystemProxy {
     None,
 }
 
-/// The WinINet proxy setting for the update hosts.
+/// The WinINet proxy setting for `hosts`.
 #[cfg(windows)]
-fn system_proxy() -> SystemProxy {
+fn system_proxy(hosts: &[&str]) -> SystemProxy {
     use winreg::enums::HKEY_CURRENT_USER;
     let Ok(settings) = winreg::RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
@@ -439,11 +467,11 @@ fn system_proxy() -> SystemProxy {
         return SystemProxy::None;
     };
     let overrides: String = settings.get_value("ProxyOverride").unwrap_or_default();
-    wininet_proxy(&server, &overrides, &UPDATE_HOSTS)
+    wininet_proxy(&server, &overrides, hosts)
 }
 
 #[cfg(not(windows))]
-fn system_proxy() -> SystemProxy {
+fn system_proxy(_hosts: &[&str]) -> SystemProxy {
     SystemProxy::None
 }
 
@@ -1408,11 +1436,15 @@ mod tests {
     #[test]
     fn env_proxy_reads_https_then_all_proxy_only() {
         let hosts = &UPDATE_HOSTS;
-        assert_eq!(env_proxy(env_of(&[]), hosts), None);
+        assert_eq!(env_proxy("test", env_of(&[]), hosts), None);
         // HTTP_PROXY is for plain-HTTP requests; ours are all HTTPS.
-        assert_eq!(env_proxy(env_of(&[("HTTP_PROXY", "h:1")]), hosts), None);
+        assert_eq!(
+            env_proxy("test", env_of(&[("HTTP_PROXY", "h:1")]), hosts),
+            None
+        );
         assert_eq!(
             env_proxy(
+                "test",
                 env_of(&[("ALL_PROXY", "a:1"), ("HTTPS_PROXY", "s:1")]),
                 hosts
             )
@@ -1421,6 +1453,7 @@ mod tests {
         );
         assert_eq!(
             env_proxy(
+                "test",
                 env_of(&[("all_proxy", " a:1 "), ("HTTPS_PROXY", "  ")]),
                 hosts
             )
@@ -1429,6 +1462,7 @@ mod tests {
         );
         assert_eq!(
             env_proxy(
+                "test",
                 env_of(&[("https_proxy", "l:1"), ("HTTPS_PROXY", "u:1")]),
                 hosts
             )
@@ -1442,6 +1476,7 @@ mod tests {
         let hosts = &UPDATE_HOSTS;
         let with = |no_proxy: &'static str| {
             env_proxy(
+                "test",
                 env_of(&[("HTTPS_PROXY", "p:1"), ("NO_PROXY", no_proxy)]),
                 hosts,
             )
@@ -1454,7 +1489,11 @@ mod tests {
         assert_eq!(with("github.com").as_deref(), Some("p:1"));
         assert_eq!(with("localhost,127.0.0.1").as_deref(), Some("p:1"));
         assert_eq!(
-            env_proxy(env_of(&[("HTTPS_PROXY", "p:1"), ("no_proxy", "*")]), hosts),
+            env_proxy(
+                "test",
+                env_of(&[("HTTPS_PROXY", "p:1"), ("no_proxy", "*")]),
+                hosts
+            ),
             None
         );
     }
