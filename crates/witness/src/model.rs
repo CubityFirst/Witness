@@ -10,7 +10,8 @@ use crate::ui::toasts::Notice;
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 use witness_core::events::{
-    LiveTranscript, ModelDownloadProgress, RecordingLevel, TranscriptionProgress, UpdateProgress,
+    AiOutcome, AiTask, LiveTranscript, ModelDownloadProgress, RecordingLevel,
+    TranscriptionProgress, UpdateProgress,
 };
 use witness_core::recorder::RecordingHealth;
 use witness_core::service::{AppStatus, UpdateInfo};
@@ -69,8 +70,21 @@ pub struct ShellModel {
     pub notes_acks: HashMap<i64, (u64, Option<String>)>,
     /// When the transcript's notes autosave fires (published via `UiCtx`).
     pub notes_deadline: Option<Instant>,
+    /// The AI assistant's tasks per meeting: queued/running (with the
+    /// latest stage) or failed. Finished tasks are removed (the meeting
+    /// reload shows their result).
+    pub ai_tasks: HashMap<(i64, AiTask), AiTaskState>,
     /// Whether a watcher status has been logged yet (acceptance aid).
     watcher_seen: bool,
+}
+
+/// One AI task of one meeting, as the transcript view shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AiTaskState {
+    /// Queued or running; the stage text ("Queued", "Writing notes"…).
+    Busy(String),
+    /// The last attempt failed.
+    Failed(String),
 }
 
 impl ShellModel {
@@ -199,6 +213,45 @@ impl ShellModel {
                 }
             }
             CoreEvent::MeetingsChanged => self.refresh_tick += 1,
+            CoreEvent::AiProgress(p) => {
+                self.ai_tasks
+                    .insert((p.meeting_id, p.task), AiTaskState::Busy(p.stage.clone()));
+            }
+            CoreEvent::AiDone(done) => {
+                let key = (done.meeting_id, done.task);
+                let what = match done.task {
+                    AiTask::Title => "title",
+                    AiTask::Summary => "summary",
+                };
+                match &done.outcome {
+                    AiOutcome::Applied => {
+                        self.ai_tasks.remove(&key);
+                        if !done.automatic {
+                            effects.push(Effect::Notice(Notice::success(match done.task {
+                                AiTask::Title => "AI title applied",
+                                AiTask::Summary => "AI summary ready",
+                            })));
+                        }
+                    }
+                    AiOutcome::Skipped(why) => {
+                        self.ai_tasks.remove(&key);
+                        // Automatic skips are routine (feature off, the user's
+                        // own title); a manual one says why nothing happened.
+                        if !done.automatic {
+                            effects
+                                .push(Effect::Notice(Notice::info(format!("No AI {what}: {why}"))));
+                        }
+                    }
+                    AiOutcome::Failed(error) => {
+                        self.ai_tasks
+                            .insert(key, AiTaskState::Failed(error.clone()));
+                        effects.push(Effect::Notice(Notice::error(
+                            &format!("The AI {what} failed"),
+                            error,
+                        )));
+                    }
+                }
+            }
             CoreEvent::UpdateProgress(p) => {
                 if matches!(self.update.phase, UpdatePhase::Installing(_)) {
                     self.update.progress = Some(p.clone());
@@ -222,9 +275,7 @@ impl ShellModel {
             CoreEvent::TrayRecording(_)
             | CoreEvent::TrayWarning(_)
             | CoreEvent::OpenCaptionsOverlay { .. }
-            | CoreEvent::CloseCaptionsOverlay
-            | CoreEvent::AiProgress(_)
-            | CoreEvent::AiDone(_) => {}
+            | CoreEvent::CloseCaptionsOverlay => {}
         }
         effects
     }
@@ -545,6 +596,63 @@ mod tests {
         m.set_status(status(false, None));
         m.apply(&CoreEvent::WatcherStatus(w));
         assert!(m.status.as_ref().unwrap().watcher.mic_in_use);
+    }
+
+    #[test]
+    fn ai_events_track_tasks_and_toast_what_matters() {
+        use witness_core::events::{AiDone, AiProgress};
+        let mut m = ShellModel::new();
+        let progress = |stage: &str| {
+            CoreEvent::AiProgress(AiProgress {
+                meeting_id: 4,
+                task: AiTask::Summary,
+                stage: stage.into(),
+            })
+        };
+        let done = |automatic, outcome| {
+            CoreEvent::AiDone(AiDone {
+                meeting_id: 4,
+                task: AiTask::Summary,
+                automatic,
+                outcome,
+            })
+        };
+        assert!(m.apply(&progress("Queued")).is_empty());
+        m.apply(&progress("Writing notes"));
+        assert_eq!(
+            m.ai_tasks.get(&(4, AiTask::Summary)),
+            Some(&AiTaskState::Busy("Writing notes".into()))
+        );
+        // A manual success clears the task and says so.
+        let effects = m.apply(&done(false, AiOutcome::Applied));
+        assert!(m.ai_tasks.is_empty());
+        assert!(matches!(&effects[..], [Effect::Notice(n)] if n.message == "AI summary ready"));
+        // Automatic success and skips are quiet.
+        m.apply(&progress("Queued"));
+        assert!(m.apply(&done(true, AiOutcome::Applied)).is_empty());
+        assert!(m
+            .apply(&done(true, AiOutcome::Skipped("off".into())))
+            .is_empty());
+        // A manual skip explains itself.
+        let effects = m.apply(&done(false, AiOutcome::Skipped("no transcript".into())));
+        assert!(
+            matches!(&effects[..], [Effect::Notice(n)] if n.message == "No AI summary: no transcript")
+        );
+        // Failures stay visible on the meeting and toast.
+        let effects = m.apply(&done(true, AiOutcome::Failed("429".into())));
+        assert_eq!(
+            m.ai_tasks.get(&(4, AiTask::Summary)),
+            Some(&AiTaskState::Failed("429".into()))
+        );
+        assert!(
+            matches!(&effects[..], [Effect::Notice(n)] if n.message == "The AI summary failed: 429")
+        );
+        // A new attempt replaces the failure.
+        m.apply(&progress("Queued"));
+        assert!(matches!(
+            m.ai_tasks.get(&(4, AiTask::Summary)),
+            Some(AiTaskState::Busy(_))
+        ));
     }
 
     #[test]

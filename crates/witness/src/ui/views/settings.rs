@@ -1,5 +1,6 @@
 //! Settings: Appearance, Startup, Updates, Storage, Recording,
-//! Transcription, Models, Diagnostics and Voice prints sections
+//! Transcription, AI assistant (`ai_settings.rs`), Models, Diagnostics and
+//! Voice prints sections
 //! (map-ui-settings §1, settings.tsx).
 //!
 //! - **Layout** (design/ui-rework.md): a sticky page title, then per section
@@ -28,6 +29,7 @@
 //! - Native dialogs block, so they only run inside those worker closures,
 //!   parented through `cx.dialog_owner()` (which pins the tray flyout).
 
+use super::ai_settings::AiSection;
 use super::updates::UpdatesSection;
 use crate::bridge::{OpDone, OpHandle, Task};
 use crate::platform::{autostart, dialogs, system};
@@ -158,6 +160,7 @@ impl Default for SettingsView {
 
 struct SettingsState {
     updates: UpdatesSection,
+    ai: AiSection,
     loads: Loads,
     /// First pass done (loads started, ticks recorded).
     mounted: bool,
@@ -224,6 +227,7 @@ impl SettingsState {
     fn new() -> Self {
         SettingsState {
             updates: UpdatesSection::new(),
+            ai: AiSection::new(),
             loads: Loads::default(),
             mounted: false,
             seen_download_tick: 0,
@@ -295,6 +299,7 @@ impl SettingsState {
             self.storage(ui, cx);
             self.recording(ui, cx);
             self.transcription(ui, cx);
+            self.ai.show(ui, cx);
             self.models_section(ui, cx);
             self.diagnostics_section(ui, cx);
             self.people_section(ui, cx);
@@ -350,6 +355,7 @@ impl SettingsState {
     /// Save the watch patterns / noise phrases if they were typed into
     /// since their last commit, and a slider value still being dragged.
     fn commit_drafts(&mut self, cx: &mut UiCtx) {
+        self.ai.commit_drafts(cx);
         if let Some(threshold) = self.local_threshold.take() {
             if threshold != cx.settings.current().speaker_match_threshold {
                 save(cx, |s| s.speaker_match_threshold = threshold);
@@ -1368,7 +1374,7 @@ impl SettingsState {
 // Action helpers
 
 /// Save `edit` applied to the store's current (optimistic) settings.
-fn save(cx: &mut UiCtx, edit: impl FnOnce(&mut Settings)) {
+pub(crate) fn save(cx: &mut UiCtx, edit: impl FnOnce(&mut Settings)) {
     let mut next = cx.settings.current().clone();
     edit(&mut next);
     cx.settings.save(next, cx.tasks);
@@ -2021,7 +2027,7 @@ fn hotkey_row(ui: &mut egui::Ui, name: &str, what: &str, combo: Option<&str>) {
 /// under the text instead.
 const TEXT_MIN_WIDTH: f32 = 200.0;
 /// Room for a select / text field / slider beside its text.
-const FIELD_WIDTH: f32 = 260.0;
+pub(crate) const FIELD_WIDTH: f32 = 260.0;
 /// The gap between a row's text and its control.
 const ROW_GAP: f32 = theme::S4;
 /// Diagnostics key column; under this much row width keys stack.

@@ -43,8 +43,10 @@
 //! them when playback follows along — and find searches only the shown
 //! lines.
 
+use super::ai_summary::{self, SummaryAction, SummaryInput};
 use super::player_bar::{self, PlayerBarState, Timeline, TimelineSpan, TimelineSpeaker};
 use crate::bridge::{OpDone, Task};
+use crate::model::AiTaskState;
 use crate::platform::dialogs::{self, SaveFileRequest};
 use crate::ui::format::{
     fmt_date, fmt_duration, fmt_thousands, fmt_ts, highlight_ranges, highlight_tokens,
@@ -64,7 +66,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use witness_core::db::{Bookmark, Meeting, Segment, Speaker};
-use witness_core::events::LiveTranscript;
+use witness_core::events::{AiTask, LiveTranscript};
 use witness_core::player::{PlayerLoad, PlayerSnapshot};
 use witness_core::service::{MeetingDetail, PersonInfo};
 use witness_core::settings::Engine;
@@ -878,6 +880,17 @@ fn queued_notes_for(queued: Option<&QueuedNotes>, started_at: &str) -> Option<(u
     queued
         .filter(|q| q.started_at == started_at)
         .map(|q| (q.seq, q.text.clone()))
+}
+
+/// "Copy to notes": the notes with the AI summary appended after a blank
+/// line (the user's text is never replaced).
+fn notes_with_summary(notes: &str, summary: &str) -> String {
+    let notes = notes.trim_end();
+    if notes.is_empty() {
+        summary.to_string()
+    } else {
+        format!("{notes}\n\n{summary}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2449,6 +2462,11 @@ struct TranscriptState {
     play_origin: PlayOrigin,
     /// The live-caption feed's stick-to-bottom tracking.
     live_feed: LiveFeedState,
+    /// The Summary disclosure; None until the first load decides (open
+    /// when there is a summary).
+    summary_open: Option<bool>,
+    /// An AI summary task was showing last pass (a new one opens the panel).
+    summary_seen_task: bool,
     /// Debug builds: snapshot states asked for by environment variables.
     debug: DebugHooks,
 }
@@ -2507,6 +2525,8 @@ impl TranscriptState {
             player_bar: PlayerBarState::with_volume_open(debug.volume),
             play_origin: PlayOrigin::Bar,
             live_feed: LiveFeedState::default(),
+            summary_open: None,
+            summary_seen_task: false,
             debug,
         }
     }
@@ -2826,11 +2846,18 @@ impl TranscriptState {
         self.poll_audio(cx);
     }
 
-    fn set_detail(&mut self, ctx: &egui::Context, cx: &mut UiCtx, detail: MeetingDetail) {
+    fn set_detail(&mut self, ctx: &egui::Context, cx: &mut UiCtx, mut detail: MeetingDetail) {
+        self.debug.ai.apply(&mut detail.meeting);
+        if self.summary_open.is_none() {
+            // Open when there is a summary (or a debug state to show).
+            self.summary_open =
+                Some(!detail.meeting.ai_summary.trim().is_empty() || self.debug.ai.state.is_some());
+        }
         cx.fonts.note_texts(
             ctx,
             std::iter::once(detail.meeting.title.as_str())
                 .chain(std::iter::once(detail.meeting.notes.as_str()))
+                .chain(std::iter::once(detail.meeting.ai_summary.as_str()))
                 .chain(detail.speakers.iter().map(|s| s.display_name.as_str()))
                 .chain(detail.segments.iter().map(|s| s.text.as_str()))
                 .chain(detail.bookmarks.iter().map(|b| b.note.as_str())),
@@ -3352,6 +3379,7 @@ impl TranscriptState {
         }
 
         self.notes_panel(ui, cx);
+        self.summary_section(ui, cx);
 
         let has_audio_path = self
             .detail
@@ -3425,7 +3453,12 @@ impl TranscriptState {
         if let Some(engine) = &meeting.engine {
             meta.push_str(&format!(" · {engine}"));
         }
+        if matches!(self.ai_task(cx, AiTask::Title), Some(AiTaskState::Busy(_))) {
+            meta.push_str(" · writing a title…");
+        }
         let has_segments = !detail.segments.is_empty();
+        let has_summary = !meeting.ai_summary.trim().is_empty();
+        let ai = self.ai_configured(cx);
         let copied = self.copied_until.is_some_and(|t| Instant::now() < t);
         let open_menu = self.debug.menu.take();
         let layout = header_layout(self.pane(cx));
@@ -3433,6 +3466,7 @@ impl TranscriptState {
         let mut back = false;
         let mut export_choice = None;
         let mut engine_choice = None;
+        let mut ai_choice = None;
         let mut start_edit = false;
         let mut title_done = None;
         // The row is as tall as the title block, and the buttons centre on
@@ -3458,6 +3492,25 @@ impl TranscriptState {
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
+                    // Only with a configured AI service (Settings → AI assistant).
+                    if ai {
+                        ai_choice = header_menu(
+                            ui,
+                            ph::SPARKLE,
+                            "AI assistant",
+                            "AI assistant",
+                            has_segments,
+                            &[
+                                "Generate title",
+                                if has_summary {
+                                    "Regenerate summary"
+                                } else {
+                                    "Generate summary"
+                                },
+                            ],
+                            open_menu.as_deref() == Some("ai"),
+                        );
+                    }
                     engine_choice = header_menu(
                         ui,
                         ph::ARROWS_CLOCKWISE,
@@ -3535,6 +3588,11 @@ impl TranscriptState {
             Some(2) => self.export_transcript(cx, ExportFormat::Text),
             Some(3) => self.export_transcript(cx, ExportFormat::Srt),
             Some(4) => self.export_transcript(cx, ExportFormat::Vtt),
+            _ => {}
+        }
+        match ai_choice {
+            Some(0) => self.ai_generate(cx, AiTask::Title),
+            Some(1) => self.ai_generate(cx, AiTask::Summary),
             _ => {}
         }
         match engine_choice {
@@ -3731,6 +3789,90 @@ impl TranscriptState {
         } else {
             widgets::gap(ui, theme::S1);
         }
+    }
+
+    /// The AI Summary disclosure under the notes (`ai_summary.rs`).
+    fn summary_section(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
+        let configured = self.ai_configured(cx);
+        let task = self.ai_task(cx, AiTask::Summary);
+        let Some(detail) = self.detail.as_ref() else {
+            return;
+        };
+        let meeting = &detail.meeting;
+        let input = SummaryInput {
+            meeting_id: self.meeting_id,
+            summary: &meeting.ai_summary,
+            stale: meeting.ai_summary_stale,
+            generated_at: meeting.ai_summary_at.as_deref(),
+            has_transcript: !detail.segments.is_empty(),
+            configured,
+            task: task.as_ref(),
+        };
+        if !ai_summary::shows(&input) {
+            return;
+        }
+        // A job that starts opens the panel, so its progress is visible.
+        let open = self.summary_open.get_or_insert(false);
+        if task.is_some() && !self.summary_seen_task {
+            *open = true;
+        }
+        self.summary_seen_task = task.is_some();
+        let action = ai_summary::summary_panel(ui, open, &input);
+        match action {
+            SummaryAction::None => {}
+            SummaryAction::Generate => self.ai_generate(cx, AiTask::Summary),
+            SummaryAction::CopyToNotes => self.copy_summary_to_notes(cx),
+            SummaryAction::OpenSettings => cx.nav.go(View::Settings),
+        }
+    }
+
+    /// AI actions show only with the assistant on and set up.
+    fn ai_configured(&self, cx: &UiCtx) -> bool {
+        self.debug
+            .ai
+            .configured(cx.settings.current().ai.is_configured())
+    }
+
+    /// The meeting's queued / running / failed AI task, if any.
+    fn ai_task(&self, cx: &UiCtx, task: AiTask) -> Option<AiTaskState> {
+        self.debug
+            .ai
+            .task(task)
+            .or_else(|| cx.shell.ai_tasks.get(&(self.meeting_id, task)).cloned())
+    }
+
+    /// Queue an AI title / summary (the core's worker does the request).
+    fn ai_generate(&mut self, cx: &mut UiCtx, task: AiTask) {
+        if self.synthetic {
+            return;
+        }
+        if task == AiTask::Summary {
+            self.summary_open = Some(true);
+        }
+        if let Err(error) = cx.core.ai_generate(self.meeting_id, task) {
+            cx.toasts.error("Could not ask the AI assistant", error);
+        }
+    }
+
+    /// Append the summary to the user's notes (never replacing them),
+    /// through the same ordered writer as typing.
+    fn copy_summary_to_notes(&mut self, cx: &mut UiCtx) {
+        let Some(summary) = self
+            .detail
+            .as_ref()
+            .map(|d| d.meeting.ai_summary.trim().to_string())
+            .filter(|s| !s.is_empty())
+        else {
+            return;
+        };
+        if !self.notes.loaded {
+            return;
+        }
+        self.notes.draft = notes_with_summary(&self.notes.draft, &summary);
+        self.notes.edited();
+        self.notes.open = true;
+        self.flush(cx);
+        cx.toasts.success("Summary added to your notes");
     }
 
     // ------------------------------------------------------------------
@@ -4714,6 +4856,61 @@ struct DebugHooks {
     /// `WITNESS_DEBUG_TRANSCRIPT_PANE=detail`: drawn as the split
     /// layout's detail pane (no Back button).
     pane: Option<PaneRole>,
+    /// `WITNESS_DEBUG_AI_SUMMARY` / `WITNESS_DEBUG_AI_STATE`.
+    ai: AiDebug,
+}
+
+/// Debug builds: the AI summary states without a service.
+/// `WITNESS_DEBUG_AI_SUMMARY=sample|<markdown>` shows that summary (never
+/// written); `WITNESS_DEBUG_AI_STATE=busy|failed|stale|off` shows a task in
+/// progress, a failure, a summary from an earlier transcript, or the
+/// not-configured hint. Either one alone counts as "configured".
+#[derive(Debug, Default, Clone)]
+struct AiDebug {
+    summary: Option<String>,
+    state: Option<String>,
+}
+
+impl AiDebug {
+    fn active(&self) -> bool {
+        self.summary.is_some() || self.state.is_some()
+    }
+
+    fn apply(&self, meeting: &mut Meeting) {
+        if let Some(summary) = &self.summary {
+            meeting.ai_summary = if summary == "sample" {
+                ai_summary::SAMPLE_SUMMARY.to_string()
+            } else {
+                summary.replace("\\n", "\n")
+            };
+            meeting.ai_summary_at = Some(meeting.started_at.clone());
+        }
+        if self.state.as_deref() == Some("stale") {
+            meeting.ai_summary_stale = true;
+        }
+    }
+
+    fn configured(&self, real: bool) -> bool {
+        if self.state.as_deref() == Some("off") {
+            false
+        } else {
+            real || self.active()
+        }
+    }
+
+    fn task(&self, task: AiTask) -> Option<AiTaskState> {
+        if task != AiTask::Summary {
+            return None;
+        }
+        match self.state.as_deref() {
+            Some("busy") => Some(AiTaskState::Busy("Writing notes".into())),
+            Some("failed") => Some(AiTaskState::Failed(
+                "The AI service rejected the API key (401). Check the key in Settings → AI assistant."
+                    .into(),
+            )),
+            _ => None,
+        }
+    }
 }
 
 /// `<query>[,<index>]`: a trailing number after the last comma is the hit
@@ -4749,6 +4946,14 @@ fn debug_hooks() -> DebugHooks {
         pane: var("PANE")
             .filter(|v| v == "detail")
             .map(|_| PaneRole::Detail),
+        ai: AiDebug {
+            summary: std::env::var("WITNESS_DEBUG_AI_SUMMARY")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            state: std::env::var("WITNESS_DEBUG_AI_STATE")
+                .ok()
+                .filter(|v| !v.is_empty()),
+        },
     }
 }
 
@@ -5038,6 +5243,26 @@ mod tests {
             .filter(|s| s.format.background == pal().mark_bg)
             .count();
         assert_eq!(marks, 2);
+    }
+
+    #[test]
+    fn copy_to_notes_appends_and_never_replaces() {
+        assert_eq!(notes_with_summary("", "## Summary\nx"), "## Summary\nx");
+        assert_eq!(
+            notes_with_summary("my notes\n\n", "## Summary\nx"),
+            "my notes\n\n## Summary\nx"
+        );
+        let mut debug = AiDebug::default();
+        assert!(!debug.configured(false) && debug.configured(true));
+        debug.state = Some("off".into());
+        assert!(!debug.configured(true));
+        debug.state = Some("busy".into());
+        assert!(debug.configured(false));
+        assert!(matches!(
+            debug.task(AiTask::Summary),
+            Some(AiTaskState::Busy(_))
+        ));
+        assert_eq!(debug.task(AiTask::Title), None);
     }
 
     #[test]

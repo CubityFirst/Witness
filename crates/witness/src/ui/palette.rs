@@ -26,6 +26,7 @@ use eframe::egui::{
     RichText, Sense, Stroke, WidgetInfo, WidgetType,
 };
 use witness_core::db::Meeting;
+use witness_core::events::AiTask;
 use witness_core::service::PersonInfo;
 use witness_core::{CoreResult, RecCmd, Trigger};
 
@@ -243,6 +244,9 @@ enum Command {
     SearchTranscripts(String),
     OpenMeeting(i64),
     OpenPerson(i64),
+    /// Ask the AI assistant for the open transcript's summary / title.
+    AiSummary(i64),
+    AiTitle(i64),
 }
 
 impl Command {
@@ -301,6 +305,8 @@ struct ActionState {
     dark: bool,
     record_hotkey: Option<String>,
     bookmark_hotkey: Option<String>,
+    /// The open transcript, when the AI assistant is set up (its actions).
+    ai_meeting: Option<i64>,
 }
 
 impl ActionState {
@@ -319,6 +325,12 @@ impl ActionState {
             dark: pal().dark,
             record_hotkey: cx.shell.record_hotkey.clone(),
             bookmark_hotkey: cx.shell.bookmark_hotkey.clone(),
+            ai_meeting: match cx.view {
+                View::Transcript { meeting_id, .. } if cx.settings.current().ai.is_configured() => {
+                    Some(*meeting_id)
+                }
+                _ => None,
+            },
         };
         if debug_fake_recording() {
             state.recording = true;
@@ -409,6 +421,20 @@ fn actions(state: &ActionState) -> Vec<ActionSpec> {
                 Glyph::RecIcon(ph::RECORD),
             )
         });
+    }
+    if let Some(id) = state.ai_meeting {
+        out.push(spec(
+            Command::AiSummary(id),
+            "Generate summary",
+            "ai assistant notes action items decisions summarize",
+            Glyph::Icon(ph::SPARKLE),
+        ));
+        out.push(spec(
+            Command::AiTitle(id),
+            "Generate title",
+            "ai assistant name rename meeting",
+            Glyph::Icon(ph::SPARKLE),
+        ));
     }
     out.push(spec(
         Command::GoMeetings,
@@ -1361,6 +1387,16 @@ fn run(command: Command, cx: &mut UiCtx) {
             cx.nav.go(View::People);
         }
         Command::GoSettings => cx.nav.go(View::Settings),
+        Command::AiSummary(id) | Command::AiTitle(id) => {
+            let task = if matches!(command, Command::AiTitle(_)) {
+                AiTask::Title
+            } else {
+                AiTask::Summary
+            };
+            if let Err(error) = cx.core.ai_generate(id, task) {
+                cx.toasts.error("Could not ask the AI assistant", error);
+            }
+        }
         Command::Theme { dark } => {
             cx.prefs.appearance = if dark {
                 Appearance::Dark
@@ -1600,6 +1636,16 @@ mod tests {
         };
         assert!(!has(&quitting, &Command::StartRecording));
         assert!(has(&quitting, &Command::GoSettings));
+        // AI actions only for an open transcript with the assistant set up.
+        assert!(!actions(&ActionState::default())
+            .iter()
+            .any(|a| matches!(a.command, Command::AiSummary(_) | Command::AiTitle(_))));
+        let ai = ActionState {
+            ai_meeting: Some(9),
+            ..ActionState::default()
+        };
+        assert!(has(&ai, &Command::AiSummary(9)));
+        assert!(has(&ai, &Command::AiTitle(9)));
     }
 
     #[test]
