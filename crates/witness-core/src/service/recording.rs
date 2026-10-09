@@ -4,6 +4,7 @@
 //! WASAPI directly — capture runs on its own threads owned by the recorder.
 
 use super::{assert_off_ui_thread, err, AppCore, AppStatus, CoreEvent, CoreResult, Trigger};
+use crate::db::TitleSource;
 use crate::events;
 use crate::pipeline::Job;
 use crate::recorder::{self, RecordingHealth};
@@ -307,14 +308,22 @@ impl AppCore {
                     let Ok(Some(meeting)) = state.db.get_meeting(id) else {
                         return;
                     };
-                    if !meeting.title.starts_with("Meeting 2") {
+                    if meeting.title_source != TitleSource::AUTO {
                         return; // user already renamed
                     }
                     let pre_call = state.watcher.idle_teams_windows.lock().unwrap().clone();
                     if let Some(title) = crate::meeting_title::find_teams_meeting_title(&pre_call) {
-                        log::info!("meeting {id}: auto-named from Teams window: {title}");
-                        let _ = state.db.rename_meeting(id, &title);
-                        sink.emit(CoreEvent::MeetingsChanged);
+                        // Compare-and-swap: a rename since the read wins.
+                        if let Ok(true) = state.db.replace_title_if(
+                            id,
+                            &title,
+                            TitleSource::TEAMS,
+                            &meeting.title,
+                            TitleSource::AUTO,
+                        ) {
+                            log::info!("meeting {id}: auto-named from Teams window: {title}");
+                            sink.emit(CoreEvent::MeetingsChanged);
+                        }
                         return;
                     }
                 }

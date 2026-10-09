@@ -4874,6 +4874,7 @@ fn synthetic_detail(meeting_id: i64, count: usize) -> MeetingDetail {
             engine: Some("parakeet".into()),
             trigger: "manual".into(),
             notes: String::new(),
+            ..Meeting::default()
         },
         speakers,
         segments,

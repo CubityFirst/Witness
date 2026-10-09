@@ -2332,6 +2332,7 @@ mod tests {
             engine: None,
             trigger: trigger.into(),
             notes: String::new(),
+            ..Meeting::default()
         }
     }
 

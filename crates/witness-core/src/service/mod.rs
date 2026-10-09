@@ -11,6 +11,7 @@
 //! are safe on the UI thread because they only touch short-lived locks no
 //! thread holds across I/O, or a channel.
 
+pub(crate) mod ai;
 pub(crate) mod level_check;
 pub(crate) mod library;
 pub(crate) mod maintenance;
@@ -89,6 +90,11 @@ pub enum CoreEvent {
         seq: u64,
         error: String,
     },
+    /// The AI assistant queued or advanced a task (`service/ai.rs`).
+    AiProgress(events::AiProgress),
+    /// An AI task finished (applied, skipped or failed). A success is
+    /// followed by `MeetingsChanged`.
+    AiDone(events::AiDone),
 }
 
 impl CoreEvent {
@@ -180,6 +186,8 @@ pub struct AppCore {
     pub(crate) pending_update: Mutex<Option<updater::Release>>,
     rec_tx: Sender<rec_control::Request>,
     notes: notes::NotesWriter,
+    /// The opt-in AI assistant's worker (`service/ai.rs`).
+    ai: ai::AiService,
     relaunch_args: Vec<OsString>,
     /// Self-reference for work that must outlive a `&self` borrow
     /// (`emergency_stop`'s helper thread).
@@ -216,12 +224,29 @@ impl AppCore {
 
         let db = Arc::new(Db::open(&settings.db_path())?);
 
-        // Pipeline worker: forwards its events to the UI + toasts.
+        // The AI worker (idle unless the user turned the assistant on).
+        // Unit tests never reach the real Credential Manager.
         let settings = Arc::new(Mutex::new(settings));
+        #[cfg(not(test))]
+        let credentials: Arc<dyn crate::credentials::CredentialStore> =
+            Arc::new(crate::credentials::WindowsCredentials::new());
+        #[cfg(test)]
+        let credentials: Arc<dyn crate::credentials::CredentialStore> =
+            Arc::new(crate::credentials::MemoryCredentials::default());
+        let ai = ai::AiService::spawn(ai::AiEnv {
+            db: db.clone(),
+            settings: settings.clone(),
+            sink: sink.clone(),
+            notifier: notifier.clone(),
+            transport: Arc::new(crate::ai_client::UreqTransport),
+            credentials,
+        });
+
+        // Pipeline worker: forwards its events to the UI + toasts.
         let pipeline = crate::pipeline::spawn(
             db.clone(),
             settings.clone(),
-            pipeline_adapter(db.clone(), sink.clone(), notifier.clone()),
+            pipeline_adapter(db.clone(), sink.clone(), notifier.clone(), ai.clone()),
         );
 
         let (auto_record, patterns, configured_data_dir) = {
@@ -261,6 +286,7 @@ impl AppCore {
             pending_update: Mutex::new(None),
             rec_tx: rec_control::spawn(weak.clone()),
             notes: notes::NotesWriter::spawn(weak.clone()),
+            ai,
             relaunch_args: std::env::args_os().skip(1).collect(),
             this: weak.clone(),
         });
@@ -398,6 +424,7 @@ fn pipeline_adapter(
     db: Arc<Db>,
     sink: Arc<dyn EventSink>,
     notifier: Arc<dyn Notifier>,
+    ai: ai::AiService,
 ) -> impl Fn(PipelineEvent) + Send + 'static {
     move |event| match event {
         PipelineEvent::Progress {
@@ -430,6 +457,9 @@ fn pipeline_adapter(
                         .map(|r| format!(" ({r:.0}× realtime)"))
                         .unwrap_or_default();
                     notifier.toast(&format!("Transcript ready: {}{speed}", m.title));
+                    // The automatic AI features that are on (none by default;
+                    // a no-op while the assistant is off). Its own thread.
+                    ai.on_transcribed(meeting_id);
                 }
             }
         }

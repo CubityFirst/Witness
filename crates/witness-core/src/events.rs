@@ -82,3 +82,43 @@ pub struct UpdateProgress {
     pub downloaded: u64,
     pub total: Option<u64>,
 }
+
+/// What the AI assistant writes for a meeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+pub enum AiTask {
+    Title,
+    /// The notes (`meetings.ai_summary`).
+    Summary,
+}
+
+/// An AI job for one meeting was queued or moved on. `stage` is a short
+/// human-readable step ("Queued", "Reading part 2 of 5", "Writing notes").
+#[derive(Debug, Clone, Serialize)]
+pub struct AiProgress {
+    pub meeting_id: i64,
+    pub task: AiTask,
+    pub stage: String,
+}
+
+/// How an AI task ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum AiOutcome {
+    /// Written to the meeting.
+    Applied,
+    /// Not run or not written, and that is fine (feature off, the user
+    /// renamed the meeting meanwhile, nothing to summarise…); the reason is
+    /// for manual requests' feedback.
+    Skipped(String),
+    /// A failure worth telling the user (no secrets in it).
+    Failed(String),
+}
+
+/// An AI task finished. `automatic` = started by a finished transcription,
+/// not by the user.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiDone {
+    pub meeting_id: i64,
+    pub task: AiTask,
+    pub automatic: bool,
+    pub outcome: AiOutcome,
+}

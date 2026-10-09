@@ -1063,6 +1063,7 @@ mod tests {
             engine: None,
             trigger: "manual".into(),
             notes: String::new(),
+            ..Meeting::default()
         }
     }
 

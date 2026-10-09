@@ -222,7 +222,9 @@ impl ShellModel {
             CoreEvent::TrayRecording(_)
             | CoreEvent::TrayWarning(_)
             | CoreEvent::OpenCaptionsOverlay { .. }
-            | CoreEvent::CloseCaptionsOverlay => {}
+            | CoreEvent::CloseCaptionsOverlay
+            | CoreEvent::AiProgress(_)
+            | CoreEvent::AiDone(_) => {}
         }
         effects
     }
