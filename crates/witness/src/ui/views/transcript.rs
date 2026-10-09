@@ -883,14 +883,19 @@ fn queued_notes_for(queued: Option<&QueuedNotes>, started_at: &str) -> Option<(u
 }
 
 /// "Copy to notes": the notes with the AI summary appended after a blank
-/// line (the user's text is never replaced).
-fn notes_with_summary(notes: &str, summary: &str) -> String {
+/// line (the user's text is never replaced), or None when the notes
+/// already contain it (a second click must not append it twice).
+fn notes_with_summary(notes: &str, summary: &str) -> Option<String> {
+    let summary = summary.trim();
+    if summary.is_empty() || notes.contains(summary) {
+        return None;
+    }
     let notes = notes.trim_end();
-    if notes.is_empty() {
+    Some(if notes.is_empty() {
         summary.to_string()
     } else {
         format!("{notes}\n\n{summary}")
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2467,6 +2472,8 @@ struct TranscriptState {
     summary_open: Option<bool>,
     /// An AI summary task was showing last pass (a new one opens the panel).
     summary_seen_task: bool,
+    /// The summary parsed once per text (not every frame).
+    summary_md: ai_summary::MdCache,
     /// Debug builds: snapshot states asked for by environment variables.
     debug: DebugHooks,
 }
@@ -2527,6 +2534,7 @@ impl TranscriptState {
             live_feed: LiveFeedState::default(),
             summary_open: None,
             summary_seen_task: false,
+            summary_md: ai_summary::MdCache::default(),
             debug,
         }
     }
@@ -3817,7 +3825,7 @@ impl TranscriptState {
             *open = true;
         }
         self.summary_seen_task = task.is_some();
-        let action = ai_summary::summary_panel(ui, open, &input);
+        let action = ai_summary::summary_panel(ui, open, &input, &mut self.summary_md);
         match action {
             SummaryAction::None => {}
             SummaryAction::Generate => self.ai_generate(cx, AiTask::Summary),
@@ -3868,7 +3876,13 @@ impl TranscriptState {
         if !self.notes.loaded {
             return;
         }
-        self.notes.draft = notes_with_summary(&self.notes.draft, &summary);
+        let Some(draft) = notes_with_summary(&self.notes.draft, &summary) else {
+            self.notes.open = true;
+            cx.toasts
+                .push(Notice::info("The summary is already in your notes"));
+            return;
+        };
+        self.notes.draft = draft;
         self.notes.edited();
         self.notes.open = true;
         self.flush(cx);
@@ -5247,11 +5261,15 @@ mod tests {
 
     #[test]
     fn copy_to_notes_appends_and_never_replaces() {
-        assert_eq!(notes_with_summary("", "## Summary\nx"), "## Summary\nx");
         assert_eq!(
-            notes_with_summary("my notes\n\n", "## Summary\nx"),
-            "my notes\n\n## Summary\nx"
+            notes_with_summary("", "## Summary\nx").as_deref(),
+            Some("## Summary\nx")
         );
+        let once = notes_with_summary("my notes\n\n", "## Summary\nx").unwrap();
+        assert_eq!(once, "my notes\n\n## Summary\nx");
+        // A second "Copy to notes" does not append it again.
+        assert_eq!(notes_with_summary(&once, "## Summary\nx\n"), None);
+        assert_eq!(notes_with_summary("notes", "  "), None);
         let mut debug = AiDebug::default();
         assert!(!debug.configured(false) && debug.configured(true));
         debug.state = Some("off".into());

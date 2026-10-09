@@ -54,6 +54,7 @@ pub(crate) fn summary_panel(
     ui: &mut egui::Ui,
     open: &mut bool,
     input: &SummaryInput,
+    md: &mut MdCache,
 ) -> SummaryAction {
     let busy = match input.task {
         Some(AiTaskState::Busy(stage)) => Some(stage.as_str()),
@@ -76,7 +77,7 @@ pub(crate) fn summary_panel(
     let preview = if *open {
         None
     } else if !summary.is_empty() {
-        first_text_line(summary)
+        md.parsed(summary).1.map(str::to_owned)
     } else if input.configured {
         Some("Not written yet".to_string())
     } else {
@@ -187,7 +188,7 @@ pub(crate) fn summary_panel(
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 4.0;
-                render_markdown(ui, summary);
+                render_blocks(ui, md.parsed(summary).0);
             });
         widgets::gap(ui, theme::S2);
     } else if let Some(stage) = busy {
@@ -305,16 +306,34 @@ fn elided(ui: &egui::Ui, text: &str, width: f32) -> std::sync::Arc<egui::Galley>
     ui.painter().layout_job(job)
 }
 
+/// The parsed summary, re-parsed only when its text changes (not every
+/// frame): the blocks and the closed-row preview line.
+#[derive(Debug, Default)]
+pub(crate) struct MdCache {
+    text: String,
+    blocks: Vec<Block>,
+    preview: Option<String>,
+}
+
+impl MdCache {
+    pub(crate) fn parsed(&mut self, markdown: &str) -> (&[Block], Option<&str>) {
+        if self.text != markdown || (self.blocks.is_empty() && !markdown.is_empty()) {
+            self.text = markdown.to_string();
+            self.blocks = md_blocks(markdown);
+            self.preview = first_text_line(&self.blocks);
+        }
+        (&self.blocks, self.preview.as_deref())
+    }
+}
+
 /// The first line with text, without Markdown markers (closed preview).
-fn first_text_line(markdown: &str) -> Option<String> {
-    md_blocks(markdown)
-        .into_iter()
-        .find_map(|block| match block {
-            Block::Paragraph(text) | Block::Bullet { text, .. } => {
-                Some(strip_inline(&text)).filter(|t| !t.is_empty())
-            }
-            _ => None,
-        })
+fn first_text_line(blocks: &[Block]) -> Option<String> {
+    blocks.iter().find_map(|block| match block {
+        Block::Paragraph(text) | Block::Bullet { text, .. } => {
+            Some(strip_inline(text)).filter(|t| !t.is_empty())
+        }
+        _ => None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -437,8 +456,7 @@ fn inline_job(text: &str, size: f32, color: egui::Color32) -> egui::text::Layout
     job
 }
 
-fn render_markdown(ui: &mut egui::Ui, markdown: &str) {
-    let blocks = md_blocks(markdown);
+fn render_blocks(ui: &mut egui::Ui, blocks: &[Block]) {
     for (index, block) in blocks.iter().enumerate() {
         match block {
             Block::Heading(level, text) => {
@@ -537,8 +555,23 @@ mod tests {
             vec![("Ann".into(), true), (" — ship v2".into(), false)]
         );
         assert_eq!(inline_runs("plain"), vec![("plain".into(), false)]);
-        assert_eq!(first_text_line(SAMPLE_SUMMARY).unwrap(), "The team reviewed the Q3 roadmap and agreed to move the billing migration to October so the mobile release can ship first.");
-        assert_eq!(first_text_line("## Only a heading"), None);
+        assert_eq!(first_text_line(&md_blocks(SAMPLE_SUMMARY)).unwrap(), "The team reviewed the Q3 roadmap and agreed to move the billing migration to October so the mobile release can ship first.");
+        assert_eq!(first_text_line(&md_blocks("## Only a heading")), None);
+    }
+
+    #[test]
+    fn the_summary_is_parsed_once_per_text() {
+        let mut cache = MdCache::default();
+        let first = cache.parsed(SAMPLE_SUMMARY).0.as_ptr();
+        assert_eq!(cache.parsed(SAMPLE_SUMMARY).0.as_ptr(), first, "reused");
+        assert!(cache
+            .parsed(SAMPLE_SUMMARY)
+            .1
+            .unwrap()
+            .starts_with("The team"));
+        let (blocks, preview) = cache.parsed("- other");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(preview, Some("other"));
     }
 
     #[test]
