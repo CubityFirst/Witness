@@ -103,17 +103,22 @@ thread and an in-house WSOLA time-stretch (speed) — no extra crates.
 
 - `meetings(id, started_at, ended_at, title, audio_path, duration_ms,
   status, engine, trigger, notes, deleted_at, title_source, ai_summary,
-  ai_summary_at, ai_summary_stale)` — status:
+  ai_summary_at, ai_summary_stale, transcript_rev)` — status:
   recording→recorded→processing→transcribed|failed; `deleted_at` = recycle
   bin (purged after 30 days at startup); `notes` has its own FTS table.
   `title_source` (`db::TitleSource`): `auto` (the "Meeting <timestamp>" a
   recording starts with) | `teams` | `ai` | `user` (default; every rename).
   `ai_summary` = the AI assistant's Markdown notes ('' = none, not in FTS),
   `ai_summary_stale` = written for an earlier transcript (set by
-  `replace_transcript`, cleared when notes are written). v5→v6 is additive:
-  four `ADD COLUMN`s, and only exact `Meeting YYYY-MM-DD HH:MM` titles are
-  backfilled to `auto` (a v5 db can't tell a Teams name from a rename, so
-  those stay protected as `user`). Older builds refuse a v6 db.
+  `replace_transcript`, cleared when notes are written),
+  `transcript_rev` = bumped by every `replace_transcript`; notes are stored
+  only if it still matches the revision they were written from. Both AI
+  writes also match `started_at` (ids are reused after a purge). v5→v6 is
+  additive: five `ADD COLUMN`s, and only exact `Meeting YYYY-MM-DD HH:MM`
+  titles are backfilled to `auto` (a v5 db can't tell a Teams name from a
+  rename, so those stay protected as `user`). Stock 0.2.x refuses a v6 db
+  and then panics at launch: rollbacks must carry
+  `docs/rollback/v0.2.1-open-schema-6.patch` (docs/RELEASE_CHECKLIST.md).
 - `pipeline_jobs(meeting_id, transcribe, engine, queued_at, attempts,
   last_error, revision)` — the durable processing queue.
 - `speakers(id, meeting_id, label, display_name, person_id, auto_labeled,
@@ -211,34 +216,46 @@ thread and an in-house WSOLA time-stretch (speed) — no extra crates.
   chat/tab. Falls back to all windows if no new ones survive filtering.
 - **"Never overwrite a user rename" is `title_source`.** `rename_meeting`
   (every user rename) sets `user`; automation writes only through
-  `Db::replace_title_if` — a compare-and-swap on (title, title_source) as
-  read before the slow part — so a rename made while Teams naming or an AI
+  `Db::replace_title_if` — a compare-and-swap on (started_at, title,
+  title_source) as read before the slow part — so a rename made while Teams naming or an AI
   request runs always wins. Teams naming needs `auto`; automatic AI titling
   needs `auto`/`teams`; a manual "Generate title" may replace anything (the
   user asked), still via the CAS.
 - **The AI assistant is opt-in and lives on its own thread**
   (`service/ai.rs` "ai-worker", `ai_client.rs`, `credentials.rs`). Master
-  switch `settings.ai.enabled` (default off) gates *every* request — the
-  worker re-reads it (and, for automatic jobs, the feature switch and the
-  preconditions) right before each job; Settings' test/model-list are
+  switch `settings.ai.enabled` (default off) gates *every* request: a job's
+  gate re-reads the switch, base URL, model, the key epoch (bumped by
+  `set_ai_key` and by `update_settings` → `ai.settings_changed`), the
+  automatic feature switch and `is_same_live_meeting` before EVERY request
+  and every DB write, and stops with `Skipped`; switching off also drops
+  waiting jobs, and bin/purge call `ai.cancel_meeting` (drops its jobs and
+  clears the UI's task state via `AiDone`). Settings' test/model-list are
   refused while off. The pipeline adapter calls `ai.on_transcribed` after a
   finished transcription; manual requests come from `AppCore::ai_generate`
-  ([ui-ok]: a queue push). Jobs merge per meeting, run once (no retries),
-  report `CoreEvent::AiProgress`/`AiDone` (+ `MeetingsChanged` on success),
-  and automatic failures OS-toast at most every 15 min. Sent: transcript
+  ([ui-ok]: a queue push). Requests merge only into *waiting* jobs — a
+  request for a task that is running queues again (a retranscription or a
+  Regenerate must not be swallowed). Jobs run once (no retries), have a
+  request budget (parts + 8) and cap replies (part 8 KB, notes 32 KB, title
+  512 B), report `CoreEvent::AiProgress`/`AiDone` (+ `MeetingsChanged` on
+  success), and automatic failures OS-toast at most every 15 min. Sent: transcript
   as `[mm:ss] Speaker: text` turns, speaker names, the title unless it is
   the timestamp — nothing else. Over 32 000 chars the transcript is read in
   parts (map → reduce; the title then comes from the notes). The client
   speaks OpenAI Chat Completions through an `AiTransport` seam (tests use
   fakes; `UreqTransport` reuses the updater's `agent_builder`: SChannel +
   system proxy, loopback direct), redirects off, https-only except
-  loopback (`ai_client::BaseUrl`). The key is an `ApiKey` (redacted
-  `Debug`, zeroed on drop) in Windows Credential Manager
-  (`Witness/ai-api-key`, `CredentialStore` seam; unit tests — including
-  `AppCore::start` under `cfg(test)` — use `MemoryCredentials`); server
-  messages are scrubbed of key-like text. Retranscription keeps the summary
-  and flags it stale (automatic notes then rewrite it); purge deletes it
-  with the row; exports (md/txt) include it.
+  loopback (`ai_client::BaseUrl`), `User-Agent: Witness`. The key is an
+  `ApiKey` (redacted `Debug`; our copies wiped best-effort with
+  `ai_client::wipe`) in Windows Credential Manager (`Witness/ai-api-key`,
+  user name = the host it is bound to; `key_for` attaches it only to that
+  host — a local server gets none, another remote host is refused;
+  `CredentialStore` seam; unit tests — including `AppCore::start` under
+  `cfg(test)` — use `MemoryCredentials`); server messages are scrubbed of
+  key-like text. AI titles drop control/bidi characters; Markdown exports
+  run the summary through `transcript_export::safe_markdown` (no images,
+  HTML or live links). Retranscription keeps the summary and flags it
+  stale (automatic notes then rewrite it); purge deletes it with the row;
+  exports (md/txt) include it.
 - **Meeting end stops any running recording**, not just auto-started ones —
   StopMeeting only fires after a watched meeting was detected and ended, so
   manual recordings made outside a call are never touched.
@@ -474,7 +491,7 @@ validated with newer LLVM releases. The toolchain is pinned in
   `WITNESS_DEBUG_TOASTS=1`, `WITNESS_DEBUG_CONFIRM=1`,
   `WITNESS_DEBUG_CAPTIONS=1` (overlay with sample lines),
   `WITNESS_DEBUG_SYNTHETIC=1` (3,000-segment transcript),
-  `WITNESS_DEBUG_AI_SETTINGS=on|error`, `WITNESS_DEBUG_AI_SUMMARY=sample|<md>`
+  `WITNESS_DEBUG_AI_SETTINGS=on|error|other`, `WITNESS_DEBUG_AI_SUMMARY=sample|<md>`
   + `WITNESS_DEBUG_AI_STATE=busy|failed|stale|off` (AI states, never saved),
   `WITNESS_DEBUG_PANIC_HOTKEY=1` (Ctrl+Alt+Shift+F12 panics in `ui()` — for
   a human). Anything that truly needs interaction goes on a human checklist;

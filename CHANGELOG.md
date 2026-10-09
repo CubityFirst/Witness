@@ -17,7 +17,11 @@ still evolve quickly.
   localhost.
 - The API key is stored in Windows Credential Manager
   (`Witness/ai-api-key`), never in the settings file, database, logs,
-  backups or diagnostics.
+  backups or diagnostics. It is bound to the host it was entered for and is
+  never sent to another server after the base URL changes.
+- Turning the assistant off, removing the key, changing the service or
+  model, turning an automatic feature off, or deleting the meeting stops a
+  running request before its next step; nothing more is sent or written.
 - Transcript → Summary: Generate / Regenerate notes (summary, key points,
   decisions, action items with owners when stated), "Copy to notes" (appends
   to your notes), progress and errors in place. The ✦ menu and the command
@@ -27,12 +31,17 @@ still evolve quickly.
   never replaced, even one typed while the request runs) and "Write meeting
   notes automatically". Long meetings are summarised in parts. Failures are
   reported once, never retried in a loop.
-- Markdown and plain-text exports include the summary when there is one.
+- Markdown and plain-text exports include the summary when there is one
+  (Markdown keeps only plain formatting: no images, HTML or live links).
 - Database schema 6 (additive): meetings gain `title_source`, `ai_summary`,
-  `ai_summary_at` and `ai_summary_stale`. Existing timestamp titles are
-  marked automatic; every other existing title is treated as yours.
-  Retranscribing keeps a summary but marks it as written for the previous
-  transcript. Builds before this one cannot open a migrated database.
+  `ai_summary_at`, `ai_summary_stale` and `transcript_rev`. Existing
+  timestamp titles are marked automatic; every other existing title is
+  treated as yours. Retranscribing keeps a summary but marks it as written
+  for the previous transcript.
+- **Downgrades and old backups:** Witness 0.2.x cannot open a database this
+  version has opened, and 0.3.x backups cannot be restored into 0.2.x.
+  Keep a backup made with 0.2.x if you may need to go back; any official
+  rollback build is patched to open the new schema.
 
 ### Native UI
 

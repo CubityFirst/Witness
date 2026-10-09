@@ -67,7 +67,12 @@ URL only:
 - the speaker names shown in the transcript (including names you gave);
 - the meeting title, when you or Teams set it (not the default
   "Meeting <date>" title);
-- the API key, as the request's `Authorization` header, if you saved one.
+- the API key, as the request's `Authorization` header, if you saved one
+  for that same host — a key saved for one server is never sent to another;
+- the request's technical headers: `User-Agent: Witness` (no version or
+  platform), `Accept` and `Content-Type: application/json`, and the model
+  name you chose. As with any connection, the service also sees your IP
+  address and the time.
 
 It never sends audio, voice prints, your own notes, bookmarks, file paths or
 other meetings. Requests happen when you click **Generate summary** /

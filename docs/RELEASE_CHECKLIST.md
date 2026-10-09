@@ -124,26 +124,71 @@ honours `/P /UPDATE /R /ARGS /S /NS`, the per-user install location
       right-to-left display, notes spellcheck, cross-row selection in long
       transcripts — use Export → Copy to clipboard); and that choosing "uninstall first"
       in the GUI installer over 0.2.1 removes shortcuts and autostart, as it
-      always has.
+      always has. Releases that raise the database schema (0.3.0: schema 6)
+      must also say that older versions cannot open the migrated database
+      and that their backups cannot be restored into older versions.
 - [ ] Preserve build logs and test evidence.
 - [ ] Monitor private security reports and critical install/model regressions.
 
 ## Rollback runbook
 
 If a promoted release is broken, ship a higher version built from the last
-good tag so every client updates "forward" to it. For a broken 0.3.0:
+good tag so every client updates "forward" to it.
+
+**Never ship an unmodified 0.2.1 as the rollback.** Every 0.3.x launch
+migrates the database to schema 6 (additive: the AI assistant's meeting
+columns `title_source`, `ai_summary`, `ai_summary_at`, `ai_summary_stale`,
+`transcript_rev`). Stock 0.2.1 refuses any schema newer than 5, so its
+`setup()` fails and `.run().expect()` panics at every launch — no window, no
+tray, no updater: users would be stranded. The rollback must carry
+`docs/rollback/v0.2.1-open-schema-6.patch`, which lets 0.2.1's `db.rs` open
+schema 6 (safe: v6 only adds columns and 0.2.1 names every column it
+reads) and keeps 0.3.x's invariants in its own writes. For a broken 0.3.0:
 
 1. `git worktree add .worktrees/rollback v0.2.1`.
-2. In that worktree, bump to `0.3.1` with that tag's own tooling:
+2. Apply the compatibility patch from the current branch and prove it in
+   that worktree (it adds the regression test
+   `rollback_opens_a_schema_six_database`, which builds a real schema-6
+   database with 0.3.x's migration SQL):
+   `git -C .worktrees/rollback apply "$PWD/docs/rollback/v0.2.1-open-schema-6.patch"`,
+   then in `.worktrees/rollback/src-tauri`: `cargo test db::tests` — every
+   test must pass. Also launch the built rollback once against a copy of a
+   data directory that a 0.3.x build has opened. Commit the patch in the
+   worktree.
+3. In that worktree, bump to `0.3.1` with that tag's own tooling:
    `npm ci`, then `npm run version:set -- 0.3.1` (needs Node.js 24.15.x).
-3. Build it unsigned with the old flow: `npm run release:windows`.
-4. From the current branch, sign it with the xtask so the signature carries
+4. Build it unsigned with the old flow: `npm run release:windows`.
+5. From the current branch, sign it with the xtask so the signature carries
    `version:` (which native clients require):
    `cargo run -p xtask -- sign <Witness_0.3.1_x64-setup.exe> --version 0.3.1 --feed latest.json --url https://github.com/CubityFirst/Witness/releases/download/v0.3.1/Witness_0.3.1_x64-setup.exe`
    (`--url` is the installer asset URL, not the release page).
-5. Publish the installer, `.sig` and `latest.json` as a normal (latest)
-   release `v0.3.1`.
+6. Publish the installer, `.sig` and `latest.json` as a normal (latest)
+   release `v0.3.1`, with the side effects below in its notes.
 
 0.3.0 users then update forward to the rollback build, and 0.2.x users also
 receive it. For later releases, build the rollback from the last good native
-tag with `cargo run -p xtask -- version` and `xtask dist --sign` instead.
+tag with `cargo run -p xtask -- version` and `xtask dist --sign` instead —
+and if that tag predates a schema the broken release introduced, give it the
+same treatment (accept the newer additive schema, keep its invariants, test
+it in the rollback worktree).
+
+Side effects of running the patched 0.2.1 on a schema-6 database (all
+benign; say so in the release notes):
+
+- The database stays schema 6 (never downgraded), so rolling forward to a
+  fixed 0.3.x later needs no migration.
+- AI summaries stay in the database but 0.2.1 neither shows nor exports
+  them; purging a meeting still removes them.
+- With the patch, meetings recorded under 0.2.1 get `title_source = 'auto'`,
+  every rename (and every Teams-window name, which 0.2.1 applies as a
+  rename) becomes `user` — so 0.3.x's automatic AI titles leave those
+  meetings alone — and retranscriptions mark a kept summary stale and bump
+  `transcript_rev`. Without the patch none of this would happen; that is
+  one more reason never to ship it unpatched.
+- 0.2.1 rewrites `witness-settings.toml` without the `[ai]` table the first
+  time its Settings save, so after rolling forward again the AI assistant is
+  off (the safe default) and must be re-enabled; the API key stays in
+  Windows Credential Manager (`Witness/ai-api-key`).
+- Backups made by 0.3.x hold a schema-6 database: they restore into a
+  patched rollback build or a 0.3.x build, never into stock 0.2.x (see
+  BACKUP_AND_RECOVERY.md).
