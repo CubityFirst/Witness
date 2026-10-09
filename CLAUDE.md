@@ -6,9 +6,11 @@ the mic consent store, records mic + system loopback as separate tracks,
 live-captions while recording, transcribes on-device (Parakeet TDT on CUDA /
 Whisper on CPU) with diarization and cross-meeting voice identification, and
 keeps a full-text-searchable archive. Meeting content stays on the machine;
-only explicit model/GPU-library downloads and the (optional) update check use
-the network. It follows the same single-process, tray-first philosophy as the
-sibling Vigil project.
+only explicit model/GPU-library downloads, the (optional) update check and the
+opt-in AI assistant (off by default; sends transcript text, speaker names and
+the title — never audio — to the OpenAI-compatible service the user
+configured) use the network. It follows the same single-process, tray-first
+philosophy as the sibling Vigil project.
 
 PLAN.md is the original (implemented, Tauri-era) design; this file is the
 living map. 0.3.0 replaced Tauri/WebView2/Preact/Node with the native UI; the
@@ -70,8 +72,9 @@ repair, orphan recovery, bin purge) is `service/startup.rs`.
 UI (`crates/witness`): eframe 0.36 (glow renderer), no router — a `View` enum
 in `ui/mod.rs` (`ActiveView` owns the live view). Views in `ui/views/`:
 Meetings (+ recycle bin), People (stats + weekly trend), Transcript (+
-`player_bar.rs`: player, live captions, bookmarks, notes), Search (filters),
-Settings (+ `updates.rs`), plus `ui/palette.rs` (Ctrl+K command palette)
+`player_bar.rs`: player, live captions, bookmarks, notes; `ai_summary.rs`: the
+AI Summary panel), Search (filters),
+Settings (+ `updates.rs`, `ai_settings.rs`), plus `ui/palette.rs` (Ctrl+K command palette)
 and `ui/onboarding.rs` (first-run setup). The look follows **docs/UI.md**
 (flat rows, grouped surfaces, elide-don't-overflow, nothing wraps or clips
 at ≥ 380 pt, light + dark themes, the split layout from 900 pt). Colours
@@ -96,12 +99,23 @@ dialogs, system metrics). Playback is `witness_core::player`: a seekable Ogg
 Opus reader (raw stereo exactly as stored), a WASAPI shared-mode render
 thread and an in-house WSOLA time-stretch (speed) — no extra crates.
 
-## Data model (SQLite, WAL, `PRAGMA user_version` = 5)
+## Data model (SQLite, WAL, `PRAGMA user_version` = 6)
 
 - `meetings(id, started_at, ended_at, title, audio_path, duration_ms,
-  status, engine, trigger, notes, deleted_at)` — status:
+  status, engine, trigger, notes, deleted_at, title_source, ai_summary,
+  ai_summary_at, ai_summary_stale)` — status:
   recording→recorded→processing→transcribed|failed; `deleted_at` = recycle
   bin (purged after 30 days at startup); `notes` has its own FTS table.
+  `title_source` (`db::TitleSource`): `auto` (the "Meeting <timestamp>" a
+  recording starts with) | `teams` | `ai` | `user` (default; every rename).
+  `ai_summary` = the AI assistant's Markdown notes ('' = none, not in FTS),
+  `ai_summary_stale` = written for an earlier transcript (set by
+  `replace_transcript`, cleared when notes are written). v5→v6 is additive:
+  four `ADD COLUMN`s, and only exact `Meeting YYYY-MM-DD HH:MM` titles are
+  backfilled to `auto` (a v5 db can't tell a Teams name from a rename, so
+  those stay protected as `user`). Older builds refuse a v6 db.
+- `pipeline_jobs(meeting_id, transcribe, engine, queued_at, attempts,
+  last_error, revision)` — the durable processing queue.
 - `speakers(id, meeting_id, label, display_name, person_id, auto_labeled,
   embedding, emb_seconds)` — label is immutable ('me', 'S1'..'S8');
   `embedding` = this speaker's voice print in this meeting.
@@ -195,6 +209,36 @@ thread and an in-house WSOLA time-stretch (speed) — no extra crates.
   the mic is idle; naming prefers windows that appeared since (the call
   window) over the long-lived main window, whose title is just the open
   chat/tab. Falls back to all windows if no new ones survive filtering.
+- **"Never overwrite a user rename" is `title_source`.** `rename_meeting`
+  (every user rename) sets `user`; automation writes only through
+  `Db::replace_title_if` — a compare-and-swap on (title, title_source) as
+  read before the slow part — so a rename made while Teams naming or an AI
+  request runs always wins. Teams naming needs `auto`; automatic AI titling
+  needs `auto`/`teams`; a manual "Generate title" may replace anything (the
+  user asked), still via the CAS.
+- **The AI assistant is opt-in and lives on its own thread**
+  (`service/ai.rs` "ai-worker", `ai_client.rs`, `credentials.rs`). Master
+  switch `settings.ai.enabled` (default off) gates *every* request — the
+  worker re-reads it (and, for automatic jobs, the feature switch and the
+  preconditions) right before each job; Settings' test/model-list are
+  refused while off. The pipeline adapter calls `ai.on_transcribed` after a
+  finished transcription; manual requests come from `AppCore::ai_generate`
+  ([ui-ok]: a queue push). Jobs merge per meeting, run once (no retries),
+  report `CoreEvent::AiProgress`/`AiDone` (+ `MeetingsChanged` on success),
+  and automatic failures OS-toast at most every 15 min. Sent: transcript
+  as `[mm:ss] Speaker: text` turns, speaker names, the title unless it is
+  the timestamp — nothing else. Over 32 000 chars the transcript is read in
+  parts (map → reduce; the title then comes from the notes). The client
+  speaks OpenAI Chat Completions through an `AiTransport` seam (tests use
+  fakes; `UreqTransport` reuses the updater's `agent_builder`: SChannel +
+  system proxy, loopback direct), redirects off, https-only except
+  loopback (`ai_client::BaseUrl`). The key is an `ApiKey` (redacted
+  `Debug`, zeroed on drop) in Windows Credential Manager
+  (`Witness/ai-api-key`, `CredentialStore` seam; unit tests — including
+  `AppCore::start` under `cfg(test)` — use `MemoryCredentials`); server
+  messages are scrubbed of key-like text. Retranscription keeps the summary
+  and flags it stale (automatic notes then rewrite it); purge deletes it
+  with the row; exports (md/txt) include it.
 - **Meeting end stops any running recording**, not just auto-started ones —
   StopMeeting only fires after a watched meeting was detected and ended, so
   manual recordings made outside a call are never touched.
@@ -247,7 +291,9 @@ thread and an in-house WSOLA time-stretch (speed) — no extra crates.
   Tauri plugin wrapped — its `Toast::new` defaults to a sound; we pass
   `.sound(None)`, since 0.2.x toasts were silent and a chime can leak into
   the loopback track). The updater uses ureq 2 (hf-hub's major) with
-  native-tls (SChannel → Windows certificate store).
+  native-tls (SChannel → Windows certificate store); the AI client shares its
+  agent setup (`updater::agent_builder`). The API-key store uses the
+  `windows` crate's `Win32_Security_Credentials` feature — no new crates.
 - `.github/dependabot.yml` ignores mirror this list.
 - **VAD is earshot, not Silero** — `voice_activity_detector` pins ort
   =2.0.0-rc.10; parakeet-rs needs rc.13. earshot frames: exactly 256
@@ -406,7 +452,12 @@ validated with newer LLVM releases. The toolchain is pinned in
   default device), `gpu_libs_real_download`, `live_feed_check` /
   `real_021_installer_verifies` (updater against the real feed),
   `real_registry_round_trip` (the user's real `Run` key, restored after),
-  `dialogs_are_modal_over_the_owner_from_a_worker` (shows real dialogs).
+  `dialogs_are_modal_over_the_owner_from_a_worker` (shows real dialogs),
+  `real_credential_manager_round_trip` (a throwaway entry in the user's
+  real Credential Manager, deleted after), `live_chat_round_trip` (a real
+  OpenAI-compatible server: `WITNESS_AI_LIVE_BASE` / `_MODEL` / `_KEY`).
+  Never make real AI requests or touch the real `Witness/ai-api-key` entry
+  from anything else; unit tests use the transport / credential fakes.
 - **GUI verification must be passive — never synthetic mouse/keyboard
   input** (no SendInput/SetCursorPos/SendKeys, posted WM_KEY*/mouse/hotkey
   messages, SetForegroundWindow on test windows, UI Automation Invoke, or
@@ -423,6 +474,8 @@ validated with newer LLVM releases. The toolchain is pinned in
   `WITNESS_DEBUG_TOASTS=1`, `WITNESS_DEBUG_CONFIRM=1`,
   `WITNESS_DEBUG_CAPTIONS=1` (overlay with sample lines),
   `WITNESS_DEBUG_SYNTHETIC=1` (3,000-segment transcript),
+  `WITNESS_DEBUG_AI_SETTINGS=on|error`, `WITNESS_DEBUG_AI_SUMMARY=sample|<md>`
+  + `WITNESS_DEBUG_AI_STATE=busy|failed|stale|off` (AI states, never saved),
   `WITNESS_DEBUG_PANIC_HOTKEY=1` (Ctrl+Alt+Shift+F12 panics in `ui()` — for
   a human). Anything that truly needs interaction goes on a human checklist;
   add a new env hook rather than driving the UI.
@@ -482,6 +535,12 @@ GPU DLLs), `witness.log`, `ui-state.toml` (player volume/speed,
 model-banner dismissal; replaced WebView2 localStorage, reset once in
 0.3.0), `captions-overlay.toml` (overlay geometry in physical px + scale).
 data_dir changes apply to db/log on restart (Settings offers the button).
+The AI assistant's settings are the `[ai]` table (`enabled`, `base_url`,
+`model` — no default —, `auto_title`, `auto_notes`; kept last in `Settings`
+because TOML writes tables after values); its API key is never in any file
+of ours — Windows Credential Manager, generic credential
+`Witness/ai-api-key`. An invalid base URL still saves (other settings must
+keep saving); it is refused at request time and shown in Settings.
 Settings → Models → "Delete model cache" wipes `models/` (hf-cache +
 install manifest, superseded revisions included); refused while recording,
 transcribing or downloading, since Windows can't delete open model files.
@@ -497,5 +556,7 @@ The installer removes the old WebView2 profile
 - Diarization caps at 8 remote speakers; voice matching on compressed
   Teams audio is good-but-not-perfect (hence the ≈ marker + rename flow).
 - DB and audio are unencrypted at rest (local-only threat model).
+- AI jobs are not persisted: quitting drops queued or running ones (the
+  user generates again); AI summaries are not in full-text search.
 - UI regressions listed under Platform quirks (high contrast, RTL, notes
   spellcheck, cross-row selection, fixed date format).

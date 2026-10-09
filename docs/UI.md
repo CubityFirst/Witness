@@ -118,12 +118,19 @@ input:
   `WITNESS_DEBUG_LOADING=1`, `WITNESS_DEBUG_EMPTY=1|bin`,
   `WITNESS_DEBUG_SELECT=<n>|bin:<n>`, `WITNESS_DEBUG_PANE=<index>`,
   `WITNESS_DEBUG_EXPAND_PERSON=<i>`.
-- Settings: `WITNESS_DEBUG_SCROLL=<pt>`.
+- Settings: `WITNESS_DEBUG_SCROLL=<pt>`, `WITNESS_DEBUG_AI_SETTINGS=on|error`
+  (the AI assistant section configured, with a model list and a test
+  result — or an http:// base URL error and a 401; shown, never saved).
 - Transcript: `WITNESS_DEBUG_SYNTHETIC=1`,
   `WITNESS_DEBUG_TRANSCRIPT_{NOTES,SEGMENT,HIGHLIGHT,MENU,VOLUME,RENAME}`,
   `WITNESS_DEBUG_TRANSCRIPT_FIND=<query>[,<hit>]`,
   `WITNESS_DEBUG_TRANSCRIPT_FILTER=<label>[,<label>]`,
-  `WITNESS_DEBUG_TRANSCRIPT_LOADING=1`, `WITNESS_DEBUG_TRANSCRIPT_PANE=detail`.
+  `WITNESS_DEBUG_TRANSCRIPT_LOADING=1`, `WITNESS_DEBUG_TRANSCRIPT_PANE=detail`,
+  `WITNESS_DEBUG_TRANSCRIPT_MENU=ai` (the ✦ AI menu),
+  `WITNESS_DEBUG_AI_SUMMARY=sample|<markdown>` (a summary to render, never
+  written) and `WITNESS_DEBUG_AI_STATE=busy|failed|stale|off` (the Summary
+  panel generating, failed, from an earlier transcript, or the not-set-up
+  hint; any AI hook but `off` counts as configured).
 
 Anything needing real input (hover, drag, typing) can't be snapshotted —
 check those by hand. Hover marks are a neutral pill at a row's left edge,

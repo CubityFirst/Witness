@@ -9,8 +9,11 @@ Meeting audio, transcripts, notes, and voice prints are not sent to a Witness
 service. Choosing **Download** for a speech model connects to Hugging Face;
 choosing **Download GPU libraries** connects to PyPI's
 `files.pythonhosted.org` host for pinned NVIDIA-published wheels. No meeting
-content is included in those requests. See [Privacy](PRIVACY.md) before
-recording other people.
+content is included in those requests. The optional AI assistant (off by
+default) is the one feature that sends meeting text — transcript, speaker
+names and title, never audio — and only to the OpenAI-compatible service you
+configure, which can be a server on your own computer. See
+[Privacy](PRIVACY.md) before recording other people.
 
 > Witness is pre-1.0 software. Test it with non-critical recordings and keep
 > independent backups of anything you cannot replace.
@@ -31,6 +34,12 @@ recording other people.
 - Recovers interrupted recordings and queued processing after a restart.
 - Moves deleted meetings to a recycle bin before permanent deletion.
 - Creates atomic, checksummed recovery snapshots from Settings.
+- Optional, off by default: an AI assistant that titles meetings and writes
+  their notes (summary, key points, decisions, action items) through any
+  OpenAI-compatible API — OpenAI, or a local server such as Ollama or LM
+  Studio. On request from the transcript (or Ctrl+K), or automatically after
+  each transcription if you turn that on; it never replaces a title you
+  typed. The API key is kept in Windows Credential Manager.
 
 ## Install and first run
 

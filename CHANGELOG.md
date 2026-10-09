@@ -6,6 +6,34 @@ still evolve quickly.
 
 ## Unreleased
 
+### AI assistant (opt-in)
+
+- New Settings → AI assistant section, off by default: connect any
+  OpenAI-compatible service (default base URL `https://api.openai.com/v1`;
+  local servers such as Ollama or LM Studio via `http://localhost…`), pick a
+  model from the service's list or type its id, and test the connection.
+  The settings say exactly what is sent: transcript text, speaker names and
+  the meeting title — never audio. Plain `http://` is only allowed for
+  localhost.
+- The API key is stored in Windows Credential Manager
+  (`Witness/ai-api-key`), never in the settings file, database, logs,
+  backups or diagnostics.
+- Transcript → Summary: Generate / Regenerate notes (summary, key points,
+  decisions, action items with owners when stated), "Copy to notes" (appends
+  to your notes), progress and errors in place. The ✦ menu and the command
+  palette (Ctrl+K) also offer "Generate title" and "Generate summary".
+- Optional automation after each transcription: "Title new meetings
+  automatically" (only titles Witness or Teams chose — a title you typed is
+  never replaced, even one typed while the request runs) and "Write meeting
+  notes automatically". Long meetings are summarised in parts. Failures are
+  reported once, never retried in a loop.
+- Markdown and plain-text exports include the summary when there is one.
+- Database schema 6 (additive): meetings gain `title_source`, `ai_summary`,
+  `ai_summary_at` and `ai_summary_stale`. Existing timestamp titles are
+  marked automatic; every other existing title is treated as yours.
+  Retranscribing keeps a summary but marks it as written for the previous
+  transcript. Builds before this one cannot open a migrated database.
+
 ### Native UI
 
 - The user interface is rewritten natively in Rust with egui/eframe. Tauri,

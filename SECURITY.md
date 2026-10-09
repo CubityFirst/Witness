@@ -26,9 +26,36 @@ trust boundary. Data is not encrypted at the application layer, and code
 running as the user (or as administrator) can read recordings, transcripts,
 voice prints, settings, logs, and backups. See [Privacy](PRIVACY.md).
 
+### Optional AI assistant
+
+Network use for AI is opt-in: the master switch "Use an AI service" is off by
+default, and while it is off the core makes no AI request of any kind (the
+worker re-checks it before every job). When it is on, requests go only to
+the configured OpenAI-compatible base URL, which must be `https://` — plain
+`http://` is accepted only for `localhost`, `127.0.0.1` and `[::1]`. TLS uses
+SChannel (the Windows certificate store) and the system proxy, like the
+updater; loopback connects directly. Redirects are not followed, so a request
+and its key are never forwarded to another host, and non-loopback requests
+refuse any downgrade to HTTP.
+
+The API key is stored only in Windows Credential Manager as a generic
+credential (`Witness/ai-api-key`, persisted for the current user on this
+machine and protected by Windows with the user's logon credentials). It is
+never written to `witness-settings.toml`, the database, logs, backups or the
+diagnostics report; Settings never reads it back (it only learns whether one
+is stored). In memory it is wrapped in a type whose `Debug` output is
+redacted and whose bytes are zeroed when dropped. Error messages never carry
+request headers or URLs, and text from the service (including its error
+messages) is scrubbed of the key and of anything that looks like one before
+it is shown or logged. As with the rest of Witness, code running as the user
+can read the key.
+
 Security-sensitive changes should preserve these invariants:
 
 - no meeting content in telemetry or diagnostics exports;
+- no AI request unless the user turned the AI assistant on, never plain HTTP
+  to a non-loopback host, and the API key nowhere but Credential Manager and
+  the request's `Authorization` header;
 - no unverified model is loaded;
 - database migrations are transactional and forward-only;
 - paths originating in the database cannot escape their designated root;
