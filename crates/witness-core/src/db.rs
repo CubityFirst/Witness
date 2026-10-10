@@ -480,6 +480,17 @@ impl Db {
                 "#,
             )?;
         }
+        // Pre-release v6 databases (dev builds before `transcript_rev`
+        // joined the v6 step) lack that column: add it if missing. Additive
+        // and idempotent; never needed for a database a release migrated.
+        let has_rev: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('meetings') WHERE name = 'transcript_rev'")?
+            .exists([])?;
+        if !has_rev {
+            conn.execute_batch(
+                "ALTER TABLE meetings ADD COLUMN transcript_rev INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
         Ok(())
     }
 
@@ -1530,6 +1541,41 @@ impl Db {
 
 #[cfg(test)]
 mod tests {
+    /// Dev builds before `transcript_rev` joined the v6 step left v6
+    /// databases without it; opening one adds the column.
+    #[test]
+    fn pre_release_v6_without_transcript_rev_is_repaired() {
+        let dir = std::env::temp_dir().join(format!("witness-db-v6-repair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("witness.db");
+        let has_rev = |db: &Db| -> bool {
+            db.conn
+                .lock()
+                .unwrap()
+                .prepare(
+                    "SELECT 1 FROM pragma_table_info('meetings') WHERE name = 'transcript_rev'",
+                )
+                .unwrap()
+                .exists([])
+                .unwrap()
+        };
+        {
+            let db = Db::open(&path).unwrap();
+            assert!(has_rev(&db));
+            db.conn
+                .lock()
+                .unwrap()
+                .execute_batch("ALTER TABLE meetings DROP COLUMN transcript_rev;")
+                .unwrap();
+            assert!(!has_rev(&db));
+        }
+        let db = Db::open(&path).unwrap();
+        assert!(has_rev(&db));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     fn test_db(label: &str) -> (Db, std::path::PathBuf) {
