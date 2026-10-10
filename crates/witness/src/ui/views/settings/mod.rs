@@ -65,7 +65,7 @@ use ai::AiSection;
 use eframe::egui;
 use recording::{parse_patterns, patterns_id};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use storage::{cache_confirm_id, restart_confirm_id};
 use transcription::{junk_id, parse_lines};
 use updates::UpdatesSection;
@@ -491,14 +491,14 @@ impl SettingsState {
         };
         // Wait for the loads: before them the page is too short to scroll.
         let max = out.content_size.y - out.inner_rect.height();
-        if max >= y || self.started.elapsed() > Duration::from_millis(1500) {
+        if max >= y || self.started.elapsed() > std::time::Duration::from_millis(1500) {
             self.debug_scrolled = true;
             let mut state = out.state;
             state.offset.y = y.min(max.max(0.0));
             state.store(ctx, out.id);
             ctx.request_repaint();
         } else {
-            ctx.request_repaint_after(Duration::from_millis(50));
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
 
