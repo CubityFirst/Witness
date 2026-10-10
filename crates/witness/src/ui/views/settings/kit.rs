@@ -668,3 +668,77 @@ pub(crate) fn path_value(
     })
     .inner
 }
+
+/// Tests: lay out `f` in a `width` pt panel for a few passes (rows measure
+/// themselves on the first) and return what it produced last.
+#[cfg(test)]
+pub(crate) fn run_at<R>(width: f32, mut f: impl FnMut(&mut egui::Ui) -> R) -> R {
+    let ctx = theme::test_context();
+    let mut out = None;
+    for _ in 0..4 {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 2000.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| out = Some(f(ui)));
+        });
+        output.textures_delta.clear(); // no renderer to upload the font atlas
+    }
+    out.expect("ran")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A switch stays beside its label even in the narrowest window, while
+    /// a field wide enough to squeeze the text stacks under it.
+    #[test]
+    fn rows_keep_switches_beside_and_stack_fields() {
+        for width in [380.0, 460.0, 640.0, 1000.0] {
+            let (title_rect, switch_rect, field_label, field) = run_at(width, |ui| {
+                let mut on = true;
+                let mut title_rect = egui::Rect::NOTHING;
+                let switch = row(
+                    ui,
+                    "switch",
+                    Slot::Fit,
+                    |ui| {
+                        let r = widgets::elide(ui, "Auto-record", theme::regular(14.0), pal().text);
+                        title_rect = r.rect;
+                        r.id
+                    },
+                    |ui, _| widgets::switch(ui, true, &mut on, "Auto-record"),
+                );
+                let mut label_rect = egui::Rect::NOTHING;
+                let field = row(
+                    ui,
+                    "field",
+                    Slot::Fill(FIELD_WIDTH),
+                    |ui| {
+                        let r =
+                            widgets::elide(ui, "Watch patterns", theme::regular(14.0), pal().text);
+                        label_rect = r.rect;
+                        r.id
+                    },
+                    |ui, _| ui.label("field").rect,
+                );
+                (title_rect, switch.rect, label_rect, field)
+            });
+            // Beside, right-aligned, vertically centred on the title.
+            assert!(switch_rect.left() > title_rect.right(), "{width}");
+            assert!(
+                (switch_rect.center().y - title_rect.center().y).abs() < 1.5,
+                "{width}"
+            );
+            let stacked = field.top() > field_label.bottom();
+            // The panel has 8 pt margins; the field stacks below 2*8 + 260 +
+            // 16 + 200 pt.
+            assert_eq!(stacked, width < 492.0, "{width}");
+        }
+    }
+}

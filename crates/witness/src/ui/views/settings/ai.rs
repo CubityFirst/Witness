@@ -211,6 +211,11 @@ impl AiSection {
         stored
     }
 
+    /// "Off" / "On · api.openai.com · gpt-4o".
+    pub fn summary(&self, cx: &UiCtx) -> String {
+        summary(&cx.settings.current().ai)
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
         if !self.mounted {
             self.mount(cx);
@@ -248,7 +253,7 @@ impl AiSection {
         let mut enabled = on;
         let mut auto_title = ai.auto_title;
         let mut auto_notes = ai.auto_notes;
-        section(ui, "AI assistant", |ui| {
+        section(ui, "Connection", |ui| {
             out.enabled =
                 toggle(ui, true, &mut enabled, "Use an AI service", MASTER_HELP).changed();
             widgets::group_divider(ui);
@@ -315,19 +320,7 @@ impl AiSection {
                     );
                     match &key_host {
                         Some(Some(host)) => {
-                            ui.horizontal_wrapped(|ui| {
-                                status_note(
-                                    ui,
-                                    pal().ok_light,
-                                    &format!("A key is saved for {host}."),
-                                );
-                                out.remove_key = ui
-                                    .add_enabled_ui(!key_busy, |ui| {
-                                        widgets::btn_ghost(ui, "Remove")
-                                    })
-                                    .inner
-                                    .clicked();
-                            });
+                            status_note(ui, pal().ok_light, &format!("A key is saved for {host}."));
                             if let Some(warning) = key_mismatch(host, base_check.as_ref().ok()) {
                                 status_note(ui, pal().rec_light, &warning);
                             }
@@ -446,8 +439,28 @@ impl AiSection {
                     out.test = button(ui, on && !testing && has_model, text).clicked();
                 },
             );
-            widgets::group_divider(ui);
+            // The destructive action sits apart, at the end of the group.
+            if let Some(Some(host)) = &key_host {
+                widgets::group_divider(ui);
+                out.remove_key = row(
+                    ui,
+                    "ai-key-remove",
+                    Slot::Fit,
+                    |ui| {
+                        let id = title(ui, "Saved API key");
+                        note(ui, &format!("For {host}, in Windows Credential Manager."));
+                        id
+                    },
+                    |ui, _| {
+                        ui.add_enabled_ui(!key_busy, |ui| widgets::btn_danger(ui, "Remove"))
+                            .inner
+                            .clicked()
+                    },
+                );
+            }
+        });
 
+        section(ui, "Automatic", |ui| {
             out.auto_title = toggle(
                 ui,
                 configured,
@@ -614,6 +627,22 @@ impl Drop for AiSection {
     }
 }
 
+/// The AI assistant category's summary.
+fn summary(ai: &AiSettings) -> String {
+    if !ai.enabled {
+        return "Off — nothing is sent anywhere".into();
+    }
+    let host = match BaseUrl::parse(&ai.base_url) {
+        Ok(base) if base.is_local() => "local server".to_string(),
+        Ok(base) => base.host().to_string(),
+        Err(_) => return "On · the base URL needs fixing".into(),
+    };
+    match ai.model.trim() {
+        "" => format!("On · {host} · choose a model"),
+        model => format!("On · {host} · {model}"),
+    }
+}
+
 /// The warning when the saved key belongs to another host than the base
 /// URL shown (it will not be sent there).
 fn key_mismatch(key_host: &str, base: Option<&BaseUrl>) -> Option<String> {
@@ -680,6 +709,25 @@ mod tests {
             .unwrap()
             .contains("local server gets no key"));
         assert_eq!(key_mismatch("api.openai.com", None), None);
+    }
+
+    #[test]
+    fn summary_names_the_service_and_model() {
+        let mut ai = AiSettings {
+            enabled: false,
+            base_url: "https://api.openai.com/v1".into(),
+            model: "example-small".into(),
+            auto_title: true,
+            auto_notes: true,
+        };
+        assert_eq!(summary(&ai), "Off — nothing is sent anywhere");
+        ai.enabled = true;
+        assert_eq!(summary(&ai), "On · api.openai.com · example-small");
+        ai.base_url = "http://localhost:11434/v1".into();
+        ai.model = " ".into();
+        assert_eq!(summary(&ai), "On · local server · choose a model");
+        ai.base_url = "http://ai.example.com/v1".into();
+        assert_eq!(summary(&ai), "On · the base URL needs fixing");
     }
 
     #[test]

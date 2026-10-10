@@ -32,6 +32,7 @@ use toasts::Toasts;
 use views::meetings::MeetingsView;
 use views::people::PeopleView;
 use views::search::SearchView;
+pub use views::settings::SettingsRoute;
 use views::settings::SettingsView;
 use views::transcript::TranscriptView;
 use witness_core::player::Player;
@@ -244,13 +245,13 @@ impl Nav {
 pub enum UiCmd {
     /// CC button, after `check_captions_overlay` succeeded.
     ShowCaptionsOverlay,
-    /// Settings → Restart Witness (after any confirmation).
+    /// Settings → Storage → Restart Witness (after any confirmation).
     Restart,
-    /// Settings → Updates → Check for updates.
+    /// Settings → About → Check for updates.
     CheckUpdate,
-    /// Settings → Updates → Install.
+    /// Settings → About → Install.
     InstallUpdate,
-    /// Settings → Startup → Run setup again: show the first-run wizard.
+    /// Settings → General → Run setup: show the first-run wizard.
     RunSetup,
 }
 
@@ -307,6 +308,9 @@ pub struct ViewMemory {
     /// A person to open expanded when People next loads (the command
     /// palette's person rows); taken by `PeopleView`.
     pub expand_person: Option<i64>,
+    /// The Settings category shown last this session (and whether a narrow
+    /// window had it open); Settings reopens there.
+    pub settings_route: Option<SettingsRoute>,
 }
 
 /// A notes draft handed to the writer. `started_at` pins it to one meeting:

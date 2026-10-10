@@ -9,7 +9,7 @@
 //!   plugin (`name` alias, leading `v`, RFC 3339 `pub_date`,
 //!   `windows-x86_64-nsis` then `windows-x86_64`), and remember a strictly
 //!   newer release as `pending_update`.
-//! - **Download** (`download_update`, always a click in Settings → Updates):
+//! - **Download** (`download_update`, always a click in Settings → About → Updates):
 //!   stream the installer into `%TEMP%\Witness-{ver}-updater-XXXXXX\`, then
 //!   check the `MZ` header and the minisign signature against the embedded
 //!   key, *requiring* the signed `version:` to match the feed. Any failure
@@ -915,7 +915,7 @@ pub(crate) fn spawn_startup_check(core: Arc<AppCore>) {
                         info.version
                     );
                     core.toast(&format!(
-                        "Witness {} is available — install it from Settings → Updates.",
+                        "Witness {} is available — install it from Settings → About.",
                         info.version
                     ));
                 }

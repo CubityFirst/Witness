@@ -697,7 +697,7 @@ impl Wizard {
                 };
                 download = widgets::btn_primary(ui, label).clicked();
                 ui.label(
-                    RichText::new("or later, in Settings → Models")
+                    RichText::new("or later, in Settings → Storage")
                         .font(theme::regular(12.5))
                         .color(pal().text_muted),
                 );

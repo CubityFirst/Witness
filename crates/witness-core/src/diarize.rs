@@ -29,7 +29,7 @@ pub fn diarize(
     mut progress: impl FnMut(f32),
 ) -> Result<Vec<DiarSegment>> {
     let model_path = crate::models::sortformer_path(models_dir)
-        .context("Diarization model not downloaded — fetch it in Settings → Models")?;
+        .context("Diarization model not downloaded — fetch it in Settings → Storage")?;
     let mut sortformer = {
         let _permit = crate::ml_scheduler::batch();
         // The default post-processing reproduces NeMo's own diarize() output

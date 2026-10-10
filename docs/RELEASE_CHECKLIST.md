@@ -86,7 +86,7 @@ honours `/P /UPDATE /R /ARGS /S /NS`, the per-user install location
       relaunched minimized, and the old process gone.
 - [ ] End to end through the real 0.2.x updater: build 0.2.1 (`87820ee`) with
       only the endpoint pointed at a test repository's `latest.json`, publish
-      the new artifacts there, and click Install in Settings → Updates.
+      the new artifacts there, and click Install in Settings → About → Updates.
 - [ ] GUI install over 0.2.1; then uninstall and confirm the data in
       `%LOCALAPPDATA%\Witness` survives; then reinstall and confirm a custom
       install directory is restored.

@@ -53,7 +53,7 @@ Before an important call:
    device. Saved endpoint IDs are strict: if a configured device is missing,
    Witness reports it instead of silently recording another device.
 2. Make a short manual test recording and play both sides back.
-3. Download the desired models under **Settings > Models**.
+3. Download the desired models under **Settings > Storage**.
 4. Confirm local rules and participant consent allow recording.
 
 Recording works without models; transcription, diarization, voice matching,
@@ -83,7 +83,7 @@ the standard `NVIDIA\CUDNN` layout (under Program Files or LOCALAPPDATA), and
 otherwise logs which DLLs are missing. Settings shows the same GPU status.
 
 Machines with an NVIDIA GPU but no CUDA developer install can use **Settings →
-Models → Download GPU libraries** (~1 GB): Witness fetches the pinned,
+Transcription → Download GPU libraries** (~1 GB): Witness fetches the pinned,
 SHA-256-verified NVIDIA-published CUDA runtime, cuDNN, and nvJitLink wheels
 hosted by PyPI (`files.pythonhosted.org`) and installs just the required DLLs
 into the data directory — no admin rights, no system changes, removable by
@@ -137,7 +137,7 @@ verification and non-destructive restore instructions are in
 
 ## Diagnostics and troubleshooting
 
-Open **Settings > Diagnostics** to inspect the active data/database/log paths,
+Open **Settings > About > Diagnostics** to inspect the active data/database/log paths,
 SQLite health, capture loss, processing stage, queue depth, and model integrity.
 The copied/exported support report contains operational state and local paths,
 but no transcript text, notes, audio, voice prints, or private settings. Review
@@ -157,7 +157,7 @@ Common problems:
 - **Transcription is unexpectedly slow:** check the GPU line in Settings and
   `witness.log` — a warning names any CUDA/cuDNN DLLs the loader cannot find,
   and a single-digit realtime factor in completion toasts means CPU. Use
-  **Download GPU libraries** in Settings → Models (or install cuDNN 9 for
+  **Download GPU libraries** in Settings → Transcription (or install cuDNN 9 for
   CUDA 13 / set `CUDNN_PATH`) to restore GPU transcription. CPU fallback is
   functional but slower.
 - **Model integrity check failed:** use **Repair** in Settings. Witness will not

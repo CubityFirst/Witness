@@ -129,6 +129,17 @@ fn action(flow: &UpdateFlow) -> Action {
     }
 }
 
+/// The About category's summary: the version and the update state.
+pub(super) fn summary(version: &str, flow: &UpdateFlow) -> String {
+    match &flow.phase {
+        UpdatePhase::Available(info) => format!("Witness {version} · {} available", info.version),
+        UpdatePhase::Installing(info) => format!("Installing Witness {}…", info.version),
+        UpdatePhase::Checking => format!("Witness {version} · checking for updates…"),
+        UpdatePhase::Current => format!("Witness {version} · up to date"),
+        UpdatePhase::Idle => format!("Witness {version} · privacy, diagnostics"),
+    }
+}
+
 /// The release notes while an update is available or installing.
 fn release_notes(phase: &UpdatePhase) -> Option<&str> {
     match phase {
@@ -192,5 +203,20 @@ mod tests {
             None
         );
         assert_eq!(release_notes(&UpdatePhase::Available(info(None))), None);
+    }
+
+    #[test]
+    fn summary_follows_the_phase() {
+        let mut flow = UpdateFlow::default();
+        assert_eq!(
+            summary("0.3.0", &flow),
+            "Witness 0.3.0 · privacy, diagnostics"
+        );
+        flow.phase = UpdatePhase::Current;
+        assert_eq!(summary("0.3.0", &flow), "Witness 0.3.0 · up to date");
+        flow.phase = UpdatePhase::Available(info(None));
+        assert_eq!(summary("0.2.1", &flow), "Witness 0.2.1 · 0.3.0 available");
+        flow.phase = UpdatePhase::Installing(info(None));
+        assert_eq!(summary("0.2.1", &flow), "Installing Witness 0.3.0…");
     }
 }
