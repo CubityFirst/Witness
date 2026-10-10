@@ -372,6 +372,11 @@ impl SettingsState {
         self.answer_confirms(cx);
         self.sync_buffers(ui.ctx(), cx.settings.current());
         self.route(cx);
+        if let Some(page) = cx.memory.settings_target.take() {
+            // A link from elsewhere names the category to show.
+            self.search_text.clear();
+            self.open_page(cx, page);
+        }
         let wide = nav::is_wide(ui.available_width());
         if std::mem::take(&mut cx.memory.settings_search_focus) {
             // Ctrl+F / `/`: the field is on the rail, or on the index.

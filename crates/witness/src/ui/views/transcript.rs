@@ -55,7 +55,7 @@ use crate::ui::icons::{self, ph};
 use crate::ui::theme::{self, pal, speaker_text};
 use crate::ui::toasts::Notice;
 use crate::ui::widgets::{self, KeyScroll, Politeness};
-use crate::ui::{PaneRole, QueuedNotes, UiCtx, View};
+use crate::ui::{PaneRole, QueuedNotes, SettingsPage, UiCtx, View};
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Frame, Id, Key, Layout, Margin, Modifiers,
@@ -3830,7 +3830,7 @@ impl TranscriptState {
             SummaryAction::None => {}
             SummaryAction::Generate => self.ai_generate(cx, AiTask::Summary),
             SummaryAction::CopyToNotes => self.copy_summary_to_notes(cx),
-            SummaryAction::OpenSettings => cx.nav.go(View::Settings),
+            SummaryAction::OpenSettings => cx.open_settings(SettingsPage::Ai),
         }
     }
 

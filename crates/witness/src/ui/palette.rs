@@ -17,7 +17,7 @@
 use super::icons::{self, ph};
 use super::theme::{self, pal, S1, S2, S3, S4};
 use super::widgets;
-use super::{UiCtx, View};
+use super::{SettingsPage, UiCtx, View};
 use crate::bridge::{OpDone, Task};
 use crate::ui_state::Appearance;
 use chrono::{DateTime, Datelike, Local, NaiveDate};
@@ -237,6 +237,8 @@ enum Command {
     GoMeetings,
     GoPeople,
     GoSettings,
+    /// Settings, opened at a category (only offered for a query).
+    GoSettingsPage(SettingsPage),
     /// Switch Appearance to dark (`true`) or light.
     Theme {
         dark: bool,
@@ -260,6 +262,38 @@ impl Command {
                 | Command::ShowCaptions
                 | Command::OpenRecording(_)
         )
+    }
+}
+
+/// Typed matches of the "Settings: <category>" actions rank this much
+/// lower, so "settings" still finds "Go to Settings" first.
+const SETTINGS_PAGE_PENALTY: i32 = 25;
+
+/// The palette's "Settings: <category>" action title and its keywords.
+fn settings_page_action(page: SettingsPage) -> (&'static str, &'static str) {
+    match page {
+        SettingsPage::General => (
+            "Settings: General",
+            "appearance theme accent dark light startup autostart setup",
+        ),
+        SettingsPage::Recording => (
+            "Settings: Recording",
+            "auto-record devices microphone audio hotkeys shortcuts detection",
+        ),
+        SettingsPage::Transcription => (
+            "Settings: Transcription",
+            "engine gpu cuda captions noise parakeet whisper",
+        ),
+        SettingsPage::Ai => (
+            "Settings: AI assistant",
+            "ai openai api key summary notes llm",
+        ),
+        SettingsPage::Voices => (
+            "Settings: Voices",
+            "voice prints speakers people strictness",
+        ),
+        SettingsPage::Storage => ("Settings: Storage", "data folder backup models disk"),
+        SettingsPage::About => ("Settings: About", "version updates privacy diagnostics"),
     }
 }
 
@@ -454,6 +488,15 @@ fn actions(state: &ActionState) -> Vec<ActionSpec> {
         "preferences options configure",
         Glyph::Icon(ph::GEAR_SIX),
     ));
+    for page in SettingsPage::ALL {
+        let (title, keywords) = settings_page_action(page);
+        out.push(spec(
+            Command::GoSettingsPage(page),
+            title,
+            keywords,
+            Glyph::Icon(page.icon()),
+        ));
+    }
     out.push(if state.dark {
         spec(
             Command::Theme { dark: false },
@@ -605,8 +648,10 @@ fn build(
     if query.is_empty() {
         let mut groups = vec![Group {
             section: Section::Actions,
+            // The per-category Settings actions only answer a query.
             items: actions(state)
                 .into_iter()
+                .filter(|spec| !matches!(spec.command, Command::GoSettingsPage(_)))
                 .map(|spec| action_item(spec, unranked()))
                 .collect(),
         }];
@@ -627,7 +672,13 @@ fn build(
     let action_items = ranked(
         actions(state)
             .into_iter()
-            .filter_map(|spec| match_action(query, &spec).map(|m| action_item(spec, m)))
+            .filter_map(|spec| {
+                let mut m = match_action(query, &spec)?;
+                if matches!(spec.command, Command::GoSettingsPage(_)) {
+                    m.score -= SETTINGS_PAGE_PENALTY;
+                }
+                Some(action_item(spec, m))
+            })
             .collect(),
         usize::MAX,
     );
@@ -1387,6 +1438,7 @@ fn run(command: Command, cx: &mut UiCtx) {
             cx.nav.go(View::People);
         }
         Command::GoSettings => cx.nav.go(View::Settings),
+        Command::GoSettingsPage(page) => cx.open_settings(page),
         Command::AiSummary(id) | Command::AiTitle(id) => {
             let task = if matches!(command, Command::AiTitle(_)) {
                 AiTask::Title
@@ -1574,6 +1626,27 @@ mod tests {
             settings.hits.is_empty(),
             "keyword matches highlight nothing"
         );
+    }
+
+    #[test]
+    fn settings_categories_answer_queries_only() {
+        let (meetings, people) = sample();
+        let state = ActionState::default();
+        let empty = build("", &state, &meetings, &people, today());
+        assert!(!flat(&empty).any(|i| matches!(i.command, Command::GoSettingsPage(_))));
+        let first = |q| build(q, &state, &meetings, &people, today())[0].items[0].clone();
+        assert_eq!(
+            first("hotkeys").command,
+            Command::GoSettingsPage(SettingsPage::Recording)
+        );
+        assert_eq!(
+            first("settings ai").command,
+            Command::GoSettingsPage(SettingsPage::Ai)
+        );
+        let storage = build("storage", &state, &meetings, &people, today());
+        assert!(flat(&storage).any(|i| i.title == "Settings: Storage"));
+        // "settings" alone still leads with the plain action.
+        assert_eq!(first("settings").command, Command::GoSettings);
     }
 
     #[test]

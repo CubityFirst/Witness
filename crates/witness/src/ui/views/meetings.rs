@@ -32,7 +32,7 @@ use crate::ui::icons::{self, ph};
 use crate::ui::theme::{self, pal};
 use crate::ui::toasts::{Notice, ToastAction};
 use crate::ui::widgets::{self, KeyScroll};
-use crate::ui::{PaneRole, UiCtx, View};
+use crate::ui::{PaneRole, SettingsPage, UiCtx, View};
 use chrono::{DateTime, Datelike, Local, NaiveDate};
 use eframe::egui::{
     self, text::LayoutJob, text::TextWrapping, Align, Color32, CornerRadius, CursorIcon, FontId,
@@ -1288,7 +1288,7 @@ impl MeetingsView {
             // The top bar's path: its pill shows the start, and the new
             // meeting arrives through the usual refresh.
             RowAction::StartRecording => cx.submit_rec(RecCmd::Start(Trigger::Manual)),
-            RowAction::OpenSettings => cx.nav.go(View::Settings),
+            RowAction::OpenSettings => cx.open_settings(SettingsPage::Recording),
         }
     }
 

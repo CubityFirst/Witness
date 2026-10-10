@@ -32,8 +32,8 @@ use toasts::Toasts;
 use views::meetings::MeetingsView;
 use views::people::PeopleView;
 use views::search::SearchView;
-pub use views::settings::SettingsRoute;
 use views::settings::SettingsView;
+pub use views::settings::{SettingsPage, SettingsRoute};
 use views::transcript::TranscriptView;
 use witness_core::player::Player;
 use witness_core::{AppCore, RecCmd};
@@ -313,6 +313,15 @@ pub struct ViewMemory {
     pub settings_route: Option<SettingsRoute>,
     /// Ctrl+F or `/` on Settings: its search field takes focus next pass.
     pub settings_search_focus: bool,
+    /// A link into Settings ("Set up the AI assistant…"): the category to
+    /// open; taken by `SettingsView`.
+    pub settings_target: Option<SettingsPage>,
+}
+
+/// Go to Settings, opened at `page` (also when Settings already shows).
+pub fn request_settings(memory: &mut ViewMemory, nav: &mut Nav, page: SettingsPage) {
+    memory.settings_target = Some(page);
+    nav.go(View::Settings);
 }
 
 /// A notes draft handed to the writer. `started_at` pins it to one meeting:
@@ -377,6 +386,12 @@ impl UiCtx<'_> {
     pub fn go_meetings_clear_search(&mut self) {
         self.memory.search_box.clear();
         self.nav.go(View::Meetings);
+    }
+
+    /// Open Settings at a category (deep links from other views and the
+    /// command palette).
+    pub fn open_settings(&mut self, page: SettingsPage) {
+        request_settings(self.memory, self.nav, page);
     }
 
     /// Publish (or clear) the notes autosave deadline; `logic()` fires it
@@ -947,6 +962,15 @@ mod tests {
         h.go(transcript(5, Some(search("x"))), true);
         assert_eq!(h.left_keys(), ["transcript-4", "meetings"]);
         assert_eq!(h.split_pass().0 .0, "search");
+    }
+
+    #[test]
+    fn settings_links_name_their_category() {
+        let mut memory = ViewMemory::default();
+        let mut nav = Nav::default();
+        request_settings(&mut memory, &mut nav, SettingsPage::Ai);
+        assert_eq!(nav.take(), Some(View::Settings));
+        assert_eq!(memory.settings_target, Some(SettingsPage::Ai));
     }
 
     #[test]
