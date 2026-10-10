@@ -42,6 +42,7 @@ mod general;
 mod kit;
 mod nav;
 mod recording;
+mod search;
 mod storage;
 mod transcription;
 mod updates;
@@ -245,6 +246,14 @@ struct SettingsState {
     route: SettingsRoute,
     /// The remembered category was picked up (first pass).
     routed: bool,
+    /// The settings search as typed, and the result ↑/↓ selected.
+    search_text: String,
+    search_selected: usize,
+    /// Focus the search field when it next draws (Ctrl+F, `/`).
+    search_focus: bool,
+    /// Debug builds: `WITNESS_DEBUG_SETTINGS_RESULT` (opened once).
+    #[cfg(debug_assertions)]
+    debug_result: Option<usize>,
 
     models: Vec<ModelInfo>,
     cache_bytes: Option<u64>,
@@ -313,6 +322,11 @@ impl SettingsState {
             seen_settings_tick: 0,
             route: SettingsRoute::default(),
             routed: false,
+            search_text: String::new(),
+            search_selected: 0,
+            search_focus: false,
+            #[cfg(debug_assertions)]
+            debug_result: None,
             models: Vec::new(),
             cache_bytes: None,
             gpu: None,
@@ -358,7 +372,23 @@ impl SettingsState {
         self.answer_confirms(cx);
         self.sync_buffers(ui.ctx(), cx.settings.current());
         self.route(cx);
-        if nav::is_wide(ui.available_width()) {
+        let wide = nav::is_wide(ui.available_width());
+        if std::mem::take(&mut cx.memory.settings_search_focus) {
+            // Ctrl+F / `/`: the field is on the rail, or on the index.
+            self.search_focus = true;
+            if !wide && self.route.open {
+                self.close_page(cx);
+            }
+        }
+        #[cfg(debug_assertions)]
+        if let Some(n) = self.debug_result.take() {
+            let flat = search::flatten(&search::search(&self.search_text));
+            match flat.get(n) {
+                Some(&index) => self.open_hit(ui.ctx(), cx, index, true),
+                None => log::warn!("WITNESS_DEBUG_SETTINGS_RESULT={n}: no such result"),
+            }
+        }
+        if wide {
             self.wide(ui, cx);
         } else {
             self.narrow(ui, cx);
@@ -380,6 +410,16 @@ impl SettingsState {
                     Some(None) => self.close_page(cx),
                     None => log::warn!("WITNESS_DEBUG_SETTINGS_PAGE={spec:?} not understood"),
                 }
+            }
+            #[cfg(debug_assertions)]
+            if let Ok(query) = std::env::var("WITNESS_DEBUG_SETTINGS_SEARCH") {
+                // Shown with focus, on the index when narrow.
+                self.search_text = query;
+                self.search_focus = true;
+                self.route.open = false;
+                self.debug_result = std::env::var("WITNESS_DEBUG_SETTINGS_RESULT")
+                    .ok()
+                    .and_then(|n| n.trim().parse().ok());
             }
         }
     }

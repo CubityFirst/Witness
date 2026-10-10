@@ -311,6 +311,8 @@ pub struct ViewMemory {
     /// The Settings category shown last this session (and whether a narrow
     /// window had it open); Settings reopens there.
     pub settings_route: Option<SettingsRoute>,
+    /// Ctrl+F or `/` on Settings: its search field takes focus next pass.
+    pub settings_search_focus: bool,
 }
 
 /// A notes draft handed to the writer. `started_at` pins it to one meeting:

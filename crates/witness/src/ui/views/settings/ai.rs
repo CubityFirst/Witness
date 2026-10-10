@@ -391,7 +391,7 @@ impl AiSection {
             };
             row(
                 ui,
-                ("ai-models", models.is_empty()),
+                "ai-models",
                 slot,
                 |ui| {
                     let id = title(ui, "Available models");

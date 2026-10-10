@@ -85,7 +85,18 @@ impl SettingsState {
     }
 
     fn rail(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
-        let selected = self.route.page;
+        // The field lines up with the page title beside it.
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), HEADER_H),
+            Layout::top_down(Align::Min).with_main_align(Align::Center),
+            |ui| {
+                ui.set_min_size(egui::vec2(ui.available_width(), HEADER_H));
+                self.search_field(ui, cx);
+            },
+        );
+        ui.add_space(theme::S2);
+        // While searching no category is selected: the results are shown.
+        let selected = (!self.searching()).then_some(self.route.page);
         let mut picked = None;
         egui::ScrollArea::vertical()
             .id_salt("settings-rail-scroll")
@@ -93,13 +104,15 @@ impl SettingsState {
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 for page in SettingsPage::ALL {
-                    if rail_item(ui, page, page == selected).clicked() {
+                    if rail_item(ui, page, Some(page) == selected).clicked() {
                         picked = Some(page);
                     }
                 }
                 ui.add_space(theme::S4);
             });
         if let Some(page) = picked {
+            // A category picked while searching ends the search.
+            self.search_text.clear();
             self.open_page(cx, page);
         }
     }
@@ -108,12 +121,20 @@ impl SettingsState {
     fn index(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
         widgets::padded_column(ui, |ui| {
             page_header(ui, cx, "Settings", false);
+            ui.add_space(theme::S1);
+            self.search_field(ui, cx);
+            ui.add_space(theme::S1);
         });
         let summaries = SettingsPage::ALL.map(|page| self.summary(cx, page));
         let mut picked = None;
+        let searching = self.searching();
         let out = widgets::scroll_column(ui, "settings-index", KeyScroll { space: true }, |ui| {
+            if searching {
+                self.search_results(ui, cx);
+                return;
+            }
             ui.spacing_mut().item_spacing.y = 2.0;
-            ui.add_space(theme::S1);
+            ui.add_space(theme::S2);
             for (page, summary) in SettingsPage::ALL.into_iter().zip(&summaries) {
                 if index_row(ui, page, summary).clicked() {
                     picked = Some(page);
@@ -130,6 +151,10 @@ impl SettingsState {
     /// `wide` is the right padding beside the rail, None when narrow.
     fn page_pane(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx, wide: Option<f32>) {
         let page = self.route.page;
+        if let (Some(pad), true) = (wide, self.searching()) {
+            self.results_pane(ui, cx, pad);
+            return;
+        }
         let back = match wide {
             Some(pad) => {
                 left_column(ui, pad, |ui| page_header(ui, cx, page.title(), false));
@@ -154,6 +179,21 @@ impl SettingsState {
         if back {
             self.close_page(cx);
         }
+    }
+}
+
+impl SettingsState {
+    /// Wide windows while searching: the results where the page was.
+    fn results_pane(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx, pad: f32) {
+        left_column(ui, pad, |ui| page_header(ui, cx, "Search results", false));
+        let out = egui::ScrollArea::vertical()
+            .id_salt("settings-results")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                left_column(ui, pad, |ui| self.search_results(ui, cx));
+                ui.add_space(theme::S5);
+            });
+        scrolled_hairline(ui, &out);
     }
 }
 

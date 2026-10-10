@@ -267,7 +267,127 @@ pub(crate) fn section<R>(
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     widgets::section_header(ui, title);
-    widgets::group(ui, add)
+    let group = ui.scope(|ui| widgets::group(ui, add));
+    mark_section(ui, section_anchor_id(title), group.response.rect);
+    group.inner
+}
+
+// ----------------------------------------------------------------------
+// Search hits: scrolled into view and briefly highlighted
+
+/// How long a search hit's highlight stays at full strength, then fades.
+const MARK_HOLD: f32 = 0.8;
+const MARK_FADE: f32 = 1.0;
+/// For this long the hit is kept scrolled into view (rows measure
+/// themselves, and loads can still move it, in the first passes).
+const MARK_SCROLL: f32 = 0.5;
+
+/// The id a [`row`] with this `salt` answers to as a search anchor.
+pub(crate) fn row_anchor_id(salt: &str) -> egui::Id {
+    egui::Id::new(("settings-row", salt))
+}
+
+/// The id a [`section`] titled `title` answers to as a search anchor.
+pub(crate) fn section_anchor_id(title: &str) -> egui::Id {
+    egui::Id::new(("settings-section", title))
+}
+
+/// A search hit being shown.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Mark {
+    anchor: egui::Id,
+    /// `InputState::time` when it was opened.
+    at: f64,
+    /// Debug snapshots: never fades.
+    frozen: bool,
+}
+
+fn mark_key() -> egui::Id {
+    egui::Id::new("settings-search-mark")
+}
+
+/// Scroll the row or section `anchor` into view and highlight it briefly.
+pub(crate) fn show_anchor(ctx: &egui::Context, anchor: egui::Id, frozen: bool) {
+    let at = ctx.input(|i| i.time);
+    ctx.data_mut(|d| d.insert_temp(mark_key(), Mark { anchor, at, frozen }));
+    ctx.request_repaint();
+}
+
+/// How strong the highlight is `age` seconds after the hit was opened:
+/// full, then a linear fade (gone at once without animations).
+pub(crate) fn mark_strength(age: f32, animate: bool) -> f32 {
+    if age < MARK_HOLD {
+        1.0
+    } else if !animate {
+        if age < MARK_HOLD + MARK_FADE / 2.0 {
+            1.0
+        } else {
+            0.0
+        }
+    } else {
+        (1.0 - (age - MARK_HOLD) / MARK_FADE).clamp(0.0, 1.0)
+    }
+}
+
+/// The current mark for `anchor` and its strength; keeps it scrolled into
+/// view at first, repaints while it fades and forgets it once gone.
+fn active_mark(ui: &egui::Ui, anchor: egui::Id, rect: egui::Rect) -> Option<f32> {
+    let mark = ui
+        .data(|d| d.get_temp::<Mark>(mark_key()))
+        .filter(|m| m.anchor == anchor)?;
+    let age = (ui.input(|i| i.time) - mark.at) as f32;
+    let animate = crate::ui::icons::animations_enabled();
+    let strength = if mark.frozen {
+        1.0
+    } else {
+        mark_strength(age, animate)
+    };
+    if age < MARK_SCROLL || mark.frozen {
+        ui.scroll_to_rect(rect, Some(Align::Center));
+    }
+    if strength <= 0.0 {
+        ui.data_mut(|d| d.remove::<Mark>(mark_key()));
+        return None;
+    }
+    if !mark.frozen {
+        if animate && age >= MARK_HOLD {
+            crate::ui::icons::request_animation_frame(ui.ctx());
+        } else {
+            let left = (MARK_HOLD + MARK_FADE / 2.0 - age).max(0.05);
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs_f32(left));
+        }
+    }
+    Some(strength)
+}
+
+/// A row hit: a search-hit tint behind the row (into the group's padding).
+fn mark_anchor(ui: &egui::Ui, anchor: egui::Id, rect: egui::Rect, slot: egui::layers::ShapeIdx) {
+    let Some(strength) = active_mark(ui, anchor, rect) else {
+        return;
+    };
+    let fill = pal().mark_bg.gamma_multiply(strength);
+    ui.painter().set(
+        slot,
+        egui::epaint::RectShape::filled(
+            rect.expand2(egui::vec2(theme::S2, 6.0)),
+            CornerRadius::same(theme::R_MD),
+            fill,
+        ),
+    );
+}
+
+/// A section hit: an accent ring around its group.
+fn mark_section(ui: &egui::Ui, anchor: egui::Id, rect: egui::Rect) {
+    let Some(strength) = active_mark(ui, anchor, rect) else {
+        return;
+    };
+    ui.painter().rect_stroke(
+        rect.expand(1.0),
+        CornerRadius::same(theme::R_LG + 1),
+        Stroke::new(2.0, theme::alpha(pal().accent, strength)),
+        egui::StrokeKind::Outside,
+    );
 }
 
 /// How a [`row`]'s control is sized.
@@ -314,6 +434,8 @@ pub(crate) fn row<R>(
 ) -> R {
     let id = egui::Id::new(("settings-row", salt));
     let last: Option<RowMetrics> = ui.data(|d| d.get_temp(id));
+    // Behind the row: a search hit's highlight (`mark_anchor`).
+    let mark = ui.painter().add(egui::Shape::Noop);
     let full = ui.available_width();
     let band = ui.spacing().interact_size.y;
     let control_width = match slot {
@@ -331,7 +453,7 @@ pub(crate) fn row<R>(
         text(ui)
     };
 
-    let (out, now) = match beside {
+    let (out, now, rect) = match beside {
         Some(width) => {
             let text_height = last.map_or(0.0, |m| m.text_height);
             let height = text_height.max(band);
@@ -359,10 +481,8 @@ pub(crate) fn row<R>(
             let out = control(&mut control_ui, label);
             let (text_rect, control_rect) = (text_ui.min_rect(), control_ui.min_rect());
             let bottom = text_rect.bottom().max(control_rect.bottom());
-            ui.advance_cursor_after_rect(egui::Rect::from_min_max(
-                origin,
-                egui::pos2(origin.x + full, bottom),
-            ));
+            let rect = egui::Rect::from_min_max(origin, egui::pos2(origin.x + full, bottom));
+            ui.advance_cursor_after_rect(rect);
             let now = RowMetrics {
                 text_height: text_rect.height(),
                 title_width: natural_title_width(ui, label),
@@ -371,10 +491,10 @@ pub(crate) fn row<R>(
                     _ => width,
                 },
             };
-            (out, now)
+            (out, now, rect)
         }
         None => {
-            ui.scope_builder(egui::UiBuilder::new().id_salt((id, "stacked")), |ui| {
+            let scope = ui.scope_builder(egui::UiBuilder::new().id_salt((id, "stacked")), |ui| {
                 let label = ui.scope(text_block).inner;
                 widgets::gap(ui, theme::S2);
                 // Wrap (several buttons) only once the controls are known
@@ -399,10 +519,12 @@ pub(crate) fn row<R>(
                     },
                 };
                 (inner.inner, now)
-            })
-            .inner
+            });
+            let (out, now) = scope.inner;
+            (out, now, scope.response.rect)
         }
     };
+    mark_anchor(ui, id, rect, mark);
 
     let changed = last.is_none_or(|m| {
         (m.text_height - now.text_height).abs() > 0.5

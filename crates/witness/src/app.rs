@@ -888,8 +888,8 @@ impl WitnessApp {
         }
     }
 
-    /// Ctrl+F anywhere, or `/` outside a text field: go to the search box.
-    /// Modifiers are matched exactly as app.tsx does (no Alt for either, no
+    /// Ctrl+F anywhere, or `/` outside a text field: go to the search box —
+    /// on Settings, to the settings search instead. Modifiers are matched exactly as app.tsx does (no Alt for either, no
     /// Ctrl for `/`): egui's `consume_key` ignores an extra Alt, which would
     /// steal Ctrl+Alt+F / AltGr+F and Alt+/.
     fn handle_search_shortcuts(&mut self, ctx: &egui::Context) {
@@ -919,6 +919,11 @@ impl WitnessApp {
             let slash = !typing && consume_key_exact(i, Key::Slash, |m| !m.command && !m.alt);
             ctrl_f || slash
         });
+        if jump && settings_takes_search(&self.view, self.onboarding.is_active()) {
+            // Settings has its own search: find a setting, stay put.
+            self.memory.settings_search_focus = true;
+            return;
+        }
         if jump {
             // A split shows the search box beside the transcript already.
             if !self.view.has_search_box() && !split {
@@ -990,6 +995,12 @@ fn ignored_while_quitting(event: &ShellEvent) -> bool {
         event,
         ShellEvent::TrayMenuToggleRecord | ShellEvent::HotkeyRecord | ShellEvent::HotkeyBookmark
     )
+}
+
+/// Whether Ctrl+F / `/` go to the Settings search (Settings is showing and
+/// the first-run setup is not) rather than the meetings search box.
+fn settings_takes_search(view: &View, onboarding: bool) -> bool {
+    matches!(view, View::Settings) && !onboarding
 }
 
 /// Consume presses of `key` whose modifiers satisfy `accept`; true if any.
@@ -1808,6 +1819,14 @@ mod tests {
             ui.input(|i| assert!(i.key_pressed(Key::Space)));
         });
         output.textures_delta.clear(); // no renderer to upload the font atlas
+    }
+
+    #[test]
+    fn settings_keeps_ctrl_f_for_its_own_search() {
+        assert!(settings_takes_search(&View::Settings, false));
+        assert!(!settings_takes_search(&View::Settings, true), "setup shows");
+        assert!(!settings_takes_search(&View::Meetings, false));
+        assert!(!settings_takes_search(&View::People, false));
     }
 
     #[test]

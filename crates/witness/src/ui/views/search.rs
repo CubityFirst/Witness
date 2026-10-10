@@ -114,7 +114,7 @@ pub fn search_box(ui: &mut egui::Ui, cx: &mut UiCtx, current: &View) {
         changed = true;
         response.request_focus();
     }
-    if has_text && clear_button(ui, response.rect) {
+    if has_text && clear_button(ui, response.rect, egui::Id::new("search-box-clear")) {
         search.text.clear();
         changed = true;
         response.request_focus();
@@ -142,13 +142,14 @@ pub fn search_box(ui: &mut egui::Ui, cx: &mut UiCtx, current: &View) {
     }
 }
 
-/// The × inside the right edge of the search box; true when clicked.
-fn clear_button(ui: &mut egui::Ui, field: Rect) -> bool {
+/// The × inside the right edge of a search field (this one, Settings');
+/// true when clicked.
+pub(crate) fn clear_button(ui: &mut egui::Ui, field: Rect, id: egui::Id) -> bool {
     let rect = Rect::from_center_size(
         egui::pos2(field.right() - 17.0, field.center().y),
         egui::vec2(24.0, 24.0),
     );
-    let response = ui.interact(rect, egui::Id::new("search-box-clear"), Sense::click());
+    let response = ui.interact(rect, id, Sense::click());
     let hot = response.hovered() || response.has_focus();
     if hot {
         ui.painter()
