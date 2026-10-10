@@ -7,7 +7,7 @@
 //! flow is app-owned and preloaded from `core.pending_update()`, so the
 //! Install button shows as soon as the startup check has found a release.
 
-use super::settings::{button, note, progress_bar, row, section, title, toggle, Slot};
+use super::{button, note, progress_bar, row, section, title, toggle, Slot};
 use crate::model::{UpdateFlow, UpdatePhase};
 use crate::ui::widgets::{self, BadgeKind};
 use crate::ui::{UiCmd, UiCtx};

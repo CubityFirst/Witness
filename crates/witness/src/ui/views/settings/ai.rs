@@ -18,7 +18,7 @@
 //! - "Load models" and "Test connection" are view-owned tasks that use the
 //!   typed values (and a typed key before it is saved).
 
-use super::settings::{
+use super::{
     button, fill, footnote, note, notice_done, row, save, section, status_note, title, toggle,
     OpRun, Slot, FIELD_WIDTH,
 };
