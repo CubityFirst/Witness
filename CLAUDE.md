@@ -74,7 +74,10 @@ in `ui/mod.rs` (`ActiveView` owns the live view). Views in `ui/views/`:
 Meetings (+ recycle bin), People (stats + weekly trend), Transcript (+
 `player_bar.rs`: player, live captions, bookmarks, notes; `ai_summary.rs`: the
 AI Summary panel), Search (filters),
-Settings (+ `updates.rs`, `ai_settings.rs`), plus `ui/palette.rs` (Ctrl+K command palette)
+Settings (`views/settings/`: `mod.rs` view + routing, `nav.rs` rail / index,
+`search.rs` settings search index, `kit.rs` shared row helpers — also used by
+`ui/onboarding.rs` —, one file per category: `general`, `recording`,
+`transcription`, `ai`, `voices`, `storage`, `about` + `updates`), plus `ui/palette.rs` (Ctrl+K command palette)
 and `ui/onboarding.rs` (first-run setup). The look follows **docs/UI.md**
 (flat rows, grouped surfaces, elide-don't-overflow, nothing wraps or clips
 at ≥ 380 pt, light + dark themes, the split layout from 900 pt). Colours
@@ -491,6 +494,8 @@ validated with newer LLVM releases. The toolchain is pinned in
   `WITNESS_DEBUG_TOASTS=1`, `WITNESS_DEBUG_CONFIRM=1`,
   `WITNESS_DEBUG_CAPTIONS=1` (overlay with sample lines),
   `WITNESS_DEBUG_SYNTHETIC=1` (3,000-segment transcript),
+  `WITNESS_DEBUG_SETTINGS_PAGE=<category>|index`,
+  `WITNESS_DEBUG_SETTINGS_SEARCH=<q>` (+ `WITNESS_DEBUG_SETTINGS_RESULT=<n>`),
   `WITNESS_DEBUG_AI_SETTINGS=on|error|other`, `WITNESS_DEBUG_AI_SUMMARY=sample|<md>`
   + `WITNESS_DEBUG_AI_STATE=busy|failed|stale|off` (AI states, never saved),
   `WITNESS_DEBUG_PANIC_HOTKEY=1` (Ctrl+Alt+Shift+F12 panics in `ui()` — for
@@ -534,7 +539,7 @@ ignores prereleases; promote with `gh release edit vX.Y.Z
 in `docs/RELEASE_CHECKLIST.md`.
 
 Startup check after 30 s (`check_for_updates` setting) only toasts;
-installing is always a click in Settings → Updates and is refused while
+installing is always a click in Settings → About → Updates and is refused while
 recording or backing up. The download goes to
 `%TEMP%\Witness-{v}-updater-*`, is verified (MZ + signature + version), and
 removed on any failure; the app then launches the installer with
@@ -558,7 +563,7 @@ because TOML writes tables after values); its API key is never in any file
 of ours — Windows Credential Manager, generic credential
 `Witness/ai-api-key`. An invalid base URL still saves (other settings must
 keep saving); it is refused at request time and shown in Settings.
-Settings → Models → "Delete model cache" wipes `models/` (hf-cache +
+Settings → Storage → "Delete model cache" wipes `models/` (hf-cache +
 install manifest, superseded revisions included); refused while recording,
 transcribing or downloading, since Windows can't delete open model files.
 The installer removes the old WebView2 profile

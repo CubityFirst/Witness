@@ -72,6 +72,24 @@ and left the client area see-through. The live-caption overlay stays dark in bot
   the open meeting, the transcript drops its Back button. The shell keeps
   the list instance alive behind a transcript, so list `on_leave` must be
   non-destructive.
+- **Settings** (`views/settings/`) is seven categories (General, Recording,
+  Transcription, AI assistant, Voices, Storage, About). From 720 pt of
+  content width (`nav::WIDE_MIN`) a 212 pt navigation rail (search field,
+  then icon + name rows; the selected one a neutral `bg_active` fill, never
+  an accent tint) sits left of the selected page, whose title stays fixed
+  above its own scroller and whose sections sit in a left-aligned column of
+  at most `CONTENT_MAX`. Narrower (the tray flyout too) an index lists the
+  categories — icon tile, name, a one-line summary of the current values,
+  chevron — and a page opens over it with a Back button. A page is
+  sections of `kit::row`s; destructive actions (delete the model cache,
+  remove the API key, forget a voice) come last in their group. The
+  category last shown is remembered for the session; other views link in
+  with `UiCtx::open_settings(SettingsPage)`.
+- **Settings search** matches a static index (`settings/search.rs`: title,
+  description, category, keywords) — add an entry with every new setting,
+  anchored to its row salt or section title. Opening a result scrolls the
+  row into view and tints it with `mark_bg` (a section gets an accent ring),
+  fading after ~1 s.
 - `centered_column` / `padded_column` restore the normal horizontal item
   spacing for their content.
 - `list_row` senses through its scope (registered before the content), so
@@ -83,7 +101,8 @@ and left the client area see-through. The live-caption overlay stays dark in bot
 
 - **Ctrl+K** — command palette (actions, meetings, people; fuzzy-ranked).
 - **Ctrl+F** — find in the open transcript (Enter / Shift+Enter, F3); in
-  lists it focuses the search box, as does **/**.
+  lists it focuses the search box, as does **/**; on Settings both focus
+  "Find a setting" (↑/↓ + Enter pick a result, Esc clears).
 - Lists (Meetings, the bin, Search hits, People): **↑/↓** or **j/k**,
   **Home/End**, **Enter** opens / expands; Meetings also **F2** renames and
   **Delete** bins (Shift skips the confirmation). Only while no text field
@@ -118,7 +137,13 @@ input:
   `WITNESS_DEBUG_LOADING=1`, `WITNESS_DEBUG_EMPTY=1|bin`,
   `WITNESS_DEBUG_SELECT=<n>|bin:<n>`, `WITNESS_DEBUG_PANE=<index>`,
   `WITNESS_DEBUG_EXPAND_PERSON=<i>`.
-- Settings: `WITNESS_DEBUG_SCROLL=<pt>`, `WITNESS_DEBUG_AI_SETTINGS=on|error|other`
+- Settings: `WITNESS_DEBUG_SETTINGS_PAGE=<category>|index` (`general`,
+  `recording`, `transcription`, `ai`, `voices`, `storage`, `about`; `index`
+  = the narrow category list), `WITNESS_DEBUG_SETTINGS_SEARCH=<query>` (the
+  results, field focused; narrow shows them on the index) +
+  `WITNESS_DEBUG_SETTINGS_RESULT=<n>` (opens result n with its highlight
+  held), `WITNESS_DEBUG_SCROLL=<pt>` (the page scroller),
+  `WITNESS_DEBUG_AI_SETTINGS=on|error|other`
   (the AI assistant section configured, with a model list and a test
   result — or an http:// base URL error and a 401, or a base URL on
   another host than the saved key; shown, never saved).

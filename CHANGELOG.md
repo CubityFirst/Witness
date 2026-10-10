@@ -43,6 +43,29 @@ still evolve quickly.
   Keep a backup made with 0.2.x if you may need to go back; any official
   rollback build is patched to open the new schema.
 
+### Settings, reorganised
+
+- Settings is now seven categories, Windows 11–style: General (theme,
+  accent, start with Windows, setup assistant), Recording (auto-record,
+  watch patterns, devices, hotkeys), Transcription (engine, GPU and GPU
+  libraries, auto-transcribe, live captions, noise phrases), AI assistant,
+  Voices (match strictness, voice prints), Storage (data folder, backup,
+  models) and About (updates, a privacy summary, diagnostics). Every
+  setting, confirmation and save behaves as before.
+- Wide windows show a navigation rail beside the selected page; narrow
+  ones (the tray flyout) list the categories with a one-line summary of
+  their current values and open each with a Back button. Settings reopens
+  on the category you used last.
+- Search: type in "Find a setting" (or press Ctrl+F or / on Settings) to
+  filter every setting by name, description or related words ("shortcut",
+  "cudnn", "openai key"…); ↑/↓ and Enter pick a result, which opens its
+  category and briefly highlights the setting. Esc clears.
+- Links go straight to the right place: "Set up the AI assistant…" opens
+  AI assistant, the empty library's "Open Settings" opens Recording, and
+  the command palette (Ctrl+K) finds "Settings: <category>".
+- The saved API key's Remove button has its own row at the end of the AI
+  connection group, like the other destructive actions.
+
 ### Native UI
 
 - The user interface is rewritten natively in Rust with egui/eframe. Tauri,
