@@ -332,7 +332,7 @@ thread and an in-house WSOLA time-stretch (speed) — no extra crates.
 - **hf-hub stays on 0.4.x** — 1.0 is an incompatible rewrite. Models live
   in the hf-hub cache under `data_dir/models/hf-cache`; presence checks
   via `Cache` (offline), never `Api` (network).
-- **wasapi 0.23**: loopback = *render* device opened with
+- **wasapi 0.26** (≥0.25 fixes RUSTSEC-2026-0332): loopback = *render* device opened with
   `Direction::Capture` + `StreamMode::EventsShared`; `initialize_mta()`
   per thread; wasapi objects are `!Send`. The player's render thread uses
   the same crate.

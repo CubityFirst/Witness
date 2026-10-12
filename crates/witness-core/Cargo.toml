@@ -55,7 +55,7 @@ semver = "1"
 base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
-wasapi = "0.23"
+wasapi = "0.26"
 winreg = "0.55"
 # Standalone WinRT toast crate (the one tauri-plugin-notification wrapped).
 tauri-winrt-notification = "0.8.1"
