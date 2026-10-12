@@ -4,7 +4,7 @@ All notable changes to Witness are documented here. The project is pre-1.0;
 database and backup formats remain versioned, but user-visible behavior can
 still evolve quickly.
 
-## Unreleased
+## 0.3.0 — 2026-10-12
 
 ### AI assistant (opt-in)
 
