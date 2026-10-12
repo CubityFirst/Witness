@@ -522,14 +522,23 @@ impl AiService {
     /// running one read the meeting (a retranscription, a Regenerate), so
     /// it must run once more. [ui-ok]
     pub(crate) fn request(&self, meeting_id: i64, task: AiTask, automatic: bool) -> CoreResult<()> {
+        self.enqueue(meeting_id, &[task], automatic)
+    }
+
+    /// Queue `tasks` under one lock, so the worker can't take the first
+    /// before the rest merge into its job (a Title queued apart from its
+    /// Summary would re-read the whole transcript instead of the notes).
+    fn enqueue(&self, meeting_id: i64, tasks: &[AiTask], automatic: bool) -> CoreResult<()> {
         let mut queue = self.shared.queue.lock().unwrap();
         if let Some(job) = queue
             .pending
             .iter_mut()
             .find(|j| j.meeting_id == meeting_id)
         {
-            let slot = job.slot(task);
-            *slot = Some(slot.map_or(automatic, |was| was && automatic));
+            for &task in tasks {
+                let slot = job.slot(task);
+                *slot = Some(slot.map_or(automatic, |was| was && automatic));
+            }
         } else {
             if queue.pending.len() >= MAX_PENDING {
                 return Err("Too many AI requests are waiting; try again in a moment.".into());
@@ -539,16 +548,20 @@ impl AiService {
                 title: None,
                 summary: None,
             };
-            *job.slot(task) = Some(automatic);
+            for &task in tasks {
+                *job.slot(task) = Some(automatic);
+            }
             queue.pending.push_back(job);
         }
         drop(queue);
         self.shared.changed.notify_all();
-        self.env().sink.emit(CoreEvent::AiProgress(AiProgress {
-            meeting_id,
-            task,
-            stage: "Queued".into(),
-        }));
+        for &task in tasks {
+            self.env().sink.emit(CoreEvent::AiProgress(AiProgress {
+                meeting_id,
+                task,
+                stage: "Queued".into(),
+            }));
+        }
         Ok(())
     }
 
@@ -559,15 +572,18 @@ impl AiService {
         if !ai.is_configured() {
             return;
         }
-        for (on, task) in [
+        let tasks: Vec<AiTask> = [
             (ai.auto_notes, AiTask::Summary),
             (ai.auto_title, AiTask::Title),
-        ] {
-            if on {
-                if let Err(error) = self.request(meeting_id, task, true) {
-                    log::warn!("AI {task:?} for meeting {meeting_id} not queued: {error}");
-                }
-            }
+        ]
+        .into_iter()
+        .filter_map(|(on, task)| on.then_some(task))
+        .collect();
+        if tasks.is_empty() {
+            return;
+        }
+        if let Err(error) = self.enqueue(meeting_id, &tasks, true) {
+            log::warn!("AI {tasks:?} for meeting {meeting_id} not queued: {error}");
         }
     }
 
@@ -2052,12 +2068,17 @@ mod tests {
                     intervene(&settings, &service, &creds, &db, id);
                 }
             });
+            // Held so both tasks merge into the one job the change stops; a
+            // worker that took Summary first would leave Title waiting, and
+            // a waiting job runs with the new settings.
+            f.service.set_paused(true);
             if automatic {
                 f.service.on_transcribed(id);
             } else {
                 f.service.request(id, AiTask::Summary, false).unwrap();
                 f.service.request(id, AiTask::Title, false).unwrap();
             }
+            f.service.set_paused(false);
             assert!(f.service.wait_idle(Duration::from_secs(20)), "{tag}");
             assert_eq!(f.fake.calls(), 1, "{tag}: no request after the change");
             let after = f.db.get_meeting(id).unwrap().unwrap();
@@ -2162,8 +2183,11 @@ mod tests {
             CHUNK_CHARS,
         )
         .len();
+        // Held so both tasks merge into one job that reads the parts once.
+        f.service.set_paused(true);
         f.service.request(id, AiTask::Summary, false).unwrap();
         f.service.request(id, AiTask::Title, false).unwrap();
+        f.service.set_paused(false);
         assert!(f.service.wait_idle(Duration::from_secs(30)));
         assert!(
             f.fake.calls() <= parts + EXTRA_REQUESTS,
