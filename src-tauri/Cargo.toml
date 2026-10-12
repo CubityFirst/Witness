@@ -45,7 +45,7 @@ whisper-rs = "0.14"
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray"] }
 # GPU library installer (gpu_libs.rs): ureq matches hf-hub's major so the
 # tree keeps a single copy; zip reads the NVIDIA wheel archives (deflate).
-ureq = "2"
+ureq = "3"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 ndarray = "0.17"
 realfft = "3"
