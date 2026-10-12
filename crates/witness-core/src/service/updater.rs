@@ -1772,14 +1772,20 @@ mod tests {
         })
         .unwrap();
         assert_eq!(std::fs::read(&installer).unwrap(), payload);
-        assert_eq!(
-            events,
-            vec![
-                (1 << 20, Some(3 << 20)),
-                (2 << 20, Some(3 << 20)),
-                (3 << 20, Some(3 << 20))
-            ]
+        // A socket read can return less than the 64 KiB buffer, so emits
+        // land at least PROGRESS_STEP apart, not on exact 1 MiB boundaries.
+        let done: Vec<u64> = events.iter().map(|&(d, _)| d).collect();
+        assert!(
+            events.iter().all(|&(_, t)| t == Some(3 << 20)),
+            "{events:?}"
         );
+        assert_eq!(done.len(), 3, "{events:?}");
+        assert!(
+            (1 << 20..(1 << 20) + 64 * 1024).contains(&done[0]),
+            "{events:?}"
+        );
+        assert!(done[1] - done[0] >= PROGRESS_STEP, "{events:?}");
+        assert_eq!(done[2], 3 << 20);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
