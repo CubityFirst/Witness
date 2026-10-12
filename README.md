@@ -1,16 +1,17 @@
 # Witness
 
-Witness is a local meeting recorder and transcriber for Windows 11. It can
-detect Microsoft Teams calls, capture microphone and system output on separate
-tracks, transcribe on the device, identify recurring speakers, and keep a
-searchable archive.
+Witness is a local meeting recorder and transcriber for Windows 11, written
+as a single native Rust app. It can detect Microsoft Teams calls, capture
+microphone and system output on separate tracks, transcribe on the device,
+identify recurring speakers, and keep a searchable archive.
 
 Meeting audio, transcripts, notes, and voice prints are not sent to a Witness
 service. Choosing **Download** for a speech model connects to Hugging Face;
-choosing **Download GPU libraries** connects to PyPI's
-`files.pythonhosted.org` host for pinned NVIDIA-published wheels. No meeting
-content is included in those requests. The optional AI assistant (off by
-default) is the one feature that sends meeting text — transcript, speaker
+downloading the GPU libraries connects to PyPI's `files.pythonhosted.org` host
+for pinned NVIDIA-published wheels; the update check (on by default, switchable
+under **Settings > About**) and installing an update connect to GitHub. No
+meeting content is included in those requests. The optional AI assistant (off
+by default) is the one feature that sends meeting text — transcript, speaker
 names and title, never audio — and only to the OpenAI-compatible service you
 configure, which can be a server on your own computer. See
 [Privacy](PRIVACY.md) before recording other people.
@@ -27,10 +28,15 @@ configure, which can be a server on your own computer. See
 - Produces a stereo Ogg Opus archive, normally around 18 MB per hour at the
   default bitrate.
 - Runs Parakeet TDT or Whisper transcription locally. Parakeet supports live
-  captions; the final transcript replaces those provisional captions.
+  captions, in the app and in an always-on-top overlay; the final transcript
+  replaces those provisional captions.
+- Global hotkeys start/stop recording (Ctrl+Alt+R) and drop bookmarks
+  (Ctrl+Alt+B), with fallbacks if another app owns those combinations.
 - Diarizes up to eight remote speakers and stores explicit speaker enrollments
-  as local voice-print embeddings.
-- Searches transcript text and notes with SQLite FTS5.
+  as local voice-print embeddings. A People view shows each person's speaking
+  time across meetings and a 12-week trend.
+- Searches transcript text and notes with SQLite FTS5, and exports
+  transcripts as Markdown, plain text, SRT, or WebVTT.
 - Recovers interrupted recordings and queued processing after a restart.
 - Moves deleted meetings to a recycle bin before permanent deletion.
 - Creates atomic, checksummed recovery snapshots from Settings.
@@ -43,9 +49,12 @@ configure, which can be a server on your own computer. See
 
 ## Install and first run
 
-Witness currently targets Windows 11. Install a release build, start Witness,
-and leave its tray process running. Closing the main window hides it; use
-**Quit** from the tray to exit.
+Witness currently targets Windows 11. Download `Witness_<version>_x64-setup.exe`
+from [Releases](https://github.com/CubityFirst/Witness/releases) — a per-user
+install that needs no administrator rights — start Witness, and leave its tray
+process running. Closing the main window hides it; use **Quit** from the tray
+to exit. Installed copies check GitHub for signed updates; installing one is
+always a click in **Settings > About** and is refused while recording.
 
 Before an important call:
 
@@ -70,20 +79,22 @@ or interrupted download remains incomplete and can be repaired from Settings.
 | Capability | Model | Approximate disk use |
 | --- | --- | ---: |
 | Fast ASR and live captions | Parakeet TDT 0.6B v3 | 2.6 GB |
-| Remote-speaker diarization (up to 8) | NVIDIA Nemotron 3 Diarization | 380 MB |
+| Remote-speaker diarization (up to 8) | NVIDIA Nemotron 3 Diarization | 400 MB |
 | Cross-meeting speaker matching | ERes2Net | 26 MB |
-| Alternate ASR | Whisper large-v3-turbo q5 | 550 MB |
+| Alternate ASR | Whisper large-v3-turbo q5 | 575 MB |
 
 Allow at least 5 GB free when installing every model so downloads and temporary
-files have headroom. Parakeet attempts NVIDIA CUDA and falls back to CPU if the
-provider cannot initialize. GPU transcription needs the CUDA 13 runtime and
-cuDNN 9 resolvable by the DLL loader; Witness checks this before every engine
-load, automatically picks up installs referenced by `CUDNN_PATH` or placed in
-the standard `NVIDIA\CUDNN` layout (under Program Files or LOCALAPPDATA), and
-otherwise logs which DLLs are missing. Settings shows the same GPU status.
+files have headroom. **Settings > Storage > Delete model cache** frees that
+space again (refused while recording, transcribing, or downloading). Parakeet
+attempts NVIDIA CUDA and falls back to CPU if the provider cannot initialize.
+GPU transcription needs the CUDA 13 runtime and cuDNN 9 resolvable by the DLL
+loader; Witness checks this before every engine load, automatically picks up
+installs referenced by `CUDNN_PATH` or placed in the standard `NVIDIA\CUDNN`
+layout (under Program Files or LOCALAPPDATA), and otherwise logs which DLLs are
+missing. Settings shows the same GPU status.
 
-Machines with an NVIDIA GPU but no CUDA developer install can use **Settings →
-Transcription → Download GPU libraries** (~1 GB): Witness fetches the pinned,
+Machines with an NVIDIA GPU but no CUDA developer install can use **Settings >
+Transcription > GPU libraries > Download** (~1 GB): Witness fetches the pinned,
 SHA-256-verified NVIDIA-published CUDA runtime, cuDNN, and nvJitLink wheels
 hosted by PyPI (`files.pythonhosted.org`) and installs just the required DLLs
 into the data directory — no admin rights, no system changes, removable by
@@ -157,7 +168,7 @@ Common problems:
 - **Transcription is unexpectedly slow:** check the GPU line in Settings and
   `witness.log` — a warning names any CUDA/cuDNN DLLs the loader cannot find,
   and a single-digit realtime factor in completion toasts means CPU. Use
-  **Download GPU libraries** in Settings → Transcription (or install cuDNN 9 for
+  **GPU libraries > Download** in Settings > Transcription (or install cuDNN 9 for
   CUDA 13 / set `CUDNN_PATH`) to restore GPU transcription. CPU fallback is
   functional but slower.
 - **Model integrity check failed:** use **Repair** in Settings. Witness will not
