@@ -97,6 +97,17 @@ impl ShellModel {
         self.status.as_ref().is_some_and(|s| s.recording)
     }
 
+    /// Whether the pipeline is transcribing: a progress event since the
+    /// last completion, or the status naming a meeting (the status covers a
+    /// job that has not reported progress yet).
+    pub fn transcribing(&self) -> bool {
+        self.progress.is_some()
+            || self
+                .status
+                .as_ref()
+                .is_some_and(|s| s.transcribing_meeting_id.is_some())
+    }
+
     /// Live captions are running for the active recording.
     pub fn live_captions_active(&self) -> bool {
         self.live_captions
@@ -554,6 +565,28 @@ mod tests {
             })),
             vec![Effect::RefreshStatus]
         );
+    }
+
+    #[test]
+    fn transcribing_follows_progress_and_the_status() {
+        let mut m = ShellModel::new();
+        assert!(!m.transcribing());
+        m.apply(&CoreEvent::TranscriptionProgress(TranscriptionProgress {
+            meeting_id: 1,
+            stage: "asr",
+            pct: 0.5,
+        }));
+        assert!(m.transcribing());
+        m.apply(&CoreEvent::TranscriptionComplete(TranscriptionDone {
+            meeting_id: 1,
+            error: None,
+        }));
+        assert!(!m.transcribing());
+        m.set_status(AppStatus {
+            transcribing_meeting_id: Some(2),
+            ..status(false, None)
+        });
+        assert!(m.transcribing());
     }
 
     #[test]

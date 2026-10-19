@@ -91,6 +91,13 @@ pub(super) const INDEX: &[Entry] = &[
     ),
     entry(
         P::General,
+        Row("appearance-tray-icon"),
+        "Tray icon",
+        "Monochrome to match the taskbar, or the colour app icon.",
+        "tray icon notification area system tray monochrome colour color taskbar",
+    ),
+    entry(
+        P::General,
         Row("Start Witness with Windows"),
         "Start Witness with Windows",
         "Opens minimized to the tray.",

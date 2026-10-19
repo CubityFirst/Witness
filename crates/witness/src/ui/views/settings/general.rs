@@ -1,5 +1,6 @@
-//! Settings → General: Appearance (theme, accent colour — UI preferences,
-//! applied at once) and Startup (start with Windows, the setup assistant).
+//! Settings → General: Appearance (theme, accent colour, tray icon — UI
+//! preferences, applied at once) and Startup (start with Windows, the setup
+//! assistant).
 //! The appearance rows are shared with the first-run setup.
 
 use super::{
@@ -13,7 +14,7 @@ use crate::ui::theme::{self, pal};
 use crate::ui::toasts::Notice;
 use crate::ui::widgets;
 use crate::ui::{UiCmd, UiCtx};
-use crate::ui_state::{AccentSource, Appearance, UiPrefs};
+use crate::ui_state::{AccentSource, Appearance, TrayIconStyle, UiPrefs};
 use eframe::egui;
 
 impl SettingsState {
@@ -27,9 +28,9 @@ impl SettingsState {
         general_summary(cx.prefs, self.autostart)
     }
 
-    /// Theme and accent. UI preferences (`cx.prefs`), not settings: the
-    /// shell persists them and re-resolves the palette every frame, so they
-    /// apply at once.
+    /// Theme, accent and tray icon. UI preferences (`cx.prefs`), not
+    /// settings: the shell persists them and re-applies them every pass, so
+    /// they apply at once.
     fn appearance(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
         let look = self.look;
         let prefs = &mut *cx.prefs;
@@ -37,6 +38,8 @@ impl SettingsState {
             theme_row(ui, prefs);
             widgets::group_divider(ui);
             accent_row(ui, prefs, look.as_ref());
+            widgets::group_divider(ui);
+            tray_icon_row(ui, prefs);
         });
     }
 
@@ -176,6 +179,33 @@ pub(crate) fn accent_row(ui: &mut egui::Ui, prefs: &mut UiPrefs, look: Option<&S
                     windows_option,
                     Segment::new(AccentSource::Witness, "Witness blue")
                         .swatch(theme::Palette::resolve(pal().dark, None).accent),
+                ],
+            );
+        },
+    );
+}
+
+/// Tray icon: monochrome (follows the taskbar's light or dark theme) or the
+/// full-colour app icon.
+fn tray_icon_row(ui: &mut egui::Ui, prefs: &mut UiPrefs) {
+    row(
+        ui,
+        "appearance-tray-icon",
+        Slot::Fill(FIELD_WIDTH),
+        |ui| {
+            let id = title(ui, "Tray icon");
+            note(ui, "Monochrome matches the taskbar's light or dark theme.");
+            id
+        },
+        |ui, label| {
+            segmented(
+                ui,
+                "appearance-tray-icon",
+                label,
+                &mut prefs.tray_icon,
+                &[
+                    Segment::new(TrayIconStyle::Monochrome, "Monochrome"),
+                    Segment::new(TrayIconStyle::Colour, "Colour"),
                 ],
             );
         },

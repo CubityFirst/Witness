@@ -30,6 +30,8 @@ pub enum ShellEvent {
     HotkeyBookmark,
     /// A second launch asked this instance to show itself.
     SecondInstance,
+    /// Windows' default mode (which the taskbar follows) changed.
+    TaskbarTheme { light: bool },
 }
 
 /// The window a native dialog is parented to (raw HWND; 0 = none). Plain

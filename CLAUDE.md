@@ -389,6 +389,11 @@ thread and an in-house WSOLA time-stretch (speed) — no extra crates.
   "always show" promotion on exe path + uID, and the first tray-icon is uID
   2, as in 0.2.x. **No process AUMID** (`SetCurrentProcessExplicitAppUserModelID`
   is never called; 0.2.x didn't, and it would split taskbar pins).
+  Its glyph (idle / recording / transcribing) is the colour app tile or, by
+  default (Settings → General → Tray icon), monochrome inked for the
+  taskbar's theme, which follows `SystemUsesLightTheme`, not the app mode. A thread
+  parked in `RegNotifyChangeKeyValue` reports flips as
+  `ShellEvent::TaskbarTheme`, because `logic()` does not run while hidden.
 - Window operations go through `platform::window::MainWindow` (winit/Win32
   directly: synchronous, physical pixels, independent of the pass state),
   not `ViewportCommand` (`OuterPosition` uses the wrong DPI on mixed-DPI
@@ -570,7 +575,8 @@ The installer removes the old WebView2 profile
 (`%LOCALAPPDATA%\com.github.cubityfirst.witness\EBWebView`).
 `assets/brand/icons.mjs` is the source of every icon: it draws the shield
 and writes `crates/witness/icons/` (exe icon resource 32512, window icon,
-tray icons), `app-icon.png` and `assets/icon.svg`. The 16–32 px frames are
+`tray-<state>-<light|dark>.ico`), `app-icon.png` and `assets/icon.svg`. The
+16–32 px frames are
 separately grid-fitted, so edit the script and rerun it
 (`node assets/brand/icons.mjs`) rather than resizing a PNG.
 

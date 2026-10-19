@@ -294,21 +294,75 @@ fn text_scale_from_percent(percent: u32) -> f32 {
     percent.clamp(100, 225) as f32 / 100.0
 }
 
+#[cfg(windows)]
+const PERSONALIZE: &str = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+
 /// Windows' "Choose your app mode": `Some(true)` for Light, `Some(false)`
 /// for Dark (`Personalize\AppsUseLightTheme`), `None` when unknown.
 pub fn apps_use_light_theme() -> Option<bool> {
+    personalize_flag("AppsUseLightTheme")
+}
+
+/// Windows' "Choose your default Windows mode", which the taskbar and its
+/// notification area follow: `Some(true)` for Light
+/// (`Personalize\SystemUsesLightTheme`), `None` when unknown.
+pub fn system_uses_light_theme() -> Option<bool> {
+    personalize_flag("SystemUsesLightTheme")
+}
+
+fn personalize_flag(name: &str) -> Option<bool> {
     #[cfg(windows)]
     {
         use winreg::enums::HKEY_CURRENT_USER;
         let key = winreg::RegKey::predef(HKEY_CURRENT_USER)
-            .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+            .open_subkey(PERSONALIZE)
             .ok()?;
-        let value: u32 = key.get_value("AppsUseLightTheme").ok()?;
+        let value: u32 = key.get_value(name).ok()?;
         Some(value != 0)
     }
     #[cfg(not(windows))]
     {
+        let _ = name;
         None
+    }
+}
+
+/// Blocks the calling thread for good, calling `changed` after every write
+/// under `Personalize` (both theme modes, transparency). Returns only if the
+/// key cannot be watched. Event-driven, so a hidden app costs nothing.
+pub fn watch_personalize(mut changed: impl FnMut()) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Registry::{
+            RegNotifyChangeKeyValue, HKEY, REG_NOTIFY_CHANGE_LAST_SET,
+        };
+        use winreg::enums::{HKEY_CURRENT_USER, KEY_NOTIFY};
+        let key = match winreg::RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(PERSONALIZE, KEY_NOTIFY)
+        {
+            Ok(key) => key,
+            Err(error) => {
+                log::warn!("cannot watch the Windows theme: {error}");
+                return;
+            }
+        };
+        let hkey = HKEY(key.raw_handle() as *mut _);
+        loop {
+            // SAFETY: `key` stays open for the whole loop; a synchronous
+            // watch takes no event handle and returns after one change.
+            let status = unsafe {
+                RegNotifyChangeKeyValue(hkey, false, REG_NOTIFY_CHANGE_LAST_SET, None, false)
+            };
+            if status.is_err() {
+                log::warn!("watching the Windows theme stopped: {status:?}");
+                return;
+            }
+            changed();
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = &mut changed;
     }
 }
 

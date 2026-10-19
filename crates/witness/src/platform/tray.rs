@@ -1,5 +1,6 @@
 //! The notification-area icon: menu (Open Witness / Record now ⇄ Stop
-//! recording / status line / Quit), tooltip and the recording icon swap.
+//! recording / status line / Quit), tooltip and the state glyph (idle,
+//! recording, transcribing), inked for the taskbar's light or dark theme.
 //! Created exactly once per process on the main thread, as the process's
 //! first `TrayIcon` (uID 2, like 0.2.x), and never with a GUID (design §7):
 //! Explorer keys the "always show" promotion on exe path + uID, and a GUID
@@ -10,15 +11,13 @@
 //! sink, and `WitnessApp::logic()` does the work (works while hidden).
 
 use crate::bridge::UiSink;
-use crate::platform::ShellEvent;
+use crate::platform::{system, ShellEvent};
+use anyhow::Context as _;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 /// The tray icon id (as in 0.2.x).
 const TRAY_ID: &str = "witness-tray";
-/// The exe's icon resource (build.rs embeds `icons/icon.ico` under this ID,
-/// the same one tauri-build used).
-const APP_ICON_RESOURCE: u16 = 32512;
 /// The shell uID the process's first tray icon is expected to get. tray-icon
 /// draws it from a private process-wide counter starting at 1, but
 /// `TrayIconBuilder::new()` spends the first value on a default
@@ -36,14 +35,54 @@ const MENU_RECORD: &str = "record";
 const MENU_STATUS: &str = "status";
 const MENU_QUIT: &str = "quit";
 
+/// What the tray glyph shows. Recording wins over transcribing (the
+/// pipeline can run for an earlier meeting while a new one records).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayState {
+    Idle,
+    Recording,
+    Transcribing,
+}
+
+impl TrayState {
+    fn of(recording: bool, transcribing: bool) -> TrayState {
+        match (recording, transcribing) {
+            (true, _) => TrayState::Recording,
+            (false, true) => TrayState::Transcribing,
+            (false, false) => TrayState::Idle,
+        }
+    }
+}
+
+/// How the glyph is drawn: monochrome inked for a light or dark taskbar, or
+/// the full-colour app tile (Settings → General → Tray icon).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayLook {
+    Light,
+    Dark,
+    Colour,
+}
+
+impl TrayLook {
+    fn of(colour: bool, light_taskbar: bool) -> TrayLook {
+        match (colour, light_taskbar) {
+            (true, _) => TrayLook::Colour,
+            (false, true) => TrayLook::Light,
+            (false, false) => TrayLook::Dark,
+        }
+    }
+}
+
 pub struct Tray {
     icon: TrayIcon,
     record_item: MenuItem,
     status_item: MenuItem,
-    idle_icon: Icon,
-    /// None if `tray-rec.png` could not be decoded (the idle icon stays).
-    recording_icon: Option<Icon>,
     recording: bool,
+    transcribing: bool,
+    colour: bool,
+    light_taskbar: bool,
+    /// The glyph last set on the icon, so unchanged states skip the shell.
+    shown: Option<(TrayState, TrayLook)>,
     warning: Option<String>,
     /// (owner HWND, uID) for the panic hook's NIM_DELETE.
     ids: (isize, u32),
@@ -52,11 +91,12 @@ pub struct Tray {
 }
 
 impl Tray {
-    /// Create the icon and menu and route their events to `sink`.
-    pub fn build(sink: UiSink) -> anyhow::Result<Tray> {
+    /// Create the icon (full-colour or monochrome) and menu and route their
+    /// events to `sink`.
+    pub fn build(sink: UiSink, colour: bool) -> anyhow::Result<Tray> {
         let open = MenuItem::with_id(MENU_OPEN, "Open Witness", true, None);
         let record = MenuItem::with_id(MENU_RECORD, record_text(false), true, None);
-        let status = MenuItem::with_id(MENU_STATUS, status_text(false), false, None);
+        let status = MenuItem::with_id(MENU_STATUS, status_text(TrayState::Idle), false, None);
         let quit = MenuItem::with_id(MENU_QUIT, "Quit", true, None);
         let menu = Menu::with_items(&[
             &open,
@@ -79,25 +119,21 @@ impl Tray {
             };
             menu_sink.shell(shell);
         }));
-        let click_sink = sink;
+        let click_sink = sink.clone();
         TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
             if let Some((x, y)) = flyout_click(&event) {
                 click_sink.shell(ShellEvent::TrayClick { x, y });
             }
         }));
 
-        let idle_icon = app_icon()?;
-        let recording_icon = match recording_icon() {
-            Ok(icon) => Some(icon),
-            Err(error) => {
-                log::warn!("tray recording icon: {error:#}");
-                None
-            }
-        };
+        // Windows' default for an unreadable mode is a dark taskbar.
+        let light_taskbar = system::system_uses_light_theme().unwrap_or(false);
+        watch_taskbar_theme(sink, light_taskbar);
+        let look = TrayLook::of(colour, light_taskbar);
         let icon = TrayIconBuilder::new()
             .with_id(TRAY_ID)
-            .with_icon(idle_icon.clone())
-            .with_tooltip(tooltip(false, None))
+            .with_icon(glyph(TrayState::Idle, look)?)
+            .with_tooltip(tooltip(TrayState::Idle, None))
             .with_menu(Box::new(menu.clone()))
             // The menu opens on right-click only; a left click is the flyout.
             .with_menu_on_left_click(false)
@@ -126,9 +162,11 @@ impl Tray {
             icon,
             record_item: record,
             status_item: status,
-            idle_icon,
-            recording_icon,
             recording: false,
+            transcribing: false,
+            colour,
+            light_taskbar,
+            shown: Some((TrayState::Idle, look)),
             warning: None,
             ids,
             _menu: menu,
@@ -141,14 +179,54 @@ impl Tray {
         self.recording = recording;
         self.warning = None;
         self.record_item.set_text(record_text(recording));
-        self.status_item.set_text(status_text(recording));
+        self.apply_state();
+    }
+
+    /// Whether the transcription pipeline is working (shown while not
+    /// recording). Cheap to call on every pass: unchanged values do nothing.
+    pub fn set_transcribing(&mut self, transcribing: bool) {
+        if transcribing != self.transcribing {
+            self.transcribing = transcribing;
+            self.apply_state();
+        }
+    }
+
+    /// Re-ink the monochrome glyph for the taskbar's theme.
+    pub fn set_light_taskbar(&mut self, light: bool) {
+        if light != self.light_taskbar {
+            self.light_taskbar = light;
+            self.apply_icon();
+        }
+    }
+
+    /// Full-colour or monochrome. Cheap to call on every pass.
+    pub fn set_colour(&mut self, colour: bool) {
+        if colour != self.colour {
+            self.colour = colour;
+            self.apply_icon();
+        }
+    }
+
+    fn state(&self) -> TrayState {
+        TrayState::of(self.recording, self.transcribing)
+    }
+
+    fn apply_state(&mut self) {
+        self.status_item.set_text(status_text(self.state()));
         self.apply_tooltip();
-        let icon = match (&self.recording_icon, recording) {
-            (Some(rec), true) => rec.clone(),
-            _ => self.idle_icon.clone(),
-        };
-        if let Err(error) = self.icon.set_icon(Some(icon)) {
-            log::warn!("tray icon swap failed: {error}");
+        self.apply_icon();
+    }
+
+    fn apply_icon(&mut self) {
+        let wanted = (self.state(), TrayLook::of(self.colour, self.light_taskbar));
+        if self.shown == Some(wanted) {
+            return;
+        }
+        let swapped =
+            glyph(wanted.0, wanted.1).and_then(|icon| Ok(self.icon.set_icon(Some(icon))?));
+        match swapped {
+            Ok(()) => self.shown = Some(wanted),
+            Err(error) => log::warn!("tray icon swap failed: {error:#}"),
         }
     }
 
@@ -164,7 +242,7 @@ impl Tray {
     }
 
     fn apply_tooltip(&self) {
-        let text = tooltip(self.recording, self.warning.as_deref());
+        let text = tooltip(self.state(), self.warning.as_deref());
         if let Err(error) = self.icon.set_tooltip(Some(text)) {
             log::warn!("tray tooltip failed: {error}");
         }
@@ -212,39 +290,95 @@ fn record_text(recording: bool) -> &'static str {
     }
 }
 
-fn status_text(recording: bool) -> &'static str {
-    if recording {
-        "● Recording"
-    } else {
-        "Idle"
+fn status_text(state: TrayState) -> &'static str {
+    match state {
+        TrayState::Idle => "Idle",
+        TrayState::Recording => "● Recording",
+        TrayState::Transcribing => "Transcribing…",
     }
 }
 
-fn tooltip(recording: bool, warning: Option<&str>) -> String {
-    match (recording, warning) {
-        (false, _) => "Witness — idle".into(),
-        (true, None) => "Witness — recording".into(),
-        (true, Some(text)) => format!("Witness — recording — {text}"),
+/// The capture warning only shows while recording.
+fn tooltip(state: TrayState, warning: Option<&str>) -> String {
+    match (state, warning) {
+        (TrayState::Idle, _) => "Witness — idle".into(),
+        (TrayState::Transcribing, _) => "Witness — transcribing".into(),
+        (TrayState::Recording, None) => "Witness — recording".into(),
+        (TrayState::Recording, Some(text)) => format!("Witness — recording — {text}"),
     }
 }
 
-/// The exe's own icon (resource 32512) at the small-icon size, so
-/// `LoadImageW` picks `icon.ico`'s hand-tuned 16/24 px frame instead of the
-/// 32 px one the shell would downsample (`None` means `LR_DEFAULTSIZE`, the
-/// large size); the bundled PNG if the resource is missing.
-fn app_icon() -> anyhow::Result<Icon> {
-    match Icon::from_resource(APP_ICON_RESOURCE, imp::small_icon_size()) {
-        Ok(icon) => Ok(icon),
-        Err(error) => {
-            log::warn!("tray icon resource {APP_ICON_RESOURCE}: {error}; using the PNG");
-            png_icon(include_bytes!("../../icons/32x32.png"))
+/// Sends `ShellEvent::TaskbarTheme` whenever Windows' default mode flips,
+/// from a thread parked on the registry (no polling while hidden).
+fn watch_taskbar_theme(sink: UiSink, mut light: bool) {
+    let spawned = std::thread::Builder::new()
+        .name("taskbar-theme".into())
+        .spawn(move || {
+            system::watch_personalize(|| {
+                let now = system::system_uses_light_theme().unwrap_or(false);
+                if now != light {
+                    light = now;
+                    sink.shell(ShellEvent::TaskbarTheme { light });
+                }
+            });
+        });
+    if let Err(error) = spawned {
+        log::warn!("taskbar theme watcher: {error}");
+    }
+}
+
+/// `icons/tray-<state>-<light|dark|colour>.ico`, drawn by
+/// `assets/brand/icons.mjs` with grid-fitted frames for each small-icon size
+/// up to 300 % scaling.
+fn glyph_ico(state: TrayState, look: TrayLook) -> &'static [u8] {
+    use {TrayLook as L, TrayState as S};
+    match (state, look) {
+        (S::Idle, L::Light) => include_bytes!("../../icons/tray-idle-light.ico"),
+        (S::Idle, L::Dark) => include_bytes!("../../icons/tray-idle-dark.ico"),
+        (S::Idle, L::Colour) => include_bytes!("../../icons/tray-idle-colour.ico"),
+        (S::Recording, L::Light) => include_bytes!("../../icons/tray-recording-light.ico"),
+        (S::Recording, L::Dark) => include_bytes!("../../icons/tray-recording-dark.ico"),
+        (S::Recording, L::Colour) => include_bytes!("../../icons/tray-recording-colour.ico"),
+        (S::Transcribing, L::Light) => include_bytes!("../../icons/tray-transcribing-light.ico"),
+        (S::Transcribing, L::Dark) => include_bytes!("../../icons/tray-transcribing-dark.ico"),
+        (S::Transcribing, L::Colour) => {
+            include_bytes!("../../icons/tray-transcribing-colour.ico")
         }
     }
 }
 
-/// The red recording icon (`tray-rec.png`, 128×128 RGBA).
-fn recording_icon() -> anyhow::Result<Icon> {
-    png_icon(include_bytes!("../../icons/tray-rec.png"))
+/// The glyph at the shell's small-icon size (16 px at 100 %), taken from its
+/// own frame rather than scaled, so the bars stay on whole pixels.
+fn glyph(state: TrayState, look: TrayLook) -> anyhow::Result<Icon> {
+    let size = imp::small_icon_size().map_or(16, |(width, _)| width);
+    png_icon(ico_frame(glyph_ico(state, look), size)?)
+}
+
+/// The PNG frame of a PNG-compressed .ico for `size`: the smallest frame at
+/// least that big, else the largest.
+fn ico_frame(ico: &[u8], size: u32) -> anyhow::Result<&[u8]> {
+    let le32 = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+    let count = usize::from(u16::from_le_bytes(
+        ico.get(4..6).context("ico header")?.try_into()?,
+    ));
+    let mut frames = Vec::with_capacity(count);
+    for i in 0..count {
+        let entry = ico.get(6 + 16 * i..22 + 16 * i).context("ico directory")?;
+        let side = if entry[0] == 0 {
+            256
+        } else {
+            u32::from(entry[0])
+        };
+        let (len, at) = (le32(&entry[8..12]), le32(&entry[12..16]));
+        frames.push((side, ico.get(at..at + len).context("ico frame")?));
+    }
+    frames
+        .iter()
+        .filter(|(side, _)| *side >= size)
+        .min_by_key(|(side, _)| *side)
+        .or_else(|| frames.iter().max_by_key(|(side, _)| *side))
+        .map(|(_, png)| *png)
+        .context("empty ico")
 }
 
 fn png_icon(bytes: &[u8]) -> anyhow::Result<Icon> {
@@ -303,15 +437,49 @@ mod tests {
     fn texts_match_0_2_x() {
         assert_eq!(record_text(false), "Record now");
         assert_eq!(record_text(true), "Stop recording");
-        assert_eq!(status_text(false), "Idle");
-        assert_eq!(status_text(true), "● Recording");
-        assert_eq!(tooltip(false, None), "Witness — idle");
-        assert_eq!(tooltip(false, Some("x")), "Witness — idle");
-        assert_eq!(tooltip(true, None), "Witness — recording");
+        assert_eq!(status_text(TrayState::Idle), "Idle");
+        assert_eq!(status_text(TrayState::Recording), "● Recording");
+        assert_eq!(tooltip(TrayState::Idle, None), "Witness — idle");
+        assert_eq!(tooltip(TrayState::Idle, Some("x")), "Witness — idle");
+        assert_eq!(tooltip(TrayState::Recording, None), "Witness — recording");
         assert_eq!(
-            tooltip(true, Some("Microphone disconnected")),
+            tooltip(TrayState::Recording, Some("Microphone disconnected")),
             "Witness — recording — Microphone disconnected"
         );
+    }
+
+    #[test]
+    fn transcribing_shows_only_while_not_recording() {
+        assert_eq!(TrayState::of(false, false), TrayState::Idle);
+        assert_eq!(TrayState::of(false, true), TrayState::Transcribing);
+        assert_eq!(TrayState::of(true, true), TrayState::Recording);
+        assert_eq!(status_text(TrayState::Transcribing), "Transcribing…");
+        assert_eq!(
+            tooltip(TrayState::Transcribing, Some("x")),
+            "Witness — transcribing"
+        );
+    }
+
+    #[test]
+    fn colour_overrides_the_taskbar_theme() {
+        assert_eq!(TrayLook::of(false, true), TrayLook::Light);
+        assert_eq!(TrayLook::of(false, false), TrayLook::Dark);
+        assert_eq!(TrayLook::of(true, true), TrayLook::Colour);
+        assert_eq!(TrayLook::of(true, false), TrayLook::Colour);
+    }
+
+    #[test]
+    fn ico_frame_takes_the_smallest_frame_at_least_the_size() {
+        let ico = glyph_ico(TrayState::Idle, TrayLook::Light);
+        let side = |size| {
+            let png = ico_frame(ico, size).unwrap();
+            eframe::icon_data::from_png_bytes(png).unwrap().width
+        };
+        assert_eq!(side(16), 16);
+        assert_eq!(side(20), 20);
+        assert_eq!(side(30), 32);
+        assert_eq!(side(64), 48);
+        assert!(ico_frame(&[0, 0, 1, 0, 1, 0], 16).is_err());
     }
 
     #[test]
@@ -366,8 +534,24 @@ mod tests {
     }
 
     #[test]
-    fn bundled_icons_decode() {
-        assert!(recording_icon().is_ok());
-        assert!(png_icon(include_bytes!("../../icons/32x32.png")).is_ok());
+    fn every_tray_glyph_decodes_at_every_scale() {
+        for state in [
+            TrayState::Idle,
+            TrayState::Recording,
+            TrayState::Transcribing,
+        ] {
+            for look in [TrayLook::Light, TrayLook::Dark, TrayLook::Colour] {
+                for size in [16, 20, 24, 28, 32, 40, 48] {
+                    let png = ico_frame(glyph_ico(state, look), size).unwrap();
+                    let data = eframe::icon_data::from_png_bytes(png).unwrap();
+                    assert_eq!(
+                        (data.width, data.height),
+                        (size, size),
+                        "{state:?} {look:?}"
+                    );
+                    assert!(png_icon(png).is_ok());
+                }
+            }
+        }
     }
 }

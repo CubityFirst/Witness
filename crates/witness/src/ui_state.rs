@@ -21,6 +21,9 @@ pub struct UiPrefs {
     pub appearance: Appearance,
     /// Windows' accent colour, or Witness blue.
     pub accent: AccentSource,
+    /// The notification-area icon: monochrome (inked for the taskbar's
+    /// theme) or the full-colour app tile.
+    pub tray_icon: TrayIconStyle,
     /// The first-run setup was finished or skipped.
     pub onboarded: bool,
     /// The split layout's list column width (dragged at its divider).
@@ -44,6 +47,14 @@ pub enum AccentSource {
     Witness,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrayIconStyle {
+    #[default]
+    Monochrome,
+    Colour,
+}
+
 impl Default for UiPrefs {
     fn default() -> Self {
         UiPrefs {
@@ -52,6 +63,7 @@ impl Default for UiPrefs {
             speed: 1.0,
             appearance: Appearance::System,
             accent: AccentSource::Windows,
+            tray_icon: TrayIconStyle::Monochrome,
             onboarded: false,
             list_width: crate::ui::LIST_WIDTH,
         }
@@ -186,6 +198,7 @@ mod tests {
             speed: 1.5,
             appearance: Appearance::Light,
             accent: AccentSource::Witness,
+            tray_icon: TrayIconStyle::Colour,
             onboarded: true,
             list_width: 420.0,
         };
@@ -205,6 +218,7 @@ mod tests {
         .unwrap();
         assert_eq!(prefs.appearance, Appearance::System);
         assert_eq!(prefs.accent, AccentSource::Windows);
+        assert_eq!(prefs.tray_icon, TrayIconStyle::Monochrome);
         assert!(!prefs.onboarded);
         let text = toml::to_string(&UiPrefs::default()).unwrap();
         assert!(text.contains("appearance = \"system\""), "{text}");

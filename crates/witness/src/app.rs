@@ -31,7 +31,7 @@ use crate::ui::{
     icons, list_column_width, submit_recording, theme, topbar, views, widgets, ActiveView, Nav,
     PaneLayout, PaneRole, Screens, UiCmd, UiCtx, View, ViewMemory, LIST_WIDTH,
 };
-use crate::ui_state::{PrefsWriter, UiPrefs};
+use crate::ui_state::{PrefsWriter, TrayIconStyle, UiPrefs};
 use crossbeam_channel::Receiver;
 use eframe::egui::{self, Event, Key, Margin, Modifiers, Rect};
 use std::path::PathBuf;
@@ -273,8 +273,14 @@ impl WitnessApp {
         if snapshot.is_some() {
             window.hide_for_snapshot();
         }
+        let data_dir = core.runtime_data_dir();
+        let prefs = UiPrefs::load(&data_dir);
         // Snapshot runs leave the tray and the hotkeys to real instances.
-        let tray = match snapshot.is_none().then(|| Tray::build(sink.clone())) {
+        let colour_tray = prefs.tray_icon == TrayIconStyle::Colour;
+        let tray = match snapshot
+            .is_none()
+            .then(|| Tray::build(sink.clone(), colour_tray))
+        {
             None => None,
             Some(Ok(tray)) => {
                 crate::panic::register_tray(tray.notify_ids());
@@ -294,8 +300,6 @@ impl WitnessApp {
         instance_guard.attach(sink.clone());
         let startup = StartupVisibility::new(minimized, &window);
 
-        let data_dir = core.runtime_data_dir();
-        let prefs = UiPrefs::load(&data_dir);
         let system_theme = SystemTheme::read();
         let onboarding = Onboarding::new(&prefs);
         theme::apply(&ctx, resolve_palette(&prefs, &system_theme));
@@ -630,6 +634,11 @@ impl WitnessApp {
                 submit_recording(&self.tasks, RecCmd::BookmarkNow, RecOrigin::Hotkey);
             }
             ShellEvent::TrayMenuQuit => self.begin_quit(),
+            ShellEvent::TaskbarTheme { light } => {
+                if let Some(tray) = self.tray_mut() {
+                    tray.set_light_taskbar(light);
+                }
+            }
         }
         self.shell.popup_mode = self.flyout.is_popup();
     }
@@ -1450,6 +1459,12 @@ impl eframe::App for WitnessApp {
         while let Ok(msg) = self.rx.try_recv() {
             self.handle_msg(ctx, msg);
         }
+        let transcribing = self.shell.transcribing();
+        let colour_tray = self.prefs.tray_icon == TrayIconStyle::Colour;
+        if let Some(tray) = self.tray_mut() {
+            tray.set_transcribing(transcribing);
+            tray.set_colour(colour_tray);
+        }
         self.process_cmds();
         self.startup.tick(&self.window, ctx);
 
@@ -1727,6 +1742,7 @@ mod tests {
             ShellEvent::TrayMenuOpen,
             ShellEvent::SecondInstance,
             ShellEvent::TrayMenuQuit,
+            ShellEvent::TaskbarTheme { light: true },
         ] {
             assert!(!ignored_while_quitting(&event), "{event:?}");
         }

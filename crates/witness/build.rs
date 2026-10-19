@@ -1,5 +1,5 @@
 //! Windows resources for `witness.exe`: the app icon (resource ID 32512,
-//! which the tray's idle icon loads by ID — the same ID tauri-build used),
+//! the same ID tauri-build used),
 //! VERSIONINFO (the xtask checks `ProductVersion` before packaging) and the
 //! application manifest (Common Controls v6, PerMonitorV2, long paths).
 
