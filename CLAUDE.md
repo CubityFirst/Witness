@@ -568,8 +568,11 @@ install manifest, superseded revisions included); refused while recording,
 transcribing or downloading, since Windows can't delete open model files.
 The installer removes the old WebView2 profile
 (`%LOCALAPPDATA%\com.github.cubityfirst.witness\EBWebView`).
-`app-icon.png` is the 1024 px source artwork for `crates/witness/icons/`
-(exe icon resource 32512, window icon, tray icons).
+`assets/brand/icons.mjs` is the source of every icon: it draws the shield
+and writes `crates/witness/icons/` (exe icon resource 32512, window icon,
+tray icons), `app-icon.png` and `assets/icon.svg`. The 16–32 px frames are
+separately grid-fitted, so edit the script and rerun it
+(`node assets/brand/icons.mjs`) rather than resizing a PNG.
 
 ## Known limitations (accepted)
 
