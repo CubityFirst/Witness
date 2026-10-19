@@ -1,4 +1,9 @@
-# Witness
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/witness-banner-dark.png">
+    <img alt="Witness" src="assets/brand/witness-banner-light.png" width="640">
+  </picture>
+</h1>
 
 Witness is a local meeting recorder and transcriber for Windows 11, written
 as a single native Rust app. It can detect Microsoft Teams calls, capture
