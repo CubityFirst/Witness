@@ -71,7 +71,7 @@ repair, orphan recovery, bin purge) is `service/startup.rs`.
 
 UI (`crates/witness`): eframe 0.36 (glow renderer), no router — a `View` enum
 in `ui/mod.rs` (`ActiveView` owns the live view). Views in `ui/views/`:
-Meetings (+ recycle bin), People (stats + weekly trend), Transcript (+
+Meetings (+ recycle bin), People (stats + weekly trend + name filter), Transcript (+
 `player_bar.rs`: player, live captions, bookmarks, notes; `ai_summary.rs`: the
 AI Summary panel), Search (filters),
 Settings (`views/settings/`: `mod.rs` view + routing, `nav.rs` rail / index,

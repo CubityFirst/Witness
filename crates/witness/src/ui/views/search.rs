@@ -23,7 +23,7 @@ use crate::ui::views::meetings::{
     ListKeys,
 };
 use crate::ui::widgets::{self, KeyScroll, Politeness};
-use crate::ui::{PaneRole, SearchFilters, UiCtx, View, Who};
+use crate::ui::{PaneRole, SearchBox, SearchFilters, UiCtx, View, Who};
 use chrono::{DateTime, Local, NaiveDate};
 use eframe::egui::{
     self, text::LayoutJob, text::TextWrapping, CornerRadius, Key, Margin, Rect, Sense, Stroke,
@@ -58,10 +58,50 @@ const STACK_LABEL: f32 = 64.0;
 /// 250 ms debounce. Escape and the × button clear it (and so, after the
 /// debounce, leave Search). Ctrl+F / `/` set `request_focus`.
 pub fn search_box(ui: &mut egui::Ui, cx: &mut UiCtx, current: &View) {
-    let id = egui::Id::new("search-box");
-    let focused = ui.memory(|m| m.has_focus(id));
     let modal_open = cx.confirm.is_open();
     let search = &mut cx.memory.search_box;
+    let changed = search_field(
+        ui,
+        egui::Id::new("search-box"),
+        search,
+        "Search transcripts…",
+        "Search meeting transcripts",
+    );
+
+    let now = Instant::now();
+    if changed {
+        search.debounce_at = Some(now + DEBOUNCE);
+    }
+    // Held while a confirmation is open: navigating would remount the view
+    // that asked and drop its answer (closing the modal repaints).
+    if let Some(at) = search.debounce_at.filter(|_| !modal_open) {
+        if now >= at {
+            search.debounce_at = None;
+            // `apply_navigation` repaints after the pass.
+            let query = search.text.clone();
+            if !query.trim().is_empty() {
+                cx.nav.go(View::Search { query });
+            } else if matches!(current, View::Search { .. }) {
+                cx.nav.go(View::Meetings);
+            }
+        } else {
+            ui.ctx().request_repaint_after(at - now);
+        }
+    }
+}
+
+/// The full-width search input above a view (Meetings / Search, People):
+/// `<input type=search>` with a leading magnifier, and an × while there is
+/// text. Escape and the × clear it; `request_focus` (Ctrl+F, `/`) is taken
+/// on this draw. True when the text changed.
+pub(crate) fn search_field(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    search: &mut SearchBox,
+    hint: &str,
+    label: &str,
+) -> bool {
+    let focused = ui.memory(|m| m.has_focus(id));
     let has_text = !search.text.is_empty();
     // One input across the column: a leading magnifier in the left
     // padding, the × in the right one while there is text.
@@ -72,7 +112,7 @@ pub fn search_box(ui: &mut egui::Ui, cx: &mut UiCtx, current: &View) {
         bottom: 7,
     };
     let edit = egui::TextEdit::singleline(&mut search.text)
-        .hint_text("Search transcripts…")
+        .hint_text(hint)
         .font(theme::regular(14.0))
         // `<input type=search>` keeps focus on Enter.
         .return_key(None::<egui::KeyboardShortcut>)
@@ -96,7 +136,7 @@ pub fn search_box(ui: &mut egui::Ui, cx: &mut UiCtx, current: &View) {
     );
     widgets::text_edit_menu(&response);
     ui.ctx().accesskit_node_builder(id, |node| {
-        node.set_label("Search meeting transcripts");
+        node.set_label(label);
     });
     if std::mem::take(&mut search.request_focus) {
         response.request_focus();
@@ -114,32 +154,12 @@ pub fn search_box(ui: &mut egui::Ui, cx: &mut UiCtx, current: &View) {
         changed = true;
         response.request_focus();
     }
-    if has_text && clear_button(ui, response.rect, egui::Id::new("search-box-clear")) {
+    if has_text && clear_button(ui, response.rect, id.with("clear")) {
         search.text.clear();
         changed = true;
         response.request_focus();
     }
-
-    let now = Instant::now();
-    if changed {
-        search.debounce_at = Some(now + DEBOUNCE);
-    }
-    // Held while a confirmation is open: navigating would remount the view
-    // that asked and drop its answer (closing the modal repaints).
-    if let Some(at) = search.debounce_at.filter(|_| !modal_open) {
-        if now >= at {
-            search.debounce_at = None;
-            // `apply_navigation` repaints after the pass.
-            let query = search.text.clone();
-            if !query.trim().is_empty() {
-                cx.nav.go(View::Search { query });
-            } else if matches!(current, View::Search { .. }) {
-                cx.nav.go(View::Meetings);
-            }
-        } else {
-            ui.ctx().request_repaint_after(at - now);
-        }
-    }
+    changed
 }
 
 /// The × inside the right edge of a search field (this one, Settings');
