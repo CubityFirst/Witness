@@ -4,6 +4,30 @@ All notable changes to Witness are documented here. The project is pre-1.0;
 database and backup formats remain versioned, but user-visible behavior can
 still evolve quickly.
 
+## 0.3.1 — 2026-10-20
+
+### Added
+
+- New icon: the eye is replaced by the Sheltered Sound shield, drawn
+  separately at each small size so it stays crisp in the taskbar, window
+  and installer.
+- The tray icon now has three states: idle, recording and transcribing. By
+  default it is a monochrome glyph that matches the taskbar's light or dark
+  theme and changes when Windows switches modes. Settings → General → Tray
+  icon switches to the full-colour app icon, which shows the same states.
+
+### Fixed
+
+- After a transcription, automatic titling now always works from the
+  generated notes instead of sometimes reading the whole transcript again
+  in a separate request.
+- Updated the `wasapi` audio dependency to 0.26 for RUSTSEC-2026-0332. Witness
+  never called the affected function; recording and playback are unchanged.
+
+### Documentation
+
+- The README now describes the native app and has a new banner.
+
 ## 0.3.0 — 2026-10-12
 
 ### AI assistant (opt-in)
