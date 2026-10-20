@@ -1,4 +1,4 @@
-<h1>
+<h1 align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/brand/witness-banner-dark.png">
     <img alt="Witness" src="assets/brand/witness-banner-light.png" width="640">
