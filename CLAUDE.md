@@ -270,7 +270,8 @@ thread and an in-house WSOLA time-stretch (speed) — no extra crates.
   the current recording across view changes; the overlay keeps the last 20.
 - **Phantom-line defense is two-layered** (mic pops / AC hum used to become
   transcript lines): vad.rs demands ≥5 consecutive speech frames (~80 ms,
-  `MIN_SPEECH_FRAMES`) at a 0.65 threshold before a span counts as speech —
+  `MIN_SPEECH_FRAMES`) at a 0.5 threshold (earshot 1.2; 1.1 needed 0.65)
+  before a span counts as speech —
   transients light up 1–2 frames; and `asr::is_junk_text` drops known
   noise hallucinations (lone "You", "Thank you.", YouTube-outro phrases)
   plus empty/punctuation-only output, in both the pipeline and live
@@ -317,7 +318,10 @@ thread and an in-house WSOLA time-stretch (speed) — no extra crates.
 - `.github/dependabot.yml` ignores mirror this list.
 - **VAD is earshot, not Silero** — `voice_activity_detector` pins ort
   =2.0.0-rc.10; parakeet-rs needs rc.13. earshot frames: exactly 256
-  samples @ 16 kHz.
+  samples @ 16 kHz. Its minor releases retrain the model, so a bump means
+  re-tuning `vad::THRESHOLD` against real recordings: compare speech kept,
+  transcript lines a chunking no longer covers, and chunks that transcribe
+  to nothing (1.1 → 1.2 moved it from 0.65 to 0.5).
 - **Our direct `ort` dep is pinned `=2.0.0-rc.13`** to match parakeet-rs
   (shared ort-sys). Its CUDA provider hard-imports `cublas64_13` /
   `cublasLt64_13` and loads `cudnn64_9` / `cufft64_12` at runtime (CUDA 13

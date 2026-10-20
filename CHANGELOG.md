@@ -20,6 +20,13 @@ still evolve quickly.
 - Model and GPU-library downloads now show progress for the whole download
   instead of the current file, which could read 100% partway through.
 
+### Changed
+
+- Updated the speech detector (earshot 1.2) and re-tuned its threshold.
+  Transcripts keep the same speech as before, but quiet background noise
+  is sent to transcription about 40% less often, so stray noise lines are
+  rarer.
+
 ## 0.3.1 — 2026-10-20
 
 ### Added

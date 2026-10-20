@@ -12,10 +12,13 @@ use earshot::Detector;
 /// earshot frame: 256 samples @ 16 kHz = 16 ms.
 const FRAME: usize = 256;
 const FRAME_MS: u64 = 16;
-/// Per-frame speech score cutoff. 0.5 let steady low-level noise (AC hum)
-/// hover across the line; the existing 200 ms padding absorbs the slightly
-/// later speech onsets a higher bar causes.
-pub const THRESHOLD: f32 = 0.65;
+/// Per-frame speech score cutoff, tuned per earshot model. earshot 1.1 needed
+/// 0.65 (at 0.5 steady low-level noise such as AC hum hovered across the
+/// line). The 1.2 model scores more conservatively: at 0.65 it dropped short
+/// replies ("Yeah.", "Give me a second."), while at 0.5 it keeps the same
+/// speech as 1.1 did at 0.65 on real meetings and yields ~40% fewer chunks
+/// that transcribe to nothing. Re-measure when bumping earshot.
+pub const THRESHOLD: f32 = 0.5;
 /// A raw span must reach this many consecutive speech frames (~80 ms) to
 /// count as speech at all — mic pops and clicks light up 1–2 frames, real
 /// words always exceed this. Shared with the live-caption VAD gate.
