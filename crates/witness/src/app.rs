@@ -684,6 +684,7 @@ impl WitnessApp {
                         self.ensure_ui_pass();
                     }
                 }
+                UiCmd::HideCaptionsOverlay => self.captions.hide(),
                 UiCmd::RunSetup => {
                     self.prefs.onboarded = false;
                     self.palette = CommandPalette::new();
@@ -1483,6 +1484,7 @@ impl eframe::App for WitnessApp {
             self.window.hide_to_tray();
         }
         self.shell.popup_mode = self.flyout.is_popup();
+        self.shell.captions_open = self.captions.is_open();
 
         // Undo `ensure_ui_pass` once the overlay exists (or after 2 s).
         if let Some(since) = self.ui_pass_since {

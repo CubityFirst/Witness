@@ -506,8 +506,17 @@ impl CaptionsOverlay {
         self.repaint();
     }
 
-    /// Open and not closed by the user.
-    #[cfg(test)]
+    /// The CC button toggled an open overlay off: the same as × (geometry
+    /// saved, window hidden now, lines kept for a re-open this meeting).
+    /// (The button is clicked in a root pass, so `ctx` is set.)
+    pub fn hide(&mut self) {
+        if let (true, Some(ctx)) = (self.is_open(), &self.ctx) {
+            request_close(&mut lock(&self.state), ctx);
+        }
+    }
+
+    /// Open and not closed by the user (the top bar's CC button shows it
+    /// pressed).
     pub fn is_open(&self) -> bool {
         self.open && !lock(&self.state).close_requested
     }

@@ -247,6 +247,8 @@ impl Nav {
 pub enum UiCmd {
     /// CC button, after `check_captions_overlay` succeeded.
     ShowCaptionsOverlay,
+    /// CC button (or the palette) while the overlay is open: close it.
+    HideCaptionsOverlay,
     /// Settings → Storage → Restart Witness (after any confirmation).
     Restart,
     /// Settings → About → Check for updates.
