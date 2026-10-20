@@ -1,0 +1,103 @@
+name: Release
+
+# Bump with `cargo run -p xtask -- version X.Y.Z`, commit, then push the tag
+# vX.Y.Z (or run this workflow manually on that tag). Builds the signed NSIS
+# installer and publishes it with its .sig and latest.json, which installed
+# copies of Witness poll (releases/latest/download/latest.json) for updates.
+#
+# Prerelease first: a GitHub prerelease is invisible to releases/latest, so
+# installed copies do not see it until it is promoted with
+#   gh release edit vX.Y.Z --prerelease=false --latest
+# Tag pushes publish a prerelease unless the repository variable
+# RELEASE_PRERELEASE is exactly "false"; manual runs use the `prerelease`
+# input. Never publish a draft, and never use a semver prerelease version
+# (the installer's VIProductVersion must be numeric).
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: Publish as a GitHub prerelease (installed copies ignore it until promoted)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish signed installer
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: always
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+      CARGO_TARGET_DIR: ${{ github.workspace }}\target
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install LLVM 19
+        shell: pwsh
+        run: choco install llvm --version=19.1.7 --allow-downgrade --yes --no-progress
+
+      # Also fails a manual run started from a branch instead of a tag.
+      - name: Check the tag and release configuration
+        env:
+          TAG: ${{ github.ref_name }}
+        run: cargo run --locked -p xtask -- check --tag "$env:TAG"
+
+      - name: Test locked Rust targets
+        run: cargo test --workspace --locked
+
+      - name: Cache the NSIS toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/AppData/Local/witness-build
+          key: nsis-c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1-utils-5ba143b5db4a87d32d6e7802e033330aae56cbceabe0d1e3ba41948385ad4709
+
+      - name: Build signed installer and update feed
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          NOTES: See https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+        run: cargo run --locked -p xtask -- dist --sign --notes "$env:NOTES"
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
+          PRERELEASE_INPUT: ${{ inputs.prerelease }}
+          PRERELEASE_VAR: ${{ vars.RELEASE_PRERELEASE }}
+        run: |
+          # Decided here, not in an expression: `a && false || b` would fall
+          # through to b when the input is false.
+          if ($env:EVENT -eq 'workflow_dispatch') {
+            $prerelease = $env:PRERELEASE_INPUT -eq 'true'
+          } else {
+            $prerelease = $env:PRERELEASE_VAR -ne 'false'
+          }
+          $dir = "target/release/bundle/nsis"
+          $version = $env:TAG.TrimStart('v')
+          $installer = Join-Path $dir "Witness_${version}_x64-setup.exe"
+          foreach ($f in @($installer, "$installer.sig", "$dir/latest.json")) {
+            if (-not (Test-Path $f)) { throw "missing release asset $f" }
+          }
+          $flags = @()
+          if ($prerelease) { $flags += '--prerelease' }
+          Write-Host "publishing $env:TAG (prerelease: $prerelease)"
+          gh release create $env:TAG $installer "$installer.sig" "$dir/latest.json" `
+            --repo $env:GITHUB_REPOSITORY --title "Witness $env:TAG" --generate-notes @flags
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed ($LASTEXITCODE)" }

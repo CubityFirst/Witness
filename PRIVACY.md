@@ -28,6 +28,10 @@ therefore enter a meeting archive. Use a dedicated endpoint where appropriate.
 - Operational queue, capture-health, and model-provenance state.
 - Preferences, audio endpoint identifiers, and watched-application patterns.
 - A rotating local log containing operational messages and identifiers.
+- If you use the optional AI assistant: the summaries it wrote (stored with
+  the meeting, like notes) and its settings (base URL, model, feature
+  switches). Its API key is not stored by Witness at all, but in Windows
+  Credential Manager.
 
 Voice prints are used only for on-device speaker matching. Explicitly renaming
 a speaker enrolls or updates that person's print. Forgetting a person removes
@@ -38,7 +42,9 @@ the print.
 ## Network behavior
 
 Witness has no account, analytics, advertising, telemetry, cloud transcript,
-or cloud backup service. Meeting content is processed locally.
+or cloud backup service. Meeting content is processed locally — unless you
+turn on the optional AI assistant described below, which sends transcript
+text to the service you configure.
 
 When the user explicitly downloads or repairs a speech model, Witness connects
 to the model host (currently Hugging Face). When the user downloads or repairs
@@ -47,6 +53,36 @@ the optional GPU libraries, Witness connects to PyPI's
 and ordinary network intermediaries can observe network metadata such as IP
 address, time, requested package or repository, revision, and file. Audio,
 transcripts, notes, and voice prints are not part of either request.
+
+### Optional AI assistant (off by default)
+
+Settings → AI assistant can connect Witness to an OpenAI-compatible service
+of your choice — a hosted one such as OpenAI, or a server on your own
+computer (Ollama, LM Studio, llama.cpp…) — to title meetings and write their
+notes. Nothing is sent while **Use an AI service** is off: no requests, not
+even a connection test. When it is on, Witness sends, to the configured base
+URL only:
+
+- the meeting's transcript text, as `[mm:ss] Speaker: text` lines;
+- the speaker names shown in the transcript (including names you gave);
+- the meeting title, when you or Teams set it (not the default
+  "Meeting <date>" title);
+- the API key, as the request's `Authorization` header, if you saved one
+  for that same host — a key saved for one server is never sent to another;
+- the request's technical headers: `User-Agent: Witness` (no version or
+  platform), `Accept` and `Content-Type: application/json`, and the model
+  name you chose. As with any connection, the service also sees your IP
+  address and the time.
+
+It never sends audio, voice prints, your own notes, bookmarks, file paths or
+other meetings. Requests happen when you click **Generate summary** /
+**Generate title**, use **Load models** or **Test connection**, or — only if
+you turned these switches on — after each transcription ("Title new meetings
+automatically", "Write meeting notes automatically"). A hosted service
+processes and may retain that text under its own terms; check its data
+policy before turning the assistant on. Plain `http://` is accepted only for
+`localhost`, `127.0.0.1` and `[::1]`, so the text never crosses the network
+unencrypted; with a local server it does not leave the computer at all.
 
 ## Retention and deletion
 
@@ -83,6 +119,10 @@ operational details. Review it before sharing.
 - Delete and then purge individual meetings, or empty the recycle bin.
 - Keep the archive in a user-chosen local data directory.
 - Create and independently protect checksummed backups.
+- Leave the AI assistant off (the default), point it at a local server, or
+  turn it off at any time; remove its API key with Settings → AI assistant →
+  Remove (or from Windows Credential Manager, entry `Witness/ai-api-key`).
+  Existing summaries stay with their meetings until the meetings are purged.
 
 For a complete removal, quit Witness, remove its active data directory, remove
 `witness-settings.toml`, and separately remove all exports and backups. Verify

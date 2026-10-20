@@ -1,0 +1,179 @@
+diff --git a/src-tauri/src/db.rs b/src-tauri/src/db.rs
+index b1f42c3..581efa0 100644
+--- a/src-tauri/src/db.rs
++++ b/src-tauri/src/db.rs
+@@ -97,6 +97,16 @@ fn blob_to_embedding(b: &[u8]) -> Vec<f32> {
+         .collect()
+ }
+ 
++/// Rollback build: the database carries Witness 0.3.x's schema-6 columns.
++fn has_schema6(conn: &Connection) -> rusqlite::Result<bool> {
++    conn.query_row(
++        "SELECT COUNT(*) FROM pragma_table_info('meetings') WHERE name = 'transcript_rev'",
++        [],
++        |row| row.get::<_, i64>(0),
++    )
++    .map(|count| count > 0)
++}
++
+ fn default_speaker_name(label: &str) -> String {
+     if label == "me" {
+         "Me".into()
+@@ -225,6 +235,14 @@ pub struct Db {
+ 
+ const SCHEMA_VERSION: i32 = 5;
+ 
++/// Rollback build: the newest schema this build opens. Schema 6 (Witness
++/// 0.3.x) only ADDS meeting columns (title_source, ai_summary, ai_summary_at,
++/// ai_summary_stale, transcript_rev); every query here names its columns, so
++/// they are ignored — except that the writes below keep their invariants
++/// (timestamp titles automatic, renames protected, retranscription marks an
++/// AI summary stale and bumps the transcript revision).
++const MAX_OPENABLE_SCHEMA: i32 = 6;
++
+ impl Db {
+     pub fn open(path: &Path) -> Result<Db> {
+         if let Some(parent) = path.parent() {
+@@ -278,8 +296,8 @@ impl Db {
+         let conn = self.conn.lock().unwrap();
+         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+         anyhow::ensure!(
+-            version <= SCHEMA_VERSION,
+-            "database schema version {version} is newer than this Witness build supports ({SCHEMA_VERSION})"
++            version <= MAX_OPENABLE_SCHEMA,
++            "database schema version {version} is newer than this Witness build supports ({MAX_OPENABLE_SCHEMA})"
+         );
+         if version < 1 {
+             conn.execute_batch(
+@@ -423,10 +441,14 @@ impl Db {
+ 
+     pub fn create_meeting(&self, title: &str, started_at: &str, trigger: &str) -> Result<i64> {
+         let conn = self.conn.lock().unwrap();
+-        conn.execute(
+-            "INSERT INTO meetings (started_at, title, status, trigger) VALUES (?1, ?2, 'recording', ?3)",
+-            params![started_at, title, trigger],
+-        )?;
++        // Rollback build: on a schema-6 database the timestamp title is
++        // automatic (0.3.x may still replace it with a Teams / AI title).
++        let sql = if has_schema6(&conn)? {
++            "INSERT INTO meetings (started_at, title, status, trigger, title_source) VALUES (?1, ?2, 'recording', ?3, 'auto')"
++        } else {
++            "INSERT INTO meetings (started_at, title, status, trigger) VALUES (?1, ?2, 'recording', ?3)"
++        };
++        conn.execute(sql, params![started_at, title, trigger])?;
+         Ok(conn.last_insert_rowid())
+     }
+ 
+@@ -603,10 +625,14 @@ impl Db {
+ 
+     pub fn rename_meeting(&self, id: i64, title: &str) -> Result<()> {
+         let conn = self.conn.lock().unwrap();
+-        conn.execute(
+-            "UPDATE meetings SET title = ?2 WHERE id = ?1",
+-            params![id, title],
+-        )?;
++        // Rollback build: a renamed title is protected from 0.3.x's
++        // automatic titling (Teams names land here too: protected as well).
++        let sql = if has_schema6(&conn)? {
++            "UPDATE meetings SET title = ?2, title_source = 'user' WHERE id = ?1"
++        } else {
++            "UPDATE meetings SET title = ?2 WHERE id = ?1"
++        };
++        conn.execute(sql, params![id, title])?;
+         Ok(())
+     }
+ 
+@@ -1132,10 +1158,16 @@ impl Db {
+                 ])?;
+             }
+         }
+-        tx.execute(
+-            "UPDATE meetings SET status = 'transcribed', engine = ?2 WHERE id = ?1",
+-            params![meeting_id, engine],
+-        )?;
++        // Rollback build: on a schema-6 database a kept AI summary now
++        // describes the previous transcript.
++        let sql = if has_schema6(&tx)? {
++            "UPDATE meetings SET status = 'transcribed', engine = ?2,
++               ai_summary_stale = (ai_summary != ''), transcript_rev = transcript_rev + 1
++             WHERE id = ?1"
++        } else {
++            "UPDATE meetings SET status = 'transcribed', engine = ?2 WHERE id = ?1"
++        };
++        tx.execute(sql, params![meeting_id, engine])?;
+         for person_id in affected_people {
+             recompute_person(&tx, person_id)?;
+         }
+@@ -1831,4 +1863,72 @@ mod tests {
+         drop(db);
+         let _ = std::fs::remove_dir_all(&dir);
+     }
++
++    /// Rollback build: a database Witness 0.3.x migrated to schema 6 opens,
++    /// and the writes keep the 0.3.x invariants. The SQL below is 0.3.x's
++    /// v6 migration verbatim.
++    #[test]
++    fn rollback_opens_a_schema_six_database() {
++        let (db, dir) = test_db("schema6");
++        let path = dir.join("test.db");
++        let before = db
++            .create_meeting("Meeting 2026-08-01 12:00", "2026-08-01T12:00:00Z", "auto")
++            .unwrap();
++        drop(db);
++        let conn = Connection::open(&path).unwrap();
++        conn.execute_batch(
++            r#"
++            BEGIN;
++            ALTER TABLE meetings ADD COLUMN title_source TEXT NOT NULL DEFAULT 'user';
++            ALTER TABLE meetings ADD COLUMN ai_summary TEXT NOT NULL DEFAULT '';
++            ALTER TABLE meetings ADD COLUMN ai_summary_at TEXT;
++            ALTER TABLE meetings ADD COLUMN ai_summary_stale INTEGER NOT NULL DEFAULT 0;
++            ALTER TABLE meetings ADD COLUMN transcript_rev INTEGER NOT NULL DEFAULT 0;
++            UPDATE meetings SET title_source = 'auto'
++              WHERE title GLOB 'Meeting [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]';
++            PRAGMA user_version = 6;
++            COMMIT;
++            "#,
++        )
++        .unwrap();
++        conn.execute(
++            "UPDATE meetings SET ai_summary = '## Summary', title_source = 'ai' WHERE id = ?1",
++            params![before],
++        )
++        .unwrap();
++        drop(conn);
++
++        let db = Db::open(&path).expect("a schema-6 database opens");
++        let column = |id: i64, name: &str| -> String {
++            let conn = db.conn.lock().unwrap();
++            conn.query_row(
++                &format!("SELECT CAST({name} AS TEXT) FROM meetings WHERE id = ?1"),
++                params![id],
++                |row| row.get(0),
++            )
++            .unwrap()
++        };
++        assert_eq!(db.list_meetings(0, 10).unwrap().len(), 1);
++        let id = db
++            .create_meeting("Meeting 2026-08-02 09:00", "2026-08-02T09:00:00Z", "auto")
++            .unwrap();
++        assert_eq!(column(id, "title_source"), "auto");
++        db.rename_meeting(id, "Typed in the rollback build").unwrap();
++        assert_eq!(column(id, "title_source"), "user");
++        db.replace_transcript(before, &[], &[], "parakeet").unwrap();
++        assert_eq!(column(before, "ai_summary_stale"), "1");
++        assert_eq!(column(before, "transcript_rev"), "1");
++        assert_eq!(column(before, "ai_summary"), "## Summary", "kept");
++        {
++            let conn = db.conn.lock().unwrap();
++            let version: i32 = conn
++                .query_row("PRAGMA user_version", [], |r| r.get(0))
++                .unwrap();
++            assert_eq!(version, 6, "never downgraded");
++            conn.execute_batch("PRAGMA user_version = 7;").unwrap();
++        }
++        drop(db);
++        assert!(Db::open(&path).is_err(), "anything newer is still refused");
++        let _ = std::fs::remove_dir_all(&dir);
++    }
+ }

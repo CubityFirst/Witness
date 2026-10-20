@@ -12,14 +12,16 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  # whisper-rs-sys runs bindgen; LLVM stays on 19.x (see CLAUDE.md).
+  LIBCLANG_PATH: C:\Program Files\LLVM\bin
+
 jobs:
   validate:
     name: Locked Windows validation
     runs-on: windows-latest
     timeout-minutes: 90
-    env:
-      CARGO_TERM_COLOR: always
-      LIBCLANG_PATH: C:\Program Files\LLVM\bin
 
     steps:
       - name: Check out source
@@ -27,46 +29,116 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Node.js
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      - name: Install LLVM 19
+        shell: pwsh
+        run: choco install llvm --version=19.1.7 --allow-downgrade --yes --no-progress
+
+      - name: Install RustSec audit tool
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      # RUSTSEC-2024-0429 (glib, unsound) is reached only through muda's Linux
+      # GTK backend (tray-icon) and is never compiled on Windows. The
+      # event-listener advisory (RUSTSEC-2026-0221) left with Tauri.
+      - name: Audit Rust dependencies
+        run: cargo audit --deny unsound --ignore RUSTSEC-2024-0429
+
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+
+      - name: Lint locked Rust targets
+        run: cargo clippy --workspace --locked --all-targets -- -D warnings
+
+      - name: Test locked Rust targets
+        run: cargo test --workspace --locked
+
+      - name: Check the release configuration
+        run: cargo run --locked -p xtask -- check
+
+  dist:
+    name: Unsigned installer
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      # Pin the target dir so the artifact path below is known (xtask dist
+      # resolves it through cargo metadata either way).
+      CARGO_TARGET_DIR: ${{ github.workspace }}\target
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          node-version-file: .nvmrc
-          cache: npm
+          persist-credentials: false
 
       - name: Install LLVM 19
         shell: pwsh
         run: choco install llvm --version=19.1.7 --allow-downgrade --yes --no-progress
 
-      - name: Install locked frontend dependencies
-        run: npm ci
+      # NSIS 3.11 + nsis_tauri_utils 0.5.3, keyed on their pinned SHA-256s
+      # (xtask/src/nsis.rs; a test keeps this key in sync, and the xtask
+      # re-verifies cached files anyway).
+      - name: Cache the NSIS toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/AppData/Local/witness-build
+          key: nsis-c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1-utils-5ba143b5db4a87d32d6e7802e033330aae56cbceabe0d1e3ba41948385ad4709
 
-      - name: Validate frontend
-        run: npm run check
+      - name: Build the installer
+        run: cargo run --locked -p xtask -- dist
 
-      - name: Audit JavaScript dependencies
-        run: npm run audit
+      - name: Upload the installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: witness-installer
+          path: target/release/bundle/nsis/Witness_*_x64-setup.exe
+          if-no-files-found: error
+          retention-days: 14
 
-      - name: Install RustSec audit tool
-        run: cargo install cargo-audit --locked --version 0.22.2
+      # The upgrade smoke test needs a version above the shipped 0.2.1. Until
+      # the release PR bumps the workspace, `dist` stamps 0.2.1 itself, which
+      # makes the /UPDATE run a same-version reinstall and its DisplayVersion
+      # checks vacuous. Same binaries and installer script, rehearsal version
+      # (above any real release) stamped in.
+      - name: Package a higher-version rehearsal installer
+        run: cargo run --locked -p xtask -- package --srcdir target/release --version 99.0.0 --out target/release/Witness_99.0.0_x64-setup.exe
 
-      - name: Audit Rust dependencies
-        working-directory: src-tauri
-        run: >
-          cargo audit --deny unsound
-          --ignore RUSTSEC-2026-0221
-          --ignore RUSTSEC-2024-0429
+      - name: Upload the rehearsal installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: witness-installer-rehearsal
+          path: target/release/Witness_99.0.0_x64-setup.exe
+          if-no-files-found: error
+          retention-days: 14
 
-      - name: Check Rust formatting
-        working-directory: src-tauri
-        run: cargo fmt --all --check
+  upgrade-smoke:
+    # Guards the update contract every installed 0.2.x copy relies on: install
+    # the shipped 0.2.1, update over it the way its updater does, and assert
+    # registry, shortcuts + AUMID, autostart and data survival.
+    name: Upgrade from 0.2.1
+    needs: dist
+    runs-on: windows-latest
+    timeout-minutes: 30
 
-      - name: Lint locked Rust targets
-        working-directory: src-tauri
-        run: cargo clippy --locked --all-targets -- -D warnings
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
-      - name: Test locked Rust targets
-        working-directory: src-tauri
-        run: cargo test --locked
+      - name: Download the installer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          # The 99.0.0 rehearsal build of this PR's installer: a real
+          # version increase over 0.2.1 (see the dist job).
+          name: witness-installer-rehearsal
+          path: installer-under-test
 
-      - name: Build and verify Windows installer
-        run: npm run release:windows
+      - name: Install 0.2.1, update over it, uninstall
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem installer-under-test -Filter "Witness_*_x64-setup.exe" | Select-Object -First 1
+          if (-not $setup) { throw "no installer artifact" }
+          ./installer/tests/upgrade-smoke.ps1 -NewInstaller $setup.FullName
+          exit $LASTEXITCODE
+
+      - name: Signatures pass the 0.2.x client's checks
+        run: cargo test --locked -p xtask sig_compat

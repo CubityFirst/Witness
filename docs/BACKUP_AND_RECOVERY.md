@@ -75,6 +75,13 @@ identified by `WITNESS_SETTINGS` (or beside `witness.exe`) and edit `data_dir`
 to the absolute new recovery directory before launching. Keep an untouched copy
 of the backup while editing.
 
+**Restore a backup with the same or a newer Witness.** Database migrations
+are forward-only. Backups made by 0.3.x contain a schema-6 database (the AI
+assistant's meeting columns), which Witness 0.2.x refuses to open — 0.2.x
+then fails at every launch. Restore 0.3.x backups only into 0.3.x (or a
+rollback build patched to open schema 6, see RELEASE_CHECKLIST.md). Older
+backups restore into newer builds, which migrate them on first start.
+
 Do not restore into a non-empty data directory: colliding meeting IDs, audio
 filenames, model cache state, or WAL sidecars can produce an incoherent archive.
 Witness does not support merging databases.

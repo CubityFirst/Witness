@@ -1,0 +1,24 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Witness build, signing and release tooling (cargo run -p xtask -- <cmd>)"
+publish = false
+
+[dependencies]
+# Exactly the signer tauri-cli 2.11.4 uses (0.7.4–0.8.0 were broken; 0.9+
+# pulls getrandom 0.4). Do not upgrade casually.
+minisign = "=0.7.3"
+# Exactly the verifier installed 0.2.x clients (tauri-plugin-updater 2.12.0)
+# use: every signature is self-checked with it before it is written.
+minisign-verify = "=0.2.5"
+semver = "1"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+ureq = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+anyhow = "1"
+chrono = "0.4"

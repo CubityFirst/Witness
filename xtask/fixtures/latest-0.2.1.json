@@ -1,0 +1,11 @@
+{
+  "version": "0.2.1",
+  "notes": "See https://github.com/CubityFirst/Witness/releases/tag/v0.2.1",
+  "pub_date": "2026-09-23T22:22:14Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUWXJPWUFiZmNHV3RJUmJ1ZFNwUnFoVHF1L2FncmZSYzR2WmVWVU5vN0VqMmlNbVM3UGRpekJaUUl0Yzh2SWlxbDh2Szl3TG9STUtoVGRaY1E0YVpJdmJtdGpMckFiblEwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwMjAyMTM0CWZpbGU6V2l0bmVzc18wLjIuMV94NjQtc2V0dXAuZXhlCjA1cUZWYW9VVE52T0czTUJnYmdhaWlFZXdSMTVML2JuSTlxMnVkUEtmZnlOeGdZRFh3YW5zU0lCeSs4QXJXbTFwaXBsdGZ6RnpSK3dKN3M1MWprNUFBPT0K",
+      "url": "https://github.com/CubityFirst/Witness/releases/download/v0.2.1/Witness_0.2.1_x64-setup.exe"
+    }
+  }
+}
