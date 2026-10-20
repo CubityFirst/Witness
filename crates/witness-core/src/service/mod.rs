@@ -215,7 +215,11 @@ impl AppCore {
             std::fs::create_dir_all(&dir)?;
         }
         startup::init_logging(&data_dir);
-        log::info!("Witness starting; data dir: {}", data_dir.display());
+        log::info!(
+            "Witness starting; data dir: {}; models: {}",
+            data_dir.display(),
+            settings.models_dir().display()
+        );
         // Surface CUDA problems at startup, where they are easy to spot — ort
         // would otherwise fall back to CPU without a word (gpu.rs). The managed
         // GPU-library dir must register first so preflight can use it.

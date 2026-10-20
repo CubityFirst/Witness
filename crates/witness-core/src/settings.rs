@@ -411,6 +411,10 @@ impl Settings {
     }
 
     pub fn models_dir(&self) -> PathBuf {
+        #[cfg(all(debug_assertions, not(test)))]
+        if let Some(dir) = dev_models_dir() {
+            return dir.clone();
+        }
         self.data_dir().join("models")
     }
 
@@ -526,6 +530,35 @@ fn replace_file(temporary_path: &Path, destination: &Path) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// Debug builds share the installed app's models instead of downloading
+/// ~3.5 GB into every dev data dir: `WITNESS_MODELS_DIR` if set, else the
+/// installed app's `models/` (its own `data_dir` setting honoured). Launches
+/// with their own `WITNESS_SETTINGS` (test and snapshot runs) stay isolated
+/// unless `WITNESS_MODELS_DIR` says otherwise. Resolved once.
+#[cfg(all(debug_assertions, not(test)))]
+fn dev_models_dir() -> Option<&'static PathBuf> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let env = |name| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+        let dir = if let Some(dir) = env("WITNESS_MODELS_DIR") {
+            PathBuf::from(dir.trim())
+        } else if env("WITNESS_SETTINGS").is_some() {
+            return None;
+        } else {
+            let install = crate::notify::registry_install_dir()?;
+            let installed =
+                Settings::load_from_path(&install.join("witness-settings.toml")).ok()?;
+            installed
+                .data_dir
+                .map(PathBuf::from)
+                .unwrap_or(install)
+                .join("models")
+        };
+        Some(dir)
+    })
+    .as_ref()
 }
 
 /// Directory containing the running executable (falls back to the cwd).

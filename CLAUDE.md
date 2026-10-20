@@ -562,6 +562,10 @@ GPU DLLs), `witness.log`, `ui-state.toml` (player volume/speed,
 model-banner dismissal; replaced WebView2 localStorage, reset once in
 0.3.0), `captions-overlay.toml` (overlay geometry in physical px + scale).
 data_dir changes apply to db/log on restart (Settings offers the button).
+Debug builds read models from `WITNESS_MODELS_DIR`, else the installed
+app's `models/` (`settings::dev_models_dir`; skipped when `WITNESS_SETTINGS`
+is set, so test/snapshot launches stay isolated) — "Delete model cache" in
+a debug build therefore wipes the installed app's models.
 The AI assistant's settings are the `[ai]` table (`enabled`, `base_url`,
 `model` — no default —, `auto_title`, `auto_notes`; kept last in `Settings`
 because TOML writes tables after values); its API key is never in any file
