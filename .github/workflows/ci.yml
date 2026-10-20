@@ -33,8 +33,20 @@ jobs:
         shell: pwsh
         run: choco install llvm --version=19.1.7 --allow-downgrade --yes --no-progress
 
+      # Dependencies only (workspace crates always rebuild). Saved from master
+      # alone, so PRs and release tags restore it without thrashing the 10 GB
+      # cache quota; Cargo.lock and the toolchain are part of the key.
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: debug
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      # Prebuilt binary (compiling it took ~6 minutes per run).
       - name: Install RustSec audit tool
-        run: cargo install cargo-audit --locked --version 0.22.2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-audit@0.22.2
 
       # RUSTSEC-2024-0429 (glib, unsound) is reached only through muda's Linux
       # GTK backend (tray-icon) and is never compiled on Windows. The
@@ -81,6 +93,12 @@ jobs:
         with:
           path: ~/AppData/Local/witness-build
           key: nsis-c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1-utils-5ba143b5db4a87d32d6e7802e033330aae56cbceabe0d1e3ba41948385ad4709
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: release
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Build the installer
         run: cargo run --locked -p xtask -- dist
