@@ -57,8 +57,11 @@ jobs:
       # RUSTSEC-2024-0429 (glib, unsound) is reached only through muda's Linux
       # GTK backend (tray-icon) and is never compiled on Windows. The
       # event-listener advisory (RUSTSEC-2026-0221) left with Tauri.
+      # RUSTSEC-2026-0381 matches webpki-roots 0.26.11 (ureq 2, hf-hub's
+      # major), the last 0.26 release: a semver shim that re-exports
+      # TLS_SERVER_ROOTS from webpki-roots 1, which is on the fixed 1.0.10.
       - name: Audit Rust dependencies
-        run: cargo audit --deny unsound --ignore RUSTSEC-2024-0429
+        run: cargo audit --deny unsound --ignore RUSTSEC-2024-0429 --ignore RUSTSEC-2026-0381
 
       - name: Check Rust formatting
         run: cargo fmt --all --check
