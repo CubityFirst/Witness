@@ -17,7 +17,7 @@
 use super::icons::{self, ph};
 use super::theme::{self, pal, S1, S2, S3, S4};
 use super::widgets;
-use super::{SettingsPage, UiCtx, View};
+use super::{SettingsPage, UiCmd, UiCtx, View};
 use crate::bridge::{OpDone, Task};
 use crate::ui_state::Appearance;
 use chrono::{DateTime, Datelike, Local, NaiveDate};
@@ -232,6 +232,7 @@ enum Command {
     StopRecording,
     AddBookmark,
     ShowCaptions,
+    HideCaptions,
     /// Open the transcript of the meeting being recorded.
     OpenRecording(i64),
     GoMeetings,
@@ -260,6 +261,7 @@ impl Command {
                 | Command::StopRecording
                 | Command::AddBookmark
                 | Command::ShowCaptions
+                | Command::HideCaptions
                 | Command::OpenRecording(_)
         )
     }
@@ -331,6 +333,8 @@ struct ActionState {
     recording: bool,
     /// A live-caption session runs (the top bar's CC button shows then).
     live_captions: bool,
+    /// The caption overlay is open (the captions action hides it).
+    captions_open: bool,
     /// The meeting being recorded, when known.
     recording_meeting: Option<i64>,
     /// Tray Quit is running: nothing may start a recording.
@@ -349,6 +353,7 @@ impl ActionState {
         let mut state = ActionState {
             recording,
             live_captions: recording && cx.shell.live_captions_active(),
+            captions_open: cx.shell.captions_open,
             recording_meeting: cx
                 .shell
                 .status
@@ -437,7 +442,14 @@ fn actions(state: &ActionState) -> Vec<ActionSpec> {
                 Glyph::Icon(ph::FILE_TEXT),
             ));
         }
-        if state.live_captions {
+        if state.live_captions && state.captions_open {
+            out.push(spec(
+                Command::HideCaptions,
+                "Hide live captions",
+                "overlay subtitles cc close",
+                Glyph::Icon(ph::CLOSED_CAPTIONING),
+            ));
+        } else if state.live_captions {
             out.push(spec(
                 Command::ShowCaptions,
                 "Show live captions",
@@ -1430,6 +1442,7 @@ fn run(command: Command, cx: &mut UiCtx) {
                 |error| OpDone::CaptionsCheck(Err(error)),
             );
         }
+        Command::HideCaptions => cx.cmds.push(UiCmd::HideCaptionsOverlay),
         Command::OpenRecording(id) | Command::OpenMeeting(id) => open_transcript(cx, id),
         Command::GoMeetings => cx.go_meetings_clear_search(),
         Command::GoPeople => cx.nav.go(View::People),
@@ -1702,6 +1715,14 @@ mod tests {
             ..recording.clone()
         };
         assert!(!has(&no_captions, &Command::ShowCaptions));
+        // An open overlay: the captions action hides it instead.
+        let open = ActionState {
+            captions_open: true,
+            ..recording.clone()
+        };
+        assert!(has(&open, &Command::HideCaptions));
+        assert!(!has(&open, &Command::ShowCaptions));
+        assert!(!has(&recording, &Command::HideCaptions));
         // Quitting: nothing starts a recording.
         let quitting = ActionState {
             quitting: true,

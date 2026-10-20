@@ -15,7 +15,7 @@ use super::format::{capture_warning, fmt_elapsed};
 use super::icons::{self, ph};
 use super::theme::{self, pal};
 use super::widgets::{self, PillKind, Politeness};
-use super::{UiCtx, View};
+use super::{UiCmd, UiCtx, View};
 use crate::bridge::OpDone;
 use crate::model::ShellModel;
 use crate::ui::toasts::Notice;
@@ -176,6 +176,8 @@ struct BarModel {
     /// A live-caption session runs (the CC button only makes sense then;
     /// the core rejects it otherwise).
     live_captions: bool,
+    /// The caption overlay is open: CC shows pressed and closes it.
+    captions_open: bool,
     /// Tray-flyout mode: no window controls.
     popup: bool,
     /// A start or stop is in flight (`ShellModel::recording_action`).
@@ -210,6 +212,7 @@ impl BarModel {
         let mut model = BarModel {
             recording,
             live_captions: recording && cx.shell.live_captions_active(),
+            captions_open: cx.shell.captions_open,
             popup: cx.flyout.is_popup(),
             busy: cx.shell.recording_action,
             pill: PillState::of(cx.shell),
@@ -257,6 +260,7 @@ enum BarAction {
     Record,
     Bookmark,
     ShowCaptions,
+    HideCaptions,
     /// The recording pill: open the recording's transcript.
     OpenTranscript,
     Nav(NavItem),
@@ -273,6 +277,7 @@ impl BarAction {
             BarAction::Record
                 | BarAction::Bookmark
                 | BarAction::ShowCaptions
+                | BarAction::HideCaptions
                 | BarAction::OpenTranscript
         )
     }
@@ -344,6 +349,7 @@ pub fn show(ui: &mut egui::Ui, cx: &mut UiCtx, split_list: Option<&View>) -> Top
                     |error| OpDone::CaptionsCheck(Err(error)),
                 );
             }
+            BarAction::HideCaptions => cx.cmds.push(UiCmd::HideCaptionsOverlay),
             BarAction::OpenTranscript => {
                 if let Some(meeting_id) = cx.shell.status.as_ref().and_then(|s| s.meeting_id) {
                     // Transcripts never nest: from a transcript, Back goes
@@ -595,7 +601,10 @@ fn draw_bar(ui: &mut egui::Ui, model: &BarModel) -> DrawnBar {
                             bookmark_button(ui, &model.bookmark_tooltip),
                             BarAction::Bookmark,
                         ),
-                        _ => (captions_button(ui), BarAction::ShowCaptions),
+                        _ if model.captions_open => {
+                            (captions_button(ui, true), BarAction::HideCaptions)
+                        }
+                        _ => (captions_button(ui, false), BarAction::ShowCaptions),
                     };
                     if response.clicked() {
                         actions.push(action);
@@ -812,17 +821,33 @@ fn bookmark_tooltip(hotkey: Option<&str>) -> String {
     }
 }
 
-/// Re-open (or focus) the captions overlay.
-fn captions_button(ui: &mut egui::Ui) -> egui::Response {
-    let label = "Show the caption overlay";
+/// A toggle for the captions overlay: accent-tinted (like a pressed
+/// toggle) while it is open, and a click then closes it.
+fn captions_button(ui: &mut egui::Ui, open: bool) -> egui::Response {
+    let look = if open {
+        let p = pal();
+        Look {
+            fill: p.accent_soft,
+            hover_fill: p.accent_soft,
+            glyph: p.accent,
+            hover_glyph: p.accent_hover,
+        }
+    } else {
+        ghost()
+    };
+    let tooltip = if open {
+        "Hide the caption overlay"
+    } else {
+        "Show the caption overlay"
+    };
     bar_button(
         ui,
         Some((ph::CLOSED_CAPTIONING, 18.0)),
-        label,
-        ghost(),
-        None,
+        "Caption overlay",
+        look,
+        Some(open),
     )
-    .on_hover_text(label)
+    .on_hover_text(tooltip)
 }
 
 /// The settings gear; filled (neutral) while Settings is open.
@@ -1860,6 +1885,7 @@ mod tests {
         BarModel {
             recording,
             live_captions: recording && captions,
+            captions_open: false,
             popup,
             busy: pill == PillState::Stopping,
             pill,
@@ -1895,6 +1921,13 @@ mod tests {
             (
                 "recording cc",
                 bar_model(recording("12:34", false), true, false),
+            ),
+            (
+                "recording cc open",
+                BarModel {
+                    captions_open: true,
+                    ..bar_model(recording("12:34", false), true, false)
+                },
             ),
             (
                 "long recording cc warn",
@@ -1938,6 +1971,54 @@ mod tests {
 
     fn rect_of(rects: &[(Item, Rect)], item: Item) -> Rect {
         rects.iter().find(|(i, _)| *i == item).unwrap().1
+    }
+
+    /// The CC button toggles: Show while the overlay is closed, Hide (and
+    /// drawn pressed) while it is open.
+    #[test]
+    fn the_cc_button_toggles_the_overlay() {
+        for (open, want) in [
+            (false, BarAction::ShowCaptions),
+            (true, BarAction::HideCaptions),
+        ] {
+            let model = BarModel {
+                captions_open: open,
+                ..bar_model(recording("12:34", false), true, false)
+            };
+            let (_, rects, _) = lay_out_bar(1000.0, &model);
+            let at = rect_of(&rects, Item::Captions).center();
+            let ctx = theme::test_context();
+            let mut actions = Vec::new();
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            for events in [
+                vec![egui::Event::PointerMoved(at)],
+                vec![button(true)],
+                vec![button(false)],
+            ] {
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 620.0),
+                    )),
+                    events,
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(input, |ui| {
+                    egui::Panel::top("topbar")
+                        .frame(frame())
+                        .resizable(false)
+                        .show_separator_line(false)
+                        .show(ui, |ui| actions.extend(draw_bar(ui, &model).actions));
+                });
+                output.textures_delta.clear();
+            }
+            assert_eq!(actions, vec![want], "open: {open}");
+        }
     }
 
     #[test]
