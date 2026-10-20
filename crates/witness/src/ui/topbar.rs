@@ -42,8 +42,9 @@ const EDGE_GRAB: f32 = 8.0;
 const RESIZE_EDGE: f32 = 6.0;
 const RESIZE_CORNER: f32 = 12.0;
 
-/// The bar's height and side padding (the right side clears the 6 pt
-/// resize strip, so the close button keeps its whole hit area).
+/// The bar's height and side padding. With the window controls the right
+/// side only clears the 6 pt resize strip, so the close button keeps its
+/// whole hit area; without them (tray flyout) the gear gets the left's 12.
 const BAR_HEIGHT: f32 = 48.0;
 const PAD_LEFT: f32 = 12.0;
 const PAD_RIGHT: f32 = 6.0;
@@ -444,7 +445,8 @@ pub(crate) struct RowWidths {
     pill: [f32; 4],
     /// The nav with labels, and icon-only.
     nav: [f32; 2],
-    /// The gear and the window controls, with the gaps before them.
+    /// The gear and the window controls, with the gaps before them and
+    /// the right padding.
     trail: f32,
 }
 
@@ -459,7 +461,6 @@ impl RowWidths {
             + GAP
             + self.nav[usize::from(level.nav_icons())]
             + self.trail
-            + PAD_RIGHT
     }
 }
 
@@ -478,9 +479,19 @@ fn lead_width(recording: bool, live_captions: bool) -> f32 {
     BTN + extra as f32 * (TIGHT_GAP + BTN)
 }
 
-/// The gear plus (outside the tray flyout) the window controls.
+/// The gear plus (outside the tray flyout) the window controls, and the
+/// right padding.
 fn trail_width(popup: bool) -> f32 {
-    TIGHT_GAP + BTN + if popup { 0.0 } else { GAP + CONTROLS_WIDTH }
+    TIGHT_GAP + BTN + pad_right(popup) + if popup { 0.0 } else { GAP + CONTROLS_WIDTH }
+}
+
+/// The right padding: see [`PAD_RIGHT`].
+fn pad_right(popup: bool) -> f32 {
+    if popup {
+        PAD_LEFT
+    } else {
+        PAD_RIGHT
+    }
 }
 
 /// One nav segment for a label `label_w` wide (or icon-only).
@@ -633,7 +644,7 @@ fn draw_bar(ui: &mut egui::Ui, model: &BarModel) -> DrawnBar {
             // The right-hand group hugs the right edge: positions come right
             // to left, but the items are drawn left to right so Tab moves
             // through the bar in reading order (nav, gear, window controls).
-            let mut right = row.right() - PAD_RIGHT;
+            let mut right = row.right() - pad_right(model.popup);
             let controls = (!model.popup).then(|| {
                 right -= CONTROLS_WIDTH + GAP;
                 slot(right + GAP, CONTROLS_WIDTH, BTN)
@@ -2043,7 +2054,8 @@ mod tests {
                 // Every item inside the bar, centred on its middle line…
                 for (item, rect) in &rects {
                     assert!(rect.left() >= PAD_LEFT - 0.01, "{item:?} {at}");
-                    assert!(rect.right() <= width - PAD_RIGHT + 0.01, "{item:?} {at}");
+                    let pad = pad_right(model.popup);
+                    assert!(rect.right() <= width - pad + 0.01, "{item:?} {at}");
                     assert!(
                         (rect.center().y - bar.center().y).abs() < 0.01,
                         "{item:?} {at}"
@@ -2092,6 +2104,10 @@ mod tests {
         let (_, rects, _) = lay_out_bar(640.0, &rec);
         assert!((rect_of(&rects, Item::Controls).right() - (640.0 - PAD_RIGHT)).abs() < 0.01);
         assert!((rect_of(&rects, Item::Record).left() - PAD_LEFT).abs() < 0.01);
+        // Without them (tray flyout) the gear is padded like the record button.
+        let flyout = bar_model(PillState::Idle, false, true);
+        let (_, rects, _) = lay_out_bar(640.0, &flyout);
+        assert!((rect_of(&rects, Item::Settings).right() - (640.0 - PAD_LEFT)).abs() < 0.01);
     }
 
     #[test]
