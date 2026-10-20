@@ -417,6 +417,7 @@ fn extract_dlls(
         let entry = zip.by_index_raw(index).context("listing archive")?;
         let basename = entry
             .name()
+            .context("reading an entry name")?
             .rsplit(['/', '\\'])
             .next()
             .unwrap_or_default()

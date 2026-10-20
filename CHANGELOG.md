@@ -19,6 +19,10 @@ still evolve quickly.
 
 - Model and GPU-library downloads now show progress for the whole download
   instead of the current file, which could read 100% partway through.
+- Updated `rustls` to 0.23.46 (RUSTSEC-2026-0346 to -0349) and `zip` to 9.0
+  (RUSTSEC-2026-0367 to -0369). Witness never used the affected zip
+  extraction path for the GPU libraries; the build tool's NSIS unpacking did,
+  on a hash-pinned download.
 
 ### Changed
 
