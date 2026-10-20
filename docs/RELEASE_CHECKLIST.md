@@ -107,7 +107,8 @@ honours `/P /UPDATE /R /ARGS /S /NS`, the per-user install location
       `timestamp:…\tfile:…\tversion:X.Y.Z` (native clients require the
       `version:` field), self-verifies the signature against the pinned key,
       and writes `latest.json` with both `windows-x86_64` and
-      `windows-x86_64-nsis` entries.
+      `windows-x86_64-nsis` entries. The tests and the signed build run as
+      parallel jobs; the release is published only when both pass.
 - [ ] Prerelease first for risky releases (always for the first native
       release): tag pushes publish a GitHub **prerelease** while the
       repository variable `RELEASE_PRERELEASE` is not `false`; manual runs use

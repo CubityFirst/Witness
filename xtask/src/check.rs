@@ -792,6 +792,13 @@ mod tests {
         assert!(release.contains("-- check --tag"));
         assert!(release.contains("-- dist --sign --notes"));
         assert!(!release.contains("--draft"), "a draft is never served");
+        // Tests run beside the signed build, and nothing publishes unless
+        // both passed.
+        assert!(release.contains("cargo test --workspace --locked"));
+        assert!(
+            release.contains("needs: [test, build]"),
+            "publish must wait for the tests and the build"
+        );
     }
 
     #[test]
