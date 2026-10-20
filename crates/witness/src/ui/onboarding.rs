@@ -961,6 +961,8 @@ fn fake_download(model_id: &str) -> witness_core::events::ModelDownloadProgress 
         total_bytes: Some(2_440_000_000),
         file_index: 1,
         file_count: 4,
+        job_downloaded_bytes: 820_000_000,
+        job_total_bytes: Some(3_550_000_000),
         done: false,
         error: None,
     }

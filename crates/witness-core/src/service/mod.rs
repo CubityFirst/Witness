@@ -493,6 +493,8 @@ mod tests {
                 total_bytes: None,
                 file_index: 0,
                 file_count: 0,
+                job_downloaded_bytes: 0,
+                job_total_bytes: None,
                 done,
                 error: None,
             })

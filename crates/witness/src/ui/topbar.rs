@@ -1571,13 +1571,22 @@ pub fn health_banner(ui: &mut egui::Ui, cx: &mut UiCtx, full_width: bool) {
         });
 }
 
-/// `file <i> of <n> — <pct>%`, or `… — downloading…` without a total.
+/// `file <i> of <n> — <pct>%` (of the whole job, else of the current
+/// file), or `… — downloading…` without a total.
 pub(crate) fn download_text(p: &ModelDownloadProgress) -> String {
-    let amount = match p.total_bytes.filter(|t| *t > 0) {
-        Some(total) => format!(
-            "{}%",
-            ((p.downloaded_bytes as f64 / total as f64) * 100.0).round()
-        ),
+    let job = p
+        .job_total_bytes
+        .filter(|t| *t > 0)
+        .map(|total| (p.job_downloaded_bytes, total));
+    let file = || {
+        p.total_bytes
+            .filter(|t| *t > 0)
+            .map(|total| (p.downloaded_bytes, total))
+    };
+    let amount = match job.or_else(file) {
+        Some((downloaded, total)) => {
+            format!("{}%", ((downloaded as f64 / total as f64) * 100.0).round())
+        }
         None => "downloading…".to_owned(),
     };
     format!("file {} of {} — {amount}", p.file_index, p.file_count)
@@ -2253,10 +2262,16 @@ mod tests {
             total_bytes: Some(200),
             file_index: 2,
             file_count: 5,
+            job_downloaded_bytes: 0,
+            job_total_bytes: None,
             done: false,
             error: None,
         };
         assert_eq!(download_text(&p), "file 2 of 5 — 25%");
+        p.job_downloaded_bytes = 300;
+        p.job_total_bytes = Some(1000);
+        assert_eq!(download_text(&p), "file 2 of 5 — 30%");
+        p.job_total_bytes = None;
         p.total_bytes = None;
         assert_eq!(download_text(&p), "file 2 of 5 — downloading…");
         p.total_bytes = Some(0);

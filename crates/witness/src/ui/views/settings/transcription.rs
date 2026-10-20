@@ -361,6 +361,8 @@ mod tests {
             total_bytes: Some(1_000_000_000),
             file_index: 2,
             file_count: 5,
+            job_downloaded_bytes: 0,
+            job_total_bytes: None,
             done,
             error: error.map(String::from),
         }

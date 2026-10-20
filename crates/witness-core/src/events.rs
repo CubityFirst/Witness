@@ -73,6 +73,11 @@ pub struct ModelDownloadProgress {
     pub file_index: u32,
     /// Total files in the download job (0 when done).
     pub file_count: u32,
+    /// Bytes of the whole job so far: every earlier file counts as done
+    /// (fetched or already cached), plus the current file's progress.
+    pub job_downloaded_bytes: u64,
+    /// Pinned size of every file in the job (None when done).
+    pub job_total_bytes: Option<u64>,
     pub done: bool,
     pub error: Option<String>,
 }

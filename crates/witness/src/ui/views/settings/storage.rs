@@ -360,14 +360,19 @@ pub(crate) fn download_active(dl: Option<&ModelDownloadProgress>) -> bool {
     dl.is_some_and(|d| !d.done)
 }
 
-/// The progress badge text (map-ui-settings §1.9).
+/// The progress badge text (map-ui-settings §1.9): the percentage and size
+/// are the whole job's, falling back to the current file's.
 pub(crate) fn download_progress_text(p: &ModelDownloadProgress) -> String {
-    match p.total_bytes.filter(|t| *t > 0) {
+    let (downloaded, total) = match p.job_total_bytes.filter(|t| *t > 0) {
+        Some(total) => (p.job_downloaded_bytes, Some(total)),
+        None => (p.downloaded_bytes, p.total_bytes.filter(|t| *t > 0)),
+    };
+    match total {
         Some(total) => format!(
             "file {} of {} — {}% of {} MB",
             p.file_index,
             p.file_count,
-            (p.downloaded_bytes as f64 / total as f64 * 100.0).round(),
+            (downloaded as f64 / total as f64 * 100.0).round(),
             (total as f64 / 1e6).round()
         ),
         None => format!(
@@ -379,9 +384,13 @@ pub(crate) fn download_progress_text(p: &ModelDownloadProgress) -> String {
     }
 }
 
-/// How far a download is overall (0..1), when its size is known: the
-/// finished files plus the current file's share.
+/// How far a download is overall (0..1), when its size is known: by bytes
+/// across the whole job, else the finished files plus the current file's
+/// share.
 pub(crate) fn download_fraction(p: &ModelDownloadProgress) -> Option<f32> {
+    if let Some(total) = p.job_total_bytes.filter(|t| *t > 0) {
+        return Some((p.job_downloaded_bytes as f64 / total as f64).clamp(0.0, 1.0) as f32);
+    }
     let total = p.total_bytes.filter(|t| *t > 0)?;
     let count = p.file_count.max(1) as f32;
     let file = (p.downloaded_bytes as f32 / total as f32).clamp(0.0, 1.0);
@@ -503,6 +512,8 @@ mod tests {
             total_bytes: Some(1_000_000_000),
             file_index: 2,
             file_count: 5,
+            job_downloaded_bytes: 0,
+            job_total_bytes: None,
             done,
             error: error.map(String::from),
         }
@@ -529,6 +540,15 @@ mod tests {
         assert_eq!(download_progress_text(&p), "file 2 of 5 — 250 MB…");
         p.total_bytes = Some(0);
         assert_eq!(download_progress_text(&p), "file 2 of 5 — 250 MB…");
+    }
+
+    #[test]
+    fn progress_text_and_fraction_cover_the_whole_job() {
+        let mut p = progress("parakeet", false, None);
+        p.job_downloaded_bytes = 1_500_000_000;
+        p.job_total_bytes = Some(3_000_000_000);
+        assert_eq!(download_progress_text(&p), "file 2 of 5 — 50% of 3000 MB");
+        assert_eq!(download_fraction(&p), Some(0.5));
     }
 
     #[test]

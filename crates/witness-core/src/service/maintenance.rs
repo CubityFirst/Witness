@@ -223,6 +223,7 @@ fn collect_diagnostics(state: &AppState) -> Diagnostics {
 }
 
 /// Progress event for a download job (`done` is the terminal event).
+/// `job_sizes` is every file's pinned size, in `file_index` order.
 fn download_progress(
     model_id: &str,
     file: &str,
@@ -230,7 +231,14 @@ fn download_progress(
     total: Option<u64>,
     file_index: u32,
     file_count: u32,
+    job_sizes: &[u64],
 ) -> CoreEvent {
+    let before = file_index.saturating_sub(1) as usize;
+    let earlier: u64 = job_sizes.iter().take(before).sum();
+    let current = job_sizes
+        .get(before)
+        .map_or(downloaded, |&size| downloaded.min(size));
+    let job_total: u64 = job_sizes.iter().sum();
     CoreEvent::ModelDownloadProgress(events::ModelDownloadProgress {
         model_id: model_id.to_string(),
         file: file.to_string(),
@@ -238,6 +246,8 @@ fn download_progress(
         total_bytes: total,
         file_index,
         file_count,
+        job_downloaded_bytes: earlier + current,
+        job_total_bytes: (job_total > 0).then_some(job_total),
         done: false,
         error: None,
     })
@@ -251,6 +261,8 @@ fn download_done(model_id: String, error: Option<String>) -> CoreEvent {
         total_bytes: None,
         file_index: 0,
         file_count: 0,
+        job_downloaded_bytes: 0,
+        job_total_bytes: None,
         done: true,
         error,
     })
@@ -351,6 +363,7 @@ impl AppCore {
         let spawned = std::thread::Builder::new()
             .name("model-download".into())
             .spawn(move || {
+                let job_sizes = models::job_file_sizes(engine);
                 let emit = |model_id: &str,
                             file: &str,
                             downloaded: u64,
@@ -358,7 +371,7 @@ impl AppCore {
                             file_index: u32,
                             file_count: u32| {
                     sink.emit(download_progress(
-                        model_id, file, downloaded, total, file_index, file_count,
+                        model_id, file, downloaded, total, file_index, file_count, &job_sizes,
                     ));
                 };
                 let result = models::download(engine, &models_dir, emit);
@@ -435,6 +448,7 @@ impl AppCore {
         let spawned = std::thread::Builder::new()
             .name("gpu-libs-download".into())
             .spawn(move || {
+                let job_sizes = crate::gpu_libs::job_file_sizes();
                 let emit = |_: &str,
                             file: &str,
                             downloaded: u64,
@@ -442,7 +456,7 @@ impl AppCore {
                             file_index: u32,
                             file_count: u32| {
                     sink.emit(download_progress(
-                        "gpu-libs", file, downloaded, total, file_index, file_count,
+                        "gpu-libs", file, downloaded, total, file_index, file_count, &job_sizes,
                     ));
                 };
                 let result = crate::gpu_libs::download(&cuda_dir, emit);
@@ -590,6 +604,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn download_progress_counts_earlier_files_toward_the_job() {
+        let sizes = [100, 300, 600];
+        let job = |event| match event {
+            CoreEvent::ModelDownloadProgress(p) => (p.job_downloaded_bytes, p.job_total_bytes),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            job(download_progress("m", "b", 150, Some(300), 2, 3, &sizes)),
+            (250, Some(1000))
+        );
+        // Never past the current file's pinned size.
+        assert_eq!(
+            job(download_progress("m", "c", 700, Some(600), 3, 3, &sizes)),
+            (1000, Some(1000))
+        );
+        assert_eq!(
+            job(download_progress("m", "a", 5, None, 1, 1, &[])),
+            (5, None)
+        );
+    }
+
+    #[test]
     fn diagnostics_file_name_shape() {
         let name = AppCore::diagnostics_file_name();
         assert!(name.starts_with("Witness-diagnostics-"), "{name}");
@@ -600,7 +636,7 @@ mod tests {
 
     #[test]
     fn download_progress_events_are_high_rate_until_done() {
-        assert!(download_progress("parakeet", "a.onnx", 1, Some(2), 1, 3).is_high_rate());
+        assert!(download_progress("parakeet", "a.onnx", 1, Some(2), 1, 3, &[2]).is_high_rate());
         assert!(!download_done("parakeet".into(), None).is_high_rate());
     }
 }

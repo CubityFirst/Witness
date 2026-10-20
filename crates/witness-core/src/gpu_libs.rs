@@ -127,6 +127,12 @@ pub fn download_size_bytes() -> u64 {
     ARCHIVES.iter().map(|archive| archive.size).sum()
 }
 
+/// Pinned size of every archive `download` covers, indexed by its 1-based
+/// `file_index` − 1.
+pub fn job_file_sizes() -> Vec<u64> {
+    ARCHIVES.iter().map(|archive| archive.size).collect()
+}
+
 fn manifest_path(cuda_dir: &Path) -> PathBuf {
     cuda_dir.join(MANIFEST_FILE)
 }
