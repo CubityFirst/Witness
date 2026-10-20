@@ -894,6 +894,23 @@ pub fn download_speaker_id(models_dir: &Path) -> Result<()> {
     )
 }
 
+/// The models one engine's download covers, in download order.
+fn job_ids(engine: Engine) -> &'static [&'static str] {
+    match engine {
+        Engine::Parakeet => &["parakeet", "sortformer", "speaker-id"],
+        Engine::Whisper => &["whisper"],
+    }
+}
+
+/// Pinned size of every file `download(engine, ..)` covers, indexed by its
+/// 1-based `file_index` − 1.
+pub fn job_file_sizes(engine: Engine) -> Vec<u64> {
+    job_ids(engine)
+        .iter()
+        .flat_map(|id| spec(id).files.iter().map(|file| file.size))
+        .collect()
+}
+
 /// Blocking download of everything the given engine needs. Downloads use
 /// hf-hub's resumable temporary blobs; files become usable only after their
 /// pinned SHA-256 checksums pass and the install manifest is atomically saved.
@@ -912,34 +929,19 @@ pub fn download(
         )
     })?;
     let mut manifest = manifest_for_download(models_dir);
-    match engine {
-        Engine::Parakeet => {
-            let ids = ["parakeet", "sortformer", "speaker-id"];
-            let file_count: u32 = ids.iter().map(|id| spec(id).files.len() as u32).sum();
-            let mut file_offset = 0;
-            for id in ids {
-                download_repo(
-                    models_dir,
-                    spec(id),
-                    &mut manifest,
-                    file_offset,
-                    file_count,
-                    &cb,
-                )?;
-                file_offset += spec(id).files.len() as u32;
-            }
-        }
-        Engine::Whisper => {
-            let file_count = spec("whisper").files.len() as u32;
-            download_repo(
-                models_dir,
-                spec("whisper"),
-                &mut manifest,
-                0,
-                file_count,
-                &cb,
-            )?;
-        }
+    let ids = job_ids(engine);
+    let file_count: u32 = ids.iter().map(|id| spec(id).files.len() as u32).sum();
+    let mut file_offset = 0;
+    for id in ids {
+        download_repo(
+            models_dir,
+            spec(id),
+            &mut manifest,
+            file_offset,
+            file_count,
+            &cb,
+        )?;
+        file_offset += spec(id).files.len() as u32;
     }
     Ok(())
 }

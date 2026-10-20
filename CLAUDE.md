@@ -71,7 +71,7 @@ repair, orphan recovery, bin purge) is `service/startup.rs`.
 
 UI (`crates/witness`): eframe 0.36 (glow renderer), no router — a `View` enum
 in `ui/mod.rs` (`ActiveView` owns the live view). Views in `ui/views/`:
-Meetings (+ recycle bin), People (stats + weekly trend), Transcript (+
+Meetings (+ recycle bin), People (stats + weekly trend + name filter), Transcript (+
 `player_bar.rs`: player, live captions, bookmarks, notes; `ai_summary.rs`: the
 AI Summary panel), Search (filters),
 Settings (`views/settings/`: `mod.rs` view + routing, `nav.rs` rail / index,
@@ -562,6 +562,10 @@ GPU DLLs), `witness.log`, `ui-state.toml` (player volume/speed,
 model-banner dismissal; replaced WebView2 localStorage, reset once in
 0.3.0), `captions-overlay.toml` (overlay geometry in physical px + scale).
 data_dir changes apply to db/log on restart (Settings offers the button).
+Debug builds read models from `WITNESS_MODELS_DIR`, else the installed
+app's `models/` (`settings::dev_models_dir`; skipped when `WITNESS_SETTINGS`
+is set, so test/snapshot launches stay isolated) — "Delete model cache" in
+a debug build therefore wipes the installed app's models.
 The AI assistant's settings are the `[ai]` table (`enabled`, `base_url`,
 `model` — no default —, `auto_title`, `auto_notes`; kept last in `Settings`
 because TOML writes tables after values); its API key is never in any file

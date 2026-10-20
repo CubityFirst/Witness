@@ -684,6 +684,7 @@ impl WitnessApp {
                         self.ensure_ui_pass();
                     }
                 }
+                UiCmd::HideCaptionsOverlay => self.captions.hide(),
                 UiCmd::RunSetup => {
                     self.prefs.onboarded = false;
                     self.palette = CommandPalette::new();
@@ -933,6 +934,11 @@ impl WitnessApp {
             self.memory.settings_search_focus = true;
             return;
         }
+        if jump && self.view == View::People && !self.onboarding.is_active() {
+            // People has its own box: filter people, stay put.
+            self.memory.people_search.request_focus = true;
+            return;
+        }
         if jump {
             // A split shows the search box beside the transcript already.
             if !self.view.has_search_box() && !split {
@@ -1160,7 +1166,11 @@ fn view_header(ui: &mut egui::Ui, cx: &mut UiCtx) {
                     widgets::gap(ui, theme::S3);
                 }
                 let current = cx.view.clone();
-                views::search::search_box(ui, cx, &current);
+                if current == View::People {
+                    views::people::search_box(ui, cx);
+                } else {
+                    views::search::search_box(ui, cx, &current);
+                }
             }
         });
         widgets::gap(ui, theme::S2);
@@ -1474,6 +1484,7 @@ impl eframe::App for WitnessApp {
             self.window.hide_to_tray();
         }
         self.shell.popup_mode = self.flyout.is_popup();
+        self.shell.captions_open = self.captions.is_open();
 
         // Undo `ensure_ui_pass` once the overlay exists (or after 2 s).
         if let Some(since) = self.ui_pass_since {

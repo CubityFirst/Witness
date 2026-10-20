@@ -119,9 +119,11 @@ impl View {
         }
     }
 
-    /// Meetings and Search show the search box above the view.
+    /// Meetings and Search show the transcript search box above the view,
+    /// People its name filter (in the same place, so switching between
+    /// them moves nothing).
     pub fn has_search_box(&self) -> bool {
-        self.is_list()
+        self.is_list() || matches!(self, View::People)
     }
 
     /// The views that list meetings: Meetings and Search.
@@ -245,6 +247,8 @@ impl Nav {
 pub enum UiCmd {
     /// CC button, after `check_captions_overlay` succeeded.
     ShowCaptionsOverlay,
+    /// CC button (or the palette) while the overlay is open: close it.
+    HideCaptionsOverlay,
     /// Settings → Storage → Restart Witness (after any confirmation).
     Restart,
     /// Settings → About → Check for updates.
@@ -301,6 +305,9 @@ pub struct ViewMemory {
     pub meetings_loaded: usize,
     pub search_filters: SearchFilters,
     pub search_box: SearchBox,
+    /// People's name filter. It filters as you type, so `debounce_at` stays
+    /// unused.
+    pub people_search: SearchBox,
     /// meeting id → the newest notes draft handed to the writer this
     /// session, so reopening a meeting cannot adopt a database read that
     /// raced the previous visit's last write (transcript.rs `Notes::load`).
@@ -703,6 +710,9 @@ mod tests {
         assert_eq!(t(7).key(), "transcript-7");
         assert_ne!(t(7).key(), t(8).key());
         assert!(View::Meetings.has_search_box());
+        assert!(View::People.has_search_box());
+        assert!(!View::People.is_list());
+        assert!(!View::Settings.has_search_box());
         assert!(!t(1).has_search_box());
     }
 

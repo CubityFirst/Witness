@@ -107,8 +107,9 @@ pub fn is_installed_build() -> bool {
     })
 }
 
+/// `$INSTDIR` of the installed app, when one is installed.
 #[cfg(windows)]
-fn registry_install_dir() -> Option<PathBuf> {
+pub(crate) fn registry_install_dir() -> Option<PathBuf> {
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
     let key = RegKey::predef(HKEY_CURRENT_USER)
@@ -120,7 +121,7 @@ fn registry_install_dir() -> Option<PathBuf> {
 }
 
 #[cfg(not(windows))]
-fn registry_install_dir() -> Option<PathBuf> {
+pub(crate) fn registry_install_dir() -> Option<PathBuf> {
     None
 }
 

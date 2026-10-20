@@ -58,6 +58,8 @@ pub struct ShellModel {
     pub refresh_tick: u64,
     /// Tray-flyout mode (window controls hidden); mirrors `FlyoutState`.
     pub popup_mode: bool,
+    /// The live-caption overlay is open; mirrors `CaptionsOverlay::is_open`.
+    pub captions_open: bool,
     /// Top-bar start/stop in flight (spinner, debounce).
     pub recording_action: bool,
     /// Tray Quit is stopping the recording and exiting: no new recordings.
@@ -600,6 +602,8 @@ mod tests {
                 total_bytes: Some(2),
                 file_index: 1,
                 file_count: 3,
+                job_downloaded_bytes: 1,
+                job_total_bytes: Some(6),
                 done,
                 error: error.map(String::from),
             })
