@@ -586,7 +586,9 @@ and writes `crates/witness/icons/` (exe icon resource 32512, window icon,
 `tray-<state>-<light|dark>.ico`), `app-icon.png` and `assets/icon.svg`. The
 16–32 px frames are
 separately grid-fitted, so edit the script and rerun it
-(`node assets/brand/icons.mjs`) rather than resizing a PNG.
+(`node assets/brand/icons.mjs`) rather than resizing a PNG. The README
+banners (`witness-banner-{light,dark}.png`) come from
+`assets/brand/banner.mjs`, which reuses `assets/icon.svg`.
 
 ## Known limitations (accepted)
 
