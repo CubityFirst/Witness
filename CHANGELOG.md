@@ -4,6 +4,22 @@ All notable changes to Witness are documented here. The project is pre-1.0;
 database and backup formats remain versioned, but user-visible behavior can
 still evolve quickly.
 
+## Unreleased
+
+### Added
+
+- People has a search box in the same place as the Meetings one. It
+  filters people by name as you type, and the ↑/↓ selection skips anyone it
+  hides. Ctrl+F and / focus it while People is open; Esc or × clear it.
+- The top bar's CC button shows when the caption overlay is open, and
+  clicking it then hides the overlay. The command palette offers "Hide live
+  captions" in that state.
+
+### Fixed
+
+- Model and GPU-library downloads now show progress for the whole download
+  instead of the current file, which could read 100% partway through.
+
 ## 0.3.1 — 2026-10-20
 
 ### Added
