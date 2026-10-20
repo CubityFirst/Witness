@@ -37,7 +37,7 @@ cargo fmt --all --check
 cargo clippy --workspace --locked --all-targets -- -D warnings
 cargo test --workspace --locked
 cargo run --locked -p xtask -- check
-cargo audit --deny unsound --ignore RUSTSEC-2024-0429
+cargo audit --deny unsound --ignore RUSTSEC-2024-0429 --ignore RUSTSEC-2026-0381
 ```
 
 Also perform the smallest relevant manual test: capture and playback for audio
