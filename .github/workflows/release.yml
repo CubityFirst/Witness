@@ -61,6 +61,12 @@ jobs:
           shared-key: debug
           save-if: false
 
+      # ort-sys links onnxruntime from its download cache outside target/ and
+      # copies its DLLs next to the binaries (dist packages them); the Rust
+      # cache keeps neither. Dropping its fingerprints reruns its build script.
+      - name: Rerun the ort-sys build script
+        run: if (Test-Path target) { Get-ChildItem target/*/.fingerprint/ort-sys-* -Directory | Remove-Item -Recurse -Force }
+
       - name: Test locked Rust targets
         run: cargo test --workspace --locked
 
@@ -88,6 +94,12 @@ jobs:
         with:
           shared-key: release
           save-if: false
+
+      # ort-sys links onnxruntime from its download cache outside target/ and
+      # copies its DLLs next to the binaries (dist packages them); the Rust
+      # cache keeps neither. Dropping its fingerprints reruns its build script.
+      - name: Rerun the ort-sys build script
+        run: if (Test-Path target) { Get-ChildItem target/*/.fingerprint/ort-sys-* -Directory | Remove-Item -Recurse -Force }
 
       # Also fails a manual run started from a branch instead of a tag.
       - name: Check the tag and release configuration

@@ -42,6 +42,12 @@ jobs:
           shared-key: debug
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
+      # ort-sys links onnxruntime from its download cache outside target/ and
+      # copies its DLLs next to the binaries (dist packages them); the Rust
+      # cache keeps neither. Dropping its fingerprints reruns its build script.
+      - name: Rerun the ort-sys build script
+        run: if (Test-Path target) { Get-ChildItem target/*/.fingerprint/ort-sys-* -Directory | Remove-Item -Recurse -Force }
+
       # Prebuilt binary (compiling it took ~6 minutes per run).
       - name: Install RustSec audit tool
         uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
@@ -99,6 +105,12 @@ jobs:
         with:
           shared-key: release
           save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      # ort-sys links onnxruntime from its download cache outside target/ and
+      # copies its DLLs next to the binaries (dist packages them); the Rust
+      # cache keeps neither. Dropping its fingerprints reruns its build script.
+      - name: Rerun the ort-sys build script
+        run: if (Test-Path target) { Get-ChildItem target/*/.fingerprint/ort-sys-* -Directory | Remove-Item -Recurse -Force }
 
       - name: Build the installer
         run: cargo run --locked -p xtask -- dist
