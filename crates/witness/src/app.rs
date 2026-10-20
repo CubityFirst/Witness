@@ -933,6 +933,11 @@ impl WitnessApp {
             self.memory.settings_search_focus = true;
             return;
         }
+        if jump && self.view == View::People && !self.onboarding.is_active() {
+            // People has its own box: filter people, stay put.
+            self.memory.people_search.request_focus = true;
+            return;
+        }
         if jump {
             // A split shows the search box beside the transcript already.
             if !self.view.has_search_box() && !split {
@@ -1160,7 +1165,11 @@ fn view_header(ui: &mut egui::Ui, cx: &mut UiCtx) {
                     widgets::gap(ui, theme::S3);
                 }
                 let current = cx.view.clone();
-                views::search::search_box(ui, cx, &current);
+                if current == View::People {
+                    views::people::search_box(ui, cx);
+                } else {
+                    views::search::search_box(ui, cx, &current);
+                }
             }
         });
         widgets::gap(ui, theme::S2);

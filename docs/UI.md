@@ -101,8 +101,9 @@ and left the client area see-through. The live-caption overlay stays dark in bot
 
 - **Ctrl+K** — command palette (actions, meetings, people; fuzzy-ranked).
 - **Ctrl+F** — find in the open transcript (Enter / Shift+Enter, F3); in
-  lists it focuses the search box, as does **/**; on Settings both focus
-  "Find a setting" (↑/↓ + Enter pick a result, Esc clears).
+  lists it focuses the search box, as does **/**; on People both focus
+  "Search people" (filters by name as you type, Esc clears); on Settings
+  both focus "Find a setting" (↑/↓ + Enter pick a result, Esc clears).
 - Lists (Meetings, the bin, Search hits, People): **↑/↓** or **j/k**,
   **Home/End**, **Enter** opens / expands; Meetings also **F2** renames and
   **Delete** bins (Shift skips the confirmation). Only while no text field
@@ -136,7 +137,8 @@ input:
 - Lists: `WITNESS_DEBUG_BIN=1`, `WITNESS_DEBUG_FILTERS=1`,
   `WITNESS_DEBUG_LOADING=1`, `WITNESS_DEBUG_EMPTY=1|bin`,
   `WITNESS_DEBUG_SELECT=<n>|bin:<n>`, `WITNESS_DEBUG_PANE=<index>`,
-  `WITNESS_DEBUG_EXPAND_PERSON=<i>`.
+  `WITNESS_DEBUG_EXPAND_PERSON=<i>`, `WITNESS_DEBUG_PEOPLE_SEARCH=<text>`
+  (People's name filter).
 - Settings: `WITNESS_DEBUG_SETTINGS_PAGE=<category>|index` (`general`,
   `recording`, `transcription`, `ai`, `voices`, `storage`, `about`; `index`
   = the narrow category list), `WITNESS_DEBUG_SETTINGS_SEARCH=<query>` (the

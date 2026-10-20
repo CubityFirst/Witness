@@ -9,6 +9,11 @@
 //! ↑/↓ (j/k, Home/End) select a person and Enter / Space opens or closes
 //! their detail, as in the Meetings list. The first load shows a skeleton
 //! of the trend and the rows; no people a designed empty state.
+//!
+//! The shell draws a name filter above the view, where Meetings has its
+//! search box ([`search_box`]; app-owned text, so it survives leaving
+//! People). It filters the loaded people as you type: the list and the
+//! keyboard selection skip the rest; the trend stays whole.
 
 use crate::bridge::{OpDone, Task};
 use crate::ui::format::{fmt_date, fmt_date_short, fmt_duration, fmt_thousands};
@@ -20,6 +25,7 @@ use crate::ui::views::meetings::{
     debug_flag, debug_index, empty_hero, follow_focus, list_keys_free, open_transcript,
     read_list_keys, skeleton_at, skeleton_due, step_selection, ListKeys,
 };
+use crate::ui::views::search::search_field;
 use crate::ui::widgets::{self, KeyScroll};
 use crate::ui::{UiCtx, View};
 use chrono::{DateTime, Datelike, Days, Local, NaiveDate};
@@ -191,6 +197,13 @@ fn aggregate(stats: &[PersonMeetingStat]) -> Vec<PersonAgg> {
     people
 }
 
+/// Whether `p` passes the name filter: the filter (trimmed) appears in
+/// their name, ignoring case. A blank filter keeps everyone.
+fn name_matches(p: &PersonAgg, filter: &str) -> bool {
+    let filter = filter.trim();
+    filter.is_empty() || p.name.to_lowercase().contains(&filter.to_lowercase())
+}
+
 /// `Math.round(part / whole * 100)`.
 fn percent(part: i64, whole: i64) -> i64 {
     (part as f64 / whole.max(1) as f64 * 100.0).round() as i64
@@ -309,6 +322,20 @@ enum Action {
     TryAgain,
     /// The empty state's way to the transcripts (where speakers are named).
     GoMeetings,
+    /// "Clear search" when the name filter matches no one.
+    ClearSearch,
+}
+
+/// The name filter above People, where Meetings has its search box (the
+/// shell draws it; Ctrl+F and `/` focus it).
+pub fn search_box(ui: &mut egui::Ui, cx: &mut UiCtx) {
+    search_field(
+        ui,
+        egui::Id::new("people-search"),
+        &mut cx.memory.people_search,
+        "Search people…",
+        "Search people by name",
+    );
 }
 
 pub struct PeopleView {
@@ -329,6 +356,9 @@ pub struct PeopleView {
     reveal: bool,
     /// `WITNESS_DEBUG_SELECT` has been applied.
     debug_selected: bool,
+    /// `WITNESS_DEBUG_PEOPLE_SEARCH` has been applied.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    debug_searched: bool,
 }
 
 impl Default for PeopleView {
@@ -351,6 +381,7 @@ impl PeopleView {
             cursor: None,
             reveal: false,
             debug_selected: false,
+            debug_searched: false,
         }
     }
 
@@ -364,15 +395,16 @@ impl PeopleView {
 
         // The list keys go before the scroller, which would otherwise
         // scroll by the arrows / Home / End (and page by Space).
+        let filter = cx.memory.people_search.text.clone();
         let mut actions = Vec::new();
         if list_keys_free(ui.ctx(), cx.confirm.is_open()) && !self.people.is_empty() {
             // Space toggles only once there is a selection to toggle;
             // before that it still pages down.
             let keys = read_list_keys(ui.ctx(), self.cursor.is_some(), false);
-            actions.extend(self.key_actions(keys));
+            actions.extend(self.key_actions(keys, &filter));
         }
         widgets::scroll_column(ui, "people-scroll", KeyScroll { space: true }, |ui| {
-            self.draw(ui, &mut actions)
+            self.draw(ui, &filter, &mut actions)
         });
         for action in actions {
             match action {
@@ -385,6 +417,10 @@ impl PeopleView {
                     };
                 }
                 Action::GoMeetings => cx.nav.go(View::Meetings),
+                Action::ClearSearch => {
+                    cx.memory.people_search.clear();
+                    cx.memory.people_search.request_focus = true;
+                }
                 Action::Open(meeting_id) => open_transcript(cx, meeting_id, View::People),
                 Action::Forget { id, name, skip } => {
                     if skip {
@@ -434,10 +470,16 @@ impl PeopleView {
         });
     }
 
-    /// Apply the list keys to the selection; Enter (or Space, once there
-    /// is a selection) opens or closes the selected person's detail.
-    fn key_actions(&mut self, keys: ListKeys) -> Vec<Action> {
-        let keys_in_order: Vec<String> = self.people.iter().map(|p| p.key.clone()).collect();
+    /// Apply the list keys to the selection (the people `filter` shows);
+    /// Enter (or Space, once there is a selection) opens or closes the
+    /// selected person's detail.
+    fn key_actions(&mut self, keys: ListKeys, filter: &str) -> Vec<Action> {
+        let keys_in_order: Vec<String> = self
+            .people
+            .iter()
+            .filter(|p| name_matches(p, filter))
+            .map(|p| p.key.clone())
+            .collect();
         if let Some(motion) = keys.motion {
             self.cursor = step_selection(&keys_in_order, self.cursor.as_ref(), motion);
             self.reveal = true;
@@ -491,6 +533,14 @@ impl PeopleView {
                 self.load_error = None;
                 #[cfg(debug_assertions)]
                 self.debug_expand();
+                // Debug builds only: `WITNESS_DEBUG_PEOPLE_SEARCH=<text>`
+                // types into the name filter, once.
+                #[cfg(debug_assertions)]
+                if let Ok(text) = std::env::var("WITNESS_DEBUG_PEOPLE_SEARCH") {
+                    if !std::mem::replace(&mut self.debug_searched, true) {
+                        cx.memory.people_search.text = text;
+                    }
+                }
                 self.expand_requested(cx);
                 // Debug builds only: `WITNESS_DEBUG_EMPTY=1` shows the empty
                 // state, `WITNESS_DEBUG_SELECT=<n>` selects the n-th person.
@@ -517,7 +567,11 @@ impl PeopleView {
             return;
         };
         let key = format!("p{id}");
-        if self.people.iter().any(|p| p.key == key) {
+        if let Some(person) = self.people.iter().find(|p| p.key == key) {
+            // A filter that hides them would hide what was asked for.
+            if !name_matches(person, &cx.memory.people_search.text) {
+                cx.memory.people_search.clear();
+            }
             self.expanded = Some(key);
         }
     }
@@ -548,7 +602,7 @@ impl PeopleView {
         }
     }
 
-    fn draw(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+    fn draw(&mut self, ui: &mut egui::Ui, filter: &str, actions: &mut Vec<Action>) {
         ui.ctx()
             .accesskit_node_builder(ui.id().with("people-heading"), |node| {
                 node.set_role(egui::accesskit::Role::Heading);
@@ -590,7 +644,27 @@ impl PeopleView {
         trend_card(ui, &self.weeks);
         widgets::section_header(ui, "People");
         ui.spacing_mut().item_spacing.y = 2.0;
-        for person in &self.people {
+        let mut shown = self
+            .people
+            .iter()
+            .filter(|p| name_matches(p, filter))
+            .peekable();
+        if shown.peek().is_none() {
+            let body = format!("No one's name contains \u{201c}{}\u{201d}.", filter.trim());
+            if empty_hero(
+                ui,
+                ph::MAGNIFYING_GLASS,
+                "No matching people",
+                &body,
+                &["Clear search"],
+                true,
+            )
+            .is_some()
+            {
+                actions.push(Action::ClearSearch);
+            }
+        }
+        for person in shown {
             let print = person
                 .person_id
                 .and_then(|id| self.prints.iter().find(|p| p.id == id));
@@ -1322,20 +1396,72 @@ mod tests {
             ..ListKeys::default()
         };
         // Nothing selected: Enter does nothing.
-        assert!(view.key_actions(toggle).is_empty());
-        view.key_actions(step(Motion::By(1)));
+        assert!(view.key_actions(toggle, "").is_empty());
+        view.key_actions(step(Motion::By(1)), "");
         assert_eq!(view.cursor.as_ref(), Some(&order[0]));
         assert!(view.reveal);
-        view.key_actions(step(Motion::Last));
+        view.key_actions(step(Motion::Last), "");
         assert_eq!(
-            view.key_actions(toggle),
+            view.key_actions(toggle, ""),
             vec![Action::Toggle(order[2].clone())]
         );
-        view.key_actions(step(Motion::By(-1)));
+        view.key_actions(step(Motion::By(-1)), "");
         assert_eq!(view.cursor.as_ref(), Some(&order[1]));
         // A forgotten person's selection is inert.
         view.people.truncate(1);
-        assert!(view.key_actions(toggle).is_empty());
+        assert!(view.key_actions(toggle, "").is_empty());
+    }
+
+    #[test]
+    fn the_name_filter_ignores_case_and_blanks() {
+        let people = aggregate(&[
+            stat(None, "Me", 1, 1_000, 500),
+            stat(Some(2), "Bob Ávila", 1, 1_000, 100),
+            stat(Some(3), "Cara", 2, 9_000, 100),
+        ]);
+        let names = |filter: &str| -> Vec<&str> {
+            people
+                .iter()
+                .filter(|p| name_matches(p, filter))
+                .map(|p| p.name.as_str())
+                .collect()
+        };
+        assert_eq!(names(""), ["Me", "Cara", "Bob Ávila"]);
+        assert_eq!(names("   "), names(""));
+        assert_eq!(names("ca"), ["Cara"]);
+        assert_eq!(names(" AVI"), Vec::<&str>::new(), "accents are kept");
+        assert_eq!(names("ávila "), ["Bob Ávila"]);
+        assert_eq!(names("ÁVILA"), ["Bob Ávila"]);
+        assert!(names("zed").is_empty());
+    }
+
+    #[test]
+    fn keys_walk_only_the_people_the_filter_shows() {
+        let mut view = PeopleView::new();
+        view.people = aggregate(&[
+            stat(None, "Me", 1, 1_000, 500),
+            stat(Some(2), "Bob", 1, 1_000, 100),
+            stat(Some(3), "Cara", 2, 9_000, 100),
+            stat(Some(4), "Carl", 2, 5_000, 100),
+        ]);
+        let step = |motion| ListKeys {
+            motion: Some(motion),
+            ..ListKeys::default()
+        };
+        let toggle = ListKeys {
+            activate: true,
+            ..ListKeys::default()
+        };
+        view.key_actions(step(Motion::By(1)), "car");
+        assert_eq!(view.cursor.as_deref(), Some("p3"));
+        view.key_actions(step(Motion::Last), "car");
+        assert_eq!(view.cursor.as_deref(), Some("p4"));
+        assert_eq!(
+            view.key_actions(toggle, "car"),
+            vec![Action::Toggle("p4".into())]
+        );
+        // A selection the filter now hides is inert.
+        assert!(view.key_actions(toggle, "bob").is_empty());
     }
 
     #[test]
