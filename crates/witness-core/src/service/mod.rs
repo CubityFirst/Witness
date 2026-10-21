@@ -250,7 +250,13 @@ impl AppCore {
         let pipeline = crate::pipeline::spawn(
             db.clone(),
             settings.clone(),
-            pipeline_adapter(db.clone(), sink.clone(), notifier.clone(), ai.clone()),
+            pipeline_adapter(
+                db.clone(),
+                settings.clone(),
+                sink.clone(),
+                notifier.clone(),
+                ai.clone(),
+            ),
         );
 
         let (auto_record, patterns, configured_data_dir) = {
@@ -426,6 +432,7 @@ impl AppCore {
 /// Pipeline events → UI events + toasts (formerly main.rs:216-271).
 fn pipeline_adapter(
     db: Arc<Db>,
+    settings: Arc<Mutex<Settings>>,
     sink: Arc<dyn EventSink>,
     notifier: Arc<dyn Notifier>,
     ai: ai::AiService,
@@ -452,15 +459,18 @@ fn pipeline_adapter(
                 },
             ));
             sink.emit(CoreEvent::MeetingsChanged);
-            // Only toast when a transcript was actually produced. The
-            // realtime factor doubles as a GPU sanity check: single-digit
-            // numbers on this box mean ort fell back to CPU.
+            // Only toast when a transcript was actually produced (and the
+            // user wants to hear about it). The realtime factor doubles as a
+            // GPU sanity check: single-digit numbers on this box mean ort
+            // fell back to CPU — it is logged either way.
             if let Ok(Some(m)) = db.get_meeting(meeting_id) {
                 if m.status == "transcribed" {
                     let speed = rtf
                         .map(|r| format!(" ({r:.0}× realtime)"))
                         .unwrap_or_default();
-                    notifier.toast(&format!("Transcript ready: {}{speed}", m.title));
+                    if settings.lock().unwrap().notify_transcribed {
+                        notifier.toast(&format!("Transcript ready: {}{speed}", m.title));
+                    }
                     // The automatic AI features that are on (none by default;
                     // a no-op while the assistant is off). Its own thread.
                     ai.on_transcribed(meeting_id);
@@ -573,6 +583,74 @@ mod tests {
     fn trigger_strings_match_the_database() {
         assert_eq!(Trigger::Auto.as_str(), "auto");
         assert_eq!(Trigger::Manual.as_str(), "manual");
+    }
+
+    #[test]
+    fn transcript_ready_toast_follows_the_setting() {
+        #[derive(Default)]
+        struct Toasts(Mutex<Vec<String>>);
+        impl Notifier for Toasts {
+            fn toast(&self, body: &str) {
+                self.0.lock().unwrap().push(body.to_string());
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "witness-core-notify-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(Db::open(&dir.join("t.db")).unwrap());
+        let settings = Arc::new(Mutex::new(Settings::default()));
+        let sink = Arc::new(testing::CollectSink::default());
+        let toasts = Arc::new(Toasts::default());
+        // The assistant is off by default, so no request can be made.
+        let ai = ai::AiService::spawn(ai::AiEnv {
+            db: db.clone(),
+            settings: settings.clone(),
+            sink: sink.clone(),
+            notifier: toasts.clone(),
+            transport: Arc::new(crate::ai_client::UreqTransport),
+            credentials: Arc::new(crate::credentials::MemoryCredentials::default()),
+        });
+        let adapter = pipeline_adapter(
+            db.clone(),
+            settings.clone(),
+            sink.clone(),
+            toasts.clone(),
+            ai,
+        );
+        let id = db
+            .create_meeting("Standup", "2026-10-21T09:00:00Z", "manual")
+            .unwrap();
+        db.set_status(id, "transcribed").unwrap();
+
+        adapter(PipelineEvent::Complete {
+            meeting_id: id,
+            rtf: Some(40.0),
+        });
+        assert_eq!(
+            *toasts.0.lock().unwrap(),
+            ["Transcript ready: Standup (40× realtime)"]
+        );
+
+        settings.lock().unwrap().notify_transcribed = false;
+        adapter(PipelineEvent::Complete {
+            meeting_id: id,
+            rtf: None,
+        });
+        assert_eq!(toasts.0.lock().unwrap().len(), 1);
+        // Failures always toast: the user has to act on them.
+        adapter(PipelineEvent::Failed {
+            meeting_id: id,
+            error: "boom".into(),
+        });
+        assert_eq!(toasts.0.lock().unwrap().len(), 2);
+
+        drop(adapter);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

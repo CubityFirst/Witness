@@ -77,6 +77,11 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub caption_overlay: bool,
 
+    /// Raise a Windows notification when a meeting's transcript is ready.
+    /// Failure toasts are always shown.
+    #[serde(default = "default_true")]
+    pub notify_transcribed: bool,
+
     /// Cosine similarity needed to auto-label a speaker from a voice print.
     #[serde(default = "default_threshold")]
     pub speaker_match_threshold: f32,
@@ -210,6 +215,7 @@ impl Default for Settings {
             auto_transcribe: true,
             live_transcribe: true,
             caption_overlay: true,
+            notify_transcribed: true,
             check_for_updates: true,
             speaker_match_threshold: 0.6,
             watch_patterns: default_patterns(),

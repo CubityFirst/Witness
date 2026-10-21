@@ -198,6 +198,13 @@ pub(super) const INDEX: &[Entry] = &[
     ),
     entry(
         P::Transcription,
+        Row("Notify when transcribed"),
+        "Notify when transcribed",
+        "A Windows notification when a transcript is ready.",
+        "toast notification alert popup done finished ready",
+    ),
+    entry(
+        P::Transcription,
         Row("Live captions"),
         "Live captions",
         "While recording; the final pass replaces them.",

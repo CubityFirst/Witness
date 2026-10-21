@@ -1,6 +1,7 @@
 //! Settings → Transcription: the engine and what runs it (GPU status, the
-//! managed CUDA libraries), when transcription runs (after recording, live
-//! captions, the floating caption window) and the noise-phrase filter.
+//! managed CUDA libraries), when transcription runs (after recording, the
+//! "transcript ready" notification, live captions, the floating caption
+//! window) and the noise-phrase filter.
 
 use super::storage::installed_text;
 use super::{
@@ -43,6 +44,7 @@ impl SettingsState {
             .map_or_else(|| "checking…".to_string(), |g| g.detail.clone());
         let gpu_libs = self.gpu_libs.as_ref().filter(|l| l.driver_present);
         let mut auto_transcribe = settings.auto_transcribe;
+        let mut notify = settings.notify_transcribed;
         let mut live = settings.live_transcribe;
         let mut overlay = settings.caption_overlay;
         let mut engine = settings.engine;
@@ -90,36 +92,46 @@ impl SettingsState {
         });
         footnote(ui, DIARIZATION_NOTE);
 
-        let (auto, live_changed, overlay_changed) = section(ui, "When to transcribe", |ui| {
-            let auto = toggle(
-                ui,
-                true,
-                &mut auto_transcribe,
-                "Auto-transcribe",
-                "Runs after each recording.",
-            )
-            .changed();
-            widgets::group_divider(ui);
-            let live_changed = toggle(
-                ui,
-                true,
-                &mut live,
-                "Live captions",
-                "Parakeet, while recording. Provisional — the final pass replaces them.",
-            )
-            .changed();
-            widgets::group_divider(ui);
-            // Disabled without live captions, but its value is kept.
-            let overlay_changed = toggle(
-                ui,
-                settings.live_transcribe,
-                &mut overlay,
-                "Floating caption window",
-                "On top of other apps while recording.",
-            )
-            .changed();
-            (auto, live_changed, overlay_changed)
-        });
+        let (auto, notify_changed, live_changed, overlay_changed) =
+            section(ui, "When to transcribe", |ui| {
+                let auto = toggle(
+                    ui,
+                    true,
+                    &mut auto_transcribe,
+                    "Auto-transcribe",
+                    "Runs after each recording.",
+                )
+                .changed();
+                widgets::group_divider(ui);
+                let notify_changed = toggle(
+                    ui,
+                    true,
+                    &mut notify,
+                    "Notify when transcribed",
+                    "A Windows notification when a transcript is ready.",
+                )
+                .changed();
+                widgets::group_divider(ui);
+                let live_changed = toggle(
+                    ui,
+                    true,
+                    &mut live,
+                    "Live captions",
+                    "Parakeet, while recording. Provisional — the final pass replaces them.",
+                )
+                .changed();
+                widgets::group_divider(ui);
+                // Disabled without live captions, but its value is kept.
+                let overlay_changed = toggle(
+                    ui,
+                    settings.live_transcribe,
+                    &mut overlay,
+                    "Floating caption window",
+                    "On top of other apps while recording.",
+                )
+                .changed();
+                (auto, notify_changed, live_changed, overlay_changed)
+            });
 
         let junk = section(ui, "Noise filter", |ui| {
             row(
@@ -151,6 +163,9 @@ impl SettingsState {
 
         if auto {
             save(cx, |s| s.auto_transcribe = auto_transcribe);
+        }
+        if notify_changed {
+            save(cx, |s| s.notify_transcribed = notify);
         }
         if live_changed {
             save(cx, |s| s.live_transcribe = live);
