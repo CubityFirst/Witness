@@ -263,7 +263,7 @@ impl AiTransport for UreqTransport {
             // API roots don't redirect, so a 3xx is reported instead.
             .redirects(0)
             .https_only(request.https_only)
-            // A neutral user agent: no version (PRIVACY.md lists it).
+            // A neutral user agent: no version or platform.
             .user_agent(AI_USER_AGENT)
             .build();
         let mut call = match request.method {

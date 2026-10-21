@@ -12,8 +12,7 @@ the title — never audio — to the OpenAI-compatible service the user
 configured) use the network. It follows the same single-process, tray-first
 philosophy as the sibling Vigil project.
 
-PLAN.md is the original (implemented, Tauri-era) design; this file is the
-living map. 0.3.0 replaced Tauri/WebView2/Preact/Node with the native UI; the
+This file is the living map. 0.3.0 replaced Tauri/WebView2/Preact/Node with the native UI; the
 backend, database, archive, settings file, installer identity and update feed
 carried over unchanged.
 
