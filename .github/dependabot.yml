@@ -43,6 +43,9 @@ updates:
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: wasapi
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      # earshot minor releases retrain the model: re-tune vad::THRESHOLD first.
+      - dependency-name: earshot
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
 
   - package-ecosystem: github-actions
     directory: /

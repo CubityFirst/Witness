@@ -197,7 +197,7 @@ thread and an in-house WSOLA time-stretch (speed) — no extra crates.
   instance mutex, flush log, `process::exit`). If a spawn/launch fails, the
   app keeps running intact. Restart/update hold `core.exit_guard(..)`
   (recorder + backup locks) so nothing starts between the check and exit.
-- **Panic policy** (`crates/witness/src/panic.rs`): UI code now shares the
+- **Panic policy** (`crates/witness/src/panic.rs`): UI code shares the
   event-loop thread, so a main-thread panic is fatal. The hook logs (with
   backtrace) for every thread; worker panics are contained by `catch_unwind`
   in `Tasks`. On the main thread, once: `emergency_stop` (stop + save the
@@ -314,7 +314,9 @@ thread and an in-house WSOLA time-stretch (speed) — no extra crates.
   native-tls (SChannel → Windows certificate store); the AI client shares its
   agent setup (`updater::agent_builder`). The API-key store uses the
   `windows` crate's `Win32_Security_Credentials` feature — no new crates.
-- `.github/dependabot.yml` ignores mirror this list.
+- `.github/dependabot.yml` ignores mirror this list for the updater,
+  egui/winit/wgpu and ML/audio pins (earshot included); tray-icon,
+  global-hotkey, rfd and the toast crate still get Dependabot PRs.
 - **VAD is earshot, not Silero** — `voice_activity_detector` pins ort
   =2.0.0-rc.10; parakeet-rs needs rc.13. earshot frames: exactly 256
   samples @ 16 kHz. Its minor releases retrain the model, so a bump means
@@ -421,7 +423,8 @@ thread and an in-house WSOLA time-stretch (speed) — no extra crates.
   `com.github.cubityfirst.witness` that NSIS writes on the shortcut and
   shows "Witness"; dev builds borrow PowerShell's AUMID and are attributed
   to it.
-- Root viewport `clear_color` = `BG` (no white flash on resize);
+- Root viewport clear colour = the palette's window background
+  (`theme::clear_color()`; no white flash on resize);
   `persist_window: false`.
 - **No large stack arrays.** The main thread runs the whole UI and has
   Windows' 1 MB stack, and release inlining hoists a callee's array into
@@ -433,7 +436,8 @@ thread and an in-house WSOLA time-stretch (speed) — no extra crates.
 - The installer ships the ort CUDA provider DLLs because they are listed in
   `installer/witness.nsi` (`xtask check` asserts exactly those two).
 - **Accepted UI regressions** (0.3.0): no high-contrast palette (detected
-  and logged only — the palette is `const`s), no bidi reordering for RTL
+  and logged only — the light/dark palettes ignore the system HC colours),
+  no bidi reordering for RTL
   scripts (egui shapes but doesn't reorder), no notes spellcheck, fixed
   day-month-year dates.
 
