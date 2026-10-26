@@ -318,11 +318,16 @@ fn hotkey_parts(what: &str, combo: Option<&str>) -> (String, Option<String>) {
 fn watcher_text(watcher: Option<&WatcherStatus>) -> String {
     match watcher {
         Some(w) => format!(
-            "Watcher: Teams key found: {} · mic in use: {}{}",
+            "Watcher: Teams key found: {} · mic in use: {}{}{}",
             yes_no(w.teams_key_found),
             yes_no(w.mic_in_use),
             if w.suppressed {
                 " · auto-restart suppressed"
+            } else {
+                ""
+            },
+            if w.consent_store_stale {
+                " · Windows mic tracking stalled, using audio sessions"
             } else {
                 ""
             }
@@ -489,10 +494,20 @@ mod tests {
             teams_key_found: true,
             mic_in_use: false,
             suppressed: true,
+            consent_store_stale: false,
         };
         assert_eq!(
             watcher_text(Some(&w)),
             "Watcher: Teams key found: yes · mic in use: no · auto-restart suppressed"
+        );
+        let w = WatcherStatus {
+            suppressed: false,
+            consent_store_stale: true,
+            ..w
+        };
+        assert_eq!(
+            watcher_text(Some(&w)),
+            "Watcher: Teams key found: yes · mic in use: no · Windows mic tracking stalled, using audio sessions"
         );
     }
 

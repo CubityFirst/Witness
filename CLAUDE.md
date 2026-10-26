@@ -2,7 +2,7 @@
 
 Local-only meeting recorder & transcriber for Windows 11 (pure Rust: native
 egui/eframe UI over a UI-agnostic backend library). Detects Teams calls via
-the mic consent store, records mic + system loopback as separate tracks,
+the mic consent store + capture audio sessions, records mic + system loopback as separate tracks,
 live-captions while recording, transcribes on-device (Parakeet TDT on CUDA /
 Whisper on CPU) with diarization and cross-meeting voice identification, and
 keeps a full-text-searchable archive. Meeting content stays on the machine;
@@ -37,7 +37,7 @@ witness.exe main (winit) thread: eframe WitnessApp (app.rs) + tray + hotkeys
      Op(OpDone) ◄─ Tasks::spawn_op workers
   ui() draws top bar + active view; views call AppCore via Tasks (workers)
                                                              │
-meeting_watcher.rs ──(registry poll 2s, debounce 2/5 ticks)──┤
+meeting_watcher.rs ──(consent store + sessions, 2s, 2/5)─────┤
 tray / hotkeys / top bar ──► service::rec_control (one ordered worker)
                                                              ▼
          witness_core::AppCore (Arc) — service/recording.rs start/stop
@@ -258,6 +258,17 @@ thread and an in-house WSOLA time-stretch (speed) — no extra crates.
   HTML or live links). Retranscription keeps the summary and flags it
   stale (automatic notes then rewrite it); purge deletes it with the row;
   exports (md/txt) include it.
+- **Call detection uses two signals, either one counts**
+  (`meeting_watcher.rs`): the mic consent store (`LastUsedTimeStart` set,
+  `LastUsedTimeStop` 0) and a running WASAPI session on any capture
+  endpoint whose owning process matches a watch pattern (exe path, its
+  `#`-encoded NonPackaged form, or MSIX package family). Windows can stop
+  updating the consent store for *every* app (2026-10-25, build 26300,
+  after a Settings-initiated restart: a day of Teams calls went unrecorded),
+  so it is not trusted alone. A call seen only through sessions for ~10 s
+  logs a warning and sets `WatcherStatus::consent_store_stale` (Settings →
+  Recording's watcher row) until the store reports mic use again; the
+  reverse case is logged at info.
 - **Meeting end stops any running recording**, not just auto-started ones —
   StopMeeting only fires after a watched meeting was detected and ended, so
   manual recordings made outside a call are never touched.
@@ -480,8 +491,9 @@ validated with newer LLVM releases. The toolchain is pinned in
   `tts_transcribe` / `whisper_tts` / `vad_keeps_tts_speech` (SAPI speech
   end-to-end, both engines), `voice_print_discrimination` (two TTS voices,
   same/cross cosine), `live_captions` (streams TTS through the live
-  worker), `list_devices_smoke`, `playback_smoke` (plays through the
-  default device), `gpu_libs_real_download`, `live_feed_check` /
+  worker), `list_devices_smoke`, `list_capture_sessions_smoke` (capture
+  sessions with their owner exe/package — run it during a call),
+  `playback_smoke` (plays through the default device), `gpu_libs_real_download`, `live_feed_check` /
   `real_021_installer_verifies` (updater against the real feed),
   `real_registry_round_trip` (the user's real `Run` key, restored after),
   `dialogs_are_modal_over_the_owner_from_a_worker` (shows real dialogs),
