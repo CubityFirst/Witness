@@ -64,6 +64,9 @@ windows = { version = "0.62", features = [
   "Win32_UI_WindowsAndMessaging",
   "Win32_UI_Shell",
   "Win32_System_Threading",
+  # The meeting watcher matches capture sessions by the owning process's
+  # package (new Teams is MSIX), like the consent store's subkeys.
+  "Win32_Storage_Packaging_Appx",
   # The AI service's API key lives in Windows Credential Manager (credentials.rs).
   "Win32_Security_Credentials",
 ] }
