@@ -37,7 +37,7 @@ jobs:
       # alone, so PRs and release tags restore it without thrashing the 10 GB
       # cache quota; Cargo.lock and the toolchain are part of the key.
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: debug
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -104,7 +104,7 @@ jobs:
           key: nsis-c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1-utils-5ba143b5db4a87d32d6e7802e033330aae56cbceabe0d1e3ba41948385ad4709
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: release
           save-if: ${{ github.ref == 'refs/heads/master' }}
