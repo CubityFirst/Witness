@@ -261,14 +261,11 @@ thread and an in-house WSOLA time-stretch (speed) — no extra crates.
 - **Call detection uses two signals, either one counts**
   (`meeting_watcher.rs`): the mic consent store (`LastUsedTimeStart` set,
   `LastUsedTimeStop` 0) and a running WASAPI session on any capture
-  endpoint whose owning process matches a watch pattern (exe path, its
-  `#`-encoded NonPackaged form, or MSIX package family). Windows can stop
-  updating the consent store for *every* app (2026-10-25, build 26300,
-  after a Settings-initiated restart: a day of Teams calls went unrecorded),
-  so it is not trusted alone. A call seen only through sessions for ~10 s
-  logs a warning and sets `WatcherStatus::consent_store_stale` (Settings →
-  Recording's watcher row) until the store reports mic use again; the
-  reverse case is logged at info.
+  endpoint whose owning process's exe path (or its `#`-encoded NonPackaged
+  form) matches a watch pattern. Windows can stop updating the consent
+  store for *every* app (2026-10-25, build 26300, after a
+  Settings-initiated restart: a day of Teams calls went unrecorded), so it
+  is not trusted alone.
 - **Meeting end stops any running recording**, not just auto-started ones —
   StopMeeting only fires after a watched meeting was detected and ended, so
   manual recordings made outside a call are never touched.
@@ -491,8 +488,8 @@ validated with newer LLVM releases. The toolchain is pinned in
   `tts_transcribe` / `whisper_tts` / `vad_keeps_tts_speech` (SAPI speech
   end-to-end, both engines), `voice_print_discrimination` (two TTS voices,
   same/cross cosine), `live_captions` (streams TTS through the live
-  worker), `list_devices_smoke`, `list_capture_sessions_smoke` (capture
-  sessions with their owner exe/package — run it during a call),
+  worker), `list_devices_smoke`, `capture_sessions_smoke` (one real
+  session scan for Teams — run it during a call),
   `playback_smoke` (plays through the default device), `gpu_libs_real_download`, `live_feed_check` /
   `real_021_installer_verifies` (updater against the real feed),
   `real_registry_round_trip` (the user's real `Run` key, restored after),

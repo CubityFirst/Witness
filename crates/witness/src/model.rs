@@ -447,7 +447,6 @@ mod tests {
             teams_key_found: false,
             mic_in_use: false,
             suppressed: false,
-            consent_store_stale: false,
         }
     }
 

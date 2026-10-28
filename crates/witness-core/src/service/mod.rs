@@ -282,7 +282,6 @@ impl AppCore {
                 teams_key_found: false,
                 mic_in_use: false,
                 suppressed: false,
-                consent_store_stale: false,
             }),
             downloading: AtomicBool::new(false),
             hotkey: Mutex::new(None),

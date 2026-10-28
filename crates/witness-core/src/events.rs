@@ -30,9 +30,6 @@ pub struct WatcherStatus {
     pub teams_key_found: bool,
     pub mic_in_use: bool,
     pub suppressed: bool,
-    /// The last call was seen only through audio sessions: Windows' consent
-    /// store stopped recording mic use. Cleared once it reports use again.
-    pub consent_store_stale: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
