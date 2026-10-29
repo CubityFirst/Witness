@@ -83,7 +83,7 @@ Two to four sentences: what the meeting was about and how it ended.
 - Each decision that was made. If there were none, write \"- None recorded.\"
 
 ## Action items
-- **Owner** — the task (and its due date, if one was said). Name an owner only when the transcript says who will do it; otherwise write **Unassigned**. If there were none, write \"- None recorded.\"
+- **Owner**: the task (and its due date, if one was said). Name an owner only when the transcript says who will do it; otherwise write **Unassigned**. If there were none, write \"- None recorded.\"
 
 Be concise and specific. No preamble, no closing remarks, no code fences."
     )

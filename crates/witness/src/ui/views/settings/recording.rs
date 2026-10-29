@@ -14,7 +14,7 @@ use witness_core::audio_capture::AudioDevice;
 use witness_core::events::WatcherStatus;
 
 /// Under the hotkey rows.
-const HOTKEYS_HELP: &str = "They work everywhere, even with Witness in the tray. When another app owns a combination, the next free one is used.";
+const HOTKEYS_HELP: &str = "They work in any app, even with Witness in the tray. If another app owns a combination, the next free one is used.";
 
 impl SettingsState {
     /// "Auto-record on · Headset Microphone".
@@ -44,7 +44,7 @@ impl SettingsState {
                 true,
                 &mut auto_record,
                 "Auto-record",
-                "Start recording when a meeting is detected.",
+                "Records while a watched app is using the microphone.",
             )
             .changed();
             widgets::group_divider(ui);
@@ -54,7 +54,10 @@ impl SettingsState {
                 Slot::Fill(FIELD_WIDTH),
                 |ui| {
                     let id = title(ui, "Watch patterns");
-                    note(ui, "Comma-separated, matched against mic-using app names.");
+                    note(
+                        ui,
+                        "Comma-separated. An app counts if its name or path contains one.",
+                    );
                     id
                 },
                 |ui, label| {
@@ -80,7 +83,7 @@ impl SettingsState {
                     id: "mic-device",
                     default_label: "Default input device",
                     missing_badge: "configured microphone is not connected",
-                    help: None,
+                    help: Some("Recorded as you."),
                     configured: settings.mic_device.as_deref(),
                     devices: devices.map(|d| d.capture.as_slice()),
                     list_failed: failed,
@@ -95,7 +98,7 @@ impl SettingsState {
                     default_label: "Default output device",
                     missing_badge: "configured output is not connected",
                     help: Some(
-                        "The output Teams plays through — pick a dedicated one (e.g. \"Chat\") to keep music & game audio out of recordings.",
+                        "Recorded as everyone else: pick the output Teams plays through. A dedicated one (e.g. \"Chat\") keeps music and game audio out.",
                     ),
                     configured: settings.loopback_device.as_deref(),
                     devices: devices.map(|d| d.render.as_slice()),
@@ -124,14 +127,14 @@ impl SettingsState {
             hotkey_row(
                 ui,
                 "Recording hotkey",
-                "Starts/stops recording.",
+                "Starts or stops recording.",
                 record_hotkey.as_deref(),
             );
             widgets::group_divider(ui);
             hotkey_row(
                 ui,
                 "Bookmark hotkey",
-                "Bookmarks the current moment.",
+                "Marks the current moment of a recording.",
                 bookmark_hotkey.as_deref(),
             );
         });
@@ -309,7 +312,7 @@ fn hotkey_parts(what: &str, combo: Option<&str>) -> (String, Option<String>) {
     match combo {
         Some(combo) => (what.to_string(), Some(hotkey_label(combo))),
         None => (
-            format!("{what} All candidate combos are taken by other apps."),
+            format!("{what} Every combination is taken by another app."),
             None,
         ),
     }
@@ -389,15 +392,15 @@ fn device_options(
         let label = match configured_device(Some(value), list) {
             Some(ConfiguredDevice::Id) | None => None,
             Some(ConfiguredDevice::Legacy(device)) => Some(format!(
-                "{} (legacy name — reselect to pin this endpoint)",
+                "{} (old name; reselect it to pin this device)",
                 device.name
             )),
             Some(ConfiguredDevice::Missing) => Some(if devices.is_some() {
-                format!("Missing configured device — {value}")
+                format!("Not connected: {value}")
             } else if list_failed {
-                "Configured device — device list unavailable".into()
+                "Configured device (device list unavailable)".into()
             } else {
-                "Configured device — checking availability…".into()
+                "Configured device (checking…)".into()
             }),
         };
         if let Some(label) = label {
@@ -465,16 +468,16 @@ mod tests {
     fn hotkey_rows() {
         assert_eq!(hotkey_label("ctrl+alt+r"), "CTRL + ALT + R");
         assert_eq!(
-            hotkey_parts("Starts/stops recording.", Some("ctrl+alt+r")),
+            hotkey_parts("Starts or stops recording.", Some("ctrl+alt+r")),
             (
-                "Starts/stops recording.".to_string(),
+                "Starts or stops recording.".to_string(),
                 Some("CTRL + ALT + R".to_string())
             )
         );
         assert_eq!(
-            hotkey_parts("Bookmarks the current moment.", None),
+            hotkey_parts("Marks the current moment of a recording.", None),
             (
-                "Bookmarks the current moment. All candidate combos are taken by other apps."
+                "Marks the current moment of a recording. Every combination is taken by another app."
                     .to_string(),
                 None
             )
@@ -525,7 +528,7 @@ mod tests {
             legacy[1],
             DeviceOption {
                 value: "chat (goxlr)".into(),
-                label: "Chat (GoXLR) (legacy name — reselect to pin this endpoint)".into()
+                label: "Chat (GoXLR) (old name; reselect it to pin this device)".into()
             }
         );
         assert!(matches!(
@@ -535,15 +538,15 @@ mod tests {
         // Missing once loaded / while loading / when listing failed.
         assert_eq!(
             device_options(Some("Old headset"), Some(&list), false, "D")[1].label,
-            "Missing configured device — Old headset"
+            "Not connected: Old headset"
         );
         assert_eq!(
             device_options(Some("Old headset"), None, false, "D")[1].label,
-            "Configured device — checking availability…"
+            "Configured device (checking…)"
         );
         assert_eq!(
             device_options(Some("Old headset"), None, true, "D")[1].label,
-            "Configured device — device list unavailable"
+            "Configured device (device list unavailable)"
         );
         assert_eq!(
             configured_device(Some("Old headset"), &list),
@@ -601,7 +604,7 @@ mod tests {
                 widgets::group_divider(ui);
                 assert!(!warning_strip(
                     ui,
-                    "model not downloaded — transcription will fail",
+                    "model not downloaded, so transcription will fail",
                     "Download",
                     true
                 ));
@@ -611,7 +614,7 @@ mod tests {
                 hotkey_row(
                     ui,
                     "Recording hotkey",
-                    "Starts/stops recording.",
+                    "Starts or stops recording.",
                     Some("ctrl+alt+r"),
                 );
                 keycap(ui, "CTRL + ALT + B");

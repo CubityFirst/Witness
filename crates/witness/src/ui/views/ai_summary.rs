@@ -268,7 +268,7 @@ pub(crate) fn summary_panel(
     action
 }
 
-/// "AI-generated · 1 Aug 2026 — check it before relying on it." or the
+/// "AI-generated · 1 Aug 2026. Check it before relying on it." or the
 /// off-state pointer.
 fn provenance(input: &SummaryInput) -> String {
     if input.summary.trim().is_empty() {
@@ -281,7 +281,7 @@ fn provenance(input: &SummaryInput) -> String {
     if input.stale {
         line.push_str(" · written for an earlier transcript");
     }
-    line.push_str(" — check it before relying on it.");
+    line.push_str(". Check it before relying on it.");
     line
 }
 
@@ -499,7 +499,7 @@ fn render_blocks(ui: &mut egui::Ui, blocks: &[Block]) {
 
 /// A sample summary for debug snapshots (`WITNESS_DEBUG_AI_SUMMARY=sample`).
 #[cfg_attr(not(any(debug_assertions, test)), allow(dead_code))]
-pub(crate) const SAMPLE_SUMMARY: &str = "## Summary\nThe team reviewed the Q3 roadmap and agreed to move the billing migration to October so the mobile release can ship first.\n\n## Key points\n- Mobile release is feature-complete; **QA** needs one more week.\n- Billing migration depends on the new invoicing API, which is late.\n- Support volume rose 12% after the pricing change.\n\n## Decisions\n- Ship the mobile release on **15 September**.\n- Postpone the billing migration to October.\n\n## Action items\n- **Priya** — publish the updated roadmap by Friday.\n- **Marco** — confirm the invoicing API date with the vendor.\n- **Unassigned** — draft the customer email about the pricing FAQ.";
+pub(crate) const SAMPLE_SUMMARY: &str = "## Summary\nThe team reviewed the Q3 roadmap and agreed to move the billing migration to October so the mobile release can ship first.\n\n## Key points\n- Mobile release is feature-complete; **QA** needs one more week.\n- Billing migration depends on the new invoicing API, which is late.\n- Support volume rose 12% after the pricing change.\n\n## Decisions\n- Ship the mobile release on **15 September**.\n- Postpone the billing migration to October.\n\n## Action items\n- **Priya**: publish the updated roadmap by Friday.\n- **Marco**: confirm the invoicing API date with the vendor.\n- **Unassigned**: draft the customer email about the pricing FAQ.";
 
 #[cfg(test)]
 mod tests {
@@ -585,7 +585,7 @@ mod tests {
             configured,
             task: None,
         };
-        assert!(provenance(&input("x", false, true)).starts_with("AI-generated —"));
+        assert!(provenance(&input("x", false, true)).starts_with("AI-generated. Check"));
         assert!(provenance(&input("x", true, true)).contains("earlier transcript"));
         assert!(provenance(&input("", false, false)).contains("nothing is sent"));
         assert!(shows(&input("", false, false)));

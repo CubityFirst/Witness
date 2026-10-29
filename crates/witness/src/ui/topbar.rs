@@ -1600,7 +1600,7 @@ pub(crate) fn download_text(p: &ModelDownloadProgress) -> String {
         }
         None => "downloading…".to_owned(),
     };
-    format!("file {} of {} — {amount}", p.file_index, p.file_count)
+    format!("file {} of {} · {amount}", p.file_index, p.file_count)
 }
 
 /// The model banner's text: a semibold lead, then the explanation.
@@ -2283,15 +2283,15 @@ mod tests {
             done: false,
             error: None,
         };
-        assert_eq!(download_text(&p), "file 2 of 5 — 25%");
+        assert_eq!(download_text(&p), "file 2 of 5 · 25%");
         p.job_downloaded_bytes = 300;
         p.job_total_bytes = Some(1000);
-        assert_eq!(download_text(&p), "file 2 of 5 — 30%");
+        assert_eq!(download_text(&p), "file 2 of 5 · 30%");
         p.job_total_bytes = None;
         p.total_bytes = None;
-        assert_eq!(download_text(&p), "file 2 of 5 — downloading…");
+        assert_eq!(download_text(&p), "file 2 of 5 · downloading…");
         p.total_bytes = Some(0);
-        assert_eq!(download_text(&p), "file 2 of 5 — downloading…");
+        assert_eq!(download_text(&p), "file 2 of 5 · downloading…");
     }
 
     #[test]

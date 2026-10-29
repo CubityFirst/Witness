@@ -483,7 +483,7 @@ fn pipeline_adapter(
                 error: Some(error),
             }));
             sink.emit(CoreEvent::MeetingsChanged);
-            notifier.toast("Transcription failed — you can retry from the meeting page.");
+            notifier.toast("Transcription failed. You can retry from the meeting page.");
         }
     }
 }

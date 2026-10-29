@@ -15,7 +15,7 @@ pub struct ParakeetEngine {
 impl ParakeetEngine {
     pub fn new(models_dir: &Path) -> Result<ParakeetEngine> {
         let model_dir = crate::models::parakeet_dir(models_dir)
-            .context("Parakeet model not downloaded — fetch it in Settings → Storage")?;
+            .context("Parakeet model not downloaded; download it in Settings → Storage")?;
         let config = ExecutionConfig::new().with_execution_provider(ExecutionProvider::Cuda);
         let inner = ParakeetTDT::from_pretrained(&model_dir, Some(config))
             .with_context(|| format!("loading Parakeet from {}", model_dir.display()))?;

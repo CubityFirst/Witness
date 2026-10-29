@@ -301,10 +301,10 @@ fn status_text(state: TrayState) -> &'static str {
 /// The capture warning only shows while recording.
 fn tooltip(state: TrayState, warning: Option<&str>) -> String {
     match (state, warning) {
-        (TrayState::Idle, _) => "Witness — idle".into(),
-        (TrayState::Transcribing, _) => "Witness — transcribing".into(),
-        (TrayState::Recording, None) => "Witness — recording".into(),
-        (TrayState::Recording, Some(text)) => format!("Witness — recording — {text}"),
+        (TrayState::Idle, _) => "Witness · idle".into(),
+        (TrayState::Transcribing, _) => "Witness · transcribing".into(),
+        (TrayState::Recording, None) => "Witness · recording".into(),
+        (TrayState::Recording, Some(text)) => format!("Witness · recording · {text}"),
     }
 }
 
@@ -439,12 +439,12 @@ mod tests {
         assert_eq!(record_text(true), "Stop recording");
         assert_eq!(status_text(TrayState::Idle), "Idle");
         assert_eq!(status_text(TrayState::Recording), "● Recording");
-        assert_eq!(tooltip(TrayState::Idle, None), "Witness — idle");
-        assert_eq!(tooltip(TrayState::Idle, Some("x")), "Witness — idle");
-        assert_eq!(tooltip(TrayState::Recording, None), "Witness — recording");
+        assert_eq!(tooltip(TrayState::Idle, None), "Witness · idle");
+        assert_eq!(tooltip(TrayState::Idle, Some("x")), "Witness · idle");
+        assert_eq!(tooltip(TrayState::Recording, None), "Witness · recording");
         assert_eq!(
             tooltip(TrayState::Recording, Some("Microphone disconnected")),
-            "Witness — recording — Microphone disconnected"
+            "Witness · recording · Microphone disconnected"
         );
     }
 
@@ -456,7 +456,7 @@ mod tests {
         assert_eq!(status_text(TrayState::Transcribing), "Transcribing…");
         assert_eq!(
             tooltip(TrayState::Transcribing, Some("x")),
-            "Witness — transcribing"
+            "Witness · transcribing"
         );
     }
 

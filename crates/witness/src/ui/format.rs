@@ -25,11 +25,11 @@ pub fn fmt_date_short(date: NaiveDate) -> String {
     date.format("%d/%m/%Y").to_string()
 }
 
-/// Meeting durations: `"—"` when unknown, else `"1 h 5 min"`, `"12 min"`
+/// Meeting durations: `"–"` when unknown, else `"1 h 5 min"`, `"12 min"`
 /// or `"40 s"` (seconds rounded half up, like `Math.round`).
 pub fn fmt_duration(ms: Option<i64>) -> String {
     let Some(ms) = ms else {
-        return "—".into();
+        return "–".into();
     };
     let s = (ms.max(0) + 500) / 1000;
     let h = s / 3600;
@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn durations_round_like_math_round() {
-        assert_eq!(fmt_duration(None), "—");
+        assert_eq!(fmt_duration(None), "–");
         assert_eq!(fmt_duration(Some(0)), "0 s");
         assert_eq!(fmt_duration(Some(499)), "0 s");
         assert_eq!(fmt_duration(Some(500)), "1 s");

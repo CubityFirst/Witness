@@ -400,14 +400,14 @@ impl AppCore {
         // by far the most common way GPU transcription silently degrades.
         let status = crate::gpu::preflight();
         let detail = if !status.driver_present {
-            "No NVIDIA driver found — transcription will run on CPU".into()
+            "No NVIDIA driver found, so transcription runs on the CPU.".into()
         } else if status.missing_dlls.is_empty() {
-            "NVIDIA driver and CUDA/cuDNN runtime found — Parakeet will attempt GPU acceleration"
+            "NVIDIA driver and CUDA/cuDNN runtime found; Parakeet will attempt GPU acceleration."
                 .into()
         } else {
             format!(
-                "NVIDIA driver found, but {} missing — Parakeet will run on CPU. \
-                 Use Download GPU libraries below, or install cuDNN 9 for CUDA 13 and set CUDNN_PATH; only system-level changes may require a restart.",
+                "NVIDIA driver found, but {} missing, so Parakeet runs on the CPU. \
+                 Download the CUDA runtime + cuDNN below, or install cuDNN 9 for CUDA 13 and set CUDNN_PATH (a system install may need a restart).",
                 status.missing_dlls.join(", ")
             )
         };

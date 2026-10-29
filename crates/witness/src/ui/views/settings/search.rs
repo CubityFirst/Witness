@@ -100,7 +100,7 @@ pub(super) const INDEX: &[Entry] = &[
         P::General,
         Row("Start Witness with Windows"),
         "Start Witness with Windows",
-        "Opens minimized to the tray.",
+        "Starts in the tray when you sign in.",
         "autostart startup boot login launch sign in tray",
     ),
     entry(
@@ -115,28 +115,28 @@ pub(super) const INDEX: &[Entry] = &[
         P::Recording,
         Row("Auto-record"),
         "Auto-record",
-        "Start recording when a meeting is detected.",
+        "Records while a watched app is using the microphone.",
         "automatic teams detect detection meeting watcher call",
     ),
     entry(
         P::Recording,
         Row("watch-patterns"),
         "Watch patterns",
-        "The apps whose microphone use counts as a meeting.",
+        "Apps whose microphone use counts as a meeting.",
         "teams zoom msteams detection apps process",
     ),
     entry(
         P::Recording,
         Row("mic-device"),
         "Microphone",
-        "The input recorded as you.",
+        "Recorded as you.",
         "mic input device headset audio me capture",
     ),
     entry(
         P::Recording,
         Row("loopback-device"),
         "Meeting audio",
-        "The output Teams plays through.",
+        "Recorded as everyone else: the output Teams plays through.",
         "loopback speakers output device them chat goxlr headphones audio",
     ),
     entry(
@@ -150,14 +150,14 @@ pub(super) const INDEX: &[Entry] = &[
         P::Recording,
         Row("Recording hotkey"),
         "Recording hotkey",
-        "Starts and stops recording from anywhere.",
+        "Starts or stops recording from any app.",
         "shortcut keyboard global hotkey keys ctrl alt",
     ),
     entry(
         P::Recording,
         Row("Bookmark hotkey"),
         "Bookmark hotkey",
-        "Bookmarks the current moment.",
+        "Marks the current moment of a recording.",
         "shortcut keyboard global hotkey keys ctrl alt mark",
     ),
     // Transcription
@@ -193,7 +193,7 @@ pub(super) const INDEX: &[Entry] = &[
         P::Transcription,
         Row("Auto-transcribe"),
         "Auto-transcribe",
-        "Runs after each recording.",
+        "Transcribes each recording as soon as it stops.",
         "automatic transcript after recording",
     ),
     entry(
@@ -207,21 +207,21 @@ pub(super) const INDEX: &[Entry] = &[
         P::Transcription,
         Row("Live captions"),
         "Live captions",
-        "While recording; the final pass replaces them.",
+        "Rough captions while recording; the finished transcript replaces them.",
         "subtitles realtime real-time cc live",
     ),
     entry(
         P::Transcription,
         Row("Open caption window automatically"),
         "Open caption window automatically",
-        "When recording starts; the CC button opens it anytime.",
+        "Always on top, opened when recording starts.",
         "floating overlay captions always on top subtitles cc default",
     ),
     entry(
         P::Transcription,
         Row("junk-phrases"),
         "Discarded noise phrases",
-        "Phrases dropped as noise.",
+        "Lines that say only one of these are dropped.",
         "filter hallucinations junk phantom lines thank you",
     ),
     // AI assistant
@@ -286,14 +286,14 @@ pub(super) const INDEX: &[Entry] = &[
         P::Voices,
         Row("threshold"),
         "Voice match strictness",
-        "How sure a match must be to label a speaker.",
+        "How alike two voices must sound to label a speaker.",
         "threshold speaker identification voice id sensitivity auto-label",
     ),
     entry(
         P::Voices,
         Section("Voice prints"),
         "Voice prints",
-        "Enrolled voices; forget one.",
+        "The people Witness recognizes by voice.",
         "people speakers enrolled forget delete voice identification",
     ),
     // Storage
@@ -308,7 +308,7 @@ pub(super) const INDEX: &[Entry] = &[
         P::Storage,
         Row("backup"),
         "Backup",
-        "A complete snapshot of your data.",
+        "A verified copy of the database, recordings and settings.",
         "export copy archive snapshot save restore",
     ),
     entry(
@@ -337,7 +337,7 @@ pub(super) const INDEX: &[Entry] = &[
         P::About,
         Row("Check for updates at startup"),
         "Check for updates at startup",
-        "No meeting data is sent.",
+        "Looks for a new version shortly after launch.",
         "automatic update check",
     ),
     entry(
@@ -576,7 +576,7 @@ impl SettingsState {
             );
             ui.add(
                 egui::Label::new(
-                    RichText::new("Try another word \u{2014} for example hotkey, GPU or backup.")
+                    RichText::new("Try another word, for example hotkey, GPU or backup.")
                         .font(theme::regular(12.5))
                         .color(pal().text_muted),
                 )

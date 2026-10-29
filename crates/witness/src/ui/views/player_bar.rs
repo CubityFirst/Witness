@@ -665,7 +665,7 @@ fn bookmark_marker(
         (time.clone(), format!("Go to bookmark at {time}"))
     } else {
         (
-            format!("{time} — {}", bookmark.note),
+            format!("{time} · {}", bookmark.note),
             format!("Go to bookmark at {time}: {}", bookmark.note),
         )
     };

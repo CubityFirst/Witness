@@ -39,7 +39,7 @@ use winit::dpi::PhysicalPosition;
 use witness_core::events::LiveTranscript;
 
 /// The overlay's window title (also how its HWND is found).
-pub const TITLE: &str = "Witness — live captions";
+pub const TITLE: &str = "Witness live captions";
 const GEOMETRY_FILE: &str = "captions-overlay.toml";
 /// Lines of history (`prev.slice(-19) + new`).
 const MAX_LINES: usize = 20;

@@ -61,7 +61,7 @@ pub(crate) fn capture_warning(health: &RecordingHealth) -> Option<(WarningKind, 
         if !track.connected && track.device_loss_count > 0 {
             return Some((
                 WarningKind::DeviceLost(name),
-                format!("{name} device lost — recording silence until it returns"),
+                format!("{name} device lost; recording silence until it returns"),
             ));
         }
         if track.capture_overflow_count > 0 {
@@ -679,7 +679,7 @@ mod tests {
         };
         assert_eq!(
             capture_warning(&lost).unwrap().1,
-            "Microphone device lost — recording silence until it returns"
+            "Microphone device lost; recording silence until it returns"
         );
     }
 

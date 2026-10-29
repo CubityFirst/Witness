@@ -80,7 +80,7 @@ impl UpdatesSection {
                 true,
                 &mut check,
                 "Check for updates at startup",
-                "No meeting data is sent.",
+                "Looks for a new version shortly after launch. No meeting data is sent.",
             )
             .changed();
             (clicked, check_changed)
@@ -110,10 +110,10 @@ fn install_fraction(flow: &UpdateFlow) -> Option<f32> {
     Some((p.downloaded as f64 / total as f64).clamp(0.0, 1.0) as f32)
 }
 
-/// "Witness 0.3.0", plus " — up to date" after a check found nothing.
+/// "Witness 0.3.0", plus " · up to date" after a check found nothing.
 fn version_label(version: &str, phase: &UpdatePhase) -> String {
     let current = if matches!(phase, UpdatePhase::Current) {
-        " — up to date"
+        " · up to date"
     } else {
         ""
     };
@@ -170,7 +170,7 @@ mod tests {
         assert_eq!(version_label("0.3.0", &UpdatePhase::Idle), "Witness 0.3.0");
         assert_eq!(
             version_label("0.3.0", &UpdatePhase::Current),
-            "Witness 0.3.0 — up to date"
+            "Witness 0.3.0 · up to date"
         );
 
         let mut flow = UpdateFlow::default();

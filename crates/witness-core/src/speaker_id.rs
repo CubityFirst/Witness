@@ -202,7 +202,7 @@ impl Embedder {
     /// Loads the embedding model (CPU — it's tiny and runs in milliseconds).
     pub fn new(models_dir: &Path) -> Result<Embedder> {
         let path = crate::models::speaker_id_path(models_dir)
-            .context("speaker-ID model not downloaded — fetch it in Settings → Storage")?;
+            .context("speaker-ID model not downloaded; download it in Settings → Storage")?;
         let session = ort::session::Session::builder()
             .context("ort session builder")?
             .commit_from_file(&path)

@@ -50,7 +50,7 @@ const AVATAR: f32 = 32.0;
 const CHEVRON: f32 = 16.0;
 /// The one confirmation this view can have open.
 const CONFIRM_ID: &str = "people-confirm";
-const HINT: &str = "\"Speaking\" totals come from transcribed segments; word counts are approximate. Unnamed speakers (Speaker 1…) aren't tracked across meetings — rename them to a person to include them here. Enrolled voices can also be managed in Settings.";
+const HINT: &str = "\"Speaking\" totals come from transcribed segments; word counts are approximate. Unnamed speakers (Speaker 1…) aren't tracked across meetings; rename them to a person to include them here. Enrolled voices can also be managed in Settings.";
 
 // ----------------------------------------------------------------------
 // Weekly trend (pure)
@@ -127,12 +127,12 @@ fn week_text(week: &Week) -> String {
     )
 }
 
-/// `Last 12 weeks — {n} meetings, {duration} total` (always "meetings").
+/// `Last 12 weeks: {n} meetings, {duration} total` (always "meetings").
 fn trend_title(weeks: &[Week]) -> String {
     let count: usize = weeks.iter().map(|w| w.count).sum();
     let ms: i64 = weeks.iter().map(|w| w.ms).sum();
     format!(
-        "Last {WEEKS} weeks — {count} meetings, {} total",
+        "Last {WEEKS} weeks: {count} meetings, {} total",
         fmt_duration(Some(ms))
     )
 }
@@ -1094,7 +1094,7 @@ fn person_entry(
                     ui,
                     egui::RichText::new("Forget voice…").color(pal().rec_light),
                 )
-                .on_hover_text("Forget this voice — Shift-click to skip confirmation");
+                .on_hover_text("Forget this voice (Shift-click skips confirmation)");
                 follow_focus(&button);
                 if button.clicked() {
                     actions.push(Action::Forget {
@@ -1188,7 +1188,7 @@ mod tests {
         assert_eq!(weeks.iter().map(|w| w.count).sum::<usize>(), 3);
         assert_eq!(
             trend_title(&weeks),
-            "Last 12 weeks — 3 meetings, 1 min total"
+            "Last 12 weeks: 3 meetings, 1 min total"
         );
         assert_eq!(week_text(&weeks[0]), "Week of 20/07/2026: 1 meeting, 1 s");
         assert_eq!(week_text(&weeks[1]), "Week of 27/07/2026: 0 meetings, 0 s");

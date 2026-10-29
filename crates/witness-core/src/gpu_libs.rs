@@ -202,7 +202,7 @@ fn verify_archives(
             .with_context(|| format!("{} has not been installed", archive.id))?;
         ensure!(
             installed.url == archive.url && installed.sha256.eq_ignore_ascii_case(archive.sha256),
-            "{} was installed from a superseded release — download again",
+            "{} was installed from a superseded release; download it again",
             archive.id
         );
         ensure!(

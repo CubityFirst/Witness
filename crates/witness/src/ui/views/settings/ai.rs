@@ -33,7 +33,7 @@ use witness_core::ai_client::{wipe, ApiKey, BaseUrl};
 use witness_core::settings::AiSettings;
 use witness_core::CoreResult;
 
-const MASTER_HELP: &str = "Off by default. While on, Witness sends a meeting\u{2019}s transcript text, speaker names and title \u{2014} never audio \u{2014} to the service below, and nowhere else. A server on this computer (localhost) keeps everything local.";
+const MASTER_HELP: &str = "Off by default. While on, Witness sends a meeting\u{2019}s transcript text, speaker names and title (never audio) to the service below, and nowhere else. A server on this computer (localhost) keeps everything local.";
 
 fn base_id() -> egui::Id {
     egui::Id::new("ai-base-url")
@@ -336,7 +336,7 @@ impl AiSection {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     let width = (ui.available_width() - 32.0).max(80.0);
                     let hint = if matches!(key_host, Some(Some(_))) {
-                        "Saved \u{2014} type to replace"
+                        "Saved. Type to replace it"
                     } else {
                         "Paste the key, then Enter"
                     };
@@ -466,7 +466,7 @@ impl AiSection {
                 configured,
                 &mut auto_title,
                 "Title new meetings automatically",
-                "After each transcription. Only replaces a title Witness or Teams chose \u{2014} never one you typed.",
+                "After each transcription. Only replaces a title Witness or Teams chose, never one you typed.",
             )
             .changed();
             widgets::group_divider(ui);
@@ -482,9 +482,9 @@ impl AiSection {
         footnote(
             ui,
             if on {
-                "AI text can be wrong \u{2014} check summaries before relying on them. The service\u{2019}s own data policy applies to what it receives."
+                "AI text can be wrong, so check summaries before relying on them. The service\u{2019}s own data policy applies to what it receives."
             } else {
-                "Nothing is sent anywhere while \u{201c}Use an AI service\u{201d} is off \u{2014} not even a connection test."
+                "Nothing is sent anywhere while \u{201c}Use an AI service\u{201d} is off, not even a connection test."
             },
         );
 
@@ -630,7 +630,7 @@ impl Drop for AiSection {
 /// The AI assistant category's summary.
 fn summary(ai: &AiSettings) -> String {
     if !ai.enabled {
-        return "Off — nothing is sent anywhere".into();
+        return "Off · nothing is sent anywhere".into();
     }
     let host = match BaseUrl::parse(&ai.base_url) {
         Ok(base) if base.is_local() => "local server".to_string(),
@@ -654,7 +654,7 @@ fn key_mismatch(key_host: &str, base: Option<&BaseUrl>) -> Option<String> {
     Some(if base.is_local() {
         format!("It is not sent to {host} (a local server gets no key).")
     } else {
-        format!("It is not sent to {host} \u{2014} enter the key for {host}.")
+        format!("It is not sent to {host}. Enter the key for {host}.")
     })
 }
 
@@ -703,7 +703,7 @@ mod tests {
         let other = BaseUrl::parse("https://ai.example.com/v1").unwrap();
         assert!(key_mismatch("api.openai.com", Some(&other))
             .unwrap()
-            .contains("enter the key for ai.example.com"));
+            .contains("Enter the key for ai.example.com"));
         let local = BaseUrl::parse("http://localhost:11434/v1").unwrap();
         assert!(key_mismatch("api.openai.com", Some(&local))
             .unwrap()
@@ -720,7 +720,7 @@ mod tests {
             auto_title: true,
             auto_notes: true,
         };
-        assert_eq!(summary(&ai), "Off — nothing is sent anywhere");
+        assert_eq!(summary(&ai), "Off · nothing is sent anywhere");
         ai.enabled = true;
         assert_eq!(summary(&ai), "On · api.openai.com · example-small");
         ai.base_url = "http://localhost:11434/v1".into();

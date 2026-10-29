@@ -138,7 +138,7 @@ impl BaseUrl {
         let host = host_of(authority).ok_or("The base URL has no host name.")?;
         if !https && !crate::service::updater::is_loopback_host(&host) {
             return Err(
-                "Use https:// — plain http:// is only allowed for localhost, 127.0.0.1 or [::1]."
+                "Use https://. Plain http:// is only allowed for localhost, 127.0.0.1 or [::1]."
                     .into(),
             );
         }

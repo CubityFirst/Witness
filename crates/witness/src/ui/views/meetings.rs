@@ -82,7 +82,7 @@ const CONFIRM_ID: &str = "meetings-confirm";
 pub(crate) fn status_label(status: &str) -> &str {
     match status {
         "recording" => "Recording",
-        "recorded" => "Recorded — not transcribed yet",
+        "recorded" => "Recorded, not transcribed yet",
         "processing" => "Transcribing…",
         "transcribed" => "Transcribed",
         "failed" => "Transcription failed",
@@ -1907,12 +1907,12 @@ fn meeting_row(
         if m.status == "failed" || m.status == "recorded" {
             let (tooltip, name) = if m.status == "failed" {
                 (
-                    "Transcription failed — click to retry",
+                    "Transcription failed. Click to retry",
                     format!("Retry transcription of {}", m.title),
                 )
             } else {
                 (
-                    "Not transcribed — click to transcribe",
+                    "Not transcribed. Click to transcribe",
                     format!("Transcribe {}", m.title),
                 )
             };
@@ -2347,7 +2347,7 @@ mod tests {
     #[test]
     fn status_words_match_the_tsx_labels() {
         assert_eq!(status_label("recording"), "Recording");
-        assert_eq!(status_label("recorded"), "Recorded — not transcribed yet");
+        assert_eq!(status_label("recorded"), "Recorded, not transcribed yet");
         assert_eq!(status_label("processing"), "Transcribing…");
         assert_eq!(status_label("transcribed"), "Transcribed");
         assert_eq!(status_label("failed"), "Transcription failed");
@@ -2366,7 +2366,7 @@ mod tests {
         assert!(line.starts_with(&format!("{time} · ")), "{line}");
         assert_eq!(time.len(), 5, "{time}");
         let manual = meeting(2, "recording", "manual", None);
-        assert!(meta_line(&manual).ends_with(" · —"));
+        assert!(meta_line(&manual).ends_with(" · –"));
         assert_eq!(fmt_time("garbage"), "garbage");
 
         let binned = DeletedMeeting {
@@ -2375,7 +2375,7 @@ mod tests {
         };
         let today = local_day("2026-10-07T12:00:00+01:00").unwrap();
         let line = bin_meta_line(&binned, today);
-        assert!(line.contains(" · — · deleted "), "{line}");
+        assert!(line.contains(" · – · deleted "), "{line}");
         assert!(line.ends_with(" · deleted yesterday"), "{line}");
         assert!(line.starts_with("Mon 5 Oct, "), "{line}");
         let last_year = NaiveDate::from_ymd_opt(2027, 1, 2).unwrap();

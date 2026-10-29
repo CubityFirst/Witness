@@ -95,7 +95,7 @@ impl SettingsState {
                     let id = title(ui, "Backup");
                     note(
                         ui,
-                        "Complete snapshot; recording and processing must be idle.",
+                        "A verified copy of the database, recordings and settings (not models). Not while recording or transcribing.",
                     );
                     if let Some(backup) = last_backup {
                         // "Backup saved to <path> (N files, X MB). Models …"
@@ -173,7 +173,7 @@ impl SettingsState {
                         "Delete model cache"
                     };
                     // The tooltip shows while disabled too, like the button's title.
-                    let tip = "Deletes every downloaded model, including old versions — Shift-click to skip confirmation";
+                    let tip = "Deletes every downloaded model, including old versions (Shift-click skips confirmation)";
                     ui.add_enabled_ui(enabled, |ui| widgets::btn_danger(ui, label))
                         .inner
                         .on_hover_text(tip)
@@ -185,7 +185,7 @@ impl SettingsState {
         });
         footnote(
             ui,
-            "Recording works without models — they're only needed for transcription.",
+            "Recording works without models; they're only needed for transcription.",
         );
 
         if let Some((engine, name)) = model_action {
@@ -233,7 +233,7 @@ impl SettingsState {
         let handle = cx.tasks.spawn_op("delete-model-cache", |c| {
             notice_done(match c.delete_model_cache() {
                 Ok(freed) => Notice::success(format!(
-                    "Deleted model cache — freed {:.2} GB",
+                    "Deleted model cache, freed {:.2} GB",
                     freed as f64 / 1e9
                 )),
                 Err(error) => Notice::error("Could not delete the model cache", error),
@@ -369,14 +369,14 @@ pub(crate) fn download_progress_text(p: &ModelDownloadProgress) -> String {
     };
     match total {
         Some(total) => format!(
-            "file {} of {} — {}% of {} MB",
+            "file {} of {} · {}% of {} MB",
             p.file_index,
             p.file_count,
             (downloaded as f64 / total as f64 * 100.0).round(),
             (total as f64 / 1e6).round()
         ),
         None => format!(
-            "file {} of {} — {} MB…",
+            "file {} of {} · {} MB…",
             p.file_index,
             p.file_count,
             (p.downloaded_bytes as f64 / 1e6).round()
@@ -535,11 +535,11 @@ mod tests {
     #[test]
     fn progress_text_with_and_without_a_total() {
         let mut p = progress("parakeet", false, None);
-        assert_eq!(download_progress_text(&p), "file 2 of 5 — 25% of 1000 MB");
+        assert_eq!(download_progress_text(&p), "file 2 of 5 · 25% of 1000 MB");
         p.total_bytes = None;
-        assert_eq!(download_progress_text(&p), "file 2 of 5 — 250 MB…");
+        assert_eq!(download_progress_text(&p), "file 2 of 5 · 250 MB…");
         p.total_bytes = Some(0);
-        assert_eq!(download_progress_text(&p), "file 2 of 5 — 250 MB…");
+        assert_eq!(download_progress_text(&p), "file 2 of 5 · 250 MB…");
     }
 
     #[test]
@@ -547,7 +547,7 @@ mod tests {
         let mut p = progress("parakeet", false, None);
         p.job_downloaded_bytes = 1_500_000_000;
         p.job_total_bytes = Some(3_000_000_000);
-        assert_eq!(download_progress_text(&p), "file 2 of 5 — 50% of 3000 MB");
+        assert_eq!(download_progress_text(&p), "file 2 of 5 · 50% of 3000 MB");
         assert_eq!(download_fraction(&p), Some(0.5));
     }
 
@@ -580,7 +580,7 @@ mod tests {
         let running = progress("parakeet", false, None);
         assert_eq!(
             model_state(&parakeet, Some(&running)),
-            ModelState::Progress("file 2 of 5 — 25% of 1000 MB".into())
+            ModelState::Progress("file 2 of 5 · 25% of 1000 MB".into())
         );
         // Siblings wait while the engine-named model downloads.
         assert_eq!(

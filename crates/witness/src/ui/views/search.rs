@@ -267,15 +267,15 @@ fn group_hits(hits: &[SearchHit]) -> Vec<Vec<usize>> {
     groups.into_iter().map(|(_, group)| group).collect()
 }
 
-/// `Results for “{q}” — {n}{+} match(es)`: (main, muted suffix).
+/// `Results for “{q}” · {n}{+} match(es)`: (main, muted suffix).
 fn heading(query: &str, count: usize, has_more: bool) -> (String, String) {
     let plus = if has_more { "+" } else { "" };
     let noun = if count == 1 { "match" } else { "matches" };
-    (heading_main(query), format!(" — {count}{plus} {noun}"))
+    (heading_main(query), format!(" · {count}{plus} {noun}"))
 }
 
 /// The heading while the first page is on its way (no count yet).
-const SEARCHING: &str = " — searching…";
+const SEARCHING: &str = " · searching…";
 
 /// `Results for “{q}”`.
 fn heading_main(query: &str) -> String {
@@ -1395,11 +1395,11 @@ mod tests {
             heading("budget ", 1, false),
             (
                 "Results for \u{201c}budget \u{201d}".into(),
-                " — 1 match".into()
+                " · 1 match".into()
             )
         );
-        assert_eq!(heading("q", 0, false).1, " — 0 matches");
-        assert_eq!(heading("q", 40, true).1, " — 40+ matches");
+        assert_eq!(heading("q", 0, false).1, " · 0 matches");
+        assert_eq!(heading("q", 40, true).1, " · 40+ matches");
     }
 
     #[test]
@@ -1409,7 +1409,7 @@ mod tests {
             let short = heading_galley(ui, "server", &heading("server", 11, false).1, 300.0);
             assert_eq!(
                 short.text(),
-                "Results for \u{201c}server\u{201d} — 11 matches"
+                "Results for \u{201c}server\u{201d} · 11 matches"
             );
             assert!(!short.elided);
 
@@ -1419,7 +1419,7 @@ mod tests {
                 let text = galley.text();
                 assert!(galley.rows.len() <= 2, "{text}");
                 assert!(!galley.elided, "{text}");
-                assert!(text.ends_with("\u{2026}\u{201d} — 3+ matches"), "{text}");
+                assert!(text.ends_with("\u{2026}\u{201d} · 3+ matches"), "{text}");
                 assert!(galley.size().x <= 300.5, "{}", galley.size().x);
             }
         });

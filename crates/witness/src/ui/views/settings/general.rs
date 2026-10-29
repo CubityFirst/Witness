@@ -52,7 +52,7 @@ impl SettingsState {
                 loaded,
                 &mut enabled,
                 "Start Witness with Windows",
-                "Opens minimized to the tray.",
+                "Starts in the tray when you sign in.",
             )
             .changed();
             widgets::group_divider(ui);

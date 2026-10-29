@@ -13,7 +13,7 @@ pub struct WhisperEngine {
 impl WhisperEngine {
     pub fn new(models_dir: &Path) -> Result<WhisperEngine> {
         let model_path = crate::models::whisper_path(models_dir)
-            .context("Whisper model not downloaded — fetch it in Settings → Storage")?;
+            .context("Whisper model not downloaded; download it in Settings → Storage")?;
         let ctx = WhisperContext::new_with_params(
             model_path.to_str().context("model path is not UTF-8")?,
             WhisperContextParameters::default(),

@@ -492,7 +492,7 @@ impl Wizard {
                 ui,
                 ph::MICROPHONE,
                 "Records the call",
-                "Your microphone and the meeting audio as separate tracks — automatically when a Teams call starts, or with one click.",
+                "Your microphone and the meeting audio as separate tracks, automatically when a Teams call starts or with one click.",
             );
             feature(
                 ui,
@@ -600,7 +600,7 @@ impl Wizard {
         tip(
             ui,
             ph::LIGHTBULB,
-            "In Teams, set Settings → Devices → Speaker to a dedicated output — say your headset's \"Chat\" channel — and pick the same output here. Recordings then hold just the meeting, not music or game audio. A headset also keeps the call from echoing into your microphone.",
+            "In Teams, set Settings → Devices → Speaker to a dedicated output (say your headset's \"Chat\" channel) and pick the same output here. Recordings then hold just the meeting, not music or game audio. A headset also keeps the call from echoing into your microphone.",
         );
         Forward::primary("Next")
     }
@@ -671,7 +671,7 @@ impl Wizard {
                 .iter()
                 .find(|m| m.id == progress.model_id)
                 .map_or("models", |m| m.display_name.as_str());
-            let text = format!("Downloading {name} — {}", download_progress_text(progress));
+            let text = format!("Downloading {name}: {}", download_progress_text(progress));
             status_note(ui, pal().text, &text);
             settings::progress_bar(ui, download_fraction(progress).unwrap_or(0.0));
             widgets::announce(
@@ -1272,7 +1272,7 @@ fn shortcut(ui: &mut egui::Ui, keys: f32, combo: Option<&str>, what: &str) {
             match combo {
                 Some(combo) => keycap(ui, combo),
                 None => {
-                    ui.label(RichText::new("—").color(pal().text_faint));
+                    ui.label(RichText::new("–").color(pal().text_faint));
                 }
             }
         });

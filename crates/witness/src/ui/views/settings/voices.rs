@@ -16,7 +16,7 @@ pub(super) const THRESHOLD_MIN: f32 = 0.40;
 pub(super) const THRESHOLD_MAX: f32 = 0.80;
 pub(super) const THRESHOLD_STEP: f32 = 0.05;
 /// What the voice-match slider trades off.
-const THRESHOLD_HELP: &str = "Lower = more auto-labels (more mistakes), higher = fewer.";
+const THRESHOLD_HELP: &str = "How alike two voices must sound to label a speaker automatically. Lower labels more, with more mistakes.";
 
 impl SettingsState {
     /// "3 voices enrolled · strictness 0.60".
@@ -49,7 +49,7 @@ impl SettingsState {
             if people.is_empty() {
                 note(
                     ui,
-                    "No one enrolled yet. Rename a speaker in any transcript to teach Witness their voice — future meetings will label them automatically.",
+                    "No one enrolled yet. Rename a speaker in any transcript to teach Witness their voice; future meetings then label them automatically.",
                 );
                 return None;
             }
@@ -72,7 +72,7 @@ impl SettingsState {
                             ui,
                             ph::TRASH,
                             15.0,
-                            "Forget this voice — Shift-click to skip confirmation",
+                            "Forget this voice (Shift-click skips confirmation)",
                         )
                         .clicked()
                     },
@@ -222,7 +222,7 @@ fn threshold_value_text(t: f32) -> String {
     } else {
         "strict"
     };
-    format!("{t:.2} — {word}")
+    format!("{t:.2} · {word}")
 }
 
 fn speech_learned(sample_seconds: f64) -> String {
@@ -269,9 +269,9 @@ mod tests {
         assert_eq!(snap_threshold(0.93), 0.8);
         assert_eq!(snap_threshold(0.62), 0.6);
         assert_eq!(threshold_readout(0.6), "0.60");
-        assert_eq!(threshold_value_text(0.5), "0.50 — lenient");
-        assert_eq!(threshold_value_text(0.55), "0.55 — balanced");
-        assert_eq!(threshold_value_text(0.7), "0.70 — strict");
+        assert_eq!(threshold_value_text(0.5), "0.50 · lenient");
+        assert_eq!(threshold_value_text(0.55), "0.55 · balanced");
+        assert_eq!(threshold_value_text(0.7), "0.70 · strict");
     }
 
     #[test]

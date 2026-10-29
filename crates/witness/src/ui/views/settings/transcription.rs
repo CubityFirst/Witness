@@ -68,7 +68,7 @@ impl SettingsState {
             let download = missing
                 && warning_strip(
                     ui,
-                    "Model not downloaded — transcription will fail",
+                    "Model not downloaded, so transcription will fail",
                     "Download",
                     !download_active,
                 );
@@ -92,14 +92,16 @@ impl SettingsState {
         });
         footnote(ui, DIARIZATION_NOTE);
 
-        let (auto, notify_changed, live_changed, overlay_changed) =
-            section(ui, "When to transcribe", |ui| {
+        let (auto, notify_changed, live_changed, overlay_changed) = section(
+            ui,
+            "When to transcribe",
+            |ui| {
                 let auto = toggle(
                     ui,
                     true,
                     &mut auto_transcribe,
                     "Auto-transcribe",
-                    "Runs after each recording.",
+                    "Transcribes each recording as soon as it stops.",
                 )
                 .changed();
                 widgets::group_divider(ui);
@@ -117,7 +119,7 @@ impl SettingsState {
                     true,
                     &mut live,
                     "Live captions",
-                    "Parakeet, while recording. Provisional — the final pass replaces them.",
+                    "Rough captions while recording (Parakeet). The finished transcript replaces them.",
                 )
                 .changed();
                 widgets::group_divider(ui);
@@ -127,11 +129,12 @@ impl SettingsState {
                     settings.live_transcribe,
                     &mut overlay,
                     "Open caption window automatically",
-                    "When recording starts. The CC button in the top bar opens it anytime.",
+                    "Always on top, opened when recording starts. The CC button opens it anytime.",
                 )
                 .changed();
                 (auto, notify_changed, live_changed, overlay_changed)
-            });
+            },
+        );
 
         let junk = section(ui, "Noise filter", |ui| {
             row(
@@ -142,7 +145,7 @@ impl SettingsState {
                     let id = title(ui, "Discarded noise phrases");
                     note(
                         ui,
-                        "One exact phrase per line; clear the list to disable phrase filtering.",
+                        "Lines that say only one of these are dropped, ignoring case and punctuation. One per line.",
                     );
                     id
                 },
@@ -266,7 +269,7 @@ fn gpu_libs_row(
                         progress_bar(ui, f);
                     }
                 }
-                GpuLibsState::System => note(ui, "using system CUDA libraries"),
+                GpuLibsState::System => note(ui, "Using the system's CUDA libraries."),
                 GpuLibsState::Idle {
                     integrity_error: Some(error),
                     ..
@@ -274,7 +277,7 @@ fn gpu_libs_row(
                     status_note(ui, theme::pal().rec_light, "integrity check failed")
                         .on_hover_text(error);
                 }
-                _ => {}
+                _ => note(ui, "Lets Parakeet run on an NVIDIA GPU."),
             }
             id
         },

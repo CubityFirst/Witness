@@ -1727,12 +1727,9 @@ fn turn_header(
         who.name.to_string()
     };
     let tooltip = if who.auto {
-        format!(
-            "{} — auto-matched by voice, click to rename/confirm",
-            who.name
-        )
+        format!("{}: matched by voice. Click to confirm or rename", who.name)
     } else {
-        format!("{} — click to rename", who.name)
+        format!("{}: click to rename", who.name)
     };
     let width = ui.available_width();
     let ts_width = player_bar::stable_width(ui, &fmt_ts(seg.start_ms), theme::regular(12.0));
@@ -2075,7 +2072,7 @@ fn hidden_row(ui: &mut egui::Ui, rc: &RowCtx, first: usize, count: usize) {
 /// The note as a button (a faint placeholder when empty); a click edits it.
 fn bookmark_note(ui: &mut egui::Ui, bookmark: &Bookmark, actions: &mut Vec<RowAction>) {
     let (text, color) = if bookmark.note.is_empty() {
-        ("bookmark — click to add a note", pal().text_faint)
+        ("Bookmark: click to add a note", pal().text_faint)
     } else {
         (bookmark.note.as_str(), pal().text)
     };
@@ -3644,7 +3641,7 @@ impl TranscriptState {
             };
             let segment = ui.interact(rect, ui.id().with(("summary-bar", i)), Sense::click());
             let selected = self.filter.contains(&stat.key);
-            let full = format!("{} — {}", stat.name, stat_text(stat));
+            let full = format!("{}: {}", stat.name, stat_text(stat));
             segment.widget_info(|| {
                 egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &full)
             });
@@ -4406,7 +4403,7 @@ fn legend_item(
     let height = name.size().y.max(figures.size().y);
     let size = egui::vec2(DOT + GAP + name.size().x + GAP + figures.size().x, height);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-    let full = format!("{} — {}", stat.name, stat_text(stat));
+    let full = format!("{}: {}", stat.name, stat_text(stat));
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, &full)
     });
@@ -4758,9 +4755,8 @@ fn live_feed(
                         let text = if captions_active {
                             "Listening… captions appear a few seconds after speech."
                         } else {
-                            "Live captions are off — enable them in Settings / download the \
-                             transcription models. The full transcript is produced after the \
-                             recording."
+                            "Live captions are off, or the transcription model isn't downloaded (see \
+                             Settings). The full transcript is produced after the recording."
                         };
                         ui.horizontal(|ui| {
                             ui.add_space(ROW_PAD_X - ui.spacing().item_spacing.x);

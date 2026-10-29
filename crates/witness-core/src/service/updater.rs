@@ -915,7 +915,7 @@ pub(crate) fn spawn_startup_check(core: Arc<AppCore>) {
                         info.version
                     );
                     core.toast(&format!(
-                        "Witness {} is available — install it from Settings → About.",
+                        "Witness {} is available. Install it from Settings → About.",
                         info.version
                     ));
                 }
@@ -962,7 +962,7 @@ impl AppCore {
             .lock()
             .unwrap()
             .clone()
-            .ok_or("No update is pending — check for updates first")?;
+            .ok_or("No update is pending. Check for updates first")?;
         // Fail fast before a ~100 MB download.
         if self.state.recorder.lock().unwrap().is_busy() {
             return Err("Stop the recording before installing the update".into());
@@ -1824,7 +1824,7 @@ mod tests {
         assert!(core.pending_update().is_none());
         assert_eq!(
             core.download_update().unwrap_err(),
-            "No update is pending — check for updates first"
+            "No update is pending. Check for updates first"
         );
         *core.pending_update.lock().unwrap() = parse_feed(FEED, &v("0.0.1")).unwrap();
         let info = core.pending_update().unwrap();
