@@ -126,8 +126,8 @@ impl SettingsState {
                     ui,
                     settings.live_transcribe,
                     &mut overlay,
-                    "Floating caption window",
-                    "On top of other apps while recording.",
+                    "Open caption window automatically",
+                    "When recording starts. The CC button in the top bar opens it anytime.",
                 )
                 .changed();
                 (auto, notify_changed, live_changed, overlay_changed)

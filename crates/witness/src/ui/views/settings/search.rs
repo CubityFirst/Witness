@@ -212,10 +212,10 @@ pub(super) const INDEX: &[Entry] = &[
     ),
     entry(
         P::Transcription,
-        Row("Floating caption window"),
-        "Floating caption window",
-        "On top of other apps while recording.",
-        "overlay captions always on top subtitles cc",
+        Row("Open caption window automatically"),
+        "Open caption window automatically",
+        "When recording starts; the CC button opens it anytime.",
+        "floating overlay captions always on top subtitles cc default",
     ),
     entry(
         P::Transcription,
