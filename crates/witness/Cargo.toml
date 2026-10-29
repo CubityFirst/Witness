@@ -27,7 +27,7 @@ wgpu = { version = "30", default-features = false, features = ["std", "parking_l
 raw-window-handle = "0.6.2"
 # Re-exports muda 0.21 as tray_icon::menu.
 tray-icon = "0.26.0"
-global-hotkey = "0.8.0"
+global-hotkey = "0.9.0"
 rfd = "0.17.2"
 winreg = "0.55"
 windows = { version = "0.62", features = [
