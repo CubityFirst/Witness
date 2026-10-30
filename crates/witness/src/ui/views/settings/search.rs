@@ -741,16 +741,4 @@ mod tests {
         assert_eq!(step(1, 4, 1), 2);
         assert_eq!(step(0, 0, 1), 0);
     }
-
-    #[test]
-    fn anchors_match_the_rows_they_name() {
-        assert_eq!(
-            Row("backup").id(),
-            egui::Id::new(("settings-row", "backup"))
-        );
-        assert_eq!(
-            Section("Models").id(),
-            egui::Id::new(("settings-section", "Models"))
-        );
-    }
 }

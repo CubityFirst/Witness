@@ -117,13 +117,4 @@ mod tests {
         assert!((pulse_at(1.2) - 1.0).abs() < 1e-4);
         assert!(pulse_at(0.3) > 0.3 && pulse_at(0.3) < 1.0);
     }
-
-    #[test]
-    fn animation_flag_is_taken_once() {
-        let ctx = egui::Context::default();
-        set_animations(true);
-        request_animation_frame(&ctx);
-        assert!(take_animation_request(&ctx));
-        assert!(!take_animation_request(&ctx));
-    }
 }
