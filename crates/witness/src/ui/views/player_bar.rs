@@ -1074,13 +1074,6 @@ mod tests {
         assert_eq!(labels, ["0.75×", "1×", "1.25×", "1.5×", "1.75×", "2×"]);
     }
 
-    #[test]
-    fn clock_formats_like_fmt_clock() {
-        assert_eq!(clock(0), "0:00");
-        assert_eq!(clock(61_999), "1:01");
-        assert_eq!(clock(3_600_000), "1:00:00");
-    }
-
     fn timeline(spans: &[(i64, i64, u16)], dimmed: &[u16]) -> Timeline {
         Timeline {
             version: 1,

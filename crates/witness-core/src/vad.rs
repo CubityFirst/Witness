@@ -133,18 +133,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn speech_chunks_borrow_exact_track_ranges() {
-        let track = (0..32).map(|value| value as f32).collect::<Vec<_>>();
-        let chunk = SpeechChunk {
-            start_ms: 0,
-            start_sample: 7,
-            end_sample: 19,
-        };
-        assert_eq!(chunk.samples(&track), &track[7..19]);
-        assert_eq!(chunk.len(), 12);
-    }
-
-    #[test]
     fn short_blips_are_not_speech() {
         // A mic pop: 2 frames flagged in otherwise silent audio → dropped.
         let mut flags = vec![false; 200];

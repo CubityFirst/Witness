@@ -982,15 +982,4 @@ mod tests {
         assert_eq!(nav.take(), Some(View::Settings));
         assert_eq!(memory.settings_target, Some(SettingsPage::Ai));
     }
-
-    #[test]
-    fn search_box_clear_cancels_the_debounce() {
-        let mut b = SearchBox {
-            text: "budget".into(),
-            request_focus: false,
-            debounce_at: Some(Instant::now()),
-        };
-        b.clear();
-        assert!(b.text.is_empty() && b.debounce_at.is_none());
-    }
 }

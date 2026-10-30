@@ -707,19 +707,20 @@ mod tests {
                 panic!("the old instance must be primary");
             };
             guard.begin_exit();
-            ready_tx.send(()).unwrap();
+            ready_tx.send(Instant::now()).unwrap();
             // Still pumping (and refusing) for a while, then let go.
             pump_until(Duration::from_millis(600), || false);
             guard.release();
         });
 
-        ready_rx.recv().unwrap();
-        let started = Instant::now();
-        let new = launch(names);
-        old.join().unwrap();
-        assert!(new.join().unwrap(), "the new launch must take over");
+        let exiting = ready_rx.recv().unwrap();
+        assert!(
+            launch(names).join().unwrap(),
+            "the new launch must take over"
+        );
         // It waited for the release instead of exiting on the refusal.
-        assert!(started.elapsed() >= Duration::from_millis(500));
+        assert!(exiting.elapsed() >= Duration::from_millis(600));
+        old.join().unwrap();
     }
 
     /// The old instance died holding the mutex (its thread ended without

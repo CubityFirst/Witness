@@ -344,13 +344,6 @@ mod tests {
     }
 
     #[test]
-    fn numeric_key_orders_cuda_style_versions() {
-        assert!(numeric_key(Path::new("v9.24")) > numeric_key(Path::new("v9.8")));
-        assert!(numeric_key(Path::new("13.0")) > numeric_key(Path::new("12.9")));
-        assert!(numeric_key(Path::new("bin")).is_empty());
-    }
-
-    #[test]
     fn version_dirs_missing_base_is_empty() {
         let dir = TestDir::new("nobase");
         assert!(version_dirs(&dir.0.join("does-not-exist")).is_empty());

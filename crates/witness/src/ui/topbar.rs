@@ -2294,12 +2294,38 @@ mod tests {
         assert_eq!(download_text(&p), "file 2 of 5 · downloading…");
     }
 
+    /// A press on a zone hands its direction to the OS sizing loop; a hover
+    /// or a press inside the window does not.
     #[test]
-    fn edge_resize_registers_zones_without_panicking() {
+    fn edge_resize_reports_the_pressed_zone() {
         let ctx = theme::test_context();
-        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            assert_eq!(edge_resize(ui.ctx(), "test"), None);
-        });
-        output.textures_delta.clear();
+        let press = |at| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let corner = egui::pos2(2.0, 2.0);
+        let inside = egui::pos2(200.0, 200.0);
+        let mut hits = Vec::new();
+        // Two hover passes: new areas are hit-tested from the pass after.
+        for events in [
+            vec![egui::Event::PointerMoved(corner)],
+            vec![],
+            vec![press(corner)],
+            vec![egui::Event::PointerMoved(inside), press(inside)],
+        ] {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(460.0, 620.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| hits.push(edge_resize(ui.ctx(), "test")));
+            output.textures_delta.clear();
+        }
+        assert_eq!(hits, [None, None, Some(ResizeDirection::NorthWest), None]);
     }
 }

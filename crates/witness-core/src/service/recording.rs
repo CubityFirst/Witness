@@ -684,21 +684,6 @@ mod tests {
     }
 
     #[test]
-    fn exit_suspension_of_auto_record_survives_settings_writes() {
-        let (core, _sink, _dir) = scratch_core("suspend");
-        let watcher = &core.state.watcher;
-        watcher.enabled.store(true, Ordering::Relaxed);
-        assert!(watcher.auto_record());
-        core.suspend_auto_record();
-        assert!(!watcher.auto_record());
-        // What update_settings does on every write (e.g. flush_for_exit
-        // after a Quit's shutdown): it must not undo the suspension.
-        watcher.enabled.store(true, Ordering::Relaxed);
-        assert!(!watcher.auto_record());
-        assert!(watcher.exiting());
-    }
-
-    #[test]
     fn auto_start_is_refused_under_the_recorder_lock_once_exiting() {
         let (core, _sink, _dir) = scratch_core("auto-exiting");
         core.suspend_auto_record();

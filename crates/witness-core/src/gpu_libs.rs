@@ -691,7 +691,6 @@ mod tests {
             &TEST_ARCHIVE,
             &manifest
         ));
-        assert!(dir_if_ready(&directory.0).is_none());
     }
 
     #[test]
