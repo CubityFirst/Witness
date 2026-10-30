@@ -10,6 +10,9 @@ updates:
       time: "05:00"
       timezone: Europe/London
     open-pull-requests-limit: 5
+    # Supply-chain hardening: only propose versions published at least 7 days ago.
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "chore(deps)"
     # Mirrors CLAUDE.md "do not upgrade casually": these move only by hand,
@@ -55,5 +58,7 @@ updates:
       time: "05:00"
       timezone: Europe/London
     open-pull-requests-limit: 3
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "chore(deps)"
