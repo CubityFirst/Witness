@@ -471,11 +471,13 @@ validated with newer LLVM releases. The toolchain is pinned in
   resolves the target dir from `cargo metadata` (never assumes `target\`)
   and fetches the hash-pinned NSIS toolchain into
   `%LOCALAPPDATA%\witness-build` (`WITNESS_BUILD_CACHE` overrides).
-- **Dev data dirs from the Tauri era live in `src-tauri/target*`** (real
-  databases, audio, 4 GB of models); never delete them — point
-  `data_dir`/`WITNESS_SETTINGS` at them (the untracked
-  `target\{debug,release}\witness-settings.toml` files do). Test launches use
-  their own `WITNESS_SETTINGS` + empty `data_dir`.
+- **Dev builds keep their data in `%LOCALAPPDATA%\Witness-dev`** (real
+  meetings; the untracked `target\{debug,release}\witness-settings.toml`
+  point `data_dir` there), separate from the installed app's
+  `%LOCALAPPDATA%\Witness`. The Tauri-era `src-tauri/target*` data dirs were
+  merged into the installed app's database and are gone (archived outside
+  the repo). Test launches use their own `WITNESS_SETTINGS` + empty
+  `data_dir`.
 - When ort-sys has to *copy* (not symlink) its DLLs it skips `deps/`, so
   test binaries can't see `onnxruntime_providers_cuda.dll` and `cuda_smoke`
   silently runs on CPU — copy the two provider DLLs into
