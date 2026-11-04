@@ -35,6 +35,7 @@ use views::people::PeopleView;
 use views::search::SearchView;
 use views::settings::SettingsView;
 pub use views::settings::{SettingsPage, SettingsRoute};
+use views::stats::StatsView;
 use views::transcript::TranscriptView;
 use witness_core::player::Player;
 use witness_core::{AppCore, RecCmd};
@@ -45,6 +46,7 @@ pub enum View {
     #[default]
     Meetings,
     People,
+    Stats,
     /// `from` is where Back returns to (Meetings when absent). Openers set
     /// it; the recording pill uses the current transcript's own `from`, so
     /// transcripts never nest.
@@ -61,7 +63,7 @@ pub enum View {
 }
 
 /// `WITNESS_DEBUG_START_VIEW` (debug builds only) for passive visual
-/// checks: `meetings`, `people`, `settings`, `search:<query>` or
+/// checks: `meetings`, `people`, `stats`, `settings`, `search:<query>` or
 /// `transcript:<meeting id>` (opened from Meetings, so a wide window shows
 /// it split beside the list). Anything else (or unset) is Meetings.
 pub fn debug_start_view() -> View {
@@ -86,6 +88,7 @@ fn parse_start_view(spec: &str) -> Option<View> {
     match (kind.trim(), arg) {
         ("meetings", None) => Some(View::Meetings),
         ("people", None) => Some(View::People),
+        ("stats", None) => Some(View::Stats),
         ("settings", None) => Some(View::Settings),
         ("search", Some(query)) => Some(View::Search {
             query: query.to_owned(),
@@ -114,6 +117,7 @@ impl View {
         match self {
             View::Meetings => "meetings".into(),
             View::People => "people".into(),
+            View::Stats => "stats".into(),
             View::Transcript { meeting_id, .. } => format!("transcript-{meeting_id}"),
             View::Search { .. } => "search".into(),
             View::Settings => "settings".into(),
@@ -610,6 +614,7 @@ impl<V> Screens<V> {
 pub enum ActiveView {
     Meetings(MeetingsView),
     People(PeopleView),
+    Stats(StatsView),
     Transcript(TranscriptView),
     Search(SearchView),
     Settings(SettingsView),
@@ -621,6 +626,7 @@ impl ActiveView {
         match view {
             View::Meetings => ActiveView::Meetings(MeetingsView::new()),
             View::People => ActiveView::People(PeopleView::new()),
+            View::Stats => ActiveView::Stats(StatsView::new()),
             View::Transcript {
                 meeting_id,
                 segment_id,
@@ -640,6 +646,7 @@ impl ActiveView {
         match self {
             ActiveView::Meetings(v) => v.show(ui, cx),
             ActiveView::People(v) => v.show(ui, cx),
+            ActiveView::Stats(v) => v.show(ui, cx),
             ActiveView::Transcript(v) => v.show(ui, cx),
             ActiveView::Search(v) => v.show(ui, cx),
             ActiveView::Settings(v) => v.show(ui, cx),
@@ -653,6 +660,7 @@ impl ActiveView {
         match self {
             ActiveView::Meetings(v) => v.flush(cx),
             ActiveView::People(v) => v.flush(cx),
+            ActiveView::Stats(v) => v.flush(cx),
             ActiveView::Transcript(v) => v.flush(cx),
             ActiveView::Search(v) => v.flush(cx),
             ActiveView::Settings(v) => v.flush(cx),
@@ -665,6 +673,7 @@ impl ActiveView {
         match self {
             ActiveView::Meetings(v) => v.on_leave(cx),
             ActiveView::People(v) => v.on_leave(cx),
+            ActiveView::Stats(v) => v.on_leave(cx),
             ActiveView::Transcript(v) => v.on_leave(cx),
             ActiveView::Search(v) => v.on_leave(cx),
             ActiveView::Settings(v) => v.on_leave(cx),
@@ -679,6 +688,7 @@ mod tests {
     #[test]
     fn debug_start_view_grammar() {
         assert_eq!(parse_start_view("people"), Some(View::People));
+        assert_eq!(parse_start_view("stats"), Some(View::Stats));
         assert_eq!(parse_start_view("settings"), Some(View::Settings));
         assert_eq!(parse_start_view("meetings"), Some(View::Meetings));
         assert_eq!(
@@ -774,6 +784,7 @@ mod tests {
         for view in [
             transcript(7, Some(View::People)),
             View::People,
+            View::Stats,
             View::Settings,
         ] {
             assert_eq!(

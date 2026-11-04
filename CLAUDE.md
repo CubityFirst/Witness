@@ -70,7 +70,10 @@ repair, orphan recovery, bin purge) is `service/startup.rs`.
 
 UI (`crates/witness`): eframe 0.36 (glow renderer), no router — a `View` enum
 in `ui/mod.rs` (`ActiveView` owns the live view). Views in `ui/views/`:
-Meetings (+ recycle bin), People (stats + weekly trend + name filter), Transcript (+
+Meetings (+ recycle bin), People (stats + weekly trend + name filter), Stats
+(`stats.rs`: archive-wide fun insights from `witness_core::stats` — who you
+meet, talk balance, filler words, word clouds, the week grid; one
+`AppCore::stats_report` pass per load), Transcript (+
 `player_bar.rs`: player, live captions, bookmarks, notes; `ai_summary.rs`: the
 AI Summary panel), Search (filters),
 Settings (`views/settings/`: `mod.rs` view + routing, `nav.rs` rail / index,
@@ -515,7 +518,7 @@ validated with newer LLVM releases. The toolchain is pinned in
   `PrintWindow(PW_RENDERFULLCONTENT)`, kill it. Reach states through
   debug-build-only env hooks instead of clicks (full list in docs/UI.md):
   `WITNESS_DEBUG_START_VIEW`
-  (`meetings|people|settings|search:<q>|transcript:<id>`),
+  (`meetings|people|stats|settings|search:<q>|transcript:<id>`),
   `WITNESS_DEBUG_TOASTS=1`, `WITNESS_DEBUG_CONFIRM=1`,
   `WITNESS_DEBUG_CAPTIONS=1` (overlay with sample lines),
   `WITNESS_DEBUG_SYNTHETIC=1` (3,000-segment transcript),
