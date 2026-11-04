@@ -425,7 +425,9 @@ thread and an in-house WSOLA time-stretch (speed) — no extra crates.
 - Global hotkeys walk candidate chains (record: ctrl+alt+r→w→shift+r;
   bookmark: ctrl+alt+b→m) because other apps can own combos system-wide;
   bound combos go to `core.set_bound_hotkeys` and are exposed through
-  status.
+  status. Settings → Recording rebinds either one (Change captures a
+  Ctrl/Alt combo in-app, Reset returns to the chain); the pick is saved in
+  `ui-state.toml` and tried before the chain at startup.
 - Toasts: the installed build (exe dir == `HKCU\Software\github\Witness`
   default; cargo profile dirs never count) uses the AUMID
   `com.github.cubityfirst.witness` that NSIS writes on the shortcut and
@@ -576,7 +578,7 @@ removed on any failure; the app then launches the installer with
 `WITNESS_SETTINGS` env var → `witness-settings.toml` (next to exe) →
 `data_dir`: `witness.db`, `audio/{id}.opus`, `rec-tmp/` (in-flight WAVs +
 `.meta.toml` crash sidecars), `models/hf-cache/`, `cuda/` (optional managed
-GPU DLLs), `witness.log`, `ui-state.toml` (player volume/speed,
+GPU DLLs), `witness.log`, `ui-state.toml` (player volume/speed, picked hotkeys,
 model-banner dismissal; replaced WebView2 localStorage, reset once in
 0.3.0), `captions-overlay.toml` (overlay geometry in physical px + scale).
 data_dir changes apply to db/log on restart (Settings offers the button).

@@ -8,6 +8,9 @@ still evolve quickly.
 
 ### Added
 
+- The recording and bookmark hotkeys can be changed in Settings →
+  Recording: click Change and press the new combination (it needs Ctrl or
+  Alt). Reset goes back to the defaults.
 - People has a search box in the same place as the Meetings one. It
   filters people by name as you type, and the ↑/↓ selection skips anyone it
   hides. Ctrl+F and / focus it while People is open; Esc or × clear it.

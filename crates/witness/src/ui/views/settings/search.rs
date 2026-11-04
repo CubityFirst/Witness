@@ -151,14 +151,14 @@ pub(super) const INDEX: &[Entry] = &[
         Row("Recording hotkey"),
         "Recording hotkey",
         "Starts or stops recording from any app.",
-        "shortcut keyboard global hotkey keys ctrl alt",
+        "shortcut keyboard global hotkey keys ctrl alt change rebind customize",
     ),
     entry(
         P::Recording,
         Row("Bookmark hotkey"),
         "Bookmark hotkey",
         "Marks the current moment of a recording.",
-        "shortcut keyboard global hotkey keys ctrl alt mark",
+        "shortcut keyboard global hotkey keys ctrl alt mark change rebind customize",
     ),
     // Transcription
     entry(

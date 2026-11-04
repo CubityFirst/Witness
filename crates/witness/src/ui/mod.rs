@@ -19,6 +19,7 @@ pub mod widgets;
 
 use crate::bridge::{OpDone, RecOrigin, Tasks};
 use crate::model::ShellModel;
+use crate::platform::hotkeys::HotkeyAction;
 use crate::platform::window::{FlyoutState, MainWindow};
 use crate::platform::OwnerHwnd;
 use crate::settings_store::SettingsStore;
@@ -243,7 +244,7 @@ impl Nav {
 
 /// App-level commands pushed by views. Handled in `logic()` (never in
 /// `ui()`), so they run whether or not the window is visible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCmd {
     /// CC button, after `check_captions_overlay` succeeded.
     ShowCaptionsOverlay,
@@ -257,6 +258,9 @@ pub enum UiCmd {
     InstallUpdate,
     /// Settings → General → Run setup: show the first-run wizard.
     RunSetup,
+    /// Settings → Recording: bind a global hotkey to a combo, or back to
+    /// its defaults (None).
+    RebindHotkey(HotkeyAction, Option<String>),
 }
 
 /// Search "Who" filter.
