@@ -112,7 +112,7 @@ impl<T> Segment<T> {
 }
 
 /// The gap between a segmented control's track and its segments.
-const SEGMENT_INSET: f32 = 3.0;
+pub(super) const SEGMENT_INSET: f32 = 3.0;
 
 /// A segmented choice (Windows 11's selector bar): an inset track as wide
 /// as the slot, equal segments, the picked one an accent tint with accent
