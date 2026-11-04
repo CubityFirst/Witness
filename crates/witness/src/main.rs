@@ -195,9 +195,55 @@ fn run(
     )
 }
 
+/// The window's first size in content points: wide enough for the split
+/// layout (meetings beside the transcript, `ui::SPLIT_MIN_WIDTH`) with room
+/// to spare.
+const DEFAULT_CONTENT_SIZE: [f32; 2] = [1040.0, 700.0];
+/// Kept clear around a default window clamped to a small work area.
+const WORK_AREA_MARGIN: f32 = 32.0;
+
+/// The default inner size and (centred) position, in logical points, for a
+/// work area of `work` (logical x, y, w, h). The app zooms by the Windows
+/// text-size setting (`text_scale`), so the window grows with it to keep
+/// the same content width; a work area too small for that wins (the window
+/// then fits it and may show a single column).
+fn default_window_rect(text_scale: f32, work: [f32; 4]) -> ([f32; 2], [f32; 2]) {
+    let [x, y, w, h] = work;
+    let fit = |want: f32, avail: f32| want.min(avail - 2.0 * WORK_AREA_MARGIN).max(380.0);
+    let size = [
+        fit(DEFAULT_CONTENT_SIZE[0] * text_scale, w),
+        fit(DEFAULT_CONTENT_SIZE[1] * text_scale, h),
+    ];
+    let pos = [
+        x + ((w - size[0]) / 2.0).max(0.0),
+        y + ((h - size[1]) / 2.0).max(0.0),
+    ];
+    (size, pos)
+}
+
+/// The primary monitor's work area in logical points (x, y, w, h).
+fn primary_work_area() -> [f32; 4] {
+    let origin = winit::dpi::PhysicalPosition::new(0, 0);
+    let area = platform::system::work_area_at(origin);
+    let scale = platform::system::dpi_at(origin).max(1) as f32 / 96.0;
+    [
+        area.x as f32 / scale,
+        area.y as f32 / scale,
+        area.w as f32 / scale,
+        area.h as f32 / scale,
+    ]
+}
+
 fn native_options(renderer: RendererChoice) -> eframe::NativeOptions {
     let snapshot = snapshot::config();
-    let size = snapshot.as_ref().map_or([460.0, 620.0], |s| s.size);
+    let (size, position) = match &snapshot {
+        Some(s) => (s.size, None),
+        None => {
+            let (size, pos) =
+                default_window_rect(platform::system::text_scale_factor(), primary_work_area());
+            (size, Some(pos))
+        }
+    };
     let min_size = match &snapshot {
         Some(s) => [s.size[0].min(380.0), s.size[1].min(360.0)],
         None => [380.0, 360.0],
@@ -205,7 +251,11 @@ fn native_options(renderer: RendererChoice) -> eframe::NativeOptions {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Witness")
         .with_inner_size(size)
-        .with_min_inner_size(min_size)
+        .with_min_inner_size(min_size);
+    if let Some(pos) = position {
+        viewport = viewport.with_position(pos);
+    }
+    let mut viewport = viewport
         .with_decorations(false)
         .with_resizable(true)
         // Nothing drops files on Witness, and winit's OleInitialize for
@@ -243,4 +293,33 @@ fn native_options(renderer: RendererChoice) -> eframe::NativeOptions {
         }
     }
     options
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_window_opens_as_a_split() {
+        // 1080p at 100 %: the full default, centred in the work area.
+        let (size, pos) = default_window_rect(1.0, [0.0, 0.0, 1920.0, 1032.0]);
+        assert_eq!(size, DEFAULT_CONTENT_SIZE);
+        assert_eq!(pos, [440.0, 166.0]);
+        assert!(size[0] >= ui::SPLIT_MIN_WIDTH);
+        // Larger text: the window grows so the content width stays a split.
+        let (size, _) = default_window_rect(1.25, [0.0, 0.0, 2560.0, 1392.0]);
+        assert!(size[0] / 1.25 >= ui::SPLIT_MIN_WIDTH);
+    }
+
+    #[test]
+    fn a_small_work_area_clamps_the_default_window() {
+        let (size, pos) = default_window_rect(1.0, [100.0, 0.0, 1024.0, 728.0]);
+        assert_eq!(size, [1024.0 - 64.0, 728.0 - 64.0]);
+        assert_eq!(pos, [132.0, 32.0]);
+        // Never below the minimum window size.
+        assert_eq!(
+            default_window_rect(1.0, [0.0, 0.0, 300.0, 300.0]).0,
+            [380.0, 380.0]
+        );
+    }
 }

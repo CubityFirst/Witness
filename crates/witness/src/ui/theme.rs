@@ -280,7 +280,7 @@ pub fn regular(size: f32) -> FontId {
     FontId::proportional(size)
 }
 
-/// The `@media (max-width: 620px)` switch. At the default 460 px window the
+/// The `@media (max-width: 620px)` switch. In a 380–460 pt window the
 /// narrow look is the normal look. Inside a split column it measures the
 /// column ([`set_pane_width`]), not the window.
 pub fn narrow(ui: &egui::Ui) -> bool {
