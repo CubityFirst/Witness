@@ -43,6 +43,18 @@ pub fn cache_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(local).join("witness-build"))
 }
 
+/// Lowercase hex of a finished digest (sha2 0.11's output type no longer
+/// implements `LowerHex`).
+fn to_hex(digest: &[u8]) -> String {
+    use std::fmt::Write as _;
+    digest
+        .iter()
+        .fold(String::with_capacity(digest.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
 /// Hex SHA-256 of a reader.
 pub fn sha256_hex(mut reader: impl Read) -> Result<String> {
     let mut hasher = Sha256::new();
@@ -54,7 +66,7 @@ pub fn sha256_hex(mut reader: impl Read) -> Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(to_hex(&hasher.finalize()))
 }
 
 pub fn sha256_file(path: &Path) -> Result<String> {
@@ -90,7 +102,7 @@ fn fetch_verified(url: &str, sha256: &str, path: &Path) -> Result<()> {
     }
     out.flush()?;
     drop(out);
-    let got = format!("{:x}", hasher.finalize());
+    let got = to_hex(&hasher.finalize());
     if got != sha256 {
         let _ = std::fs::remove_file(&part);
         bail!("SHA-256 mismatch for {url}: expected {sha256}, got {got}; refusing to use it");
