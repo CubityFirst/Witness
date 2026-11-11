@@ -114,7 +114,7 @@ fn enable_at(keys: Keys<'_>, data: &str) -> io::Result<()> {
             VALUE_NAME,
             &RegValue {
                 vtype: RegType::REG_BINARY,
-                bytes: APPROVED_ENABLED.to_vec(),
+                bytes: APPROVED_ENABLED.as_slice().into(),
             },
         )?;
     }
@@ -294,7 +294,9 @@ mod tests {
 
         fn approved_bytes(&self) -> Option<Vec<u8>> {
             let key = self.hkcu().open_subkey(&self.approved).ok()?;
-            key.get_raw_value(VALUE_NAME).ok().map(|v| v.bytes)
+            key.get_raw_value(VALUE_NAME)
+                .ok()
+                .map(|v| v.bytes.into_owned())
         }
 
         fn set_approved_bytes(&self, bytes: &[u8]) {
@@ -305,7 +307,7 @@ mod tests {
                     VALUE_NAME,
                     &RegValue {
                         vtype: RegType::REG_BINARY,
-                        bytes: bytes.to_vec(),
+                        bytes: bytes.into(),
                     },
                 )
                 .unwrap();
@@ -433,7 +435,7 @@ mod tests {
         let s = Scratch::new("binary", false);
         s.set_run_raw(&RegValue {
             vtype: RegType::REG_BINARY,
-            bytes: vec![1, 2, 3],
+            bytes: vec![1, 2, 3].into(),
         });
         assert!(!is_enabled_at(s.keys()).unwrap());
     }
@@ -523,8 +525,8 @@ mod tests {
     /// on drop — including when an assert in the test panics, so a failed
     /// run never leaves autostart pointing at the test binary.
     struct RealValues {
-        run: Option<RegValue>,
-        approved: Option<RegValue>,
+        run: Option<RegValue<'static>>,
+        approved: Option<RegValue<'static>>,
     }
 
     impl RealValues {
@@ -535,7 +537,7 @@ mod tests {
             }
         }
 
-        fn read(key: &str) -> Option<RegValue> {
+        fn read(key: &str) -> Option<RegValue<'static>> {
             RegKey::predef(HKEY_CURRENT_USER)
                 .open_subkey(key)
                 .ok()?
