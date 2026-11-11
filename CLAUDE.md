@@ -329,13 +329,17 @@ thread and an in-house WSOLA time-stretch (speed) — no extra crates.
   egui/winit/wgpu and ML/audio pins (earshot included); tray-icon,
   global-hotkey, rfd and the toast crate still get Dependabot PRs.
 - **VAD is earshot, not Silero** — `voice_activity_detector` pins ort
-  =2.0.0-rc.10; parakeet-rs needs rc.13. earshot frames: exactly 256
+  =2.0.0-rc.10; parakeet-rs needs rc.15. earshot frames: exactly 256
   samples @ 16 kHz. Its minor releases retrain the model, so a bump means
   re-tuning `vad::THRESHOLD` against real recordings: compare speech kept,
   transcript lines a chunking no longer covers, and chunks that transcribe
   to nothing (1.1 → 1.2 moved it from 0.65 to 0.5).
-- **Our direct `ort` dep is pinned `=2.0.0-rc.13`** to match parakeet-rs
-  (shared ort-sys). Its CUDA provider hard-imports `cublas64_13` /
+- **Our direct `ort` dep is pinned `=2.0.0-rc.15`** to match parakeet-rs
+  (shared ort-sys). Since rc.14 every session needs an explicit
+  `Environment` and ort allows **one per process** — a second
+  `ort::init().build()` fails forever, even after the first is dropped — so
+  Parakeet, Sortformer and speaker_id all share `ort_env::environment()`
+  (built lazily, telemetry off). Its CUDA provider hard-imports `cublas64_13` /
   `cublasLt64_13` and loads `cudnn64_9` / `cufft64_12` at runtime (CUDA 13
   runtime + cuDNN 9) — mirrored in gpu.rs `CUDA_EP_DLLS`; re-check the
   provider's imports and embedded DLL names when bumping ort. ort-sys only
@@ -355,19 +359,20 @@ thread and an in-house WSOLA time-stretch (speed) — no extra crates.
 - **Diarization = NVIDIA Nemotron 3 Diarization** (streaming Sortformer v3,
   OpenMDW-1.1) via parakeet-rs, ONNX from `altunenes/parakeet-rs`
   (`nemotron-3-diarization/`). Output units = samples @ 16 kHz (÷16 → ms);
-  ≤8 speakers; runs on CPU (no execution config), offline profile from the
-  ONNX metadata. **Never call `Sortformer::flush()`** — in 0.3.8 it hands
-  ORT a column-major mel array whenever the tail is a whole number of 80 ms
-  frames (~1 in 8 recordings); diarize.rs instead feeds one model window of
-  silence and clamps segments. Remove the workaround once upstream fixes it
-  (`diarize_tail_frame_multiple` is the regression test). Compared with v2
+  ≤8 speakers; runs on CPU (default execution provider + the shared
+  environment), offline profile from the ONNX metadata. The tail is drained
+  with `Sortformer::flush()` (0.3.8's flush handed ORT a column-major mel
+  array whenever the tail was a whole number of 80 ms frames; fixed in
+  0.4.0 — `diarize_tail_frame_multiple` is the regression test); segments
+  are still clamped to the real audio. Compared with v2
   on real meetings, v3 stops splitting one person into two speakers, but it
   merges the two stock SAPI voices (Hazel/Zira) — the TTS dialogue test
   pitches one down.
-- **parakeet-rs is a git pin** (rev `4fa6bdae`; 0.3.8 isn't on crates.io
-  yet) — swap to the crates.io release when it lands. 0.3.8 dropped
-  Sortformer v2 support. **TDT ~4–5 min inference cap** → vad.rs
-  hard-splits at 240 s.
+- **parakeet-rs is an exact crates.io pin `=0.4.4`** (default features =
+  ONNX Runtime; its pure-Rust burn backend stays off). Its patch releases
+  move its exact ort pin, so it is bumped by hand with ort (Dependabot
+  ignores both). 0.3.8 dropped Sortformer v2 support. **TDT ~4–5 min
+  inference cap** → vad.rs hard-splits at 240 s.
 - **FTS5 probe queries need `LIMIT 1`** — with `LIMIT 0` the MATCH
   expression is never parsed and invalid syntax slips through.
 - Whisper CUDA is behind witness-core's `whisper-cuda` cargo feature (needs

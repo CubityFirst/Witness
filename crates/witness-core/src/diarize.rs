@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use parakeet_rs::sortformer::{DiarizationConfig, Sortformer};
+use parakeet_rs::ExecutionConfig;
 use std::path::Path;
 
 /// Remote speakers the model can separate (labels S1..S8).
@@ -20,8 +21,6 @@ pub struct DiarSegment {
 }
 
 const FEED_CHUNK: usize = 16_000 * 10; // 10 s @ 16 kHz
-/// One 80 ms model frame of slack on top of the streaming window.
-const FEED_TAIL_MARGIN: usize = 1_280;
 
 pub fn diarize(
     models_dir: &Path,
@@ -30,11 +29,13 @@ pub fn diarize(
 ) -> Result<Vec<DiarSegment>> {
     let model_path = crate::models::sortformer_path(models_dir)
         .context("Diarization model not downloaded; download it in Settings → Storage")?;
+    // CPU: no execution provider, only the shared ONNX Runtime environment.
+    let execution = ExecutionConfig::new().with_environment(crate::ort_env::environment()?);
     let mut sortformer = {
         let _permit = crate::ml_scheduler::batch();
         // The default post-processing reproduces NeMo's own diarize() output
         // for this model (plain 0.5 threshold, no padding or smoothing).
-        Sortformer::with_config(&model_path, None, DiarizationConfig::default())
+        Sortformer::with_config(&model_path, Some(execution), DiarizationConfig::default())
             .with_context(|| format!("loading diarization model from {}", model_path.display()))?
     };
 
@@ -48,23 +49,18 @@ pub fn diarize(
         raw.extend(fed);
         progress(((i + 1) * FEED_CHUNK).min(total) as f32 / total as f32);
     }
-    // Drain the tail with one model window of silence instead of `flush()`:
-    // parakeet-rs 0.3.8's flush hands ONNX Runtime a column-major mel array
-    // whenever the leftover is a whole number of 80 ms frames (~1 in 8
-    // recordings, by length alone) and fails with "non-contiguous layout".
-    // `feed()` slices its window and so always copies to row-major. The
-    // padding reads as the meeting continuing in silence; segments are
-    // clamped to the real audio below.
-    let window_samples = (sortformer.latency() * 16_000.0).ceil() as usize + FEED_TAIL_MARGIN;
+    // The buffered tail (up to one streaming window) is padded to whole
+    // 80 ms frames, as NeMo does. (parakeet-rs 0.3.8's flush handed ONNX
+    // Runtime a column-major mel array whenever that tail was already a
+    // whole number of frames; fixed in 0.4.0, see `diarize_tail_frame_multiple`.)
     let fed = {
         let _permit = crate::ml_scheduler::batch();
-        sortformer
-            .feed(&vec![0.0; window_samples])
-            .context("Sortformer feed (tail)")?
+        sortformer.flush().context("Sortformer flush")?
     };
     raw.extend(fed);
 
-    // SpeakerSegment start/end are in samples @ 16 kHz.
+    // SpeakerSegment start/end are in samples @ 16 kHz. Clamped anyway: the
+    // final frame's padding must not stretch a segment past the audio.
     let real_ms = samples_16k.len() as u64 / 16;
     let mut out: Vec<DiarSegment> = raw
         .into_iter()

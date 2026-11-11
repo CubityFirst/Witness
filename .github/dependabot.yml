@@ -36,12 +36,12 @@ updates:
       - dependency-name: wgpu
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
       # ML/audio stack: pinned for shared ort-sys, CUDA provider imports and
-      # APIs. ort is an exact pin matching parakeet-rs.
+      # APIs. ort is an exact pin matching parakeet-rs, whose patch releases
+      # move their own exact ort pin (0.4.2: rc.14 → rc.15) — bump both by hand.
       - dependency-name: ort
       - dependency-name: hf-hub
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: parakeet-rs
-        update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: whisper-rs
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: wasapi
