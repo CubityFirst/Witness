@@ -4,17 +4,17 @@
 
 use super::{
     badge_or_text, footnote, keycap, note, row, save, section, text_width, title, toggle,
-    SettingsState, Slot, FIELD_WIDTH,
+    HotkeyAction, SettingsState, Slot, FIELD_WIDTH,
 };
 use crate::ui::theme::{self, pal};
 use crate::ui::widgets::{self, BadgeKind};
-use crate::ui::UiCtx;
+use crate::ui::{UiCmd, UiCtx};
 use eframe::egui::{self, RichText};
 use witness_core::audio_capture::AudioDevice;
 use witness_core::events::WatcherStatus;
 
 /// Under the hotkey rows.
-const HOTKEYS_HELP: &str = "They work in any app, even with Witness in the tray. If another app owns a combination, the next free one is used.";
+const HOTKEYS_HELP: &str = "They work in any app, even with Witness in the tray. If another app owns a combination, the next free one is used. A new combination needs Ctrl or Alt.";
 
 impl SettingsState {
     /// "Auto-record on · Headset Microphone".
@@ -123,22 +123,51 @@ impl SettingsState {
             (mic, loopback, refresh)
         });
 
-        section(ui, "Global hotkeys", |ui| {
-            hotkey_row(
+        let capture = self.hotkey_capture;
+        let captured = capture.and_then(|_| ui.input_mut(take_capture));
+        let record_custom = cx.prefs.record_hotkey.is_some();
+        let bookmark_custom = cx.prefs.bookmark_hotkey.is_some();
+        let (record_click, bookmark_click) = section(ui, "Global hotkeys", |ui| {
+            let record = hotkey_row(
                 ui,
                 "Recording hotkey",
                 "Starts or stops recording.",
                 record_hotkey.as_deref(),
+                capture == Some(HotkeyAction::Record),
+                record_custom,
             );
             widgets::group_divider(ui);
-            hotkey_row(
+            let bookmark = hotkey_row(
                 ui,
                 "Bookmark hotkey",
                 "Marks the current moment of a recording.",
                 bookmark_hotkey.as_deref(),
+                capture == Some(HotkeyAction::Bookmark),
+                bookmark_custom,
             );
+            (record, bookmark)
         });
         footnote(ui, HOTKEYS_HELP);
+        if let (Some(action), Some(captured)) = (capture, captured) {
+            self.hotkey_capture = None;
+            if let Captured::Combo(combo) = captured {
+                cx.cmds.push(UiCmd::RebindHotkey(action, Some(combo)));
+            }
+        }
+        for (action, click) in [
+            (HotkeyAction::Record, record_click),
+            (HotkeyAction::Bookmark, bookmark_click),
+        ] {
+            match click {
+                Some(HotkeyClick::Change) => self.hotkey_capture = Some(action),
+                Some(HotkeyClick::Cancel) => self.hotkey_capture = None,
+                Some(HotkeyClick::Reset) => {
+                    self.hotkey_capture = None;
+                    cx.cmds.push(UiCmd::RebindHotkey(action, None));
+                }
+                None => {}
+            }
+        }
 
         if auto {
             save(cx, |s| s.auto_record = auto_record);
@@ -228,8 +257,25 @@ pub(crate) fn device_row(ui: &mut egui::Ui, spec: &DeviceRow) -> Option<Option<S
     picked.map(|value| (!value.is_empty()).then_some(value))
 }
 
-/// A global-hotkey row: the bound combo as a key cap, or "Unavailable".
-fn hotkey_row(ui: &mut egui::Ui, name: &str, what: &str, combo: Option<&str>) {
+/// A button on a global-hotkey row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotkeyClick {
+    Change,
+    Cancel,
+    Reset,
+}
+
+/// A global-hotkey row: the bound combo as a key cap (or "Unavailable"),
+/// Change, and Reset once the user picked a combo. While `capturing`, a
+/// prompt and Cancel instead.
+fn hotkey_row(
+    ui: &mut egui::Ui,
+    name: &str,
+    what: &str,
+    combo: Option<&str>,
+    capturing: bool,
+    custom: bool,
+) -> Option<HotkeyClick> {
     let (description, key) = hotkey_parts(what, combo);
     row(
         ui,
@@ -240,13 +286,124 @@ fn hotkey_row(ui: &mut egui::Ui, name: &str, what: &str, combo: Option<&str>) {
             note(ui, &description);
             id
         },
-        |ui, _| match &key {
-            Some(key) => keycap(ui, key),
-            None => {
-                ui.label(RichText::new("Unavailable").color(pal().text_muted));
-            }
+        |ui, _| {
+            ui.horizontal(|ui| {
+                if capturing {
+                    keycap(ui, "Press a combination…");
+                    return widgets::btn_ghost(ui, "Cancel")
+                        .clicked()
+                        .then_some(HotkeyClick::Cancel);
+                }
+                match &key {
+                    Some(key) => keycap(ui, key),
+                    None => {
+                        ui.label(RichText::new("Unavailable").color(pal().text_muted));
+                    }
+                }
+                let mut click = None;
+                if widgets::btn(ui, "Change").clicked() {
+                    click = Some(HotkeyClick::Change);
+                }
+                if custom && widgets::btn_ghost(ui, "Reset").clicked() {
+                    click = Some(HotkeyClick::Reset);
+                }
+                click
+            })
+            .inner
         },
-    );
+    )
+}
+
+/// What a key press did while a hotkey row was capturing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Captured {
+    Combo(String),
+    Cancelled,
+}
+
+/// Take the first usable key press (or Escape) out of this pass's input,
+/// so nothing else acts on it.
+fn take_capture(input: &mut egui::InputState) -> Option<Captured> {
+    let mut captured = None;
+    input.events.retain(|event| {
+        let egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } = event
+        else {
+            return true;
+        };
+        if captured.is_some() {
+            return true;
+        }
+        captured = if *key == egui::Key::Escape && !modifiers.any() {
+            Some(Captured::Cancelled)
+        } else {
+            capture_combo(*key, *modifiers).map(Captured::Combo)
+        };
+        captured.is_none()
+    });
+    captured
+}
+
+/// A global-hotkey combo string for a key press ("ctrl+alt+f9"), None if
+/// it has neither Ctrl nor Alt (it would swallow plain typing everywhere)
+/// or the key cannot be a global hotkey.
+fn capture_combo(key: egui::Key, modifiers: egui::Modifiers) -> Option<String> {
+    use egui::Key as K;
+    if !(modifiers.ctrl || modifiers.alt) {
+        return None;
+    }
+    let name = match key {
+        K::ArrowDown => "down",
+        K::ArrowLeft => "left",
+        K::ArrowRight => "right",
+        K::ArrowUp => "up",
+        K::Space => "space",
+        K::Insert => "insert",
+        K::Delete => "delete",
+        K::Home => "home",
+        K::End => "end",
+        K::PageUp => "pageup",
+        K::PageDown => "pagedown",
+        K::Comma => "comma",
+        K::Backslash => "backslash",
+        K::Slash => "slash",
+        K::OpenBracket => "bracketleft",
+        K::CloseBracket => "bracketright",
+        K::Backtick => "backquote",
+        K::Minus => "minus",
+        K::Period => "period",
+        K::Equals => "equal",
+        K::Semicolon => "semicolon",
+        K::Quote => "quote",
+        _ => {
+            let name = key.name();
+            let single = name.len() == 1 && name.chars().all(|c| c.is_ascii_alphanumeric());
+            let function = name
+                .strip_prefix('F')
+                .and_then(|n| n.parse::<u8>().ok())
+                .is_some_and(|n| (1..=24).contains(&n));
+            if !(single || function) {
+                return None;
+            }
+            name
+        }
+    };
+    let mut combo = String::new();
+    for (on, part) in [
+        (modifiers.ctrl, "ctrl+"),
+        (modifiers.alt, "alt+"),
+        (modifiers.shift, "shift+"),
+    ] {
+        if on {
+            combo.push_str(part);
+        }
+    }
+    combo.push_str(&name.to_ascii_lowercase());
+    Some(combo)
 }
 
 /// A device `<select>` named by the row title `label_id`, as wide as the
@@ -485,6 +642,50 @@ mod tests {
     }
 
     #[test]
+    fn captured_presses_become_global_hotkey_combos() {
+        use egui::{Key, Modifiers};
+        let ctrl_alt = Modifiers {
+            ctrl: true,
+            alt: true,
+            ..Modifiers::NONE
+        };
+        let ctrl_shift = Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Modifiers::NONE
+        };
+        assert_eq!(
+            capture_combo(Key::R, ctrl_alt).as_deref(),
+            Some("ctrl+alt+r")
+        );
+        assert_eq!(
+            capture_combo(Key::F9, ctrl_shift).as_deref(),
+            Some("ctrl+shift+f9")
+        );
+        assert_eq!(
+            capture_combo(Key::Num5, Modifiers::ALT).as_deref(),
+            Some("alt+5")
+        );
+        assert_eq!(
+            capture_combo(Key::ArrowUp, ctrl_alt).as_deref(),
+            Some("ctrl+alt+up")
+        );
+        // Plain or Shift-only keys would swallow typing.
+        assert_eq!(capture_combo(Key::R, Modifiers::NONE), None);
+        assert_eq!(capture_combo(Key::R, Modifiers::SHIFT), None);
+        assert_eq!(capture_combo(Key::Escape, ctrl_alt), None);
+        // Every combo produced parses as a global hotkey.
+        for key in Key::ALL {
+            if let Some(combo) = capture_combo(*key, ctrl_alt) {
+                assert!(
+                    <global_hotkey::hotkey::HotKey as std::str::FromStr>::from_str(&combo).is_ok(),
+                    "{combo}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn watcher_row() {
         assert_eq!(watcher_text(None), "Watcher: …");
         let w = WatcherStatus {
@@ -616,7 +817,10 @@ mod tests {
                     "Recording hotkey",
                     "Starts or stops recording.",
                     Some("ctrl+alt+r"),
+                    false,
+                    true,
                 );
+                hotkey_row(ui, "Bookmark hotkey", "Marks.", None, true, false);
                 keycap(ui, "CTRL + ALT + B");
             });
             footnote(ui, "paragraph");

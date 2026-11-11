@@ -28,6 +28,10 @@ pub struct UiPrefs {
     pub onboarded: bool,
     /// The split layout's list column width (dragged at its divider).
     pub list_width: f32,
+    /// Global hotkeys picked in Settings (e.g. "ctrl+shift+f9"); None =
+    /// the default chain. Tried first at startup.
+    pub record_hotkey: Option<String>,
+    pub bookmark_hotkey: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -66,6 +70,8 @@ impl Default for UiPrefs {
             tray_icon: TrayIconStyle::Monochrome,
             onboarded: false,
             list_width: crate::ui::LIST_WIDTH,
+            record_hotkey: None,
+            bookmark_hotkey: None,
         }
     }
 }
@@ -201,6 +207,8 @@ mod tests {
             tray_icon: TrayIconStyle::Colour,
             onboarded: true,
             list_width: 420.0,
+            record_hotkey: Some("ctrl+shift+f9".into()),
+            bookmark_hotkey: None,
         };
         prefs.save(&dir).unwrap();
         assert_eq!(UiPrefs::load(&dir), prefs);

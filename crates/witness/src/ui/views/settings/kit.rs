@@ -112,7 +112,7 @@ impl<T> Segment<T> {
 }
 
 /// The gap between a segmented control's track and its segments.
-const SEGMENT_INSET: f32 = 3.0;
+pub(super) const SEGMENT_INSET: f32 = 3.0;
 
 /// A segmented choice (Windows 11's selector bar): an inset track as wide
 /// as the slot, equal segments, the picked one an accent tint with accent
@@ -862,5 +862,21 @@ mod tests {
             // 16 + 200 pt.
             assert_eq!(stacked, width < 492.0, "{width}");
         }
+    }
+
+    /// A search hit's anchor is the id the row it names marks itself under.
+    #[test]
+    fn row_anchors_name_the_rendered_row() {
+        let measured = run_at(460.0, |ui| {
+            row(
+                ui,
+                "backup",
+                Slot::Fit,
+                |ui| ui.label("Backup").id,
+                |_, _| (),
+            );
+            ui.data(|d| d.get_temp::<RowMetrics>(row_anchor_id("backup")))
+        });
+        assert!(measured.is_some());
     }
 }

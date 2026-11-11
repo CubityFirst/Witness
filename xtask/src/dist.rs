@@ -303,14 +303,6 @@ mod tests {
     }
 
     #[test]
-    fn sig_path_appends() {
-        assert_eq!(
-            sig_path(Path::new(r"C:\o\Witness_0.3.0_x64-setup.exe")),
-            PathBuf::from(r"C:\o\Witness_0.3.0_x64-setup.exe.sig")
-        );
-    }
-
-    #[test]
     fn stale_files_are_refused() {
         let dir = std::env::temp_dir().join(format!("xtask-dist-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

@@ -64,7 +64,10 @@ and left the client area see-through. The live-caption overlay stays dark in bot
   overlay the page padding and take no width, so a view's column lines up
   exactly with the shell's search box and banners.
 - **Split layout** (`ui::PaneLayout`): from 900 pt of content width,
-  Meetings / Search and a transcript opened from them show side by side —
+  Meetings / Search and a transcript opened from them show side by side
+  (the window opens at 1040×700 pt of content — scaled by the Windows
+  text size, clamped and centred on the primary work area — so the split
+  is the default; `main.rs` `default_window_rect`) —
   the list column 360 pt (drag the hairline divider between 300 and 520,
   double-click to reset; remembered in `ui-state.toml`), the transcript
   beside it or a "Select a meeting" placeholder. Views read `cx.pane`

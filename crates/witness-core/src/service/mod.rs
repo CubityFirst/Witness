@@ -658,6 +658,10 @@ mod tests {
         std::thread::spawn(|| {
             mark_ui_thread();
             assert!(is_ui_thread());
+            // The guard every blocking method starts with fires there.
+            if cfg!(debug_assertions) {
+                assert!(std::panic::catch_unwind(|| assert_off_ui_thread("test")).is_err());
+            }
         })
         .join()
         .unwrap();

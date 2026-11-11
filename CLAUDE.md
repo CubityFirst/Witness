@@ -70,7 +70,10 @@ repair, orphan recovery, bin purge) is `service/startup.rs`.
 
 UI (`crates/witness`): eframe 0.36 (glow renderer), no router — a `View` enum
 in `ui/mod.rs` (`ActiveView` owns the live view). Views in `ui/views/`:
-Meetings (+ recycle bin), People (stats + weekly trend + name filter), Transcript (+
+Meetings (+ recycle bin), People (stats + weekly trend + name filter), Stats
+(`stats.rs`: archive-wide fun insights from `witness_core::stats` — who you
+meet, talk balance, filler words, word clouds, the week grid; one
+`AppCore::stats_report` pass per load), Transcript (+
 `player_bar.rs`: player, live captions, bookmarks, notes; `ai_summary.rs`: the
 AI Summary panel), Search (filters),
 Settings (`views/settings/`: `mod.rs` view + routing, `nav.rs` rail / index,
@@ -425,7 +428,9 @@ thread and an in-house WSOLA time-stretch (speed) — no extra crates.
 - Global hotkeys walk candidate chains (record: ctrl+alt+r→w→shift+r;
   bookmark: ctrl+alt+b→m) because other apps can own combos system-wide;
   bound combos go to `core.set_bound_hotkeys` and are exposed through
-  status.
+  status. Settings → Recording rebinds either one (Change captures a
+  Ctrl/Alt combo in-app, Reset returns to the chain); the pick is saved in
+  `ui-state.toml` and tried before the chain at startup.
 - Toasts: the installed build (exe dir == `HKCU\Software\github\Witness`
   default; cargo profile dirs never count) uses the AUMID
   `com.github.cubityfirst.witness` that NSIS writes on the shortcut and
@@ -471,11 +476,13 @@ validated with newer LLVM releases. The toolchain is pinned in
   resolves the target dir from `cargo metadata` (never assumes `target\`)
   and fetches the hash-pinned NSIS toolchain into
   `%LOCALAPPDATA%\witness-build` (`WITNESS_BUILD_CACHE` overrides).
-- **Dev data dirs from the Tauri era live in `src-tauri/target*`** (real
-  databases, audio, 4 GB of models); never delete them — point
-  `data_dir`/`WITNESS_SETTINGS` at them (the untracked
-  `target\{debug,release}\witness-settings.toml` files do). Test launches use
-  their own `WITNESS_SETTINGS` + empty `data_dir`.
+- **Dev builds keep their data in `%LOCALAPPDATA%\Witness-dev`** (real
+  meetings; the untracked `target\{debug,release}\witness-settings.toml`
+  point `data_dir` there), separate from the installed app's
+  `%LOCALAPPDATA%\Witness`. The Tauri-era `src-tauri/target*` data dirs were
+  merged into the installed app's database and are gone (archived outside
+  the repo). Test launches use their own `WITNESS_SETTINGS` + empty
+  `data_dir`.
 - When ort-sys has to *copy* (not symlink) its DLLs it skips `deps/`, so
   test binaries can't see `onnxruntime_providers_cuda.dll` and `cuda_smoke`
   silently runs on CPU — copy the two provider DLLs into
@@ -511,7 +518,7 @@ validated with newer LLVM releases. The toolchain is pinned in
   `PrintWindow(PW_RENDERFULLCONTENT)`, kill it. Reach states through
   debug-build-only env hooks instead of clicks (full list in docs/UI.md):
   `WITNESS_DEBUG_START_VIEW`
-  (`meetings|people|settings|search:<q>|transcript:<id>`),
+  (`meetings|people|stats|settings|search:<q>|transcript:<id>`),
   `WITNESS_DEBUG_TOASTS=1`, `WITNESS_DEBUG_CONFIRM=1`,
   `WITNESS_DEBUG_CAPTIONS=1` (overlay with sample lines),
   `WITNESS_DEBUG_SYNTHETIC=1` (3,000-segment transcript),
@@ -574,7 +581,7 @@ removed on any failure; the app then launches the installer with
 `WITNESS_SETTINGS` env var → `witness-settings.toml` (next to exe) →
 `data_dir`: `witness.db`, `audio/{id}.opus`, `rec-tmp/` (in-flight WAVs +
 `.meta.toml` crash sidecars), `models/hf-cache/`, `cuda/` (optional managed
-GPU DLLs), `witness.log`, `ui-state.toml` (player volume/speed,
+GPU DLLs), `witness.log`, `ui-state.toml` (player volume/speed, picked hotkeys,
 model-banner dismissal; replaced WebView2 localStorage, reset once in
 0.3.0), `captions-overlay.toml` (overlay geometry in physical px + scale).
 data_dir changes apply to db/log on restart (Settings offers the button).

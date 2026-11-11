@@ -5,10 +5,10 @@
 
 use super::{
     fill, note, notice_done, quiet, row, section, segmented, title, toggle, OpRun, Segment,
-    SettingsState, Slot, FIELD_WIDTH,
+    SettingsState, Slot, FIELD_WIDTH, SEGMENT_INSET,
 };
 use crate::bridge::Task;
-use crate::platform::{autostart, system};
+use crate::platform::{autostart, system, tray};
 use crate::ui::icons::ph;
 use crate::ui::theme::{self, pal};
 use crate::ui::toasts::Notice;
@@ -16,6 +16,7 @@ use crate::ui::widgets;
 use crate::ui::{UiCmd, UiCtx};
 use crate::ui_state::{AccentSource, Appearance, TrayIconStyle, UiPrefs};
 use eframe::egui;
+use eframe::emath::GuiRounding as _;
 
 impl SettingsState {
     pub(super) fn general_page(&mut self, ui: &mut egui::Ui, cx: &mut UiCtx) {
@@ -40,6 +41,7 @@ impl SettingsState {
             accent_row(ui, prefs, look.as_ref());
             widgets::group_divider(ui);
             tray_icon_row(ui, prefs);
+            tray_preview_row(ui, look.is_some_and(|look| look.light_taskbar));
         });
     }
 
@@ -100,6 +102,9 @@ impl SettingsState {
 pub(crate) struct SystemLook {
     /// `AccentPalette`: light3 … base … dark3.
     pub accent: Option<[egui::Color32; 7]>,
+    /// The taskbar is light (`SystemUsesLightTheme`; unreadable = dark, as
+    /// the tray assumes): what the tray icon preview sits on.
+    pub light_taskbar: bool,
 }
 
 impl SystemLook {
@@ -107,6 +112,7 @@ impl SystemLook {
         cx.tasks.spawn("system-look", |_| SystemLook {
             accent: system::accent_palette()
                 .map(|shades| shades.map(|[r, g, b]| egui::Color32::from_rgb(r, g, b))),
+            light_taskbar: system::system_uses_light_theme().unwrap_or(false),
         })
     }
 
@@ -210,6 +216,119 @@ fn tray_icon_row(ui: &mut egui::Ui, prefs: &mut UiPrefs) {
             );
         },
     );
+}
+
+/// Under the tray icon choice: each set's idle, recording and transcribing
+/// glyphs on the taskbar's colour, each tile under its segment.
+fn tray_preview_row(ui: &mut egui::Ui, light_taskbar: bool) {
+    row(
+        ui,
+        "appearance-tray-preview",
+        Slot::Fill(FIELD_WIDTH),
+        |ui| {
+            let id = title(ui, "Preview");
+            note(ui, "Idle, recording and transcribing, on your taskbar.");
+            id
+        },
+        |ui, label| {
+            let height = ui.spacing().interact_size.y;
+            let (rect, response) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), height),
+                egui::Sense::hover(),
+            );
+            response.labelled_by(label);
+            // The taskbar's own colours, not the app palette's.
+            let taskbar = if light_taskbar {
+                egui::Color32::from_rgb(238, 238, 238)
+            } else {
+                egui::Color32::from_rgb(32, 32, 32)
+            };
+            let ppp = ui.ctx().pixels_per_point();
+            // The frame the tray would pick for a 16 pt small icon.
+            let px = (16.0 * ppp).round().max(1.0) as u32;
+            let inner = rect.shrink(SEGMENT_INSET);
+            let width = inner.width() / 2.0;
+            for (i, colour) in [false, true].into_iter().enumerate() {
+                let tile = egui::Rect::from_min_size(
+                    inner.min + egui::vec2(width * i as f32, 0.0),
+                    egui::vec2(width, inner.height()),
+                )
+                .shrink2(egui::vec2(SEGMENT_INSET, 0.0));
+                ui.painter().rect(
+                    tile,
+                    egui::CornerRadius::same(theme::R_SM),
+                    taskbar,
+                    egui::Stroke::new(1.0, pal().border),
+                    egui::StrokeKind::Inside,
+                );
+                let Some(glyphs) = tray_textures(ui.ctx(), colour, light_taskbar, px) else {
+                    continue;
+                };
+                const GAP: f32 = 12.0;
+                let sides = glyphs.each_ref().map(|t| t.size_vec2() / ppp);
+                let total = sides.iter().map(|s| s.x).sum::<f32>() + GAP * 2.0;
+                let mut x = tile.center().x - total / 2.0;
+                for ((texture, side), name) in
+                    glyphs
+                        .iter()
+                        .zip(sides)
+                        .zip(["Idle", "Recording", "Transcribing"])
+                {
+                    let min = egui::pos2(x, tile.center().y - side.y / 2.0);
+                    let at = egui::Rect::from_min_size(min.round_to_pixels(ppp), side);
+                    ui.painter().image(
+                        texture.id(),
+                        at,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                    ui.interact(
+                        at,
+                        ui.id().with(("tray-preview", i, name)),
+                        egui::Sense::hover(),
+                    )
+                    .on_hover_text(name);
+                    x += side.x + GAP;
+                }
+            }
+        },
+    );
+}
+
+/// The preview's textures for one icon set at `px`, decoded once per
+/// context (a failure is logged once and leaves the tile empty).
+fn tray_textures(
+    ctx: &egui::Context,
+    colour: bool,
+    light_taskbar: bool,
+    px: u32,
+) -> Option<[egui::TextureHandle; 3]> {
+    let id = egui::Id::new(("tray-preview", colour, light_taskbar, px));
+    if let Some(cached) = ctx.data(|d| d.get_temp::<Option<[egui::TextureHandle; 3]>>(id)) {
+        return cached;
+    }
+    let loaded = match tray::preview_glyphs(colour, light_taskbar, px) {
+        Ok(glyphs) => {
+            let mut i = 0;
+            Some(glyphs.map(|glyph| {
+                i += 1;
+                ctx.load_texture(
+                    format!("tray-preview-{colour}-{light_taskbar}-{px}-{i}"),
+                    egui::ColorImage::from_rgba_unmultiplied(
+                        [glyph.width as usize, glyph.height as usize],
+                        &glyph.rgba,
+                    ),
+                    egui::TextureOptions::LINEAR,
+                )
+            }))
+        }
+        Err(error) => {
+            log::warn!("tray icon preview: {error:#}");
+            None
+        }
+    };
+    ctx.data_mut(|d| d.insert_temp(id, loaded.clone()));
+    loaded
 }
 
 /// The General category's one-line summary.
