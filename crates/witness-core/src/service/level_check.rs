@@ -196,11 +196,17 @@ mod tests {
             qpc_100ns: 0,
         })
         .unwrap();
+        let dropped = Instant::now();
         drop(LevelCheck {
             shared: shared.clone(),
         });
         thread.join().unwrap();
-        assert!(shared.stop.load(Ordering::Relaxed));
+        // Stopped by the flag, not by running out MAX_DURATION.
+        assert!(
+            dropped.elapsed() < MAX_DURATION / 6,
+            "{:?}",
+            dropped.elapsed()
+        );
     }
 
     #[test]

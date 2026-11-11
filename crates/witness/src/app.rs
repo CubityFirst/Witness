@@ -13,7 +13,7 @@
 
 use crate::bridge::{wake_root, OpDone, RecOrigin, Tasks, UiMsg, UiSink};
 use crate::model::{Effect, ShellModel, UpdatePhase};
-use crate::platform::hotkeys::Hotkeys;
+use crate::platform::hotkeys::{HotkeyAction, Hotkeys};
 use crate::platform::single_instance::InstanceGuard;
 use crate::platform::system;
 use crate::platform::tray::Tray;
@@ -294,7 +294,11 @@ impl WitnessApp {
         let hotkeys = if snapshot.is_some() {
             Hotkeys::none()
         } else {
-            Hotkeys::register(sink.clone())
+            Hotkeys::register(
+                sink.clone(),
+                prefs.record_hotkey.as_deref(),
+                prefs.bookmark_hotkey.as_deref(),
+            )
         };
         core.set_bound_hotkeys(hotkeys.record_combo(), hotkeys.bookmark_combo());
         instance_guard.attach(sink.clone());
@@ -699,8 +703,31 @@ impl WitnessApp {
                 }
                 UiCmd::CheckUpdate => self.shell.update.check(&self.tasks),
                 UiCmd::InstallUpdate => self.shell.update.install(&self.tasks),
+                UiCmd::RebindHotkey(action, combo) => self.rebind_hotkey(action, combo),
             }
         }
+    }
+
+    /// Settings → Recording: bind, remember the choice, and show what bound.
+    fn rebind_hotkey(&mut self, action: HotkeyAction, combo: Option<String>) {
+        let Some(objects) = self.shell_objects.as_mut() else {
+            return;
+        };
+        let hotkeys = &mut objects.hotkeys;
+        match hotkeys.rebind(action, combo.as_deref()) {
+            Ok(()) => {
+                let pref = match action {
+                    HotkeyAction::Record => &mut self.prefs.record_hotkey,
+                    HotkeyAction::Bookmark => &mut self.prefs.bookmark_hotkey,
+                };
+                *pref = combo;
+            }
+            Err(error) => self.toasts.error("Hotkey not changed", error),
+        }
+        self.shell.record_hotkey = hotkeys.record_combo();
+        self.shell.bookmark_hotkey = hotkeys.bookmark_combo();
+        self.core
+            .set_bound_hotkeys(hotkeys.record_combo(), hotkeys.bookmark_combo());
     }
 
     /// The app is about to minimize the window itself; see `minimized_by_app`.

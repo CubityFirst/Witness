@@ -381,6 +381,27 @@ fn ico_frame(ico: &[u8], size: u32) -> anyhow::Result<&[u8]> {
         .context("empty ico")
 }
 
+/// One icon set's glyphs for the Settings preview — idle, recording,
+/// transcribing — from the frames the tray would pick at `size` px.
+pub fn preview_glyphs(
+    colour: bool,
+    light_taskbar: bool,
+    size: u32,
+) -> anyhow::Result<[eframe::egui::IconData; 3]> {
+    let look = TrayLook::of(colour, light_taskbar);
+    let decode = |state| -> anyhow::Result<_> {
+        Ok(eframe::icon_data::from_png_bytes(ico_frame(
+            glyph_ico(state, look),
+            size,
+        )?)?)
+    };
+    Ok([
+        decode(TrayState::Idle)?,
+        decode(TrayState::Recording)?,
+        decode(TrayState::Transcribing)?,
+    ])
+}
+
 fn png_icon(bytes: &[u8]) -> anyhow::Result<Icon> {
     let data = eframe::icon_data::from_png_bytes(bytes)?;
     Ok(Icon::from_rgba(data.rgba, data.width, data.height)?)

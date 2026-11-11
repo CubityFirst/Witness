@@ -237,6 +237,7 @@ enum Command {
     OpenRecording(i64),
     GoMeetings,
     GoPeople,
+    GoStats,
     GoSettings,
     /// Settings, opened at a category (only offered for a query).
     GoSettingsPage(SettingsPage),
@@ -493,6 +494,12 @@ fn actions(state: &ActionState) -> Vec<ActionSpec> {
         "Go to People",
         "speakers voices stats",
         Glyph::Icon(ph::USERS),
+    ));
+    out.push(spec(
+        Command::GoStats,
+        "Go to Stats",
+        "statistics insights charts words fillers",
+        Glyph::Icon(ph::CHART_BAR),
     ));
     out.push(spec(
         Command::GoSettings,
@@ -1446,6 +1453,7 @@ fn run(command: Command, cx: &mut UiCtx) {
         Command::OpenRecording(id) | Command::OpenMeeting(id) => open_transcript(cx, id),
         Command::GoMeetings => cx.go_meetings_clear_search(),
         Command::GoPeople => cx.nav.go(View::People),
+        Command::GoStats => cx.nav.go(View::Stats),
         Command::OpenPerson(id) => {
             cx.memory.expand_person = Some(id);
             cx.nav.go(View::People);

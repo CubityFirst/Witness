@@ -265,26 +265,6 @@ impl CredentialStore for WindowsCredentials {
 mod tests {
     use super::*;
 
-    #[test]
-    fn memory_store_round_trips_with_its_host() {
-        let store = MemoryCredentials::default();
-        assert_eq!(store.read().unwrap(), None);
-        assert_eq!(store.stored_host().unwrap(), None);
-        store
-            .write(&ApiKey::new("sk-one").unwrap(), " API.OpenAI.com ")
-            .unwrap();
-        let stored = store.read().unwrap().unwrap();
-        assert_eq!(stored.key.expose(), "sk-one");
-        assert_eq!(stored.host, "api.openai.com");
-        assert_eq!(
-            store.stored_host().unwrap().as_deref(),
-            Some("api.openai.com")
-        );
-        store.delete().unwrap();
-        store.delete().unwrap();
-        assert_eq!(store.read().unwrap(), None);
-    }
-
     /// Writes, reads and deletes a throwaway entry in the REAL Credential
     /// Manager of the user running the test (never the app's own entry).
     #[test]

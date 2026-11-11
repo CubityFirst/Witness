@@ -446,12 +446,21 @@ mod tests {
             std::os::windows::fs::symlink_file(&source, data.0.join("audio/link.opus"))
         {
             // Creating symlinks normally needs Developer Mode or an elevated
-            // token on Windows. The production rejection still applies; skip
-            // only when this machine cannot construct the test fixture.
-            if error.raw_os_error() == Some(1314) {
-                return;
+            // token on Windows; a directory junction needs neither and is a
+            // link to `copy_tree` all the same.
+            if error.raw_os_error() != Some(1314) {
+                panic!("could not create symlink fixture: {error}");
             }
-            panic!("could not create symlink fixture: {error}");
+            let status = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(data.0.join("audio").join("link-dir"))
+                .arg(&destination.0)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "could not create junction fixture");
         }
         #[cfg(unix)]
         std::os::unix::fs::symlink(&source, data.0.join("audio/link.opus")).unwrap();

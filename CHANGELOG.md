@@ -8,6 +8,14 @@ still evolve quickly.
 
 ### Added
 
+- A Stats page beside Meetings and People: who you meet most, how the
+  talking splits between you and the others (share, pace, questions),
+  filler words such as "like" and "um", a word cloud for each side, when
+  your meetings start, and the longest meeting and monologue. Ctrl+K "Go to
+  Stats" opens it too.
+- The recording and bookmark hotkeys can be changed in Settings →
+  Recording: click Change and press the new combination (it needs Ctrl or
+  Alt). Reset goes back to the defaults.
 - People has a search box in the same place as the Meetings one. It
   filters people by name as you type, and the ↑/↓ selection skips anyone it
   hides. Ctrl+F and / focus it while People is open; Esc or × clear it.

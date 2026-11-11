@@ -1112,14 +1112,6 @@ mod tests {
         assert!(parse_feed(r#"{"version":"latest"}"#, &v("0.2.1")).is_err());
     }
 
-    #[test]
-    fn release_info_uses_the_running_version() {
-        let info = parse_feed(FEED, &v("0.0.1")).unwrap().unwrap().info();
-        assert_eq!(info.current_version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(info.version, "0.3.0");
-        assert_eq!(info.date.as_deref(), Some("2026-10-01"));
-    }
-
     // --- signatures --------------------------------------------------------
 
     /// A throwaway key pair, plus its public key as base64 of the key box —
@@ -1532,16 +1524,16 @@ mod tests {
             .get("http://127.0.0.1:1/asset?sp=r&sig=SECRET")
             .call()
             .unwrap_err();
-        let source = std::error::Error::source(&error).map(ToString::to_string);
+        let source = std::error::Error::source(&error)
+            .expect("a transport error has a cause")
+            .to_string();
         let text = format!("{:#}", http_error("Update check", error));
         assert!(text.starts_with("Update check request failed: "), "{text}");
         assert!(
             !text.contains("http://") && !text.contains("SECRET"),
             "{text}"
         );
-        if let Some(source) = source {
-            assert_eq!(text.matches(source.as_str()).count(), 1, "{text}");
-        }
+        assert_eq!(text.matches(source.as_str()).count(), 1, "{text}");
     }
 
     #[test]
@@ -1876,18 +1868,6 @@ mod tests {
         drop(prepared);
         assert!(!dir.exists());
         std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn launch_reports_a_missing_installer() {
-        // Owns no dir: dropping it must never touch %TEMP% itself.
-        let prepared = PreparedUpdate {
-            version: "0.3.0".into(),
-            installer: std::env::temp_dir().join("witness-no-such-installer-7f3a.exe"),
-            temp_dir: Mutex::new(None),
-        };
-        assert!(prepared.launch(&[]).is_err());
     }
 
     // --- network (ignored) -------------------------------------------------

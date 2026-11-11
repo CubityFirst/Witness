@@ -57,6 +57,7 @@ pub(crate) use storage::{
 
 use crate::bridge::{OpHandle, Task};
 use crate::platform::autostart;
+use crate::platform::hotkeys::HotkeyAction;
 use crate::ui::icons::ph;
 use crate::ui::theme;
 use crate::ui::UiCmd;
@@ -283,6 +284,8 @@ struct SettingsState {
     junk_dirty: bool,
     /// The slider value while it is being dragged (committed on release).
     local_threshold: Option<f32>,
+    /// The global hotkey waiting for its new combination ("Change").
+    hotkey_capture: Option<HotkeyAction>,
 
     /// A data_dir change was saved while this view was open.
     needs_restart: bool,
@@ -347,6 +350,7 @@ impl SettingsState {
             junk_source: Vec::new(),
             junk_dirty: false,
             local_threshold: None,
+            hotkey_capture: None,
             needs_restart: false,
             autostart_write: None,
             backup: None,

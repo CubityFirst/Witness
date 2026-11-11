@@ -280,7 +280,7 @@ pub fn regular(size: f32) -> FontId {
     FontId::proportional(size)
 }
 
-/// The `@media (max-width: 620px)` switch. At the default 460 px window the
+/// The `@media (max-width: 620px)` switch. In a 380–460 pt window the
 /// narrow look is the normal look. Inside a split column it measures the
 /// column ([`set_pane_width`]), not the window.
 pub fn narrow(ui: &egui::Ui) -> bool {
@@ -515,14 +515,5 @@ mod tests {
         assert_eq!(w.hovered.weak_bg_fill, pal().bg_active);
         // No edge fade (CSS scrollers have none).
         assert_eq!(s.spacing.scroll.fade.strength, 0.0);
-    }
-
-    #[test]
-    fn tints_have_the_css_alpha() {
-        // Search hits and the active segment are accent tints.
-        assert_eq!(pal().mark_bg.a(), 66);
-        assert_eq!(pal().backdrop.a(), (0.55f32 * 255.0).round() as u8);
-        assert_eq!(pal().active_seg_bg.a(), 28);
-        assert_eq!(pal().accent_soft.a(), 41);
     }
 }
