@@ -24,8 +24,8 @@ pub fn set_managed_libs_dir(dir: PathBuf) {
 }
 
 /// Runtime libraries of `onnxruntime_providers_cuda.dll` as shipped with the
-/// pinned ort build (=2.0.0-rc.13, CUDA 13 binaries), minus DLLs Windows
-/// always provides. cuBLAS is a PE import; since rc.13 cuFFT (and cuDNN,
+/// pinned ort build (=2.0.0-rc.15, CUDA 13 binaries — same set as rc.13),
+/// minus DLLs Windows always provides. cuBLAS is a PE import; since rc.13 cuFFT (and cuDNN,
 /// below) are loaded by name at runtime instead, so `dumpbin /dependents`
 /// alone no longer lists them — check the embedded DLL names too when
 /// bumping ort.

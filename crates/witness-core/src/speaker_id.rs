@@ -203,7 +203,8 @@ impl Embedder {
     pub fn new(models_dir: &Path) -> Result<Embedder> {
         let path = crate::models::speaker_id_path(models_dir)
             .context("speaker-ID model not downloaded; download it in Settings → Storage")?;
-        let session = ort::session::Session::builder()
+        let env = crate::ort_env::environment()?;
+        let session = ort::session::Session::builder(&env)
             .context("ort session builder")?
             .commit_from_file(&path)
             .with_context(|| format!("loading speaker model {}", path.display()))?;

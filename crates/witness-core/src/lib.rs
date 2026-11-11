@@ -26,6 +26,7 @@ pub mod meeting_watcher;
 pub mod ml_scheduler;
 pub mod models;
 pub mod notify;
+pub mod ort_env;
 pub mod pipeline;
 pub mod player;
 pub mod recorder;
