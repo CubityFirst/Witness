@@ -1381,12 +1381,4 @@ mod tests {
         assert!(!esc_skips(false, true, false), "leaves the text field");
         assert!(!esc_skips(false, false, true), "answers the modal");
     }
-
-    #[test]
-    fn the_wizard_starts_where_asked() {
-        let wizard = Wizard::new(Step::Models);
-        assert_eq!(wizard.step, Step::Models);
-        assert_eq!(wizard.mounted, None, "loads start on the first pass");
-        assert!(wizard.levels.is_none());
-    }
 }

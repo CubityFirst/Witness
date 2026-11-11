@@ -10,6 +10,7 @@ use crate::pipeline::Job;
 use crate::recorder;
 use crate::settings::Engine;
 use crate::state::AppState;
+use crate::stats::{StatsBuilder, StatsReport};
 use crate::transcript_export::ExportFormat;
 use std::path::{Path, PathBuf};
 
@@ -299,6 +300,19 @@ impl AppCore {
     pub fn people_stats(&self) -> CoreResult<Vec<PersonMeetingStat>> {
         assert_off_ui_thread("people_stats");
         self.state.db.people_meeting_stats().map_err(err)
+    }
+
+    /// The Stats page's archive-wide insights (one pass over every
+    /// transcript line). ⏳
+    pub fn stats_report(&self) -> CoreResult<StatsReport> {
+        assert_off_ui_thread("stats_report");
+        let db = &self.state.db;
+        let meetings = db.list_meetings_started_since("").map_err(err)?;
+        let people = db.people_meeting_stats().map_err(err)?;
+        let mut builder = StatsBuilder::new(&meetings, &people);
+        db.for_each_stats_segment(|seg| builder.add(seg))
+            .map_err(err)?;
+        Ok(builder.finish())
     }
 
     /// One page of full-text search; the track filter only accepts

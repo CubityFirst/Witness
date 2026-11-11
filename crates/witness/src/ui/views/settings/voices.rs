@@ -297,32 +297,16 @@ mod tests {
         assert_eq!(threshold_edit(0.62, 0.6, true, true), Some(0.6));
     }
 
-    /// The real egui slider, untouched, over an off-grid stored value: it
-    /// rewrites the value and reports a change, which `threshold_edit`
-    /// must ignore.
+    /// The real row, untouched, over an off-grid stored value: egui's
+    /// slider rewrites it to the grid and reports a change, which must not
+    /// be saved.
     #[test]
     fn untouched_slider_over_an_off_grid_value_saves_nothing() {
-        let ctx = theme::test_context();
-        let mut edit = Some(f32::NAN);
-        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            egui::CentralPanel::default().show(ui, |ui| {
-                let shown = 0.62_f32;
-                let mut value = shown;
-                let response = ui.add(
-                    egui::Slider::new(&mut value, THRESHOLD_MIN..=THRESHOLD_MAX)
-                        .step_by(THRESHOLD_STEP as f64)
-                        .show_value(false),
-                );
-                assert!(response.changed(), "egui reports its own rounding");
-                assert!((value - 0.6).abs() < 1e-6, "rounded to {value}");
-                let interacted = response.is_pointer_button_down_on()
-                    || response.dragged()
-                    || response.clicked();
-                assert!(!interacted);
-                edit = threshold_edit(shown, value, response.changed(), interacted);
-            });
+        let mut local = None;
+        let mut saved = None;
+        super::super::kit::run_at(640.0, |ui| {
+            saved = saved.or(threshold_row(ui, &mut local, 0.62));
         });
-        output.textures_delta.clear(); // no renderer to upload the font atlas
-        assert_eq!(edit, None);
+        assert_eq!((saved, local), (None, None));
     }
 }

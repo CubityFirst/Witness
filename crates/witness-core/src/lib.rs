@@ -34,6 +34,7 @@ pub mod service;
 pub mod settings;
 pub mod speaker_id;
 pub mod state;
+pub mod stats;
 pub mod transcript_export;
 pub mod vad;
 

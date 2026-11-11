@@ -971,7 +971,7 @@ fn person_row(ui: &mut egui::Ui, p: &PersonAgg, open: bool, selected: bool) -> (
 
 /// The detail's key/value grid: two columns when there is room, one
 /// otherwise; keys elide (full key as tooltip), values never do.
-fn stats_grid(ui: &mut egui::Ui, pairs: &[(&'static str, String)]) {
+pub(crate) fn stats_grid(ui: &mut egui::Ui, pairs: &[(&'static str, String)]) {
     const GAP_X: f32 = 24.0;
     let key_font = theme::regular(12.5);
     let value_font = theme::semibold(13.0);

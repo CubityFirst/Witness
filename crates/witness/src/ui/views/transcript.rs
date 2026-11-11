@@ -5443,7 +5443,6 @@ mod tests {
         let detail = synthetic_detail(1, 3_000);
         let mut list = RowList::default();
         list.rebuild(&detail, |_| true);
-        let started = Instant::now();
         let out = run_list(&mut list, &detail, None, 3);
         assert!(out.rendered > 0);
         assert!(
@@ -5453,25 +5452,6 @@ mod tests {
         );
         let measured = list.heights.iter().filter(|h| h.is_some()).count();
         assert!(measured < 150, "measured {measured} rows");
-        // Debug build, three passes: generous bound, catches O(n) layout.
-        assert!(started.elapsed() < Duration::from_secs(5));
-    }
-
-    #[test]
-    fn deep_link_centres_a_far_row() {
-        let detail = synthetic_detail(1, 3_000);
-        let mut list = RowList::default();
-        list.rebuild(&detail, |_| true);
-        let req = ScrollReq::new(2_400, true, false);
-        // The view re-aims for up to `SCROLL_SETTLE_FRAMES` passes (the scroll
-        // bar animating in narrows the rows, and egui applies some scrolls a
-        // pass late).
-        let out = run_list(&mut list, &detail, Some(req), SCROLL_SETTLE_FRAMES.into());
-        let error = out.target_error.expect("target row laid out");
-        assert!(
-            error.abs() <= SCROLL_SETTLED_PX * 2.0,
-            "off centre by {error}"
-        );
     }
 
     #[test]

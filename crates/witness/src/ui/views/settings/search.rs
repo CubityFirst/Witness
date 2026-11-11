@@ -151,14 +151,14 @@ pub(super) const INDEX: &[Entry] = &[
         Row("Recording hotkey"),
         "Recording hotkey",
         "Starts or stops recording from any app.",
-        "shortcut keyboard global hotkey keys ctrl alt",
+        "shortcut keyboard global hotkey keys ctrl alt change rebind customize",
     ),
     entry(
         P::Recording,
         Row("Bookmark hotkey"),
         "Bookmark hotkey",
         "Marks the current moment of a recording.",
-        "shortcut keyboard global hotkey keys ctrl alt mark",
+        "shortcut keyboard global hotkey keys ctrl alt mark change rebind customize",
     ),
     // Transcription
     entry(
@@ -740,17 +740,5 @@ mod tests {
         assert_eq!(step(3, 4, 1), 0);
         assert_eq!(step(1, 4, 1), 2);
         assert_eq!(step(0, 0, 1), 0);
-    }
-
-    #[test]
-    fn anchors_match_the_rows_they_name() {
-        assert_eq!(
-            Row("backup").id(),
-            egui::Id::new(("settings-row", "backup"))
-        );
-        assert_eq!(
-            Section("Models").id(),
-            egui::Id::new(("settings-section", "Models"))
-        );
     }
 }

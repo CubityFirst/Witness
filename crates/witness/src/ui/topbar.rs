@@ -4,7 +4,7 @@
 //!
 //! The bar is one 48 pt row that never wraps: the leading actions (record,
 //! and while recording bookmark + CC), the status pill, a flexible gap,
-//! the Meetings / People segmented control, the settings gear and the
+//! the Meetings / People / Stats segmented control, the settings gear and the
 //! window controls. Every item's width is known before anything is drawn
 //! (fixed button sizes, texts measured with the fonts), so the layout is
 //! decided up front: [`degrade`] picks the first [`Degrade`] level whose
@@ -148,6 +148,7 @@ fn fake_model_banner() -> bool {
 enum NavItem {
     Meetings,
     People,
+    Stats,
     Settings,
 }
 
@@ -156,6 +157,7 @@ impl NavItem {
         match self {
             NavItem::Meetings => ph::WAVEFORM,
             NavItem::People => ph::USERS,
+            NavItem::Stats => ph::CHART_BAR,
             NavItem::Settings => ph::GEAR_SIX,
         }
     }
@@ -164,6 +166,7 @@ impl NavItem {
         match self {
             NavItem::Meetings => "Meetings",
             NavItem::People => "People",
+            NavItem::Stats => "Stats",
             NavItem::Settings => "Settings",
         }
     }
@@ -202,6 +205,7 @@ fn active_nav(view: &View, split_list: Option<&View>) -> Option<NavItem> {
     match split_list.unwrap_or(view) {
         View::Meetings => Some(NavItem::Meetings),
         View::People => Some(NavItem::People),
+        View::Stats => Some(NavItem::Stats),
         View::Settings => Some(NavItem::Settings),
         View::Transcript { .. } | View::Search { .. } => None,
     }
@@ -371,6 +375,7 @@ pub fn show(ui: &mut egui::Ui, cx: &mut UiCtx, split_list: Option<&View>) -> Top
             // box matches the unfiltered list.
             BarAction::Nav(NavItem::Meetings) => cx.go_meetings_clear_search(),
             BarAction::Nav(NavItem::People) => cx.nav.go(View::People),
+            BarAction::Nav(NavItem::Stats) => cx.nav.go(View::Stats),
             BarAction::Nav(NavItem::Settings) => cx.nav.go(View::Settings),
             // Minimize and close are performed by `app.rs`, which runs
             // `will_hide()` first.
@@ -410,15 +415,22 @@ pub(crate) enum Degrade {
     NavIcons = 1,
     /// … and the pill as dot + time (or a short text).
     PillCompact = 2,
+    /// … and the nav without Stats (it stays in the command palette), so
+    /// a recording near the minimum width keeps its time.
+    NavShort = 3,
     /// … and the pill as a dot (or spinner) only.
-    PillDot = 3,
+    PillDot = 4,
 }
 
+/// The nav's pages, in order; [`Degrade::NavShort`] drops the last.
+const NAV_ITEMS: [NavItem; 3] = [NavItem::Meetings, NavItem::People, NavItem::Stats];
+
 impl Degrade {
-    const ALL: [Degrade; 4] = [
+    const ALL: [Degrade; 5] = [
         Degrade::Full,
         Degrade::NavIcons,
         Degrade::PillCompact,
+        Degrade::NavShort,
         Degrade::PillDot,
     ];
 
@@ -426,10 +438,35 @@ impl Degrade {
         self != Degrade::Full
     }
 
+    /// The nav's variant: labelled, icon-only, icon-only without Stats
+    /// (an index into [`RowWidths::nav`]).
+    fn nav(self) -> usize {
+        match self {
+            Degrade::Full => 0,
+            Degrade::NavIcons | Degrade::PillCompact => 1,
+            Degrade::NavShort | Degrade::PillDot => 2,
+        }
+    }
+
+    /// The index into [`RowWidths::pill`].
+    fn pill_width(self) -> usize {
+        match self.pill() {
+            PillMode::Full if self == Degrade::Full => 0,
+            PillMode::Full => 1,
+            PillMode::Compact => 2,
+            PillMode::Dot => 3,
+        }
+    }
+
+    /// The nav pages shown.
+    fn nav_items(self) -> &'static [NavItem] {
+        &NAV_ITEMS[..if self.nav() == 2 { 2 } else { 3 }]
+    }
+
     fn pill(self) -> PillMode {
         match self {
             Degrade::Full | Degrade::NavIcons => PillMode::Full,
-            Degrade::PillCompact => PillMode::Compact,
+            Degrade::PillCompact | Degrade::NavShort => PillMode::Compact,
             Degrade::PillDot => PillMode::Dot,
         }
     }
@@ -443,8 +480,8 @@ pub(crate) struct RowWidths {
     /// The pill's width per [`Degrade`] level: whole, shortest full-mode
     /// text, compact, dot.
     pill: [f32; 4],
-    /// The nav with labels, and icon-only.
-    nav: [f32; 2],
+    /// The nav with labels, icon-only, and icon-only without Stats.
+    nav: [f32; 3],
     /// The gear and the window controls, with the gaps before them and
     /// the right padding.
     trail: f32,
@@ -457,9 +494,9 @@ impl RowWidths {
         PAD_LEFT
             + self.lead
             + GAP
-            + self.pill[level as usize]
+            + self.pill[level.pill_width()]
             + GAP
-            + self.nav[usize::from(level.nav_icons())]
+            + self.nav[level.nav()]
             + self.trail
     }
 }
@@ -504,7 +541,7 @@ fn segment_width(icons_only: bool, label_w: f32) -> f32 {
 }
 
 /// The segmented control holding segments for labels `label_ws` wide.
-fn nav_width(icons_only: bool, label_ws: [f32; 2]) -> f32 {
+fn nav_width(icons_only: bool, label_ws: &[f32]) -> f32 {
     NAV_INSET * 2.0
         + label_ws
             .iter()
@@ -538,7 +575,7 @@ fn measure_row(ui: &egui::Ui, model: &BarModel) -> RowWidths {
         compact.min_width(measure),
         dot.min_width(measure),
     ];
-    let labels = [NavItem::Meetings, NavItem::People].map(|item| {
+    let labels = NAV_ITEMS.map(|item| {
         ui.painter()
             .layout_no_wrap(item.label().to_owned(), nav_font(), pal().text)
             .size()
@@ -548,7 +585,11 @@ fn measure_row(ui: &egui::Ui, model: &BarModel) -> RowWidths {
     RowWidths {
         lead: lead_width(model.recording, model.live_captions),
         pill,
-        nav: [nav_width(false, labels), nav_width(true, labels)],
+        nav: [
+            nav_width(false, &labels),
+            nav_width(true, &labels),
+            nav_width(true, &labels[..2]),
+        ],
         trail: trail_width(model.popup),
     }
 }
@@ -559,7 +600,7 @@ fn draw_bar(ui: &mut egui::Ui, model: &BarModel) -> DrawnBar {
     let widths = measure_row(ui, model);
     let level = degrade(&widths, width);
     // The pill may grow into the flexible gap (a busy pill's full text).
-    let pill_room = widths.pill[level as usize] + (width - widths.total(level)).max(0.0);
+    let pill_room = widths.pill[level.pill_width()] + (width - widths.total(level)).max(0.0);
     let mut actions = Vec::new();
     #[cfg(test)]
     let mut rects = Vec::new();
@@ -652,10 +693,10 @@ fn draw_bar(ui: &mut egui::Ui, model: &BarModel) -> DrawnBar {
             right -= BTN;
             let gear = slot(right, BTN, BTN);
             let icons_only = level.nav_icons();
-            let nav_w = widths.nav[usize::from(icons_only)];
+            let nav_w = widths.nav[level.nav()];
             let nav = slot(right - TIGHT_GAP - nav_w, nav_w, BTN);
             place(ui, Item::Nav, nav, &mut |ui, actions| {
-                nav_control(ui, model.active, icons_only, actions);
+                nav_control(ui, model.active, level.nav_items(), icons_only, actions);
             });
             place(ui, Item::Settings, gear, &mut |ui, actions| {
                 let selected = model.active == Some(NavItem::Settings);
@@ -884,12 +925,13 @@ fn settings_button(ui: &mut egui::Ui, selected: bool) -> egui::Response {
     .on_hover_text(item.label())
 }
 
-/// The Meetings / People segmented control: a raised track, the current
+/// The Meetings / People / Stats segmented control: a raised track, the current
 /// page's segment accent-tinted. Icon + label, or icon-only (the label is
 /// then the tooltip). Also the keyboard path: each segment is a button.
 fn nav_control(
     ui: &mut egui::Ui,
     active: Option<NavItem>,
+    items: &[NavItem],
     icons_only: bool,
     actions: &mut Vec<BarAction>,
 ) {
@@ -902,7 +944,7 @@ fn nav_control(
         egui::StrokeKind::Inside,
     );
     ui.add_space(NAV_INSET);
-    for item in [NavItem::Meetings, NavItem::People] {
+    for &item in items {
         let response = nav_segment(ui, item, icons_only, active == Some(item));
         if response.clicked() {
             actions.push(BarAction::Nav(item));
@@ -1781,7 +1823,7 @@ mod tests {
         RowWidths {
             lead: 32.0,
             pill,
-            nav: [190.0, 68.0],
+            nav: [222.0, 100.0, 68.0],
             trail: trail_width(false),
         }
     }
@@ -1808,6 +1850,10 @@ mod tests {
         );
         assert_eq!(
             degrade(&w, w.total(Degrade::PillCompact) - 1.0),
+            Degrade::NavShort
+        );
+        assert_eq!(
+            degrade(&w, w.total(Degrade::NavShort) - 1.0),
             Degrade::PillDot
         );
         // Nothing fits: the last level (it never wraps).
@@ -1826,8 +1872,8 @@ mod tests {
             trail_width(true) < trail_width(false),
             "flyout: no controls"
         );
-        assert_eq!(nav_width(true, [60.0, 45.0]), NAV_INSET * 2.0 + 64.0);
-        assert!(nav_width(false, [60.0, 45.0]) > nav_width(true, [60.0, 45.0]));
+        assert_eq!(nav_width(true, &[60.0, 45.0, 40.0]), NAV_INSET * 2.0 + 96.0);
+        assert!(nav_width(false, &[60.0, 45.0, 40.0]) > nav_width(true, &[60.0, 45.0, 40.0]));
     }
 
     /// A fixed pill geometry (10 / 5 padding, 27 pt tall).
@@ -2086,9 +2132,10 @@ mod tests {
             assert_eq!(wide, Degrade::Full, "{name}");
         }
         let idle = bar_model(PillState::Idle, false, false);
-        assert_eq!(lay_out_bar(460.0, &idle).2, Degrade::Full, "labels at 460");
+        assert_eq!(lay_out_bar(520.0, &idle).2, Degrade::Full, "labels at 520");
         assert_eq!(lay_out_bar(380.0, &idle).2, Degrade::NavIcons);
-        // Recording with CC at the minimum width: down to the dot.
+        // Recording with CC at the minimum width: down to the dot (and
+        // the nav without Stats).
         let rec = bar_model(recording("12:34", false), true, false);
         let (_, rects, level) = lay_out_bar(380.0, &rec);
         assert_eq!(level, Degrade::PillDot);
@@ -2099,7 +2146,7 @@ mod tests {
         );
         // Without CC there is room for the time.
         let rec = bar_model(recording("12:34", false), false, false);
-        assert!(lay_out_bar(380.0, &rec).2 <= Degrade::PillCompact);
+        assert!(lay_out_bar(380.0, &rec).2 <= Degrade::NavShort);
         // Window controls hug the right edge, the record button the left.
         let (_, rects, _) = lay_out_bar(640.0, &rec);
         assert!((rect_of(&rects, Item::Controls).right() - (640.0 - PAD_RIGHT)).abs() < 0.01);
@@ -2294,12 +2341,38 @@ mod tests {
         assert_eq!(download_text(&p), "file 2 of 5 · downloading…");
     }
 
+    /// A press on a zone hands its direction to the OS sizing loop; a hover
+    /// or a press inside the window does not.
     #[test]
-    fn edge_resize_registers_zones_without_panicking() {
+    fn edge_resize_reports_the_pressed_zone() {
         let ctx = theme::test_context();
-        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            assert_eq!(edge_resize(ui.ctx(), "test"), None);
-        });
-        output.textures_delta.clear();
+        let press = |at| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let corner = egui::pos2(2.0, 2.0);
+        let inside = egui::pos2(200.0, 200.0);
+        let mut hits = Vec::new();
+        // Two hover passes: new areas are hit-tested from the pass after.
+        for events in [
+            vec![egui::Event::PointerMoved(corner)],
+            vec![],
+            vec![press(corner)],
+            vec![egui::Event::PointerMoved(inside), press(inside)],
+        ] {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(460.0, 620.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| hits.push(edge_resize(ui.ctx(), "test")));
+            output.textures_delta.clear();
+        }
+        assert_eq!(hits, [None, None, Some(ResizeDirection::NorthWest), None]);
     }
 }

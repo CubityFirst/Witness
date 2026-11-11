@@ -116,6 +116,20 @@ pub struct PersonMeetingStat {
     pub segments: i64,
 }
 
+/// One transcript line as the Stats page reads it (`Db::for_each_stats_segment`).
+#[derive(Debug, Clone)]
+pub struct StatsSegmentRow {
+    pub meeting_id: i64,
+    pub meeting_title: String,
+    /// "mic" (Me) or "loopback".
+    pub track: String,
+    pub speaker_id: Option<i64>,
+    pub speaker_name: Option<String>,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
+}
+
 /// A speaker row ready for insertion alongside a new transcript.
 #[derive(Debug, Clone)]
 pub struct NewSpeaker {
@@ -1358,6 +1372,37 @@ impl Db {
         Ok(rows)
     }
 
+    /// Every transcript line of the meetings not in the recycle bin, in
+    /// transcript order (meeting, then start time), handed to `f` one at a
+    /// time. The connection stays locked meanwhile, so `f` must be quick
+    /// and must not touch the database.
+    pub fn for_each_stats_segment(&self, mut f: impl FnMut(&StatsSegmentRow)) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT seg.meeting_id, m.title, seg.track, seg.speaker_id, sp.display_name,
+                    seg.start_ms, seg.end_ms, seg.text
+             FROM segments seg
+             JOIN meetings m ON m.id = seg.meeting_id
+             LEFT JOIN speakers sp ON sp.id = seg.speaker_id
+             WHERE m.deleted_at IS NULL
+             ORDER BY seg.meeting_id, seg.start_ms, seg.id",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            f(&StatsSegmentRow {
+                meeting_id: row.get(0)?,
+                meeting_title: row.get(1)?,
+                track: row.get(2)?,
+                speaker_id: row.get(3)?,
+                speaker_name: row.get(4)?,
+                start_ms: row.get(5)?,
+                end_ms: row.get(6)?,
+                text: row.get(7)?,
+            });
+        }
+        Ok(())
+    }
+
     // ---------- search ----------
 
     /// Sanitize a user query into an FTS5 MATCH expression: each token is
@@ -2354,6 +2399,73 @@ mod tests {
             .is_empty());
         assert!(db.get_segments(id).unwrap().is_empty());
 
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stats_segments_stream_in_order_and_skip_the_bin() {
+        let (db, dir) = test_db("stats-segments");
+        let me = NewSpeaker {
+            label: "me".into(),
+            display_name: "Me".into(),
+            embedding: None,
+            emb_seconds: 0.0,
+            person_id: None,
+            auto_labeled: false,
+        };
+        let line = |label: &str, track: &str, start_ms: i64, text: &str| NewSegment {
+            speaker_label: Some(label.into()),
+            track: track.into(),
+            start_ms,
+            end_ms: start_ms + 500,
+            text: text.into(),
+        };
+        let kept = db
+            .create_meeting("Kept", "2026-08-01T12:00:00Z", "manual")
+            .unwrap();
+        let binned = db
+            .create_meeting("Binned", "2026-08-02T12:00:00Z", "manual")
+            .unwrap();
+        for id in [kept, binned] {
+            let them = NewSpeaker {
+                label: "S1".into(),
+                display_name: "Speaker 1".into(),
+                ..me.clone()
+            };
+            db.replace_transcript(
+                id,
+                &[me.clone(), them],
+                &[
+                    line("S1", "loopback", 900, "second"),
+                    line("me", "mic", 100, "first"),
+                ],
+                "test",
+            )
+            .unwrap();
+        }
+        db.soft_delete_meeting(binned).unwrap();
+        let mut rows = Vec::new();
+        db.for_each_stats_segment(|row| rows.push(row.clone()))
+            .unwrap();
+        let got: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.meeting_title.as_str(),
+                    r.track.as_str(),
+                    r.speaker_name.as_deref(),
+                    r.text.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("Kept", "mic", Some("Me"), "first"),
+                ("Kept", "loopback", Some("Speaker 1"), "second"),
+            ]
+        );
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
