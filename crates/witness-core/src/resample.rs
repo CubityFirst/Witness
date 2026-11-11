@@ -2,8 +2,10 @@
 //! device-rate → 48 kHz while recording, and 48 kHz → 16 kHz for ASR.
 
 use anyhow::{ensure, Result};
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{
-    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    Async, FixedAsync, Indexing, Resampler, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction,
 };
 
 const CHUNK: usize = 1024;
@@ -12,8 +14,10 @@ const ONE_SHOT_BATCH: usize = CHUNK * 16;
 
 /// Mono streaming resampler; passthrough when rates match.
 pub struct StreamResampler {
-    inner: Option<SincFixedIn<f32>>,
+    inner: Option<Async<f32>>,
     pending: Vec<f32>,
+    /// Output block buffer, sized to the resampler's largest output chunk.
+    scratch: Vec<f32>,
 }
 
 impl StreamResampler {
@@ -24,20 +28,29 @@ impl StreamResampler {
             return Ok(StreamResampler {
                 inner: None,
                 pending: Vec::with_capacity(CHUNK),
+                scratch: Vec::new(),
             });
         }
         let params = SincInterpolationParameters {
             sinc_len: 128,
-            f_cutoff: 0.95,
+            f_cutoff: Some(0.95),
             interpolation: SincInterpolationType::Linear,
             oversampling_factor: 128,
             window: WindowFunction::Blackman2,
         };
-        let inner =
-            SincFixedIn::<f32>::new(out_rate as f64 / in_rate as f64, 1.1, params, CHUNK, 1)?;
+        let inner = Async::<f32>::new_sinc(
+            out_rate as f64 / in_rate as f64,
+            1.1,
+            &params,
+            CHUNK,
+            1,
+            FixedAsync::Input,
+        )?;
+        let scratch = vec![0.0; inner.output_frames_max()];
         Ok(StreamResampler {
             inner: Some(inner),
             pending: Vec::with_capacity(CHUNK),
+            scratch,
         })
     }
 
@@ -59,18 +72,16 @@ impl StreamResampler {
             remaining = &remaining[take..];
 
             if self.pending.len() == CHUNK {
-                let mut result = inner.process(&[self.pending.as_slice()], None)?;
-                out.append(&mut result[0]);
+                process_block(inner, &mut self.scratch, &self.pending, None, &mut out)?;
                 self.pending.clear();
             }
         }
 
-        // Rubato accepts borrowed channel slices, so full blocks can be
-        // processed directly from the caller's buffer without a copy.
+        // Rubato reads through a borrowed slice adapter, so full blocks can
+        // be processed directly from the caller's buffer without a copy.
         while remaining.len() >= CHUNK {
             let (chunk, rest) = remaining.split_at(CHUNK);
-            let mut result = inner.process(&[chunk], None)?;
-            out.append(&mut result[0]);
+            process_block(inner, &mut self.scratch, chunk, None, &mut out)?;
             remaining = rest;
         }
 
@@ -86,15 +97,33 @@ impl StreamResampler {
         };
         let mut out = Vec::new();
         if !self.pending.is_empty() {
-            let mut result = inner.process_partial(Some(&[self.pending.as_slice()]), None)?;
-            out.append(&mut result[0]);
+            let len = self.pending.len();
+            process_block(inner, &mut self.scratch, &self.pending, Some(len), &mut out)?;
             self.pending.clear();
         }
-        // Drain the resampler's internal delay line.
-        let mut result = inner.process_partial::<Vec<f32>>(None, None)?;
-        out.append(&mut result[0]);
+        // Drain the resampler's internal delay line with one block of silence.
+        process_block(inner, &mut self.scratch, &[], Some(0), &mut out)?;
         Ok(out)
     }
+}
+
+/// Resample one input block (`partial_len` = valid frames of a short final
+/// block, zero-padded by rubato) and append the output to `out`.
+fn process_block(
+    inner: &mut Async<f32>,
+    scratch: &mut [f32],
+    input: &[f32],
+    partial_len: Option<usize>,
+    out: &mut Vec<f32>,
+) -> Result<()> {
+    let adapter_in = InterleavedSlice::new(input, 1, input.len())?;
+    let frames = scratch.len();
+    let mut adapter_out = InterleavedSlice::new_mut(&mut *scratch, 1, frames)?;
+    let indexing = partial_len.map(|n| Indexing::new().partial_len(n));
+    let (_, written) =
+        inner.process_into_buffer(&adapter_in, &mut adapter_out, indexing.as_ref())?;
+    out.extend_from_slice(&scratch[..written]);
+    Ok(())
 }
 
 /// One-shot mono resample of a whole buffer.
