@@ -28,7 +28,7 @@ raw-window-handle = "0.6.2"
 # Re-exports muda 0.21 as tray_icon::menu.
 tray-icon = "0.26.0"
 global-hotkey = "0.9.0"
-rfd = "0.17.2"
+rfd = "0.18.0"
 winreg = "0.56"
 windows = { version = "0.62", features = [
   "Win32_Foundation",
